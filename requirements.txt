@@ -1,0 +1,8 @@
+# OpenAI provider (default) — talks to GPT-5.5 via Chat Completions.
+openai
+
+# Gemini provider — only needed when LLM_PROVIDER=gemini.
+google-genai
+
+# Loads API keys from a local .env file so we never hardcode secrets.
+python-dotenv
