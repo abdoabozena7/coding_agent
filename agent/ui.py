@@ -1,18 +1,8 @@
 """
-ui.py — terminal presentation for the agent loop.
+Terminal presentation for the agent loop.
 
-main.py owns the control flow; this module owns how each step LOOKS. Keeping the
-two apart leaves the loop readable and puts all the ANSI/formatting fuss in one
-place. Each step of a turn is rendered as a clearly separated, labeled block:
-
-  ▸ step N        — which reasoning/tool step we're on within the turn
-  💭 thinking     — the model's reasoning summary (Gemini; OpenAI omits it)
-  💬 answer       — the model's text to the user
-  🔧 tool         — the tool name + its pretty-printed arguments
-  📤 result       — what the tool returned (truncated if very long)
-  📊 tokens       — token accounting for the step
-
-Colors degrade to plain text automatically when stdout isn't a TTY (pipes/logs).
+main.py owns the control flow; this module owns how each step looks. The labels
+are intentionally ASCII-only so the app runs cleanly in Windows code pages.
 """
 
 import json
@@ -36,32 +26,28 @@ MAGENTA = _c("\033[35m")
 BLUE = _c("\033[34m")
 GREY = _c("\033[90m")
 
-_RULE = "─" * 56
+_RULE = "-" * 56
 
 
-def banner(provider: str) -> None:
+def banner(provider: str, model: str | None = None) -> None:
     """One-time header printed at startup."""
-    print(f"{BOLD}Coding agent{RESET} {DIM}· provider={provider} · type 'exit' to quit{RESET}\n")
+    model_part = f" - model={model}" if model else ""
+    print(f"{BOLD}Coding agent{RESET} {DIM}- provider={provider}{model_part} - type 'exit' to quit{RESET}\n")
 
 
 def user_prompt() -> str:
-    """The 'you' input prompt, styled to match the other labeled lines."""
-    return f"{BOLD}{CYAN}🧑 you{RESET} "
+    """The user input prompt, styled to match the other labeled lines."""
+    return f"{BOLD}{CYAN}you>{RESET} "
 
 
 def step_header(n: int) -> None:
     """Open a new reasoning/tool step within the current turn."""
     print(f"\n{DIM}{_RULE}{RESET}")
-    print(f"{BOLD}{BLUE}▸ step {n}{RESET}")
+    print(f"{BOLD}{BLUE}> step {n}{RESET}")
 
 
 class Streamer:
-    """Renders streamed thinking/answer fragments under section headers.
-
-    Headers print lazily — only once content for that section actually arrives —
-    so a tool-only step (no text) never leaves an orphaned 'answer' label, and a
-    provider with no visible reasoning never prints an empty 'thinking' block.
-    """
+    """Renders streamed thinking/answer fragments under section headers."""
 
     def __init__(self):
         self._thought_open = False
@@ -69,18 +55,17 @@ class Streamer:
 
     def on_thought(self, fragment: str) -> None:
         if not self._thought_open:
-            print(f"{MAGENTA}💭 thinking{RESET}")
-            print(DIM, end="", flush=True)  # dim the reasoning body
+            print(f"{MAGENTA}thinking{RESET}")
+            print(DIM, end="", flush=True)
             self._thought_open = True
         print(fragment, end="", flush=True)
 
     def on_text(self, fragment: str) -> None:
-        # Close the thinking block (reset dim + blank line) before the answer.
         if self._thought_open and not self._text_open:
             print(RESET)
             print()
         if not self._text_open:
-            print(f"{BOLD}{CYAN}💬 answer{RESET}")
+            print(f"{BOLD}{CYAN}answer{RESET}")
             self._text_open = True
         print(fragment, end="", flush=True)
 
@@ -92,7 +77,7 @@ class Streamer:
 
 def tool_call(name: str, args: dict) -> None:
     """Show the tool the model wants to run and its arguments."""
-    print(f"\n{BOLD}{YELLOW}🔧 tool · {name}{RESET}")
+    print(f"\n{BOLD}{YELLOW}tool - {name}{RESET}")
     if args:
         pretty = json.dumps(args, indent=2, ensure_ascii=False)
         for line in pretty.splitlines():
@@ -102,12 +87,7 @@ def tool_call(name: str, args: dict) -> None:
 
 
 def tool_result(result, limit: int = 100) -> None:
-    """Show what the tool returned, condensed to a single line.
-
-    We summarize rather than dump: the first line (truncated) plus a count of
-    whatever else was hidden, so the transcript stays scannable. The model still
-    receives the FULL result — this only trims what the human sees.
-    """
+    """Show what the tool returned, condensed to a single line."""
     text = str(result).strip()
     lines = text.splitlines() or [""]
     first = lines[0]
@@ -115,28 +95,25 @@ def tool_result(result, limit: int = 100) -> None:
     hidden = []
     if len(first) > limit:
         hidden.append(f"+{len(first) - limit} chars")
-        first = first[:limit] + "…"
+        first = first[:limit] + "..."
     if len(lines) > 1:
         hidden.append(f"+{len(lines) - 1} lines")
     suffix = f" {DIM}({', '.join(hidden)}){RESET}" if hidden else ""
 
-    print()  # blank line above, matching the spacing of the other blocks
-    print(f"{BOLD}{GREEN}📤 result{RESET} {first}{suffix}")
+    print()
+    print(f"{BOLD}{GREEN}result{RESET} {first}{suffix}")
 
 
 def usage(u) -> None:
-    """One dim line of token accounting. Watch `cached` climb across steps."""
-    print(
-        f"{GREY}📊 tokens · in={u.input_tokens} "
-        f"cached={u.cached_tokens} out={u.output_tokens}{RESET}"
-    )
+    """One dim line of token accounting."""
+    print(f"{GREY}tokens - in={u.input_tokens} cached={u.cached_tokens} out={u.output_tokens}{RESET}")
 
 
 def confirm_prompt(name: str) -> str:
     """The styled approval question for a risky tool. Returns the raw answer."""
-    return input(f"   {YELLOW}⚠ run {name}? [y/N]{RESET} ").strip().lower()
+    return input(f"   {YELLOW}run {name}? [y/N]{RESET} ").strip().lower()
 
 
 def turn_end() -> None:
-    """Blank separation after the model finishes a turn (no more tools)."""
+    """Blank separation after the model finishes a turn."""
     print()

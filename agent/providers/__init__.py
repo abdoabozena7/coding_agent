@@ -11,7 +11,7 @@ provider's SDK installed unless you actually use it.
 
 from .base import AssistantTurn, ToolCall, Usage, Provider  # re-exported for convenience
 
-_PROVIDERS = ("openai", "gemini")
+_PROVIDERS = ("openai", "gemini", "ollama")
 
 
 def get_provider(name: str):
@@ -22,4 +22,7 @@ def get_provider(name: str):
     if name == "gemini":
         from .gemini_provider import GeminiProvider
         return GeminiProvider()
+    if name == "ollama":
+        from .ollama_provider import OllamaProvider
+        return OllamaProvider()
     raise ValueError(f"Unknown LLM_PROVIDER '{name}'. Options: {', '.join(_PROVIDERS)}")

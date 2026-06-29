@@ -31,6 +31,11 @@ def provider_name() -> str:
     return os.getenv("LLM_PROVIDER", "openai").lower()
 
 
+def model_name() -> str:
+    """Return the active provider's configured model name, when available."""
+    return getattr(_active(), "model", "unknown")
+
+
 def call(conversation, tools, system, on_text=None, on_thought=None):
     """Forward to the active provider. Returns a neutral AssistantTurn."""
     return _active().call(conversation, tools, system, on_text=on_text, on_thought=on_thought)
