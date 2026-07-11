@@ -9,3 +9,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Workspace-local persistent harness state
+.coding-agent/

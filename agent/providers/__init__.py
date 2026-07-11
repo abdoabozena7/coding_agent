@@ -9,13 +9,29 @@ We import each adapter LAZILY (only when selected) so you don't need a
 provider's SDK installed unless you actually use it.
 """
 
-from .base import AssistantTurn, ToolCall, Usage, Provider  # re-exported for convenience
+from .base import (  # re-exported for convenience
+    AssistantTurn,
+    Provider,
+    ProviderCapabilities,
+    ToolCall,
+    Usage,
+)
+
+__all__ = [
+    "AssistantTurn",
+    "Provider",
+    "ProviderCapabilities",
+    "ToolCall",
+    "Usage",
+    "get_provider",
+    "get_provider_capabilities",
+]
 
 _PROVIDERS = ("openai", "gemini", "ollama")
 
 
 def get_provider(name: str):
-    name = (name or "openai").lower()
+    name = (name or "openai").strip().lower()
     if name == "openai":
         from .openai_provider import OpenAIProvider
         return OpenAIProvider()
@@ -26,3 +42,9 @@ def get_provider(name: str):
         from .ollama_provider import OllamaProvider
         return OllamaProvider()
     raise ValueError(f"Unknown LLM_PROVIDER '{name}'. Options: {', '.join(_PROVIDERS)}")
+
+
+def get_provider_capabilities(name: str) -> ProviderCapabilities:
+    """Return feature metadata without creating a network connection."""
+
+    return get_provider(name).capabilities

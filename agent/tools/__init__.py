@@ -7,6 +7,16 @@ module to the TOOLS list below. Nothing else in the codebase changes.
 """
 
 from . import read_file, list_files, grep, write_file, edit_file, run_bash
+from ._security import (
+    ToolContext,
+    ToolSecurityError,
+    configure_workspace,
+    get_tool_context,
+    get_workspace,
+    safe_os_error,
+    workspace_context,
+)
+from ._validation import ToolArgumentError, validate_tool_arguments
 
 # Every tool module the agent can use.
 TOOLS = [read_file, list_files, grep, write_file, edit_file, run_bash]
@@ -35,10 +45,19 @@ def requires_approval(name: str, args: dict | None = None) -> bool:
     tool = _BY_NAME.get(name)
     if tool is None:
         return True
+    try:
+        validated = validate_tool_arguments(tool.SCHEMA, {} if args is None else args)
+    except (ToolArgumentError, TypeError, ValueError):
+        # Malformed calls fail closed.  run_tool will return the precise
+        # validation error without invoking the implementation.
+        return True
     decider = getattr(tool, "requires_approval", None)
     if callable(decider):
-        return decider(args or {})
-    return getattr(tool, "REQUIRES_APPROVAL", True)
+        try:
+            return bool(decider(validated))
+        except Exception:
+            return True
+    return bool(getattr(tool, "REQUIRES_APPROVAL", True))
 
 
 def run_tool(name: str, args: dict) -> str:
@@ -53,6 +72,16 @@ def run_tool(name: str, args: dict) -> str:
     if tool is None:
         return f"Error: unknown tool '{name}'"
     try:
-        return tool.run(**args)
-    except Exception as e:
+        validated = validate_tool_arguments(tool.SCHEMA, args)
+        result = tool.run(**validated)
+        if not isinstance(result, str):
+            return "Error: tool returned a non-string result"
+        return result
+    except ToolArgumentError as e:
+        return f"Error: invalid arguments: {e}"
+    except ToolSecurityError as e:
         return f"Error: {e}"
+    except OSError as e:
+        return f"Error: operating-system failure: {safe_os_error(e)}"
+    except Exception as e:
+        return f"Error: tool failed unexpectedly ({type(e).__name__})"

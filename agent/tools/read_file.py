@@ -6,6 +6,16 @@ A tool is two things bundled together:
   • run()  — what actually executes on our machine when the model asks for it.
 """
 
+from ._security import (
+    MAX_PATH_CHARS,
+    bounded_output,
+    read_text_limited,
+    reject_sensitive_path,
+    reject_sensitive_spelling,
+    resolve_workspace_path,
+    sensitive_content_reason,
+)
+
 # What the model sees. This is OpenAI's "function tool" format: the model reads
 # the description + parameters to decide WHEN to call it and WITH WHAT arguments.
 REQUIRES_APPROVAL = False  # read-only — safe to run automatically
@@ -20,10 +30,13 @@ SCHEMA = {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file, relative to the current directory.",
+                    "minLength": 1,
+                    "maxLength": MAX_PATH_CHARS,
+                    "description": "Path to the file, relative to the active workspace.",
                 },
             },
             "required": ["path"],
+            "additionalProperties": False,
         },
     },
 }
@@ -31,5 +44,11 @@ SCHEMA = {
 
 def run(path: str) -> str:
     """Read the file and return its contents as a string."""
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+    reject_sensitive_spelling(path)
+    resolved = resolve_workspace_path(path, must_exist=True)
+    reject_sensitive_path(resolved)
+    content, _ = read_text_limited(resolved)
+    if sensitive_content_reason(content) is not None:
+        return "Error: file content is protected by the sensitive-data policy"
+    result, _ = bounded_output(content)
+    return result

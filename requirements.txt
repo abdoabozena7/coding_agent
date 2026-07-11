@@ -1,8 +1,12 @@
-# OpenAI provider (default) — talks to GPT-5.5 via Chat Completions.
-openai
+# OpenAI provider - Chat Completions streaming and tool calls.
+openai>=2.44,<3
 
-# Gemini provider — only needed when LLM_PROVIDER=gemini.
-google-genai
+# Gemini provider - only needed when LLM_PROVIDER=gemini.
+google-genai>=2.10,<3
 
 # Loads API keys from a local .env file so we never hardcode secrets.
-python-dotenv
+python-dotenv>=1.2,<2
+
+# Interactive slash-command completion and a portable Windows ANSI console.
+prompt-toolkit>=3.0,<4
+colorama>=0.4.6,<1

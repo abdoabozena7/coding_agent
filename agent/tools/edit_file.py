@@ -13,7 +13,16 @@ Special case: if the file does not exist and old_str is empty, the file is
 created with new_str as its contents (a handy way to create files).
 """
 
-import os
+from ._security import (
+    MAX_PATH_CHARS,
+    MAX_WRITE_BYTES,
+    atomic_write_bytes,
+    display_path,
+    encoded_text,
+    file_fingerprint,
+    read_text_limited,
+    resolve_workspace_path,
+)
 
 REQUIRES_APPROVAL = True  # writes to disk — ask the human first
 
@@ -31,37 +40,49 @@ SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Path to the file to edit."},
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_PATH_CHARS,
+                    "description": "Path to the file within the active workspace.",
+                },
                 "old_str": {
                     "type": "string",
+                    "maxLength": MAX_WRITE_BYTES,
                     "description": "Exact text to find; must be unique in the file. Empty string to create a new file.",
                 },
-                "new_str": {"type": "string", "description": "Text to replace old_str with."},
+                "new_str": {
+                    "type": "string",
+                    "maxLength": MAX_WRITE_BYTES,
+                    "description": "Text to replace old_str with.",
+                },
             },
             "required": ["path", "old_str", "new_str"],
+            "additionalProperties": False,
         },
     },
 }
 
 
 def run(path: str, old_str: str, new_str: str) -> str:
+    resolved = resolve_workspace_path(path)
+
     # --- Create-a-new-file case: empty old_str means "make this file". ---
     if old_str == "":
-        if os.path.exists(path):
-            return f"Error: {path} already exists; pass a non-empty old_str to edit it."
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(new_str)
-        return f"Created {path} ({len(new_str)} characters)"
+        if resolved.exists():
+            return (
+                f"Error: {display_path(resolved)} already exists; "
+                "pass a non-empty old_str to edit it."
+            )
+        data = encoded_text(new_str, limit=MAX_WRITE_BYTES)
+        atomic_write_bytes(resolved, data, overwrite=False)
+        return f"Created {display_path(resolved)} ({len(new_str)} characters)"
 
     # --- Edit-an-existing-file case. ---
-    if not os.path.isfile(path):
-        return f"Error: {path} does not exist"
+    if not resolved.exists():
+        return f"Error: {display_path(resolved)} does not exist"
 
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
+    content, initial_info = read_text_limited(resolved)
 
     count = content.count(old_str)
     if count == 0:
@@ -69,6 +90,12 @@ def run(path: str, old_str: str, new_str: str) -> str:
     if count > 1:
         return f"Error: old_str appears {count} times; make it more specific so it matches exactly once."
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content.replace(old_str, new_str))
-    return f"Edited {path} (1 replacement)"
+    replacement = content.replace(old_str, new_str)
+    data = encoded_text(replacement, limit=MAX_WRITE_BYTES)
+    atomic_write_bytes(
+        resolved,
+        data,
+        overwrite=True,
+        expected=file_fingerprint(initial_info),
+    )
+    return f"Edited {display_path(resolved)} (1 replacement)"

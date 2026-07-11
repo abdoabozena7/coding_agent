@@ -1,1 +1,3 @@
-"""The coding agent package."""
+"""Persistent, plan-first coding-agent harness."""
+
+__version__ = "2.2.0"

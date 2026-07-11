@@ -6,7 +6,14 @@ read-only; from here the agent can change your project. (Phase 7 will add a
 permission gate in front of risky tools like this one.)
 """
 
-import os
+from ._security import (
+    MAX_PATH_CHARS,
+    MAX_WRITE_BYTES,
+    atomic_write_bytes,
+    display_path,
+    encoded_text,
+    resolve_workspace_path,
+)
 
 REQUIRES_APPROVAL = True  # writes to disk — ask the human first
 
@@ -23,19 +30,27 @@ SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Path to the file to write."},
-                "content": {"type": "string", "description": "Full contents to write to the file."},
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_PATH_CHARS,
+                    "description": "Path to the file within the active workspace.",
+                },
+                "content": {
+                    "type": "string",
+                    "maxLength": MAX_WRITE_BYTES,
+                    "description": "Full UTF-8 contents to write to the file.",
+                },
             },
             "required": ["path", "content"],
+            "additionalProperties": False,
         },
     },
 }
 
 
 def run(path: str, content: str) -> str:
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)  # create intermediate dirs if needed
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-    return f"Wrote {len(content)} characters to {path}"
+    resolved = resolve_workspace_path(path)
+    data = encoded_text(content, limit=MAX_WRITE_BYTES)
+    atomic_write_bytes(resolved, data, overwrite=True)
+    return f"Wrote {len(content)} characters to {display_path(resolved)}"

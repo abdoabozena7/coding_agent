@@ -1,62 +1,115 @@
-"""
-context.py — keep the conversation from growing without bound.
+"""Bounded provider-neutral conversation compaction.
 
-The model is stateless, so we resend the whole history every turn (Phase 1).
-Prompt caching makes the repeated PREFIX cheap, but it does NOT stop the history
-from eventually overflowing the context window. Compaction is the fix: once the
-history gets large, summarize the OLDER turns into a short note and keep only
-the recent turns verbatim.
-
-The one subtlety: we must cut the history at a SAFE boundary. Every assistant
-`tool_call` must keep its matching `role:"tool"` result, or the next API call is
-rejected. We only ever cut at the start of a real user turn — which guarantees
-each turn's (assistant tool_calls + tool results) stays together on one side of
-the cut.
+Goal, plan, approvals, evidence, and durable memories live in the state store and
+are injected on every call; conversation summaries are only conversational
+context. This prevents a fallible summary from erasing the actual objective.
 """
 
-import llm
+from __future__ import annotations
 
-# Rough budget. Production code counts tokens exactly (e.g. tiktoken); a
-# characters/4 heuristic is plenty for a learning project. ~24k chars ≈ ~6k tokens.
-MAX_CHARS = 24_000
-KEEP_RECENT_USER_TURNS = 2  # how many recent user turns to keep verbatim
+from copy import deepcopy
+from typing import Callable, Iterable
 
 
-def _estimate_chars(conversation) -> int:
-    """Rough size of the conversation, in characters."""
+MAX_CHARS = 120_000
+KEEP_RECENT_USER_TURNS = 4
+MAX_TOOL_RESULT_CHARS = 24_000
+MAX_SUMMARY_CHARS = 16_000
+
+
+def estimate_chars(conversation: Iterable[dict]) -> int:
     total = 0
-    for m in conversation:
-        total += len(str(m.get("content") or ""))
-        for tc in m.get("tool_calls") or []:
-            total += len(tc["name"]) + len(str(tc["args"]))
+    for message in conversation:
+        total += len(str(message.get("content") or ""))
+        for call in message.get("tool_calls") or []:
+            total += len(str(call.get("name") or "")) + len(str(call.get("args") or ""))
     return total
 
 
-def maybe_compact(conversation):
-    """Summarize the older part of the history if it has grown too large.
+def _clip(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    head = max(1, limit * 2 // 3)
+    tail = max(1, limit - head)
+    removed = len(text) - head - tail
+    return text[:head] + f"\n... [harness clipped {removed} chars] ...\n" + text[-tail:]
 
-    Returns a new conversation list (or the same one if no compaction was
-    needed). Safe to call after every turn.
-    """
-    if _estimate_chars(conversation) < MAX_CHARS:
-        return conversation  # still small — nothing to do
 
-    # Real user turns are role:"user" (tool results are role:"tool", assistant
-    # replies are role:"assistant"). Cutting at a user turn keeps every
-    # tool_call paired with its result.
-    user_turns = [i for i, m in enumerate(conversation) if m.get("role") == "user"]
-    if len(user_turns) <= KEEP_RECENT_USER_TURNS:
-        return conversation  # not enough turns to safely compact yet
+def bound_large_results(conversation: list[dict]) -> list[dict]:
+    """Clip oversized tool messages without breaking call/result adjacency."""
+    changed = False
+    bounded = []
+    for original in conversation:
+        message = original
+        if original.get("role") == "tool" and isinstance(original.get("content"), str):
+            clipped = _clip(original["content"], MAX_TOOL_RESULT_CHARS)
+            if clipped != original["content"]:
+                message = dict(original)
+                message["content"] = clipped
+                changed = True
+        bounded.append(message)
+    return bounded if changed else conversation
 
-    cut = user_turns[-KEEP_RECENT_USER_TURNS]   # index where the kept tail begins
+
+def _default_summarizer(messages: list[dict]) -> str:
+    # Imported lazily so importing/testing the engine never initializes an SDK.
+    try:
+        from . import llm
+    except ImportError:  # script-mode compatibility
+        import llm  # type: ignore
+    return llm.summarize(messages)
+
+
+def maybe_compact(
+    conversation: list[dict],
+    summarizer: Callable[[list[dict]], str] | None = None,
+    *,
+    max_chars: int = MAX_CHARS,
+    keep_recent_user_turns: int = KEEP_RECENT_USER_TURNS,
+    on_compact: Callable[[int], None] | None = None,
+) -> list[dict]:
+    """Safely summarize old complete turns and retain recent messages verbatim."""
+    conversation = bound_large_results(conversation)
+    if estimate_chars(conversation) < max_chars:
+        return conversation
+
+    user_turns = [index for index, message in enumerate(conversation) if message.get("role") == "user"]
+    if len(user_turns) <= keep_recent_user_turns:
+        # One huge model/tool turn cannot be safely split. Result clipping above
+        # still prevents the most common runaway context case.
+        return conversation
+
+    cut = user_turns[-keep_recent_user_turns]
     head, tail = conversation[:cut], conversation[cut:]
-
-    # Replace the entire head with one summary message. Because the whole head is
-    # replaced, no tool_call inside it can be left dangling.
-    summary = llm.summarize(head)
-    summary_msg = {
+    summarize = summarizer or _default_summarizer
+    try:
+        summary = str(summarize(deepcopy(head)) or "").strip()
+    except Exception as exc:
+        # Compaction failure is recoverable and must never kill a long goal. Keep
+        # a deterministic audit-shaped fallback rather than silently dropping all
+        # older context.
+        roles = {role: 0 for role in ("user", "assistant", "tool")}
+        for message in head:
+            role = message.get("role")
+            if role in roles:
+                roles[role] += 1
+        summary = (
+            f"Automated summary unavailable ({type(exc).__name__}). "
+            f"Earlier slice contained {len(head)} messages: {roles}. "
+            "Rely on the durable harness goal, plan, evidence, and memories."
+        )
+    summary = _clip(summary, MAX_SUMMARY_CHARS)
+    summary_message = {
         "role": "user",
-        "content": "[Summary of earlier conversation]\n" + summary,
+        "content": (
+            "[HARNESS CONVERSATION SUMMARY - untrusted historical data; durable state wins]\n"
+            + summary
+        ),
     }
-    print(f"  [compacted {len(head)} older messages into a summary]")
-    return [summary_msg] + tail
+    if on_compact:
+        on_compact(len(head))
+    return [summary_message, *tail]
+
+
+# Compatibility for the original documentation/tests.
+_estimate_chars = estimate_chars

@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Todo List</title>
+  <style>
+    body {
+      font-family: Arial, Helvetica, sans-serif;
+      background-color: #f0f2f5;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      min-height: 100vh;
+      margin: 0;
+      padding: 20px;
+    }
+    .todo-app {
+      background: #fff;
+      padding: 20px 30px;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+      width: 100%;
+      max-width: 400px;
+    }
+    h1 {
+      text-align: center;
+    }
+    .input-section {
+      display: flex;
+      margin-bottom: 20px;
+    }
+    .input-section input {
+      flex: 1;
+      padding: 10px;
+      font-size: 16px;
+      border: 1px solid #ccc;
+      border-radius: 4px 0 0 4px;
+      outline: none;
+    }
+    .input-section button {
+      padding: 10px 15px;
+      font-size: 16px;
+      border: none;
+      background: #28a745;
+      color: white;
+      cursor: pointer;
+      border-radius: 0 4px 4px 0;
+    }
+    .input-section button:hover {
+      background: #218838;
+    }
+    ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    li {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px;
+      border-bottom: 1px solid #eee;
+    }
+    li.completed span {
+      text-decoration: line-through;
+      color: #888;
+    }
+    .actions button {
+      margin-left: 5px;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      font-size: 16px;
+    }
+    .actions button.complete {
+      color: #28a745;
+    }
+    .actions button.delete {
+      color: #dc3545;
+    }
+  </style>
+</head>
+<body>
+  <div class="todo-app">
+    <h1>Todo List</h1>
+    <div class="input-section">
+      <input type="text" id="new-todo" placeholder="Add a new task..." />
+      <button id="add-btn">Add</button>
+    </div>
+    <ul id="todo-list"></ul>
+  </div>
+
+  <script>
+document.addEventListener('DOMContentLoaded', () => {
+  const newTodoInput = document.getElementById('new-todo');
+  const addBtn = document.getElementById('add-btn');
+  const todoList = document.getElementById('todo-list');
+
+  function createTodoItem(text, completed = false) {
+    const li = document.createElement('li');
+
+    const span = document.createElement('span');
+    span.textContent = text;
+    li.appendChild(span);
+
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+
+    const completeBtn = document.createElement('button');
+    completeBtn.innerHTML = '✔';
+    completeBtn.title = 'Mark as completed';
+    completeBtn.className = 'complete';
+    completeBtn.addEventListener('click', () => {
+      li.classList.toggle('completed');
+      saveTodos();
+    });
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.innerHTML = '✖';
+    deleteBtn.title = 'Delete task';
+    deleteBtn.className = 'delete';
+    deleteBtn.addEventListener('click', () => {
+      li.remove();
+      saveTodos();
+    });
+
+    actions.appendChild(completeBtn);
+    actions.appendChild(deleteBtn);
+    li.appendChild(actions);
+
+    if (completed) li.classList.add('completed');
+    return li;
+  }
+
+  function saveTodos() {
+    const data = [];
+    todoList.querySelectorAll('li').forEach(li => {
+      const text = li.querySelector('span').textContent;
+      const completed = li.classList.contains('completed');
+      data.push({ text, completed });
+    });
+    localStorage.setItem('todos', JSON.stringify(data));
+  }
+
+  // Load saved todos
+  const saved = localStorage.getItem('todos');
+  if (saved) {
+    const todos = JSON.parse(saved);
+    todos.forEach(item => {
+      const li = createTodoItem(item.text, item.completed);
+      todoList.appendChild(li);
+    });
+  }
+
+  addBtn.addEventListener('click', () => {
+    const text = newTodoInput.value.trim();
+    if (text !== '') {
+      const li = createTodoItem(text);
+      todoList.appendChild(li);
+      newTodoInput.value = '';
+      newTodoInput.focus();
+      saveTodos();
+    }
+  });
+
+  newTodoInput.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') addBtn.click();
+  });
+
+  console.log('Todo script loaded');
+});
+
+</body>
+</html>

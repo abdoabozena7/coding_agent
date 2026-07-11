@@ -1,171 +1,227 @@
-"""
-run_bash — run a shell command (THE MOST POWERFUL, AND MOST DANGEROUS, TOOL).
+"""Approval-gated shell execution with bounded output and a scrubbed context."""
 
-This single tool unlocks almost everything: run tests, install packages, use
-git, inspect the system — it can even stand in for the other tools (cat, ls,
-sed). That breadth is the point, and also the risk: it can do anything your
-shell can, including destructive things. Phase 7 adds a permission gate in
-front of it.
+from __future__ import annotations
 
-We capture stdout, stderr, AND the exit code, and feed all three back. The exit
-code + stderr are what let the agent DEBUG: run the tests, read the failure,
-edit the code, re-run — until it's green.
-"""
-
-import shlex
+import os
+import signal
 import subprocess
+import threading
+from dataclasses import dataclass, field
+from typing import BinaryIO
 
-TIMEOUT_SECONDS = 120       # don't let a command hang the agent forever
-MAX_OUTPUT_CHARS = 10_000   # keep a chatty command from flooding the context
+from ._security import get_workspace, safe_os_error
 
-REQUIRES_APPROVAL = True  # default: arbitrary shell commands ask the human first
 
-# --- Allow-list: which commands are safe enough to run WITHOUT asking? --------
-#
-# Confirming every `ls` and `git status` is friction with no safety payoff. So
-# we auto-approve a small set of read-only commands and keep the prompt for
-# everything else. The bar to get on this list is high: the command must only
-# OBSERVE state, never change it. When in doubt, it stays off the list and the
-# human gets asked (requires_approval below defaults to True).
+TIMEOUT_SECONDS = 120
+MAX_OUTPUT_CHARS = 10_000
+MAX_CAPTURE_BYTES = 10_000
+MAX_COMMAND_CHARS = 32_768
 
-# Plain commands that only read/inspect — never write, delete, or install.
-_SAFE_COMMANDS = {
-    "ls", "pwd", "cat", "head", "tail", "wc", "echo", "printf",
-    "date", "whoami", "id", "uname", "hostname",
-    "grep", "rg", "find", "tree", "stat", "file", "which", "type", "env",
-    "df", "du", "ps",
-    "pytest",  # the agent's core debug loop — run tests, read failures, retry
+REQUIRES_APPROVAL = True
+
+# Shell children receive only operational values needed to locate executables,
+# temporary storage, and the user's home.  API keys, auth tokens, cookies,
+# dotenv configuration, Python injection variables, and application secrets are
+# absent by construction rather than relying on an incomplete deny-list.
+_ENV_ALLOWLIST = {
+    "path", "pathext", "systemroot", "windir", "comspec",
+    "temp", "tmp", "tmpdir",
+    "home", "userprofile", "homedrive", "homepath",
+    "lang", "language", "lc_all", "lc_ctype", "term", "colorterm",
+    "os", "processor_architecture", "number_of_processors",
 }
 
-# git is safe ONLY for these read-only subcommands. `git status` is fine; a bare
-# `git` on the safe list would also wave through `git push`, `git reset --hard`,
-# `git clean -fd` — so we gate on the subcommand, not just the program name.
-# Deliberately omitted: `branch` and `remote`. They LOOK read-only (`git branch`
-# lists) but are dual-use — `git branch -D x` deletes, `git remote add ...`
-# writes — and not worth vetting flag-by-flag. When in doubt, ask.
-_SAFE_GIT_SUBCOMMANDS = {
-    "status", "log", "diff", "show",
-    "ls-files", "rev-parse", "blame", "describe", "shortlog",
-}
-
-# Leading `git` global options; some consume the NEXT token as their value
-# (e.g. `git -C <dir> log`). We skip past these to find the real subcommand.
-_GIT_GLOBAL_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
-
-# `find` is read-only UNLESS one of these turns it into an action. If any
-# appears, we fall back to asking.
-_UNSAFE_FIND_FLAGS = {"-exec", "-execdir", "-ok", "-okdir", "-delete",
-                      "-fprint", "-fprintf", "-fls"}
-
-# Shell operators that can chain, redirect, or substitute hidden work into an
-# otherwise-safe command (e.g. `ls; rm -rf .`, `cat x > y`, `echo $(curl ...)`).
-# If the command string contains any of these, it is NOT auto-approved.
-_SHELL_METACHARS = ("|", "&", ";", ">", "<", "`", "$(", "${", "(", ")", "\n")
-
-
-def _git_subcommand(rest):
-    """Find git's subcommand, skipping leading global options and their values.
-
-    `git status` -> 'status'; `git -C dir log` -> 'log'. Returns None if no
-    subcommand is present (a bare `git`).
-    """
-    i = 0
-    while i < len(rest) and rest[i].startswith("-"):
-        i += 2 if rest[i] in _GIT_GLOBAL_OPTS_WITH_VALUE else 1
-    return rest[i] if i < len(rest) else None
-
-
-def _is_safe(command: str) -> bool:
-    """True if `command` only reads state and may run without confirmation."""
-    stripped = command.strip()
-    if not stripped:
-        return False
-
-    # Any chaining/redirection/substitution -> ask. We only auto-approve plain,
-    # single commands; a pipeline can always be approved manually.
-    if any(meta in stripped for meta in _SHELL_METACHARS):
-        return False
-
-    try:
-        tokens = shlex.split(stripped)
-    except ValueError:
-        return False  # unbalanced quotes etc. — let a human look at it
-    if not tokens:
-        return False
-
-    cmd, rest = tokens[0], tokens[1:]
-
-    if cmd == "git":
-        return _git_subcommand(rest) in _SAFE_GIT_SUBCOMMANDS
-
-    # `python -m pytest ...` is just our test runner under another name.
-    if cmd in {"python", "python3"} and rest[:2] == ["-m", "pytest"]:
-        return True
-
-    if cmd in _SAFE_COMMANDS:
-        if cmd == "find" and any(t in _UNSAFE_FIND_FLAGS for t in rest):
-            return False
-        return True
-
-    return False
-
-
-def requires_approval(args: dict) -> bool:
-    """Per-call permission decision (overrides the static REQUIRES_APPROVAL).
-
-    Read-only commands on the allow-list run unprompted; everything else still
-    asks. The registry calls this when present — see tools/__init__.py.
-    """
-    return not _is_safe(args.get("command", ""))
 
 SCHEMA = {
     "type": "function",
     "function": {
         "name": "run_bash",
         "description": (
-            "Run a shell command and return its stdout, stderr, and exit code. "
-            "Use this to run tests, inspect files, use git, install packages, or "
-            "anything else you'd do in a terminal. The command runs in the "
-            "current working directory."
+            "Run an approval-gated platform shell command in the active workspace "
+            "(cmd.exe on Windows, /bin/sh on POSIX; despite the legacy tool name) and "
+            "return its stdout, stderr, and exit code. Secret environment "
+            "variables are not inherited."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_COMMAND_CHARS,
                     "description": "The shell command to run.",
                 },
             },
             "required": ["command"],
+            "additionalProperties": False,
         },
     },
 }
 
 
+def _is_safe(command: str) -> bool:
+    """Shell text is never safe enough to bypass the human permission gate.
+
+    Even commands marketed as read-only can execute code (test discovery and
+    Python), dump secrets (``env``), invoke pager hooks (git), or read arbitrary
+    file paths.  Dedicated file tools provide the genuinely safe read surface.
+    """
+
+    return False
+
+
+def requires_approval(args: dict) -> bool:
+    return True
+
+
+def _scrubbed_environment(source: dict[str, str] | None = None) -> dict[str, str]:
+    source = os.environ if source is None else source
+    return {key: value for key, value in source.items() if key.casefold() in _ENV_ALLOWLIST}
+
+
+@dataclass
+class _Capture:
+    data: bytearray = field(default_factory=bytearray)
+    truncated: bool = False
+
+
+def _drain(stream: BinaryIO, capture: _Capture) -> None:
+    try:
+        while True:
+            chunk = stream.read(8_192)
+            if not chunk:
+                return
+            remaining = MAX_CAPTURE_BYTES - len(capture.data)
+            if remaining > 0:
+                capture.data.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                capture.truncated = True
+    except (OSError, ValueError):
+        return
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _terminate(process: subprocess.Popen[bytes]) -> None:
+    try:
+        if os.name != "nt":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            # CREATE_NEW_PROCESS_GROUP alone does not make Popen.kill terminate
+            # grandchildren. taskkill /T closes the full approved command tree.
+            terminated = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=_scrubbed_environment(),
+                timeout=5,
+                check=False,
+            )
+            if terminated.returncode != 0:
+                process.kill()
+    except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _decode(capture: _Capture) -> str:
+    return bytes(capture.data).decode("utf-8", errors="replace")
+
+
 def _truncate(text: str) -> str:
-    if len(text) > MAX_OUTPUT_CHARS:
-        return text[:MAX_OUTPUT_CHARS] + f"\n... (truncated at {MAX_OUTPUT_CHARS} characters)"
-    return text
+    if len(text) <= MAX_OUTPUT_CHARS:
+        return text
+    marker = f"\n... (truncated at {MAX_OUTPUT_CHARS} characters)"
+    if len(marker) >= MAX_OUTPUT_CHARS:
+        return marker[:MAX_OUTPUT_CHARS]
+    kept = max(0, MAX_OUTPUT_CHARS - len(marker))
+    return text[:kept] + marker
+
+
+def _format_result(returncode: int, stdout: _Capture, stderr: _Capture) -> str:
+    parts = [f"exit code: {returncode}"]
+
+    for label, capture in (("stdout", stdout), ("stderr", stderr)):
+        text = _decode(capture)
+        if not text and not capture.truncated:
+            continue
+        section = f"{label}:\n{text}"
+        if capture.truncated:
+            section += "\n... (output truncated)"
+        parts.append(section)
+
+    if len(parts) == 1:
+        parts.append("(no output)")
+    return _truncate("\n".join(parts))
 
 
 def run(command: str) -> str:
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,              # run through the shell so pipes, globs, &&, etc. work
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        return f"Error: command timed out after {TIMEOUT_SECONDS} seconds"
+    if not isinstance(command, str):
+        return "Error: command must be a string"
+    if not command.strip():
+        return "Error: command must not be empty"
+    if "\x00" in command:
+        return "Error: command must not contain NUL bytes"
+    if len(command) > MAX_COMMAND_CHARS:
+        return f"Error: command exceeds the {MAX_COMMAND_CHARS}-character limit"
 
-    # Build a result the model can reason about: exit code first, then output.
-    parts = [f"exit code: {result.returncode}"]
-    if result.stdout:
-        parts.append("stdout:\n" + _truncate(result.stdout))
-    if result.stderr:
-        parts.append("stderr:\n" + _truncate(result.stderr))
-    if not result.stdout and not result.stderr:
-        parts.append("(no output)")
-    return "\n".join(parts)
+    workspace = get_workspace()
+    process_options: dict[str, object] = {}
+    if os.name == "nt":
+        process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        process_options["start_new_session"] = True
+
+    try:
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=str(workspace),
+            env=_scrubbed_environment(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **process_options,
+        )
+    except OSError as exc:
+        return f"Error: command could not start: {safe_os_error(exc)}"
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout = _Capture()
+    stderr = _Capture()
+    readers = [
+        threading.Thread(target=_drain, args=(process.stdout, stdout), daemon=True),
+        threading.Thread(target=_drain, args=(process.stderr, stderr), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    try:
+        returncode = process.wait(timeout=TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        _terminate(process)
+        try:
+            process.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        for reader in readers:
+            reader.join(timeout=2)
+        return f"Error: command timed out after {TIMEOUT_SECONDS} seconds"
+    except KeyboardInterrupt:
+        _terminate(process)
+        try:
+            process.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        for reader in readers:
+            reader.join(timeout=2)
+        raise
+
+    for reader in readers:
+        reader.join(timeout=2)
+    return _format_result(returncode, stdout, stderr)

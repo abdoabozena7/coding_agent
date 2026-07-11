@@ -1,134 +1,347 @@
-"""
-Gemini adapter (google-genai). Translates neutral <-> Gemini shapes.
+"""Gemini adapter built on ``google-genai``.
 
-Needs a Gemini key in the env (GEMINI_API_KEY or GOOGLE_API_KEY). The Gemini
-wire format differs from OpenAI's in several ways, all absorbed here:
-  • turns are `contents` of `parts`; the assistant role is "model"
-  • tool calls are function_call parts; their args are already a dict
-  • tool results are function_response parts in a role:"tool" content (matched
-    by NAME, not an id)
-  • the system prompt is a separate `system_instruction`, not a message
-
-Bonus: Gemini returns its reasoning as "thought" parts inline (no separate API,
-unlike OpenAI). We surface those via on_thought when include_thoughts is on.
+Gemini function calls carry IDs in the installed SDK and may carry opaque
+thought signatures.  Both have to be replayed with the model turn, while
+function responses must be sent as ``role='user'`` content.  This adapter keeps
+that provider-owned state under the neutral message's ``native`` key.
 """
 
+from __future__ import annotations
+
+import base64
 import os
+from collections.abc import Mapping
+from typing import Any
 
 from google import genai
 from google.genai import types
 
-from .base import AssistantTurn, ToolCall, Usage, render_for_summary, SUMMARY_INSTRUCTION
+from .base import (
+    AssistantTurn,
+    ProviderCapabilities,
+    SUMMARY_INSTRUCTION,
+    ToolCall,
+    Usage,
+    coerce_tool_args,
+    native_data,
+    render_for_summary,
+    tool_call_id,
+    unique_tool_call_id,
+)
 
 DEFAULT_MODEL = "gemini-2.5-flash"
 
 
-def _function_declaration(fn: dict) -> "types.FunctionDeclaration":
-    """Build a Gemini FunctionDeclaration from our OpenAI-shaped tool schema
-    inner `function` dict ({name, description, parameters})."""
-    params = fn.get("parameters")
+def _value(obj: Any, name: str, default=None):
+    if isinstance(obj, Mapping):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _encode_signature(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.encode("utf-8")
+    if isinstance(value, bytearray):
+        value = bytes(value)
+    if not isinstance(value, bytes):
+        return None
+    return base64.b64encode(value).decode("ascii")
+
+
+def _decode_signature(value: Any) -> bytes | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value
+    if not isinstance(value, str):
+        return None
     try:
-        # Newer google-genai accepts standard JSON Schema directly.
+        return base64.b64decode(value.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError):
+        # Tolerate hand-written/legacy metadata that stored the raw string.
+        return value.encode("utf-8")
+
+
+def _function_declaration(function: Mapping[str, Any]) -> "types.FunctionDeclaration":
+    params = function.get("parameters")
+    try:
         return types.FunctionDeclaration(
-            name=fn["name"], description=fn.get("description"), parameters_json_schema=params
+            name=str(function["name"]),
+            description=function.get("description"),
+            parameters_json_schema=params,
         )
     except Exception:
-        # Fallback: hand it as `parameters` (the SDK coerces the dict to a Schema).
+        # Older google-genai releases used ``parameters``.  Keeping this
+        # fallback costs nothing and makes the adapter portable.
         return types.FunctionDeclaration(
-            name=fn["name"], description=fn.get("description"), parameters=params
+            name=str(function["name"]),
+            description=function.get("description"),
+            parameters=params,
         )
 
 
 class GeminiProvider:
+    capabilities = ProviderCapabilities(
+        streaming=True,
+        tool_calling=True,
+        thinking=True,
+        tool_call_ids=True,
+        native_replay=True,
+    )
+
     def __init__(self, model: str | None = None):
         self.model = model or os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
         self._client = None
 
     def _client_(self):
         if self._client is None:
-            self._client = genai.Client()  # reads GEMINI_API_KEY / GOOGLE_API_KEY
+            self._client = genai.Client()
         return self._client
 
-    # --- neutral conversation -> Gemini contents ---
+    @staticmethod
+    def _part_from_native(item: Mapping[str, Any]) -> "types.Part | None":
+        kind = item.get("type")
+        signature = _decode_signature(item.get("thought_signature"))
+        if kind == "function_call":
+            name = str(item.get("name") or "unknown_tool")
+            call_id = item.get("id")
+            return types.Part(
+                function_call=types.FunctionCall(
+                    id=str(call_id) if call_id else None,
+                    name=name,
+                    args=coerce_tool_args(item.get("args")),
+                ),
+                thought=bool(item.get("thought")) or None,
+                thought_signature=signature,
+            )
+        if kind in {"text", "thought"}:
+            text = item.get("text")
+            if text is None:
+                return None
+            return types.Part(
+                text=str(text),
+                thought=(kind == "thought") or bool(item.get("thought")),
+                thought_signature=signature,
+            )
+        return None
+
+    def _assistant_parts(self, message: Mapping[str, Any], message_index: int):
+        replay = native_data(message, "gemini")
+        raw_parts = replay.get("parts")
+        if isinstance(raw_parts, list):
+            native_parts = [
+                part
+                for item in raw_parts
+                if isinstance(item, Mapping)
+                for part in [self._part_from_native(item)]
+                if part is not None
+            ]
+            if native_parts:
+                return native_parts
+
+        parts = []
+        if message.get("content"):
+            parts.append(types.Part(text=str(message["content"])))
+        raw_calls = message.get("tool_calls") or []
+        if isinstance(raw_calls, (list, tuple)):
+            for call_index, call in enumerate(raw_calls):
+                if not isinstance(call, Mapping):
+                    continue
+                name = str(call.get("name") or "unknown_tool")
+                call_id = tool_call_id(
+                    "gemini",
+                    call.get("id"),
+                    message_index * 1000 + call_index,
+                    name,
+                )
+                call_native = native_data(call, "gemini")
+                parts.append(
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            id=call_id,
+                            name=name,
+                            args=coerce_tool_args(call.get("args")),
+                        ),
+                        thought_signature=_decode_signature(
+                            call_native.get("thought_signature")
+                        ),
+                    )
+                )
+        return parts
+
     def _to_contents(self, conversation):
         contents = []
-        for m in conversation:
-            role = m["role"]
+        pending_tool_parts = []
+
+        def flush_tools():
+            if pending_tool_parts:
+                # google-genai's own automatic function-calling implementation
+                # uses role="user" and groups a batch of responses in one turn.
+                contents.append(types.Content(role="user", parts=list(pending_tool_parts)))
+                pending_tool_parts.clear()
+
+        for message_index, message in enumerate(conversation or []):
+            if not isinstance(message, Mapping):
+                continue
+            role = message.get("role")
+            if role == "tool":
+                name = str(message.get("name") or "unknown_tool")
+                response_id = message.get("id")
+                content = message.get("content")
+                response = (
+                    dict(content)
+                    if isinstance(content, Mapping)
+                    else {"result": content if content is not None else ""}
+                )
+                pending_tool_parts.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            id=str(response_id) if response_id else None,
+                            name=name,
+                            response=response,
+                        )
+                    )
+                )
+                continue
+
+            flush_tools()
             if role == "user":
-                contents.append(types.Content(role="user", parts=[types.Part(text=m["content"])]))
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[types.Part(text=str(message.get("content") or ""))],
+                    )
+                )
             elif role == "assistant":
-                parts = []
-                if m.get("content"):
-                    parts.append(types.Part(text=m["content"]))
-                for tc in m.get("tool_calls") or []:
-                    parts.append(types.Part(function_call=types.FunctionCall(name=tc["name"], args=tc["args"])))
-                contents.append(types.Content(role="model", parts=parts))
-            elif role == "tool":
-                part = types.Part.from_function_response(name=m["name"], response={"result": m["content"]})
-                contents.append(types.Content(role="tool", parts=[part]))
+                parts = self._assistant_parts(message, message_index)
+                if parts:
+                    contents.append(types.Content(role="model", parts=parts))
+
+        flush_tools()
         return contents
 
     def _to_tools(self, tools):
-        # `tools` are our OpenAI-shaped schemas: {"type":"function","function":{...}}.
-        decls = [_function_declaration(t["function"]) for t in tools]
-        return [types.Tool(function_declarations=decls)]
+        declarations = []
+        for tool in tools or []:
+            if not isinstance(tool, Mapping):
+                continue
+            function = tool.get("function")
+            if not isinstance(function, Mapping) or not function.get("name"):
+                continue
+            declarations.append(_function_declaration(function))
+        return [types.Tool(function_declarations=declarations)] if declarations else []
 
     def call(self, conversation, tools, system, on_text=None, on_thought=None) -> AssistantTurn:
+        gemini_tools = self._to_tools(tools)
         config = types.GenerateContentConfig(
-            system_instruction=system,
-            tools=self._to_tools(tools),
+            system_instruction=str(system or ""),
+            tools=gemini_tools or None,
             thinking_config=types.ThinkingConfig(include_thoughts=True),
         )
-
         stream = self._client_().models.generate_content_stream(
             model=self.model,
             contents=self._to_contents(conversation),
             config=config,
         )
 
-        text_parts = []
-        tool_calls = []
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        native_parts: list[dict[str, Any]] = []
         usage = None
+        seen_ids: set[str] = set()
 
         for chunk in stream:
-            if getattr(chunk, "usage_metadata", None):
-                usage = chunk.usage_metadata
-            if not getattr(chunk, "candidates", None):
-                continue  # some thinking chunks arrive with no candidates
-            cand = chunk.candidates[0]
-            if not cand.content or not cand.content.parts:
+            chunk_usage = _value(chunk, "usage_metadata")
+            if chunk_usage is not None:
+                usage = chunk_usage
+            candidates = _value(chunk, "candidates") or []
+            if not candidates:
                 continue
-            for part in cand.content.parts:
-                fc = getattr(part, "function_call", None)
-                if fc:
-                    # Gemini calls have no id; use the name (results are matched by name).
-                    tool_calls.append(ToolCall(id=fc.name, name=fc.name, args=dict(fc.args or {})))
+            content = _value(candidates[0], "content")
+            parts = _value(content, "parts") or []
+            for part in parts:
+                function_call = _value(part, "function_call")
+                signature = _encode_signature(_value(part, "thought_signature"))
+                if function_call is not None:
+                    name = str(_value(function_call, "name") or "unknown_tool")
+                    output_index = len(tool_calls)
+                    call_id = unique_tool_call_id(
+                        "gemini",
+                        _value(function_call, "id"),
+                        output_index,
+                        name,
+                        seen_ids,
+                    )
+                    args = coerce_tool_args(_value(function_call, "args"))
+                    call_native: dict[str, Any] = {"provider": "gemini"}
+                    native_part: dict[str, Any] = {
+                        "type": "function_call",
+                        "id": call_id,
+                        "name": name,
+                        "args": args,
+                    }
+                    if signature:
+                        call_native["thought_signature"] = signature
+                        native_part["thought_signature"] = signature
+                    if _value(part, "thought", False):
+                        native_part["thought"] = True
+                    tool_calls.append(
+                        ToolCall(
+                            id=call_id,
+                            name=name,
+                            args=args,
+                            native=call_native if len(call_native) > 1 else {},
+                        )
+                    )
+                    native_parts.append(native_part)
                     continue
-                text = getattr(part, "text", None)
-                if not text:
-                    continue
-                if getattr(part, "thought", False):
-                    if on_thought:
-                        on_thought(text)  # reasoning summary
-                else:
-                    text_parts.append(text)
-                    if on_text:
-                        on_text(text)
 
-        u = None
-        if usage:
-            u = Usage(
-                input_tokens=getattr(usage, "prompt_token_count", 0) or 0,
-                cached_tokens=getattr(usage, "cached_content_token_count", 0) or 0,
-                output_tokens=getattr(usage, "candidates_token_count", 0) or 0,
+                text = _value(part, "text")
+                if text is None:
+                    continue
+                fragment = text if isinstance(text, str) else str(text)
+                is_thought = bool(_value(part, "thought", False))
+                native_part = {
+                    "type": "thought" if is_thought else "text",
+                    "text": fragment,
+                }
+                if signature:
+                    native_part["thought_signature"] = signature
+                native_parts.append(native_part)
+                if is_thought:
+                    if on_thought and fragment:
+                        on_thought(fragment)
+                else:
+                    text_parts.append(fragment)
+                    if on_text and fragment:
+                        on_text(fragment)
+
+        normalized_usage = None
+        if usage is not None:
+            normalized_usage = Usage(
+                input_tokens=_value(usage, "prompt_token_count", 0) or 0,
+                cached_tokens=_value(usage, "cached_content_token_count", 0) or 0,
+                output_tokens=_value(usage, "candidates_token_count", 0) or 0,
             )
 
-        return AssistantTurn(text="".join(text_parts) or None, tool_calls=tool_calls, usage=u)
+        native = (
+            {"provider": "gemini", "parts": native_parts} if native_parts else {}
+        )
+        return AssistantTurn(
+            text="".join(text_parts) or None,
+            tool_calls=tool_calls,
+            usage=normalized_usage,
+            native=native,
+        )
 
     def summarize(self, messages) -> str:
-        resp = self._client_().models.generate_content(
+        response = self._client_().models.generate_content(
             model=self.model,
             contents=render_for_summary(messages),
-            config=types.GenerateContentConfig(system_instruction=SUMMARY_INSTRUCTION),
+            config=types.GenerateContentConfig(
+                system_instruction=SUMMARY_INSTRUCTION
+            ),
         )
-        return resp.text or ""
+        return _value(response, "text", "") or ""
