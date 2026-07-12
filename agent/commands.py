@@ -18,6 +18,16 @@ class CommandKind(str, Enum):
     MODE = "mode"
     SETTINGS = "settings"
     MODEL = "model"
+    PERMISSIONS = "permissions"
+    TREE = "tree"
+    AGENTS = "agents"
+    MEMORY = "memory"
+    TRACE = "trace"
+    INSIGHTS = "insights"
+    QUESTIONS = "questions"
+    ANSWER = "answer"
+    METRICS = "metrics"
+    SETUP = "setup"
     GOAL = "goal"
     APPROVE = "approve"
     REJECT = "reject"
@@ -106,10 +116,17 @@ def parse_command(line: str) -> UserCommand:
         if not rest:
             return UserCommand(CommandKind.MODE, {"mode": None}, raw)
         mode = rest.lower()
-        mode_aliases = {"manual": "plan", "default": "plan", "auto": "goal", "agent": "goal"}
+        mode_aliases = {
+            "manual": "plan",
+            "default": "plan",
+            "auto": "goal",
+            "agent": "goal",
+            "deep": "ultra",
+            "max": "ultra",
+        }
         mode = mode_aliases.get(mode, mode)
-        if mode not in {"plan", "goal"}:
-            raise CommandParseError(f"Usage: {usage('mode', 'plan|goal')}")
+        if mode not in {"plan", "goal", "ultra"}:
+            raise CommandParseError(f"Usage: {usage('mode', 'plan|goal|ultra')}")
         return UserCommand(CommandKind.MODE, {"mode": mode}, raw)
     if name == "settings":
         if not rest:
@@ -125,6 +142,32 @@ def parse_command(line: str) -> UserCommand:
         )
     if name == "model":
         return UserCommand(CommandKind.MODEL, {"model": rest or None}, raw)
+    if name in {"permissions", "permission", "access"}:
+        level = rest.lower() or None
+        if level not in {None, "normal", "full"}:
+            raise CommandParseError(f"Usage: {usage('permissions', 'normal|full')}")
+        return UserCommand(CommandKind.PERMISSIONS, {"level": level}, raw)
+    if name in {"tree", "memory", "trace", "insights"}:
+        kind = {
+            "tree": CommandKind.TREE,
+            "memory": CommandKind.MEMORY,
+            "trace": CommandKind.TRACE,
+            "insights": CommandKind.INSIGHTS,
+        }[name]
+        return UserCommand(kind, {"target": rest or None}, raw)
+    if name == "agents":
+        if rest not in {"", "--all", "all"}:
+            raise CommandParseError(f"Usage: {usage('agents', '[--all]')}")
+        return UserCommand(CommandKind.AGENTS, {"all": bool(rest)}, raw)
+    if name in {"questions", "metrics", "setup"}:
+        if rest:
+            raise CommandParseError(f"{prefix}{name} does not take arguments.")
+        return UserCommand(CommandKind(name), raw=raw)
+    if name == "answer":
+        parts = rest.split(maxsplit=1)
+        if len(parts) != 2:
+            raise CommandParseError(f"Usage: {usage('answer', 'QUESTION_ID VALUE')}")
+        return UserCommand(CommandKind.ANSWER, {"question_id": parts[0], "value": parts[1].strip()}, raw)
 
     if name == "goal":
         return UserCommand(CommandKind.GOAL, {"objective": _required(rest, usage("goal", "OBJECTIVE"))}, raw)

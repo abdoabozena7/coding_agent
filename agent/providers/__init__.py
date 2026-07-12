@@ -25,23 +25,43 @@ __all__ = [
     "Usage",
     "get_provider",
     "get_provider_capabilities",
+    "create_provider",
 ]
 
 _PROVIDERS = ("openai", "gemini", "ollama")
 
 
-def get_provider(name: str):
+def get_provider(name: str, *, model: str | None = None, host: str | None = None):
+    """Create an independent adapter instance.
+
+    The optional arguments preserve the original environment-driven behavior
+    while allowing a model picker to pin the exact model (and Ollama host) in a
+    durable descriptor.  This function never caches adapters, which is
+    important when parallel agents each need isolated SDK/client state.
+    """
+
     name = (name or "openai").strip().lower()
     if name == "openai":
         from .openai_provider import OpenAIProvider
-        return OpenAIProvider()
+        return OpenAIProvider(model=model)
     if name == "gemini":
         from .gemini_provider import GeminiProvider
-        return GeminiProvider()
+        return GeminiProvider(model=model)
     if name == "ollama":
         from .ollama_provider import OllamaProvider
-        return OllamaProvider()
+        return OllamaProvider(model=model, host=host)
     raise ValueError(f"Unknown LLM_PROVIDER '{name}'. Options: {', '.join(_PROVIDERS)}")
+
+
+def create_provider(descriptor):
+    """Create a fresh adapter from a ``ModelDescriptor``-like object."""
+
+    try:
+        name = descriptor.provider
+        model = descriptor.model
+    except AttributeError as exc:
+        raise TypeError("descriptor must expose provider and model attributes") from exc
+    return get_provider(name, model=model, host=getattr(descriptor, "host", None))
 
 
 def get_provider_capabilities(name: str) -> ProviderCapabilities:

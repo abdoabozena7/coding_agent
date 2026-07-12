@@ -6,6 +6,7 @@ import unittest
 from agent.commands import CommandKind, CommandParseError, parse_command
 from agent.context import maybe_compact
 from agent.control import ControlValidationError, validate_control_call
+from agent.events import UIEvent
 from agent.safety import ProgressWatchdog, redact_data, redact_text
 from agent.ui import (
     SLASH_COMMANDS,
@@ -14,10 +15,13 @@ from agent.ui import (
     SlashCommandCompleter,
     TaskView,
     WorkerView,
+    render_agents,
     render_brand,
     render_dashboard,
+    render_memory,
     render_plan,
     render_slash_menu,
+    render_status,
 )
 
 
@@ -50,6 +54,17 @@ class CommandTests(unittest.TestCase):
             parse_command("/reject")
         with self.assertRaisesRegex(CommandParseError, r"/replan FEEDBACK"):
             parse_command("/replan")
+
+    def test_v3_ultra_views_and_permission_commands_parse(self):
+        self.assertEqual(parse_command("/mode ultra").args["mode"], "ultra")
+        self.assertEqual(parse_command("/permissions full").args["level"], "full")
+        self.assertEqual(parse_command("/tree M001").args["target"], "M001")
+        self.assertEqual(parse_command("/agents --all").args["all"], True)
+        self.assertEqual(parse_command("/trace latest").args["target"], "latest")
+        self.assertEqual(
+            parse_command("/answer platform Desktop").args,
+            {"question_id": "platform", "value": "Desktop"},
+        )
 
 
 class ControlSchemaTests(unittest.TestCase):
@@ -302,6 +317,8 @@ class TerminalUITests(unittest.TestCase):
         self.assertIn("/model", rendered)
         self.assertIn("/mode plan", rendered)
         self.assertIn("/mode goal", rendered)
+        self.assertIn("/mode ultra", rendered)
+        self.assertIn("/trace", rendered)
         self.assertIn("Legacy :commands remain supported.", rendered)
 
     def test_show_brand_without_color_matches_plain_renderer(self):
@@ -351,6 +368,66 @@ class TerminalUITests(unittest.TestCase):
         console.set_mode("plan")
         self.assertEqual(console.prompt(), "/status")
         self.assertEqual(prompts[-1], "GA3BAD [PLAN]> ")
+
+    def test_ultra_status_is_sparse_and_active_events_are_gold(self):
+        view = DashboardView(
+            objective="Build the game",
+            status="running",
+            provider="ollama",
+            model="cloud-model",
+            interaction_mode="ultra",
+            workspace="workspace",
+        )
+        rendered = render_status(
+            view,
+            access_level="full",
+            execution_class="cloud",
+            active_agents=4,
+        )
+        self.assertNotIn("+---", rendered)
+        self.assertIn("MODE ULTRA · STATUS RUNNING", rendered)
+        self.assertIn("FULL · CLOUD · agents 4", rendered)
+
+        output = io.StringIO()
+        console = ConsoleUI(stream=output, color=True, interaction_mode="ultra")
+        console.on_event(
+            UIEvent(
+                "ultra.agent_started",
+                "coder",
+                {"role": "coder", "phase": "implement", "node_id": "Physics"},
+            )
+        )
+        self.assertIn("\033[38;5;220m", output.getvalue())
+        self.assertIn("[Physics · coder]", output.getvalue())
+
+    def test_agents_view_shows_role_phase_and_node_title(self):
+        rendered = render_agents(
+            [
+                {
+                    "role": "coder",
+                    "status": "running",
+                    "phase": "implement",
+                    "work_node_id": "node-physics",
+                    "model": "qwen",
+                }
+            ],
+            node_titles={"node-physics": "Physics"},
+        )
+        self.assertIn("[coder] running · implement · Physics · qwen", rendered)
+
+    def test_memory_view_shows_the_entry_content_without_cards(self):
+        rendered = render_memory(
+            [
+                {
+                    "section": "decision",
+                    "title": "Physics units",
+                    "content": "Use SI units so every module shares one contract.",
+                }
+            ]
+        )
+        self.assertIn("[decision] Physics units", rendered)
+        self.assertIn("Use SI units", rendered)
+        self.assertNotIn("+---", rendered)
 
 
 if __name__ == "__main__":

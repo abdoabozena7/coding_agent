@@ -67,6 +67,35 @@ The interactive terminal opens with a green `GA3BAD` ASCII banner. Type `/` to
 open the live command palette; arrow keys and Tab select completions as you type.
 Legacy `:command` syntax remains accepted for existing scripts.
 
+Startup then asks for a workspace, a tool-capable model, `normal` or Docker-only
+`full` access, and `plan`, `goal`, or `ultra` mode. Ollama models are discovered
+first through `/api/tags` and `/api/show`; non-tool models are omitted. Local
+models use one sequential worker, while Ollama cloud/OpenAI/Gemini models run
+independent, write-disjoint nodes concurrently.
+
+## ULTRA mode
+
+`/mode ultra` turns a compact request into `GoalSpecV1`, architecture, and an
+approval-bound master plan. After one `/approve`, the background scheduler runs
+the same pipeline for local and cloud models:
+
+```text
+context → mini-plan → decompose → research → implement
+        → independent review → tests → bounded fixes
+        → integration → Project Brain write-back
+```
+
+Dynamic child nodes inherit their parent's forbidden changes and write scope.
+New interfaces, dependencies, or out-of-scope paths stop at a new master-plan
+approval. SQLite schema v3 stores the hierarchical task graph, role-isolated
+agent runs, versioned decisions and lessons, artifacts and hashes, redacted
+prompt traces, memory access, and path leases. `/tree`, `/agents`, `/memory`,
+`/trace`, `/insights`, and `/metrics` keep the default scrollback uncluttered.
+
+`/permissions full` is fail-closed: it works only after `/setup` builds the
+versioned non-root Docker image. The workspace is the only writable bind mount;
+the host home, Docker socket, and credentials are never mounted or injected.
+
 The original command remains supported:
 
 ```bash
@@ -80,10 +109,11 @@ python agent/main.py --workspace /path/to/project
    structured plan containing factual applicability evidence, an execution
    strategy, expected workspace changes, and task-bound verification.
 3. A separate plan critic checks coverage and verifiability.
-4. Review the dashboard. Use `/edit`, `/add`, or `/remove`, then `/approve`.
-5. Choose `/mode plan` to wait for a manual `/run` after approval, or `/mode goal`
-   to continue automatically after that explicit approval. `/auto` is also
-   available directly. Ctrl-C checkpoints automatic work safely.
+4. Review the sparse status and full `/plan`. Use `/edit`, `/add`, or `/remove`,
+   then `/approve`.
+5. Choose `/mode plan` to wait for `/run`, `/mode goal` to continue after
+   approval, or `/mode ultra` for nested Project-Brain execution. Ctrl-C
+   checkpoints automatic work safely.
 6. Add guidance or edit the checklist at any checkpoint. The durable objective is
    always re-injected, even after context compaction or restart.
 7. Completion requires all accepted tasks, direct evidence, no uncertain action,
@@ -92,36 +122,33 @@ python agent/main.py --workspace /path/to/project
 Example control surface:
 
 ```text
-+ GA3BAD CODING AGENT -------------------------------------------------------+
-| MODE GOAL | STATUS RUNNING | PLAN r3 / r3 | [########------] 5/9           |
-| GOAL Implement the service, migration, tests, security review, and docs     |
-+-----------------------------------------------------------------------------+
-| CHECKLIST                              | ACTIVE WORKERS / DYNAMIC ROLES      |
-| [x] T001 Map current architecture      | 8ac19f RUN T005 - schema migrator   |
-| [>] T004 Add durable job state         |                                     |
-| [ ] T005 Migrate existing records      |                                     |
-| [!] T006 Resolve upstream API choice   |                                     |
-+-----------------------------------------------------------------------------+
-| RECENT ACTIVITY                                                            |
-| task.status_changed: T004 -> in_progress                                    |
-| delegation.created: crash-safe SQLite migration specialist                  |
-+-----------------------------------------------------------------------------+
-| / /mode /approve /run [steps] /plan /settings /status /help /quit          |
-+-----------------------------------------------------------------------------+
+Understanding goal
+Architecture ready · 8 modules
+[Physics · coder] editing motor.py
+[reviewer] found 2 issues
+Fix loop 2/3
+[Physics · tester] updated
+GA3BAD [ULTRA]>
 ```
 
-All framework labels and borders are ASCII-only for clean Windows/SSH output.
+The logo appears once. Normal output is append-only scrollback; detailed trees,
+agents, memory, traces, and metrics appear only when requested.
 
 ## Commands
 
 | Command | Effect |
 |---|---|
 | `/` | Open the interactive slash-command palette |
-| `/mode plan`, `/mode goal` | Switch between manual post-approval execution and automatic post-approval execution; neither mode bypasses plan approval |
+| `/mode plan`, `/mode goal`, `/mode ultra` | Select manual, automatic, or Project-Brain execution; no mode bypasses master approval |
 | `/settings [NAME [VALUE]]` | Inspect safe session settings or change color/runtime limits; secrets are never displayed |
-| `/model [NAME]` | Show or switch the provider model for this session |
+| `/model [NAME]` | Reopen the picker or switch models at a safe checkpoint |
+| `/permissions normal\|full`, `/setup` | Select approvals or initialize the fail-closed Docker Full sandbox |
+| `/tree [NODE]`, `/agents [--all]` | Inspect hierarchical work and isolated agent runs |
+| `/memory [SECTION]`, `/trace [latest\|RUN_ID]` | Inspect Project Brain and redacted prompts/context/summaries |
+| `/insights [NODE]`, `/metrics` | Inspect durable findings and execution metrics |
+| `/questions`, `/answer ID VALUE` | Inspect and answer approval-bound planning decisions |
 | plain text / `/goal TEXT` | Start a goal when idle; otherwise add durable user guidance |
-| `/plan`, `/status` | Render current objective, revision, checklist, workers, and progress |
+| `/plan`, `/status` | Render the complete plan or a compact scrollback status |
 | `/approve [REV]` | Approve the exact latest plan revision |
 | `/reject FEEDBACK`, `/replan FEEDBACK` | Reject and regenerate with feedback |
 | `/add TEXT :: CRITERIA` | Add a checklist item as a new plan revision |
@@ -142,7 +169,7 @@ For scripting/non-interactive inspection:
 
 ```bash
 python -m agent --workspace ./project --command "/status"
-python -m agent --workspace ./project --mode goal --command "/approve 2"
+python -m agent --workspace ./project --provider ollama --model qwen2.5-coder:7b --mode goal --command "/approve 2"
 ```
 
 ## Lifecycle and completion authority

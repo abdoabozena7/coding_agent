@@ -130,6 +130,50 @@ class StateStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(StalePlanError, "lacks fingerprinted applicability evidence"):
             self.store.approve_plan(goal.id, plan.revision)
 
+    def test_v2_state_migrates_to_v3_without_losing_goal_or_plan(self):
+        goal = self._pending_goal()
+        plan = self.store.create_plan(
+            goal.id,
+            "v2 accepted shape",
+            [task("T001")],
+            **plan_basis("T001"),
+        )
+        path = self.store.path
+        self.store.close()
+        connection = sqlite3.connect(path)
+        try:
+            for table in (
+                "brain_entries_fts",
+                "memory_access",
+                "resource_leases",
+                "prompt_traces",
+                "artifacts",
+                "agent_runs",
+                "brain_entries",
+                "work_nodes",
+                "ultra_runs",
+            ):
+                connection.execute(f"DROP TABLE IF EXISTS {table}")
+            connection.execute("PRAGMA user_version=2")
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.store = StateStore(self.workspace)
+
+        self.assertEqual(self.store.get_goal(goal.id).id, goal.id)
+        self.assertEqual(self.store.get_plan(goal.id, plan.revision).fingerprint, plan.fingerprint)
+        migrated = sqlite3.connect(path)
+        try:
+            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertIsNotNone(
+                migrated.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='ultra_runs'"
+                ).fetchone()
+            )
+        finally:
+            migrated.close()
+
     def test_invalid_dependency_graph_is_never_persisted(self):
         goal = self._pending_goal()
         with self.assertRaises(TaskGraphError):

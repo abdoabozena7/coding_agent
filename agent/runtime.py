@@ -59,6 +59,12 @@ from .safety import ProgressWatchdog, redact_data, redact_text
 from .store import NotFoundError, StateStore, StateStoreError
 from .ui import DashboardView, TaskView, WorkerView
 
+try:
+    from .model_catalog import ExecutionClass, ModelDescriptor
+    from .sandbox import AccessLevel, PermissionAdapter
+except ImportError:  # pragma: no cover - direct-script compatibility
+    ExecutionClass = ModelDescriptor = AccessLevel = PermissionAdapter = Any  # type: ignore
+
 
 ApprovalCallback = Callable[[str, dict[str, Any], str], bool]
 
@@ -147,6 +153,8 @@ class AgentRuntime:
         approval: ApprovalCallback | None = None,
         config: RuntimeConfig | None = None,
         sleeper: Callable[[float], None] = time.sleep,
+        model_descriptor: ModelDescriptor | None = None,
+        permission_adapter: PermissionAdapter | None = None,
     ) -> None:
         self.provider = provider
         self.store = store
@@ -155,6 +163,9 @@ class AgentRuntime:
         self.approval = approval or (lambda _name, _args, _risk: False)
         self.config = config or RuntimeConfig.from_env()
         self.sleeper = sleeper
+        self.model_descriptor = model_descriptor
+        self.permission_adapter = permission_adapter
+        self.ultra_session: Any | None = None
         self._lock = RLock()
         self._work_conversation: list[dict[str, Any]] = []
         self._watchdog = ProgressWatchdog(self.config.repeated_action_limit)
@@ -188,6 +199,39 @@ class AgentRuntime:
                     resume_status=resume_status,
                 )
                 self.store.transition_goal(goal.id, GoalStatus.PAUSED, reason="crash recovery requires user inspection")
+
+        ultra_recovery = self.store.recover_ultra_inflight()
+        if ultra_recovery.changed:
+            self.events.publish(
+                "recovery",
+                "Interrupted ULTRA agents and write leases were marked uncertain; nothing was replayed.",
+                runs=list(ultra_recovery.ultra_run_ids),
+                nodes=list(ultra_recovery.work_node_ids),
+                agents=list(ultra_recovery.agent_run_ids),
+                leases=list(ultra_recovery.lease_ids),
+            )
+            for run_id in ultra_recovery.ultra_run_ids:
+                try:
+                    recovered_run = self.store.get_ultra_run(run_id)
+                    recovered_goal = self.store.get_goal(recovered_run.goal_id)
+                    self.store.update_goal_metadata(
+                        recovered_goal.id,
+                        ultra_run_id=run_id,
+                        resume_status=GoalStatus.RUNNING.value,
+                        waiting_question=(
+                            "ULTRA stopped between evidence gates. Inspect and reconcile every "
+                            "UNCERTAIN node/action, then use /resume. Nothing is replayed automatically."
+                        ),
+                        auto_retryable=False,
+                    )
+                    if recovered_goal.status == GoalStatus.RUNNING:
+                        self.store.transition_goal(
+                            recovered_goal.id,
+                            GoalStatus.PAUSED,
+                            reason="ULTRA crash recovery requires uncertain-work inspection",
+                        )
+                except (NotFoundError, StateStoreError, DomainError):
+                    continue
 
         # Planning/review phases are model-call transients. A process can stop
         # there without an action row, so normalize them to an explicit paused
@@ -248,6 +292,72 @@ class AgentRuntime:
     def model_name(self) -> str:
         return str(getattr(self.provider, "model", "unknown"))
 
+    @property
+    def execution_class(self) -> str:
+        if self.model_descriptor is not None:
+            return self.model_descriptor.execution_class.value
+        return "cloud" if self.provider_name in {"openai", "gemini"} else "local"
+
+    @property
+    def access_level(self) -> str:
+        if self.permission_adapter is not None:
+            return self.permission_adapter.access_level.value
+        return "normal"
+
+    def replace_provider(
+        self,
+        provider: Any,
+        descriptor: ModelDescriptor,
+    ) -> None:
+        """Switch models only at a user-visible safe checkpoint."""
+
+        goal = self.active_goal()
+        if (
+            self.ultra_session is not None
+            and self.ultra_session.running
+            and not self.ultra_session.safe_for_reconfiguration
+        ):
+            raise RuntimeStateError(
+                "pause ULTRA and wait for active agents to reach a safe checkpoint before switching models"
+            )
+        if goal is not None and goal.status in {
+            GoalStatus.RUNNING,
+            GoalStatus.VERIFYING,
+            GoalStatus.REVIEWING,
+            GoalStatus.RECOVERING,
+        }:
+            raise RuntimeStateError("model switching is allowed only at a safe checkpoint")
+        self.provider = provider
+        self.model_descriptor = descriptor
+        if self.ultra_session is not None:
+            self.ultra_session.switch_model(descriptor)
+            phase = getattr(
+                getattr(self.ultra_session, "orchestrator", None),
+                "phase",
+                None,
+            )
+            if getattr(phase, "value", "") in {
+                "failed",
+                "revision_required",
+                "cancelled",
+                "completed",
+            }:
+                self.ultra_session.close()
+                self.ultra_session = None
+
+    def replace_permission_adapter(self, adapter: PermissionAdapter) -> None:
+        if (
+            self.ultra_session is not None
+            and self.ultra_session.running
+            and not self.ultra_session.safe_for_reconfiguration
+        ):
+            raise RuntimeStateError(
+                "pause ULTRA and wait for active agents to reach a safe checkpoint before changing permissions"
+            )
+        self.permission_adapter = adapter
+        if self.ultra_session is not None:
+            self.ultra_session.switch_permissions(adapter)
+
     def replace_config(self, config: RuntimeConfig) -> None:
         """Apply validated slice limits at an interactive command checkpoint."""
 
@@ -258,6 +368,175 @@ class AgentRuntime:
             # Preserve the in-memory action history so changing an unrelated
             # display/runtime setting cannot clear the no-progress guardrail.
             self._watchdog.repeat_limit = max(1, self.config.repeated_action_limit)
+
+    def _require_ultra_setup(self) -> tuple[ModelDescriptor, PermissionAdapter]:
+        if self.model_descriptor is None:
+            provider = self.provider_name
+            if provider not in {"openai", "gemini", "ollama"}:
+                raise RuntimeStateError(
+                    "ULTRA requires a selected tool-capable model descriptor; reopen /model"
+                )
+            model = self.model_name
+            cloud = provider in {"openai", "gemini"} or model.casefold().endswith(
+                (":cloud", "-cloud")
+            )
+            self.model_descriptor = ModelDescriptor(
+                provider=provider,
+                model=model,
+                execution_class=ExecutionClass.CLOUD if cloud else ExecutionClass.LOCAL,
+                host=getattr(self.provider, "host", None),
+                capabilities=("tools",),
+                source="runtime",
+            )
+        if self.permission_adapter is None:
+            raise RuntimeStateError(
+                "ULTRA permissions are not initialized; restart interactively or use /permissions"
+            )
+        return self.model_descriptor, self.permission_adapter
+
+    def _make_ultra_session(self) -> Any:
+        descriptor, permission_adapter = self._require_ultra_setup()
+        from .ultra import UltraConfig
+        from .ultra_session import UltraSession
+
+        return UltraSession(
+            store=self.store,
+            workspace=self.workspace,
+            descriptor=descriptor,
+            permission_adapter=permission_adapter,
+            approval=self.approval,
+            events=self.events,
+            config=UltraConfig(
+                min_top_modules=self.config.ultra_top_modules_min,
+                max_top_modules=self.config.ultra_top_modules_max,
+                max_depth=self.config.ultra_max_depth,
+                max_nodes=self.config.ultra_max_nodes,
+                max_fix_attempts=self.config.ultra_fix_attempts,
+                cloud_concurrency=self.config.ultra_cloud_concurrency,
+                max_concurrency=8,
+                provider_retries=self.config.max_provider_retries,
+                role_memory_ttl_hours=self.config.role_memory_ttl_hours,
+                context_chars=min(self.config.conversation_chars, 120_000),
+                prompt_trace_chars=self.config.prompt_trace_chars,
+            ),
+            agent_steps=self.config.subagent_steps,
+        )
+
+    def start_ultra(self, objective: str) -> Any:
+        """Start the sequential foundation and checkpoint at questions/approval."""
+
+        if self.active_goal() is not None:
+            raise RuntimeStateError("finish or cancel the active goal before starting ULTRA")
+        self.ultra_session = self._make_ultra_session()
+        return self.ultra_session.start(redact_text(objective, 20_000))
+
+    def active_ultra_run(self) -> Any | None:
+        goal = self.active_goal() or self.store.get_latest_goal()
+        run_id = str(goal.metadata.get("ultra_run_id", "")) if goal else ""
+        if run_id:
+            try:
+                return self.store.get_ultra_run(run_id)
+            except NotFoundError:
+                pass
+        active = self.store.get_active_ultra_run(goal.id if goal else None)
+        if active is not None:
+            return active
+        runs = self.store.list_ultra_runs(goal.id if goal else None)
+        return runs[-1] if runs else None
+
+    def ultra_questions(self) -> tuple[Mapping[str, Any], ...]:
+        if self.ultra_session is not None:
+            return self.ultra_session.questions()
+        goal = self.active_goal()
+        return tuple(goal.metadata.get("plan_questions", ())) if goal else ()
+
+    def answer_ultra_question(self, question_id: str, value: str) -> Any:
+        if self.ultra_session is None:
+            raise RuntimeStateError(
+                "this ULTRA question round belongs to a previous process; use /replan to rebuild the foundation"
+            )
+        return self.ultra_session.answer(question_id, value)
+
+    def add_ultra_guidance(self, text: str) -> Evidence:
+        goal = self.active_goal()
+        if goal is None or not goal.metadata.get("ultra_run_id"):
+            raise RuntimeStateError("there is no active ULTRA run")
+        safe = redact_text(text, 4_000)
+        item = self.store.add_evidence(
+            goal_id=goal.id,
+            plan_revision=goal.active_plan_revision,
+            kind="guidance",
+            summary=safe,
+            created_by="user",
+        )
+        if self.ultra_session is not None:
+            self.ultra_session.add_guidance(safe)
+        return item
+
+    def approve_ultra(self, revision: int | None = None) -> Plan:
+        if self.ultra_session is None:
+            raise RuntimeStateError(
+                "the ULTRA engine is not live in this process; use /replan to restore from durable evidence"
+            )
+        return self.ultra_session.approve(revision)
+
+    def restore_ultra(self, run_id: str) -> Any:
+        self.ultra_session = self._make_ultra_session()
+        return self.ultra_session.restore(run_id)
+
+    def replan_ultra(self, feedback: str) -> Any:
+        from .ultra_models import UltraRunStatus
+
+        goal = self.active_goal()
+        run = self.active_ultra_run()
+        if goal is None or run is None or not goal.metadata.get("ultra_run_id"):
+            raise RuntimeStateError("there is no active ULTRA master plan to revise")
+        if self.ultra_session is not None and self.ultra_session.running:
+            raise RuntimeStateError("pause ULTRA at a safe checkpoint before requesting a replan")
+        safe_feedback = redact_text(feedback, 4_000)
+        latest = self.store.get_latest_plan(goal.id)
+        if latest and latest.status == PlanStatus.PENDING_APPROVAL:
+            self.store.reject_plan(
+                goal.id,
+                latest.revision,
+                safe_feedback,
+                rejected_by="user",
+            )
+        else:
+            current = self.store.get_goal(goal.id)
+            if current.status == GoalStatus.PAUSED:
+                self.store.transition_goal(
+                    goal.id,
+                    GoalStatus.REVISING,
+                    reason="ULTRA master-plan revision requested",
+                )
+            elif current.status == GoalStatus.RUNNING:
+                self.store.transition_goal(
+                    goal.id,
+                    GoalStatus.REVISING,
+                    reason="ULTRA master-plan revision requested",
+                )
+            elif current.status != GoalStatus.REVISING:
+                raise RuntimeStateError(
+                    f"cannot revise ULTRA while goal is {current.status.value}"
+                )
+        self.store.update_ultra_run(
+            run.id,
+            status=UltraRunStatus.BLOCKED,
+            error=f"superseded by master-plan revision: {safe_feedback}",
+        )
+        objective = (
+            f"{goal.objective}\n\nMASTER PLAN REVISION REQUEST:\n{safe_feedback}\n"
+            "Preserve verified evidence and explicitly identify any changed scope, interface, or dependency."
+        )
+        self.ultra_session = self._make_ultra_session()
+        return self.ultra_session.restart_foundation(goal.id, objective)
+
+    def close(self) -> None:
+        """Checkpoint background ULTRA work before the SQLite connection closes."""
+
+        if self.ultra_session is not None:
+            self.ultra_session.close()
 
     def active_goal(self) -> Goal | None:
         return self.store.load_active_goal()
@@ -460,6 +739,115 @@ class AgentRuntime:
         )
         self.store.transition_goal(goal.id, GoalStatus.PAUSED, reason=reason)
 
+    def _pause_for_plan_questions(
+        self,
+        goal: Goal,
+        questions: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Persist a non-retryable planning interview checkpoint."""
+
+        current = self.store.get_goal(goal.id)
+        if current.status not in {GoalStatus.DISCOVERING, GoalStatus.REVISING}:
+            raise RuntimeStateError("planning questions can only pause an active planning phase")
+        values = [redact_data(dict(item)) for item in questions]
+        first = str(values[0].get("question", ""))
+        self.store.update_goal_metadata(
+            goal.id,
+            plan_questions=values,
+            plan_answers={},
+            waiting_question=first,
+            resume_status=current.status.value,
+            retry_reason="",
+            retry_after_ms=0,
+            auto_retryable=False,
+        )
+        self.store.append_event(
+            "plan.questions_requested",
+            goal_id=goal.id,
+            payload={"questions": values},
+        )
+        self.store.transition_goal(
+            goal.id,
+            GoalStatus.PAUSED,
+            reason="planner needs non-discoverable user decisions",
+        )
+        self.events.publish(
+            "questions",
+            f"Planning needs {len(values)} decision(s). Use /questions and /answer ID VALUE.",
+            questions=values,
+        )
+
+    def plan_questions(self) -> tuple[dict[str, Any], ...]:
+        goal = self.active_goal()
+        if goal is None:
+            return ()
+        answers = dict(goal.metadata.get("plan_answers", {}))
+        return tuple(
+            {**dict(item), "answer": answers.get(str(item.get("id")))}
+            for item in goal.metadata.get("plan_questions", ())
+            if isinstance(item, Mapping)
+        )
+
+    def answer_plan_question(self, question_id: str, value: str) -> Plan | None:
+        goal = self.active_goal()
+        if goal is None:
+            raise RuntimeStateError("there is no active planning interview")
+        questions = {
+            str(item.get("id")): dict(item)
+            for item in goal.metadata.get("plan_questions", ())
+            if isinstance(item, Mapping)
+        }
+        question_id = str(question_id).strip()
+        answer = redact_text(value, 2_000).strip()
+        if question_id not in questions:
+            raise RuntimeStateError(f"unknown planning question id: {question_id}")
+        if not answer:
+            raise ValueError("question answers must not be empty")
+        item = questions[question_id]
+        labels = {
+            str(option.get("label", "")).strip()
+            for option in item.get("options", ())
+            if isinstance(option, Mapping)
+        }
+        if labels and answer not in labels and not bool(item.get("allow_freeform", True)):
+            raise ValueError(
+                f"answer must be one of: {', '.join(sorted(labels))}"
+            )
+        answers = dict(goal.metadata.get("plan_answers", {}))
+        answers[question_id] = answer
+        unanswered = [key for key in questions if not str(answers.get(key, "")).strip()]
+        waiting = str(questions[unanswered[0]].get("question", "")) if unanswered else ""
+        self.store.update_goal_metadata(
+            goal.id,
+            plan_answers=answers,
+            waiting_question=waiting,
+        )
+        self.store.append_event(
+            "plan.question_answered",
+            goal_id=goal.id,
+            entity_type="question",
+            entity_id=question_id,
+            payload={"answer": answer},
+        )
+        if unanswered:
+            self.events.publish(
+                "questions",
+                f"Saved {question_id}; {len(unanswered)} planning decision(s) remain.",
+            )
+            return None
+        if goal.status != GoalStatus.PAUSED:
+            raise RuntimeStateError("all answers are saved, but planning is not paused")
+        desired = GoalStatus(goal.metadata.get("resume_status", GoalStatus.DISCOVERING.value))
+        if desired not in {GoalStatus.DISCOVERING, GoalStatus.REVISING}:
+            desired = GoalStatus.DISCOVERING
+        self.store.transition_goal(
+            goal.id,
+            desired,
+            reason="planning questions answered",
+        )
+        self.events.publish("phase", "Planning decisions saved; rebuilding the approval-bound plan.")
+        return self.generate_plan("Use the durable user answers when finalizing this plan.")
+
     def _goal_retry_delay_ms(self, consecutive: int) -> int:
         exponent = min(max(0, consecutive - 1), 12)
         return min(
@@ -539,6 +927,8 @@ class AgentRuntime:
                 goal = self.active_goal()
 
         previous_plan = self.store.get_latest_plan(goal.id)
+        planning_questions = tuple(goal.metadata.get("plan_questions", ()))
+        planning_answers = dict(goal.metadata.get("plan_answers", {}))
         conversation: list[dict[str, Any]] = [
             {
                 "role": "user",
@@ -547,6 +937,8 @@ class AgentRuntime:
                         "objective": goal.objective,
                         "workspace": str(self.workspace),
                         "user_feedback": feedback,
+                        "planning_questions": list(planning_questions),
+                        "planning_answers": planning_answers,
                         "previous_plan": None
                         if previous_plan is None
                         else {
@@ -578,6 +970,7 @@ class AgentRuntime:
             )
             conversation.append(turn.to_message())
             proposed: dict[str, Any] | None = None
+            requested_questions: list[dict[str, Any]] | None = None
             for call in turn.tool_calls:
                 self.events.publish("tool_call", call.name, args=redact_data(call.args), actor="planner")
                 if call.name == "propose_plan":
@@ -586,6 +979,20 @@ class AgentRuntime:
                         result = "Plan proposal captured for independent critique."
                     except ControlValidationError as exc:
                         result = f"Error: invalid plan proposal: {exc}"
+                elif call.name == "request_plan_input":
+                    try:
+                        request = validate_control_call(call.name, call.args)
+                        if not inspections_before_turn:
+                            raise ControlValidationError(
+                                "inspect the workspace successfully before asking the user"
+                            )
+                        ids = [str(item["id"]) for item in request["questions"]]
+                        if len(ids) != len(set(ids)):
+                            raise ControlValidationError("question ids must be unique")
+                        requested_questions = [dict(item) for item in request["questions"]]
+                        result = "Question round captured; planning will checkpoint for the user."
+                    except ControlValidationError as exc:
+                        result = f"Error: invalid plan question request: {exc}"
                 elif call.name in READ_ONLY_TOOLS:
                     result = self._execute_workspace_tool(goal, call, task_id=None, actor="planner")
                     if not result.startswith("Error:") and not result.startswith("Permission denied"):
@@ -601,7 +1008,23 @@ class AgentRuntime:
                 conversation.append({"role": "tool", "id": call.id, "name": call.name, "content": result})
                 self.events.publish("tool_result", result, tool=call.name, actor="planner")
 
+            if requested_questions is not None and proposed is None:
+                self._pause_for_plan_questions(goal, requested_questions)
+                return None
+
             if proposed is not None:
+                if planning_answers:
+                    proposed = dict(proposed)
+                    proposed["execution_strategy"] = (
+                        str(proposed["execution_strategy"]).rstrip()
+                        + "\n\nApproval-bound user planning decisions: "
+                        + json.dumps(
+                            planning_answers,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    )
                 try:
                     if len(json.dumps(proposed, ensure_ascii=False, default=str)) > 120_000:
                         raise ValueError(
@@ -666,6 +1089,8 @@ class AgentRuntime:
                         retry_reason="",
                         retry_after_ms=0,
                         auto_retryable=False,
+                        plan_questions=[],
+                        waiting_question="",
                     )
                     return plan
                 revisions += 1
@@ -712,6 +1137,8 @@ class AgentRuntime:
         plan = self.latest_plan()
         if goal is None or plan is None:
             raise RuntimeStateError("there is no plan to approve")
+        if goal.metadata.get("ultra_run_id"):
+            return self.approve_ultra(revision)
         requested = plan.revision if revision is None else revision
         accepted, _approval = self.store.approve_plan(
             goal.id,
@@ -1071,7 +1498,31 @@ class AgentRuntime:
             for task in (() if plan is None else plan.tasks)
             if task.status == TaskStatus.UNCERTAIN
         ]
-        return tuple(dict.fromkeys([*action_ids, *delegation_ids, *task_ids]))
+        ultra_ids: list[str] = []
+        goal = self.store.get_goal(goal_id)
+        run_id = str(goal.metadata.get("ultra_run_id", ""))
+        if run_id:
+            try:
+                ultra_ids.extend(
+                    item.id
+                    for item in self.store.list_work_nodes(run_id)
+                    if item.status.value == "uncertain"
+                )
+                ultra_ids.extend(
+                    item.id
+                    for item in self.store.list_agent_runs(run_id)
+                    if item.status.value == "uncertain"
+                )
+                ultra_ids.extend(
+                    item.id
+                    for item in self.store.list_resource_leases(run_id)
+                    if item.status.value == "uncertain"
+                )
+            except StateStoreError:
+                pass
+        return tuple(
+            dict.fromkeys([*action_ids, *delegation_ids, *task_ids, *ultra_ids])
+        )
 
     def pause(self, reason: str = "paused by user") -> Goal:
         goal = self.active_goal()
@@ -1079,6 +1530,8 @@ class AgentRuntime:
             raise RuntimeStateError("no active goal")
         if goal.status == GoalStatus.PAUSED:
             return goal
+        if self.ultra_session is not None and self.ultra_session.running:
+            self.ultra_session.pause()
         self.store.update_goal_metadata(goal.id, resume_status=goal.status.value)
         result = self.store.transition_goal(goal.id, GoalStatus.PAUSED, reason=reason)
         self.events.publish("phase", "Goal paused safely; state is durable.")
@@ -1111,6 +1564,27 @@ class AgentRuntime:
         self.store.update_goal_metadata(goal.id, retry_after_ms=0, auto_retryable=False)
         result = self.store.transition_goal(goal.id, desired, reason="resumed by user")
         self.events.publish("phase", f"Goal resumed in {desired.value}.")
+        ultra_run_id = str(goal.metadata.get("ultra_run_id", ""))
+        if ultra_run_id and self.ultra_session is None:
+            try:
+                self.restore_ultra(ultra_run_id)
+            except Exception:
+                current = self.store.get_goal(goal.id)
+                if current.status == GoalStatus.RUNNING:
+                    self.store.transition_goal(
+                        goal.id,
+                        GoalStatus.PAUSED,
+                        reason="ULTRA restore could not safely start",
+                    )
+                raise
+            self.events.publish(
+                "phase",
+                "ULTRA scheduler rebuilt from the last durable evidence gate.",
+            )
+            return result
+        if self.ultra_session is not None and self.ultra_session.running:
+            self.ultra_session.resume()
+            return result
         if desired in {GoalStatus.DISCOVERING, GoalStatus.REVISING}:
             self.generate_plan("Resume the interrupted planning pass from durable goal state.")
             return self.active_goal() or self.store.get_goal(goal.id)
@@ -1122,6 +1596,8 @@ class AgentRuntime:
         goal = self.active_goal()
         if goal is None:
             raise RuntimeStateError("no active goal")
+        if self.ultra_session is not None:
+            self.ultra_session.cancel()
         result = self.store.transition_goal(goal.id, GoalStatus.CANCELLED, reason="explicitly cancelled by user")
         self.events.publish("phase", "Goal cancelled by explicit user request.")
         return result
@@ -1137,10 +1613,86 @@ class AgentRuntime:
             )
             entity = "action"
         except NotFoundError:
-            result = self.store.resolve_delegation(
-                action_id, resolution, safe_note, actor="user"
-            )
-            entity = "delegation"
+            try:
+                result = self.store.resolve_delegation(
+                    action_id, resolution, safe_note, actor="user"
+                )
+                entity = "delegation"
+            except NotFoundError:
+                try:
+                    from .ultra_models import ResultPackageV1, WorkNodeStatus
+
+                    node = self.store.get_work_node(action_id)
+                    if node.status is not WorkNodeStatus.UNCERTAIN:
+                        raise RuntimeStateError(
+                            f"ULTRA node {action_id} is not uncertain"
+                        )
+                    if resolution == "applied":
+                        result = self.store.transition_work_node(
+                            action_id,
+                            WorkNodeStatus.COMPLETED,
+                            result=ResultPackageV1(
+                                summary=safe_note,
+                                metadata={
+                                    "success": True,
+                                    "reconciled_by": "user",
+                                    "resolution": resolution,
+                                },
+                            ),
+                            checkpoint="reconciled",
+                        )
+                    else:
+                        result = self.store.transition_work_node(
+                            action_id,
+                            WorkNodeStatus.PENDING,
+                            error=None,
+                            checkpoint="reconciled_not_run",
+                        )
+                    entity = "ULTRA node"
+                except NotFoundError:
+                    from .ultra_models import AgentRunStatus, ResultPackageV1
+
+                    try:
+                        agent = self.store.get_agent_run(action_id)
+                    except NotFoundError:
+                        lease = next(
+                            (
+                                item
+                                for item in self.store.list_resource_leases()
+                                if item.id == action_id
+                            ),
+                            None,
+                        )
+                        if lease is None:
+                            raise NotFoundError(
+                                f"recovery entity not found: {action_id}"
+                            )
+                        result = self.store.release_resource_lease(action_id)
+                        entity = "ULTRA lease"
+                    else:
+                        if agent.status is not AgentRunStatus.UNCERTAIN:
+                            raise RuntimeStateError(
+                                f"ULTRA agent {action_id} is not uncertain"
+                            )
+                        result = self.store.update_agent_run(
+                            action_id,
+                            AgentRunStatus.COMPLETED
+                            if resolution == "applied"
+                            else AgentRunStatus.CANCELLED,
+                            result=(
+                                ResultPackageV1(
+                                    summary=safe_note,
+                                    metadata={
+                                        "success": resolution == "applied",
+                                        "reconciled_by": "user",
+                                    },
+                                )
+                                if resolution == "applied"
+                                else None
+                            ),
+                            error=None if resolution == "applied" else safe_note,
+                        )
+                        entity = "ULTRA agent"
         self.events.publish(
             "recovery",
             f"Resolved uncertain {entity} {action_id} as {resolution}: {safe_note}",
@@ -1311,7 +1863,12 @@ class AgentRuntime:
         if decision.stalled:
             return f"Error: {decision.reason}"
         risk = TOOL_RISK.get(call.name, "unknown")
-        needs_approval = tools.requires_approval(call.name, args)
+        normal_requirement = tools.requires_approval(call.name, args)
+        needs_approval = (
+            self.permission_adapter.requires_approval(normal_requirement)
+            if self.permission_adapter is not None
+            else normal_requirement
+        )
         action_id: str | None = None
         if needs_approval and not self.approval(call.name, copy.deepcopy(args), risk):
             action_id = self.store.begin_action(
@@ -1336,7 +1893,17 @@ class AgentRuntime:
             mutating=call.name in MUTATING_TOOLS,
         )
         try:
-            raw_result = tools.run_tool(call.name, args)
+            with tools.workspace_context(self.workspace):
+                if call.name == "run_bash" and self.permission_adapter is not None:
+                    raw_result = self.permission_adapter.run_shell(
+                        str(args.get("command", "")),
+                        self.workspace,
+                        normal_runner=lambda command: tools.run_tool(
+                            "run_bash", {"command": command}
+                        ),
+                    )
+                else:
+                    raw_result = tools.run_tool(call.name, args)
             result = redact_text(raw_result, 50_000)
             terminal = "failed" if result.startswith("Error:") else "completed"
             self.store.complete_action(action_id, redact_text(result, 2_000), status=terminal)
@@ -2076,11 +2643,19 @@ class AgentRuntime:
 
     def apply_command(self, command: UserCommand) -> Any:
         kind, args = command.kind, command.args
+        if kind == CommandKind.ANSWER:
+            goal = self.active_goal()
+            if goal and goal.metadata.get("ultra_run_id"):
+                return self.answer_ultra_question(args["question_id"], args["value"])
+            return self.answer_plan_question(args["question_id"], args["value"])
         if kind == CommandKind.GOAL:
             return self.start_goal(args["objective"])
         if kind == CommandKind.APPROVE:
             return self.approve_plan(args["revision"])
         if kind in {CommandKind.REJECT, CommandKind.REPLAN}:
+            goal = self.active_goal()
+            if goal and goal.metadata.get("ultra_run_id"):
+                return self.replan_ultra(args["feedback"])
             return self.reject_plan(args["feedback"])
         if kind == CommandKind.ADD:
             return self.add_user_task(args["text"], args["acceptance_criteria"])

@@ -44,6 +44,11 @@ real file/artifact paths tied to task IDs. Do not use TBD/unknown placeholders.
 Do not submit a chat-only explanation,
 generic advice, or a plan based only on assumptions about files you did not inspect.
 
+If a high-impact product preference cannot be discovered from the repository,
+call request_plan_input with one to three concise mutually-exclusive questions.
+Put the recommended option first. Do not ask about facts the read-only tools can
+answer. Planning will resume with the durable answers in a fresh state envelope.
+
 Before proposing, silently challenge the draft: missing requirement, unsafe
 assumption, untestable criterion, circular dependency, destructive migration,
 and likely small-model failure. Repair those issues in the submitted plan.
@@ -121,6 +126,50 @@ acceptance criteria—not generic advice. Absence of an obvious bug is not proof
 
 {SECURITY_BOUNDARY}
 """
+
+
+ULTRA_GOAL_SYSTEM_PROMPT = f"""\
+You are the goal-understanding foundation of GA3BAD ULTRA mode. Convert the
+user's short request and inspected repository into a bounded GoalSpec: rewritten
+objective, target user/use case, in-scope and out-of-scope behavior, constraints,
+observable success criteria, assumptions, and unresolved product decisions.
+Never invent repository facts. Request user input only for consequential choices
+that inspection cannot answer. This is planning only; do not mutate files.
+
+{SECURITY_BOUNDARY}
+"""
+
+
+ULTRA_ARCHITECT_SYSTEM_PROMPT = f"""\
+You are the fresh-context architecture pass of GA3BAD ULTRA mode. Given an
+approved GoalSpec and current Project Brain, define adaptive module boundaries,
+interfaces, data flow, path ownership, risks, decisions with reasons/rejected
+alternatives, and integration verification. Prefer 4-12 top-level modules when
+the project warrants it; never force a count. Do not implement code.
+
+{SECURITY_BOUNDARY}
+"""
+
+
+ULTRA_DECOMPOSER_SYSTEM_PROMPT = f"""\
+You are the hierarchical task decomposer for GA3BAD ULTRA mode. Turn one
+approved module contract into contained milestone/module/submodule/task nodes.
+Every child must inherit forbidden changes, keep write paths within its parent,
+declare dependencies, outputs, acceptance criteria, verification, evidence, and
+project relevance. Material scope/interface changes require a master replan.
+
+{SECURITY_BOUNDARY}
+"""
+
+
+ULTRA_NODE_ROLE_PROMPTS: dict[str, str] = {
+    "planner": "Create a small executable node plan from the exact task contract.",
+    "researcher": "Inspect only the references and repository facts needed by this node.",
+    "implementer": "Implement the bounded contract with the smallest reversible change.",
+    "reviewer": "Independently review the node result, diff, contracts, and risks in fresh context.",
+    "tester": "Run or inspect the required verification and return evidence, never confidence alone.",
+    "integrator": "Check interfaces, integration, parent-goal alignment, and propose memory write-back.",
+}
 
 
 def subagent_system_prompt(role: str, depth: int, max_depth: int) -> str:

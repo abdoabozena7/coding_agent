@@ -13,6 +13,7 @@ class InteractionMode(str, Enum):
 
     PLAN = "plan"
     GOAL = "goal"
+    ULTRA = "ultra"
 
     @classmethod
     def parse(cls, value: str | "InteractionMode") -> "InteractionMode":
@@ -24,12 +25,14 @@ class InteractionMode(str, Enum):
             "default": cls.PLAN.value,
             "auto": cls.GOAL.value,
             "agent": cls.GOAL.value,
+            "deep": cls.ULTRA.value,
+            "max": cls.ULTRA.value,
         }
         normalized = aliases.get(normalized, normalized)
         try:
             return cls(normalized)
         except ValueError as exc:
-            raise ValueError("mode must be 'plan' or 'goal'") from exc
+            raise ValueError("mode must be 'plan', 'goal', or 'ultra'") from exc
 
 
 @dataclass
@@ -74,6 +77,14 @@ class RuntimeConfig:
     retry_base_ms: int = 250
     goal_retry_base_ms: int = 1_000
     goal_retry_max_ms: int = 30_000
+    ultra_cloud_concurrency: int = 4
+    ultra_max_depth: int = 5
+    ultra_max_nodes: int = 500
+    ultra_top_modules_min: int = 4
+    ultra_top_modules_max: int = 12
+    ultra_fix_attempts: int = 3
+    prompt_trace_chars: int = 256_000
+    role_memory_ttl_hours: int = 168
 
     @classmethod
     def from_env(cls) -> "RuntimeConfig":
@@ -92,9 +103,19 @@ class RuntimeConfig:
             retry_base_ms=_env_int("AGENT_RETRY_BASE_MS", 250, 0, 30_000),
             goal_retry_base_ms=_env_int("AGENT_GOAL_RETRY_BASE_MS", 1_000, 0, 60_000),
             goal_retry_max_ms=_env_int("AGENT_GOAL_RETRY_MAX_MS", 30_000, 0, 60_000),
+            ultra_cloud_concurrency=_env_int("AGENT_ULTRA_CLOUD_CONCURRENCY", 4, 1, 8),
+            ultra_max_depth=_env_int("AGENT_ULTRA_MAX_DEPTH", 5, 1, 12),
+            ultra_max_nodes=_env_int("AGENT_ULTRA_MAX_NODES", 500, 10, 5_000),
+            ultra_top_modules_min=_env_int("AGENT_ULTRA_MODULES_MIN", 4, 1, 32),
+            ultra_top_modules_max=_env_int("AGENT_ULTRA_MODULES_MAX", 12, 1, 80),
+            ultra_fix_attempts=_env_int("AGENT_ULTRA_FIX_ATTEMPTS", 3, 1, 20),
+            prompt_trace_chars=_env_int("AGENT_PROMPT_TRACE_CHARS", 256_000, 16_000, 2_000_000),
+            role_memory_ttl_hours=_env_int("AGENT_ROLE_MEMORY_TTL_HOURS", 168, 1, 8_760),
         )
         if config.goal_retry_base_ms > config.goal_retry_max_ms:
             raise ValueError("AGENT_GOAL_RETRY_BASE_MS cannot exceed AGENT_GOAL_RETRY_MAX_MS")
+        if config.ultra_top_modules_min > config.ultra_top_modules_max:
+            raise ValueError("AGENT_ULTRA_MODULES_MIN cannot exceed AGENT_ULTRA_MODULES_MAX")
         return config
 
 
@@ -113,6 +134,14 @@ RUNTIME_SETTING_BOUNDS: dict[str, tuple[int, int]] = {
     "retry_base_ms": (0, 30_000),
     "goal_retry_base_ms": (0, 60_000),
     "goal_retry_max_ms": (0, 60_000),
+    "ultra_cloud_concurrency": (1, 8),
+    "ultra_max_depth": (1, 12),
+    "ultra_max_nodes": (10, 5_000),
+    "ultra_top_modules_min": (1, 32),
+    "ultra_top_modules_max": (1, 80),
+    "ultra_fix_attempts": (1, 20),
+    "prompt_trace_chars": (16_000, 2_000_000),
+    "role_memory_ttl_hours": (1, 8_760),
 }
 
 RUNTIME_SETTING_ALIASES: dict[str, str] = {
@@ -125,6 +154,11 @@ RUNTIME_SETTING_ALIASES: dict[str, str] = {
     "provider_retries": "max_provider_retries",
     "repeat_limit": "repeated_action_limit",
     "context_chars": "conversation_chars",
+    "concurrency": "ultra_cloud_concurrency",
+    "ultra_concurrency": "ultra_cloud_concurrency",
+    "ultra_depth": "ultra_max_depth",
+    "ultra_nodes": "ultra_max_nodes",
+    "fix_attempts": "ultra_fix_attempts",
 }
 
 
@@ -158,4 +192,6 @@ def update_runtime_config(config: RuntimeConfig, key: str, raw_value: str) -> Ru
     updated = replace(config, **{normalized: value})
     if updated.goal_retry_base_ms > updated.goal_retry_max_ms:
         raise ValueError("goal_retry_base_ms cannot exceed goal_retry_max_ms")
+    if updated.ultra_top_modules_min > updated.ultra_top_modules_max:
+        raise ValueError("ultra_top_modules_min cannot exceed ultra_top_modules_max")
     return updated

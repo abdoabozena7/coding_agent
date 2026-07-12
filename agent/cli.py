@@ -6,6 +6,7 @@ import argparse
 import os
 import sys
 import unicodedata
+from collections import Counter
 from pathlib import Path
 from typing import Callable, Iterable, TextIO
 
@@ -24,11 +25,23 @@ from .config import (
     update_runtime_config,
 )
 from .events import EventBus
+from .model_catalog import ExecutionClass, ModelCatalog, ModelDescriptor
 from .models import DomainError, GoalStatus
 from .providers import get_provider
 from .runtime import AgentRuntime, RuntimeErrorBase, SliceResult
+from .sandbox import AccessLevel, DockerSandbox, PermissionAdapter, SandboxError
 from .store import StateCorruptionError, StateStore, StateStoreError
-from .ui import ConsoleUI, HELP_TEXT, render_plan, render_slash_menu
+from .ui import (
+    ConsoleUI,
+    HELP_TEXT,
+    render_agents,
+    render_memory,
+    render_plan,
+    render_slash_menu,
+    render_trace,
+    render_tree,
+)
+from .ultra_models import AgentRunStatus, BrainSection
 
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -110,6 +123,117 @@ def choose_workspace(
             print(str(exc), file=output)
 
 
+def choose_model(
+    catalog: ModelCatalog,
+    *,
+    input_func: Callable[[str], str] = input,
+    output: TextIO = sys.stdout,
+) -> ModelDescriptor:
+    """Require one explicit tool-capable model selection, Ollama first."""
+
+    models = catalog.discover()
+    print("Models", file=output)
+    if not models:
+        for diagnostic in catalog.diagnostics:
+            print(f"  {diagnostic.source}: {diagnostic.message}", file=output)
+        raise ValueError(
+            "no tool-capable model is available; start Ollama or configure OpenAI/Gemini"
+        )
+    for index, descriptor in enumerate(models, start=1):
+        speed = "parallel" if descriptor.execution_class is ExecutionClass.CLOUD else "sequential"
+        print(
+            f"  {index:>2}. {descriptor.display_name}  "
+            f"[{descriptor.execution_class.value} · {speed}]",
+            file=output,
+        )
+    while True:
+        choice = input_func("model> ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(models):
+            return models[int(choice) - 1]
+        if choice:
+            exact = [
+                item
+                for item in models
+                if choice in {item.id, item.model, item.display_name}
+            ]
+            if len(exact) == 1:
+                return exact[0]
+        print("Choose one listed model by number or exact name.", file=output)
+
+
+def choose_access_level(
+    *,
+    input_func: Callable[[str], str] = input,
+    output: TextIO = sys.stdout,
+) -> AccessLevel:
+    print("Permissions", file=output)
+    print("  1. normal  approvals stay enabled", file=output)
+    print("  2. full    no workspace confirmations; Docker sandbox required", file=output)
+    choice = input_func("permissions [normal]> ").strip().lower()
+    if choice in {"2", "full"}:
+        return AccessLevel.FULL
+    if choice in {"", "1", "normal"}:
+        return AccessLevel.NORMAL
+    print("Unknown choice; using normal.", file=output)
+    return AccessLevel.NORMAL
+
+
+def choose_interaction_mode(
+    *,
+    input_func: Callable[[str], str] = input,
+    output: TextIO = sys.stdout,
+) -> InteractionMode:
+    print("Mode", file=output)
+    print("  1. plan   approve, then run manually", file=output)
+    print("  2. goal   approve, then continue automatically", file=output)
+    print("  3. ultra  Project Brain, nested nodes, review/test/fix/integration", file=output)
+    while True:
+        choice = input_func("mode> ").strip().lower()
+        aliases = {"1": "plan", "2": "goal", "3": "ultra"}
+        choice = aliases.get(choice, choice)
+        if choice in {"plan", "goal", "ultra"}:
+            return InteractionMode.parse(choice)
+        print("Choose plan, goal, or ultra.", file=output)
+
+
+def _descriptor_for_explicit_model(
+    provider: str,
+    model: str,
+    *,
+    catalog: ModelCatalog | None = None,
+) -> ModelDescriptor:
+    model = _validated_model_name(model)
+    if catalog is not None and provider == "ollama":
+        for item in catalog.discover():
+            if item.provider == provider and item.model == model:
+                return item
+        omitted = [
+            item.message
+            for item in catalog.diagnostics
+            if item.source == f"ollama:{model}" and "omit" in item.message.casefold()
+        ]
+        if omitted:
+            raise ValueError(
+                f"Ollama model {model!r} is not selectable because it does not advertise tool calling"
+            )
+    cloud = provider in {"openai", "gemini"} or model.casefold().endswith(
+        (":cloud", "-cloud")
+    )
+    host = (catalog.ollama_host if catalog is not None else os.getenv("OLLAMA_HOST")) if provider == "ollama" else None
+    if provider == "ollama" and host:
+        lowered = host.casefold()
+        if not any(marker in lowered for marker in ("localhost", "127.0.0.1", "[::1]")):
+            cloud = True
+    return ModelDescriptor(
+        provider=provider,
+        model=model,
+        host=host,
+        execution_class=ExecutionClass.CLOUD if cloud else ExecutionClass.LOCAL,
+        capabilities=("tools",),
+        source="explicit",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="coding-agent",
@@ -122,8 +246,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", help="Override the selected provider's model for this run.")
     parser.add_argument(
         "--mode",
-        choices=(InteractionMode.PLAN.value, InteractionMode.GOAL.value),
-        help="Interaction mode: plan waits after approval; goal continues automatically.",
+        choices=(InteractionMode.PLAN.value, InteractionMode.GOAL.value, InteractionMode.ULTRA.value),
+        help="Interaction mode: plan, goal, or full Project-Brain ULTRA execution.",
+    )
+    parser.add_argument(
+        "--permissions",
+        choices=(AccessLevel.NORMAL.value, AccessLevel.FULL.value),
+        help="Workspace permission profile. Full is accepted only in the ready Docker sandbox.",
+    )
+    parser.add_argument(
+        "--setup-sandbox",
+        action="store_true",
+        help="Build/validate the one-time versioned Docker sandbox, then continue.",
     )
     parser.add_argument(
         "--command",
@@ -210,7 +344,26 @@ def _show_history(runtime: AgentRuntime, console: ConsoleUI) -> None:
 
 def _show_runtime_state(runtime: AgentRuntime, console: ConsoleUI) -> None:
     view = runtime.dashboard()
-    console.show_dashboard(view)
+    active_agents = 0
+    try:
+        ultra_run = runtime.active_ultra_run()
+        if ultra_run is not None and isinstance(getattr(ultra_run, "id", None), str):
+            active_agents = len(
+                runtime.store.list_agent_runs(
+                    ultra_run.id,
+                    status=AgentRunStatus.RUNNING,
+                )
+            )
+    except (AttributeError, StateStoreError, TypeError):
+        active_agents = 0
+    access = getattr(runtime, "access_level", "normal")
+    execution = getattr(runtime, "execution_class", "local")
+    console.set_runtime_identity(
+        access_level=access if isinstance(access, str) else "normal",
+        execution_class=execution if isinstance(execution, str) else "local",
+        active_agents=active_agents,
+    )
+    console.show_status(view)
     if view.status == GoalStatus.AWAITING_PLAN_APPROVAL.value:
         console.write(render_plan(view))
 
@@ -227,6 +380,12 @@ def _set_interaction_mode(
     if selected == InteractionMode.PLAN:
         console.write(
             "PLAN mode active: create/review the plan, approve it, then use /run or /auto explicitly."
+        )
+        return
+    if selected == InteractionMode.ULTRA:
+        console.write(
+            "ULTRA mode active: GoalSpec → architecture → one master approval → "
+            "nested module waves → independent review/test/fix/integration → final evidence."
         )
         return
     goal = runtime.active_goal()
@@ -253,6 +412,8 @@ def _show_settings(
         "color": console.color_mode,
         "provider": runtime.provider_name,
         "model": runtime.model_name,
+        "permissions": runtime.access_level,
+        "execution_class": runtime.execution_class,
         "workspace": str(runtime.workspace),
         **runtime_values,
     }
@@ -271,6 +432,8 @@ def _show_settings(
     console.write(f"  color      = {console.color_mode}")
     console.write(f"  provider   = {runtime.provider_name}")
     console.write(f"  model      = {runtime.model_name}")
+    console.write(f"  access     = {runtime.access_level}")
+    console.write(f"  execution  = {runtime.execution_class}")
     console.write(f"  workspace  = {runtime.workspace}")
     console.write("Runtime limits (session only)")
     for name, value in runtime_values.items():
@@ -324,21 +487,48 @@ def _execute_settings(
 
 
 def _execute_model(runtime: AgentRuntime, console: ConsoleUI, value: str | None) -> None:
+    catalog = ModelCatalog()
     if value is None:
-        console.write(f"model = {runtime.model_name}")
-        return
-    model = _validated_model_name(value)
-    if not hasattr(runtime.provider, "model"):
-        raise ValueError("the active provider does not support session model switching")
-    runtime.provider.model = model
+        descriptor = choose_model(
+            catalog,
+            input_func=console.input_func,
+            output=console.stream,
+        )
+    else:
+        model = _validated_model_name(value)
+        discovered = catalog.discover()
+        matches = [
+            item
+            for item in discovered
+            if model in {item.id, item.model, item.display_name}
+        ]
+        if len(matches) == 1:
+            descriptor = matches[0]
+        else:
+            if runtime.provider_name not in {"openai", "gemini", "ollama"}:
+                raise ValueError("the active provider does not support session model switching")
+            descriptor = _descriptor_for_explicit_model(
+                runtime.provider_name,
+                model,
+                catalog=catalog,
+            )
+    runtime.replace_provider(descriptor.create_provider(), descriptor)
     variable = {
         "openai": "OPENAI_MODEL",
         "gemini": "GEMINI_MODEL",
         "ollama": "OLLAMA_MODEL",
-    }.get(runtime.provider_name)
+    }.get(descriptor.provider)
     if variable:
-        os.environ[variable] = model
-    console.write(f"model = {runtime.model_name} (session only)")
+        os.environ[variable] = descriptor.model
+    os.environ["LLM_PROVIDER"] = descriptor.provider
+    console.set_runtime_identity(
+        access_level=runtime.access_level,
+        execution_class=runtime.execution_class,
+    )
+    console.write(
+        f"model = {descriptor.provider}/{descriptor.model} · "
+        f"{descriptor.execution_class.value} (session only)"
+    )
 
 
 def _run_auto(runtime: AgentRuntime, console: ConsoleUI) -> None:
@@ -376,6 +566,233 @@ def _run_auto(runtime: AgentRuntime, console: ConsoleUI) -> None:
             return
 
 
+def _current_ultra_run(runtime: AgentRuntime) -> object | None:
+    try:
+        return runtime.active_ultra_run()
+    except (AttributeError, StateStoreError):
+        return None
+
+
+def _show_questions(runtime: AgentRuntime, console: ConsoleUI) -> None:
+    goal = runtime.active_goal()
+    questions = (
+        runtime.ultra_questions()
+        if goal is not None and goal.metadata.get("ultra_run_id")
+        else runtime.plan_questions()
+    )
+    if not questions:
+        console.write("Questions\n  (none pending)")
+        return
+    answers = dict(goal.metadata.get("plan_answers", {})) if goal else {}
+    lines = [f"Questions · {len(questions)}"]
+    for item in questions:
+        question_id = str(item.get("id", "?"))
+        answer = answers.get(question_id)
+        mark = "[x]" if answer else "[ ]"
+        lines.append(f"  {mark} {question_id} · {item.get('header', '')}")
+        lines.append(f"      {item.get('question', '')}")
+        for option in item.get("options", ()):
+            if not isinstance(option, dict):
+                continue
+            recommended = " (recommended)" if option.get("recommended") else ""
+            lines.append(
+                f"      - {option.get('label', '')}{recommended}: {option.get('description', '')}"
+            )
+        if answer:
+            lines.append(f"      answer: {answer}")
+    lines.append("  Use /answer QUESTION_ID VALUE")
+    console.write("\n".join(lines))
+
+
+def _show_tree(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -> None:
+    run = _current_ultra_run(runtime)
+    if run is None:
+        console.write("Project tree\n  (no ULTRA run yet)")
+        return
+    nodes = runtime.store.list_work_nodes(run.id, parent_id=target, recursive=True)
+    if target:
+        try:
+            root = runtime.store.get_work_node(target)
+        except StateStoreError:
+            console.write(f"Project tree\n  (node {target!r} was not found)")
+            return
+        values: list[object] = [
+            {
+                "id": root.id,
+                "parent_id": None,
+                "title": root.title,
+                "status": root.status.value,
+                "kind": root.kind.value,
+                "position": root.position,
+            }
+        ]
+        values.extend(
+            {
+                "id": item.id,
+                "parent_id": item.parent_id,
+                "title": item.title,
+                "status": item.status.value,
+                "kind": item.kind.value,
+                "position": item.position,
+            }
+            for item in nodes
+            if item.id != root.id
+        )
+        console.write(render_tree(values))
+        return
+    console.write(render_tree(nodes))
+
+
+def _show_agents(
+    runtime: AgentRuntime,
+    console: ConsoleUI,
+    *,
+    include_finished: bool,
+) -> None:
+    run = _current_ultra_run(runtime)
+    if run is None:
+        console.write("Agents\n  (no ULTRA run yet)")
+        return
+    node_titles = {
+        node.id: node.title for node in runtime.store.list_work_nodes(run.id)
+    }
+    console.write(
+        render_agents(
+            runtime.store.list_agent_runs(run.id),
+            include_finished=include_finished,
+            node_titles=node_titles,
+        )
+    )
+
+
+def _show_memory(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -> None:
+    run = _current_ultra_run(runtime)
+    if run is None:
+        console.write("Project Brain\n  (no ULTRA run yet)")
+        return
+    section = None
+    query = ""
+    if target:
+        normalized = target.strip().lower()
+        if normalized in {"artifact", "artifacts", "artifact_index"}:
+            entries = [
+                {
+                    "section": "artifact_index",
+                    "title": item.path or item.uri,
+                    "content": (
+                        f"{item.kind} · sha256 {item.content_hash or 'not recorded'}"
+                    ),
+                }
+                for item in runtime.store.list_artifacts(run.id)
+            ]
+            console.write(render_memory(entries, title="Project Brain · Artifact Index"))
+            return
+        try:
+            section = BrainSection(normalized)
+        except ValueError:
+            query = target
+    entries = (
+        runtime.store.search_brain(run.id, query, section=section)
+        if query
+        else runtime.store.list_brain_entries(run.id, section=section)
+    )
+    console.write(render_memory(entries))
+
+
+def _show_trace(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -> None:
+    run = _current_ultra_run(runtime)
+    trace = None
+    if target and target.lower() not in {"latest"}:
+        try:
+            trace = runtime.store.get_prompt_trace(target)
+        except StateStoreError:
+            traces = runtime.store.list_prompt_traces(target, limit=1)
+            trace = traces[0] if traces else None
+    elif run is not None:
+        trace = runtime.store.latest_prompt_trace(run.id)
+    console.write(render_trace(trace))
+
+
+def _show_insights(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -> None:
+    run = _current_ultra_run(runtime)
+    if run is None:
+        console.write("Insights\n  (no ULTRA run yet)")
+        return
+    entries = []
+    for section in (BrainSection.DECISION, BrainSection.LESSON, BrainSection.KNOWLEDGE):
+        entries.extend(
+            runtime.store.list_brain_entries(
+                run.id,
+                section=section,
+                work_node_id=target,
+                limit=100,
+            )
+        )
+    console.write(render_memory(entries, title="Insights"))
+
+
+def _show_metrics(runtime: AgentRuntime, console: ConsoleUI) -> None:
+    run = _current_ultra_run(runtime)
+    if run is None:
+        console.write(
+            f"Metrics\n  provider {runtime.provider_name}/{runtime.model_name}\n"
+            "  (no ULTRA run yet)"
+        )
+        return
+    nodes = runtime.store.list_work_nodes(run.id)
+    agents = runtime.store.list_agent_runs(run.id)
+    node_counts = Counter(item.status.value for item in nodes)
+    agent_counts = Counter(item.status.value for item in agents)
+    input_tokens = sum(int(item.usage.get("input_tokens", 0) or 0) for item in agents)
+    output_tokens = sum(int(item.usage.get("output_tokens", 0) or 0) for item in agents)
+    fixes = sum(item.attempts for item in nodes)
+    lines = [
+        f"Metrics · run {run.id}",
+        f"  execution   {run.execution_class.value} · configured concurrency {run.concurrency}",
+        f"  nodes       {len(nodes)} · " + ", ".join(f"{key}={value}" for key, value in sorted(node_counts.items())),
+        f"  agents      {len(agents)} · " + ", ".join(f"{key}={value}" for key, value in sorted(agent_counts.items())),
+        f"  fix attempts {fixes}",
+        f"  tokens      in={input_tokens} out={output_tokens}",
+        f"  traces      {len(runtime.store.list_prompt_traces(run.id, limit=10_000))}",
+        f"  artifacts   {len(runtime.store.list_artifacts(run.id, limit=10_000))}",
+    ]
+    console.write("\n".join(lines))
+
+
+def _execute_permissions(
+    runtime: AgentRuntime,
+    console: ConsoleUI,
+    level: str | None,
+) -> None:
+    if level is None:
+        console.write(f"permissions = {runtime.access_level}")
+        return
+    sandbox = (
+        runtime.permission_adapter.sandbox
+        if runtime.permission_adapter is not None
+        else DockerSandbox()
+    )
+    adapter = PermissionAdapter(level, sandbox)
+    runtime.replace_permission_adapter(adapter)
+    console.set_runtime_identity(
+        access_level=runtime.access_level,
+        execution_class=runtime.execution_class,
+    )
+    if adapter.selection.reason:
+        console.write(adapter.selection.reason)
+    console.write(f"permissions = {adapter.access_level.value} (this session)")
+
+
+def _setup_sandbox(runtime: AgentRuntime, console: ConsoleUI) -> None:
+    sandbox = (
+        runtime.permission_adapter.sandbox
+        if runtime.permission_adapter is not None
+        else DockerSandbox()
+    )
+    config = sandbox.setup()
+    console.write(f"Full sandbox ready · {config.image} · user {config.container_user}")
+
+
 def execute_command(
     runtime: AgentRuntime,
     console: ConsoleUI,
@@ -394,7 +811,9 @@ def execute_command(
     if command.kind == CommandKind.MODE:
         selected = command.args.get("mode")
         if selected is None:
-            console.write(f"mode = {preferences.mode.value}; choose /mode plan or /mode goal")
+            console.write(
+                f"mode = {preferences.mode.value}; choose /mode plan, /mode goal, or /mode ultra"
+            )
         else:
             _set_interaction_mode(runtime, console, preferences, selected)
         return True
@@ -404,20 +823,77 @@ def execute_command(
     if command.kind == CommandKind.MODEL:
         _execute_model(runtime, console, command.args.get("model"))
         return True
+    if command.kind == CommandKind.PERMISSIONS:
+        _execute_permissions(runtime, console, command.args.get("level"))
+        return True
+    if command.kind == CommandKind.SETUP:
+        _setup_sandbox(runtime, console)
+        return True
+    if command.kind == CommandKind.TREE:
+        _show_tree(runtime, console, command.args.get("target"))
+        return True
+    if command.kind == CommandKind.AGENTS:
+        _show_agents(runtime, console, include_finished=bool(command.args.get("all")))
+        return True
+    if command.kind == CommandKind.MEMORY:
+        _show_memory(runtime, console, command.args.get("target"))
+        return True
+    if command.kind == CommandKind.TRACE:
+        _show_trace(runtime, console, command.args.get("target"))
+        return True
+    if command.kind == CommandKind.INSIGHTS:
+        _show_insights(runtime, console, command.args.get("target"))
+        return True
+    if command.kind == CommandKind.QUESTIONS:
+        _show_questions(runtime, console)
+        return True
+    if command.kind == CommandKind.METRICS:
+        _show_metrics(runtime, console)
+        return True
     if command.kind == CommandKind.PLAN:
         console.write(render_plan(runtime.dashboard()))
         return True
     if command.kind == CommandKind.STATUS:
-        console.show_dashboard(runtime.dashboard())
+        _show_runtime_state(runtime, console)
         return True
     if command.kind == CommandKind.HISTORY:
         _show_history(runtime, console)
         return True
     if command.kind == CommandKind.AUTO:
+        if preferences.mode == InteractionMode.ULTRA:
+            console.write("ULTRA execution already runs in the background after master approval.")
+            _show_runtime_state(runtime, console)
+            return True
         _run_auto(runtime, console)
         return True
 
-    result = runtime.apply_command(command)
+    if preferences.mode == InteractionMode.ULTRA and command.kind in {
+        CommandKind.GOAL,
+        CommandKind.TEXT,
+    }:
+        text = command.args.get("objective", command.args.get("text", "")).strip()
+        if not text:
+            return True
+        if runtime.active_goal() is None:
+            result = runtime.start_ultra(text)
+        else:
+            pending = [
+                item
+                for item in runtime.ultra_questions()
+                if not runtime.active_goal().metadata.get("plan_answers", {}).get(
+                    str(item.get("id"))
+                )
+            ]
+            result = (
+                runtime.answer_ultra_question(str(pending[0].get("id")), text)
+                if len(pending) == 1
+                else runtime.add_ultra_guidance(text)
+            )
+    elif preferences.mode == InteractionMode.ULTRA and command.kind == CommandKind.RUN:
+        console.write("ULTRA module waves run in the background; use /agents, /tree, or /pause.")
+        result = None
+    else:
+        result = runtime.apply_command(command)
     if isinstance(result, SliceResult):
         console.write(result.message)
     _show_runtime_state(runtime, console)
@@ -453,7 +929,12 @@ def interactive_loop(
             console.write("\nInput closed. Durable goal state is saved.")
             return
         except KeyboardInterrupt:
-            console.write("\nNo action was running. Type /quit to exit or / for controls.")
+            runtime.checkpoint_interrupt()
+            console.write(
+                "\nCheckpoint saved; new agents will not launch until /resume. "
+                "Type /quit to exit or / for controls."
+            )
+            _show_runtime_state(runtime, console)
             continue
         try:
             command = parse_command(line)
@@ -462,7 +943,15 @@ def interactive_loop(
         except KeyboardInterrupt:
             runtime.checkpoint_interrupt()
             _show_runtime_state(runtime, console)
-        except (CommandParseError, RuntimeErrorBase, StateStoreError, DomainError, ValueError) as exc:
+        except (
+            CommandParseError,
+            RuntimeErrorBase,
+            StateStoreError,
+            SandboxError,
+            RuntimeError,
+            DomainError,
+            ValueError,
+        ) as exc:
             console.write(f"error: {exc}")
 
 
@@ -473,12 +962,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     console = ConsoleUI(color=False if args.no_color else None)
     preferences = SessionPreferences()
     store: StateStore | None = None
+    runtime: AgentRuntime | None = None
     try:
         load_dotenv(APP_ROOT / ".env", override=False)
         selected_provider = _configure_provider_environment(args.provider, args.model)
-        preferences = SessionPreferences.from_env(args.mode)
-        console.set_mode(preferences.mode)
-        if args.interactive or not args.command:
+        interactive_launch = bool(args.interactive or not args.command)
+        if interactive_launch:
             console.show_brand()
         if args.workspace:
             workspace_path = Path(args.workspace).expanduser()
@@ -495,8 +984,69 @@ def main(argv: Iterable[str] | None = None) -> int:
                 )
             workspace = choose_workspace(args.projects_root)
 
-        provider = get_provider(selected_provider)
+        catalog = ModelCatalog()
+        if interactive_launch and args.model is None:
+            descriptor = choose_model(catalog, output=console.stream)
+        else:
+            if not interactive_launch and args.model is None:
+                model_required = args.auto
+                for raw in args.command:
+                    try:
+                        kind = parse_command(raw).kind
+                    except CommandParseError:
+                        kind = CommandKind.TEXT
+                    if kind in {
+                        CommandKind.TEXT,
+                        CommandKind.GOAL,
+                        CommandKind.APPROVE,
+                        CommandKind.REJECT,
+                        CommandKind.REPLAN,
+                        CommandKind.RUN,
+                        CommandKind.AUTO,
+                        CommandKind.RESUME,
+                    }:
+                        model_required = True
+                if model_required:
+                    raise ValueError(
+                        "--model is required for non-interactive model work; offline inspection commands are exempt"
+                    )
+            environment_provider = get_provider(selected_provider)
+            selected_model = args.model or str(getattr(environment_provider, "model", ""))
+            descriptor = _descriptor_for_explicit_model(
+                selected_provider,
+                selected_model,
+                catalog=catalog if selected_provider == "ollama" and args.model is not None else None,
+            )
+        os.environ["LLM_PROVIDER"] = descriptor.provider
+        provider = descriptor.create_provider()
         _validated_model_name(str(getattr(provider, "model", "")))
+
+        sandbox = DockerSandbox()
+        if args.setup_sandbox:
+            sandbox.setup()
+            console.write("Full sandbox setup is ready.")
+        requested_access = (
+            AccessLevel.parse(args.permissions)
+            if args.permissions
+            else choose_access_level(output=console.stream)
+            if interactive_launch
+            else AccessLevel.NORMAL
+        )
+        permission_adapter = PermissionAdapter(requested_access, sandbox)
+        if permission_adapter.selection.reason:
+            console.write(permission_adapter.selection.reason)
+
+        if args.mode:
+            preferences = SessionPreferences.from_env(args.mode)
+        elif interactive_launch:
+            preferences = SessionPreferences(mode=choose_interaction_mode(output=console.stream))
+        else:
+            preferences = SessionPreferences.from_env()
+        console.set_mode(preferences.mode)
+        console.set_runtime_identity(
+            access_level=permission_adapter.access_level.value,
+            execution_class=descriptor.execution_class.value,
+        )
         bus = EventBus()
         bus.subscribe(console.on_event)
         store = StateStore(workspace)
@@ -506,10 +1056,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             workspace,
             events=bus,
             approval=console.confirm_action,
+            model_descriptor=descriptor,
+            permission_adapter=permission_adapter,
         )
         console.write(
-            f"GA3BAD coding agent | provider={runtime.provider_name} model={runtime.model_name} | "
-            "state=.coding-agent/state.db"
+            f"Ready · {runtime.provider_name}/{runtime.model_name} · "
+            f"{runtime.execution_class} · {runtime.access_level} · state .coding-agent/state.db"
         )
 
         for raw in args.command:
@@ -520,7 +1072,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 runtime.checkpoint_interrupt()
                 _show_runtime_state(runtime, console)
                 return 130
-        if args.auto:
+        if args.auto and preferences.mode != InteractionMode.ULTRA:
             try:
                 _run_auto(runtime, console)
             except KeyboardInterrupt:
@@ -534,15 +1086,19 @@ def main(argv: Iterable[str] | None = None) -> int:
         StateCorruptionError,
         StateStoreError,
         RuntimeErrorBase,
+        RuntimeError,
         DomainError,
         OSError,
         ValueError,
+        SandboxError,
     ) as exc:
         if args.debug:
             raise
         console.write(f"fatal: {exc}")
         return 2
     finally:
+        if runtime is not None:
+            runtime.close()
         if store is not None:
             store.close()
 

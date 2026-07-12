@@ -9,7 +9,7 @@ import sys
 import textwrap
 from dataclasses import dataclass, field
 from threading import RLock
-from typing import Any, TextIO
+from typing import Any, Iterable, Mapping, TextIO
 
 try:
     from .config import InteractionMode, runtime_setting_names
@@ -21,9 +21,10 @@ except ImportError:  # direct ``python agent/main.py`` compatibility
 try:  # Optional at import time; basic input and the bare-/ menu remain available.
     from prompt_toolkit import ANSI, PromptSession
     from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.patch_stdout import patch_stdout
     from prompt_toolkit.shortcuts import CompleteStyle
 except ImportError:  # pragma: no cover - exercised by minimal installations
-    ANSI = PromptSession = Completer = Completion = CompleteStyle = None  # type: ignore
+    ANSI = PromptSession = Completer = Completion = CompleteStyle = patch_stdout = None  # type: ignore
 
 
 BRAND_ART = (
@@ -37,9 +38,18 @@ BRAND_WIDTH = max(len(line) for line in BRAND_ART)
 BRAND_SUBTITLE = "coding agent"
 
 SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
-    ("/mode", "show or switch PLAN/GOAL mode"),
+    ("/mode", "switch PLAN / GOAL / ULTRA mode"),
+    ("/model", "choose a provider model"),
+    ("/permissions", "switch NORMAL / FULL access"),
+    ("/tree", "show the hierarchical project tree"),
+    ("/agents", "show active and recent agents"),
+    ("/memory", "inspect the Project Brain"),
+    ("/trace", "inspect redacted prompts and run trace"),
+    ("/insights", "show durable findings and decisions"),
+    ("/questions", "show pending plan questions"),
+    ("/answer", "answer a durable plan question"),
+    ("/metrics", "show quality, usage, and timing metrics"),
     ("/settings", "inspect or change session settings"),
-    ("/model", "show or switch the model for this session"),
     ("/goal", "start a durable goal"),
     ("/plan", "show the complete plan and checklist"),
     ("/approve", "approve the displayed plan revision"),
@@ -60,6 +70,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/resume", "continue paused work"),
     ("/resolve", "reconcile uncertain crash-window work"),
     ("/cancel", "explicitly abandon the active goal"),
+    ("/setup", "validate the one-time sandbox setup"),
     ("/help", "show every command"),
     ("/quit", "save state and exit"),
 )
@@ -95,9 +106,11 @@ if Completer is not None:
             trailing_space = bool(lowered and lowered[-1].isspace())
             current = "" if trailing_space else tokens[-1]
             if tokens[0] == "/mode" and len(tokens) <= 2:
-                yield from self._values(current, ("plan", "goal"))
+                yield from self._values(current, ("plan", "goal", "ultra"))
+            elif tokens[0] in {"/permissions", "/permission", "/access"} and len(tokens) <= 2:
+                yield from self._values(current, ("normal", "full"))
             elif tokens[0] == "/settings" and len(tokens) >= 2 and tokens[1] == "mode" and len(tokens) <= 3:
-                yield from self._values(current, ("plan", "goal"))
+                yield from self._values(current, ("plan", "goal", "ultra"))
             elif tokens[0] == "/settings" and len(tokens) >= 2 and tokens[1] == "color" and len(tokens) <= 3:
                 yield from self._values(current, ("auto", "on", "off"))
             elif tokens[0] == "/settings" and (
@@ -109,6 +122,10 @@ if Completer is not None:
                     "provider",
                     "model",
                     "workspace",
+                    "concurrency",
+                    "ultra_depth",
+                    "ultra_nodes",
+                    "fix_attempts",
                     "reset",
                     *runtime_setting_names(),
                 )
@@ -233,10 +250,168 @@ def render_slash_menu() -> str:
             "Modes",
             "  /mode plan   plan, review, and approve before manual execution",
             "  /mode goal   plan and approve first, then continue automatically",
+            "  /mode ultra  deep project brain, hierarchical nodes, review/test/fix loops",
             "",
             "Legacy :commands remain supported.",
         )
     )
+    return "\n".join(lines)
+
+
+def render_status(
+    view: DashboardView,
+    *,
+    access_level: str = "normal",
+    execution_class: str = "local",
+    active_agents: int = 0,
+) -> str:
+    """Render a sparse Codex-like status summary without dashboard boxes."""
+
+    completed = sum(task.status in {"done", "skipped"} for task in view.tasks)
+    lines = [
+        f"GA3BAD CODING AGENT · MODE {view.interaction_mode.upper()} · STATUS {view.status.upper()} · {view.provider}/{view.model}",
+        f"workspace  {view.workspace}",
+        f"access     {access_level.upper()} · {execution_class.upper()} · agents {active_agents}",
+        f"goal       {view.objective}",
+        f"progress   {completed}/{len(view.tasks)} · status {view.status.upper()} · plan r{view.plan_revision}",
+    ]
+    if view.waiting_question:
+        lines.append(f"input      {view.waiting_question}")
+    return "\n".join(lines)
+
+
+def render_tree(nodes: Iterable[Any], *, root_id: str | None = None) -> str:
+    """Render work nodes from dataclasses or mappings as a compact hierarchy."""
+
+    values = list(nodes)
+    if not values:
+        return "Project tree\n  (no ULTRA work nodes yet)"
+
+    def field(item: Any, name: str, default: Any = "") -> Any:
+        if isinstance(item, Mapping):
+            return item.get(name, default)
+        value = getattr(item, name, default)
+        return getattr(value, "value", value)
+
+    by_parent: dict[str | None, list[Any]] = {}
+    for item in values:
+        by_parent.setdefault(field(item, "parent_id", None), []).append(item)
+    for children in by_parent.values():
+        children.sort(
+            key=lambda item: (
+                int(field(item, "position", field(item, "priority", 0))),
+                str(field(item, "id")),
+            )
+        )
+    marks = {
+        "completed": "[x]",
+        "done": "[x]",
+        "running": "[>]",
+        "in_progress": "[>]",
+        "failed": "[!]",
+        "blocked": "[!]",
+        "conflict": "[!]",
+        "uncertain": "[?]",
+        "cancelled": "[-]",
+    }
+    lines = ["Project tree"]
+
+    def visit(parent: str | None, prefix: str = "") -> None:
+        children = by_parent.get(parent, [])
+        for index, item in enumerate(children):
+            last = index == len(children) - 1
+            node_id = str(field(item, "id"))
+            status = str(field(item, "status", "pending")).lower()
+            kind = str(field(item, "kind", field(item, "node_type", "task")))
+            title = str(field(item, "title", node_id))
+            branch = "`-" if last else "|-"
+            lines.append(f"{prefix}{branch} {marks.get(status, '[ ]')} {node_id} · {kind} · {title}")
+            visit(node_id, prefix + ("   " if last else "|  "))
+
+    visit(root_id)
+    return "\n".join(lines)
+
+
+def render_agents(
+    runs: Iterable[Any],
+    *,
+    include_finished: bool = False,
+    node_titles: Mapping[str, str] | None = None,
+) -> str:
+    values = list(runs)
+    if not include_finished:
+        def status_of(item: Any) -> str:
+            raw = item.get("status", "") if isinstance(item, Mapping) else getattr(item, "status", "")
+            return str(getattr(raw, "value", raw)).lower()
+
+        values = [
+            item
+            for item in values
+            if status_of(item)
+            in {"queued", "pending", "running", "rate_limited", "paused", "uncertain"}
+        ]
+    if not values:
+        return "Agents\n  (none active)"
+    lines = [f"Agents · {len(values)}"]
+    for item in values:
+        get = item.get if isinstance(item, Mapping) else lambda key, default="": getattr(item, key, default)
+        status = getattr(get("status", ""), "value", get("status", ""))
+        role = get("role", get("phase", "worker"))
+        node = get("work_node_id", get("node_id", get("task_id", "-")))
+        phase = get("phase", "-")
+        model = get("model", "-")
+        node_label = (node_titles or {}).get(str(node), str(node))
+        lines.append(f"  [{role}] {status} · {phase} · {node_label} · {model}")
+    return "\n".join(lines)
+
+
+def render_memory(entries: Iterable[Any], *, title: str = "Project Brain") -> str:
+    values = list(entries)
+    if not values:
+        return f"{title}\n  (empty)"
+    lines = [title]
+    for item in values:
+        get = item.get if isinstance(item, Mapping) else lambda key, default="": getattr(item, key, default)
+        category_value = get("section", get("category", "memory"))
+        category = getattr(category_value, "value", category_value)
+        key = get("title", get("key", get("id", "-")))
+        content = get("content", get("summary", ""))
+        lines.append(f"  [{category}] {key}")
+        if content and str(content).strip() != str(key).strip():
+            one_line = " ".join(str(content).split())
+            lines.append(f"      {_fit(one_line, 116).rstrip()}")
+    return "\n".join(lines)
+
+
+def render_trace(trace: Any | None) -> str:
+    if trace is None:
+        return "Trace\n  (no prompt trace recorded)"
+    get = trace.get if isinstance(trace, Mapping) else lambda key, default="": getattr(trace, key, default)
+    lines = [
+        f"Trace {get('id', '-')}",
+        f"  role      {get('role', '-')}",
+        f"  node      {get('work_node_id', get('node_id', '-'))}",
+        f"  redacted  {get('redacted', True)}",
+        f"  truncated {get('truncated', False)}",
+    ]
+    system_prompt = get("system_prompt", get("prompt", get("request_text", "")))
+    context_package = get("context_package", {})
+    self_prompt = get("self_prompt", "")
+    summary = get("reasoning_summary", get("summary", get("response_summary", "")))
+    if system_prompt:
+        lines.extend(("", "System prompt", str(system_prompt)))
+    if context_package:
+        lines.extend(
+            (
+                "",
+                "Context package",
+                json.dumps(context_package, ensure_ascii=False, indent=2, default=str),
+            )
+        )
+    if self_prompt:
+        lines.extend(("", "Self prompt", str(self_prompt)))
+    if summary:
+        lines.extend(("", "Reasoning summary (no hidden chain-of-thought)", str(summary)))
     return "\n".join(lines)
 
 
@@ -383,9 +558,12 @@ Slash palette and modes
   /mode                      show the current interaction mode
   /mode plan                 plan/approve, then wait for manual /run
   /mode goal                 plan/approve, then continue automatically
+  /mode ultra                Project Brain + hierarchical agents + full quality gates
   /settings                  show safe session settings (never secrets)
   /settings NAME VALUE       change mode, color, or a runtime limit this session
-  /model [NAME]              show or switch the current model this session
+  /model                     reopen the tool-capable model picker at a safe checkpoint
+  /permissions normal|full   choose approvals or Docker-isolated Full access
+  /setup                     build/validate the one-time Full-access sandbox
 
 Goal and plan
   /goal TEXT                 start a durable goal (plain text also works when idle)
@@ -393,6 +571,8 @@ Goal and plan
   /reject FEEDBACK           reject and regenerate the draft
   /replan FEEDBACK           ask for a revised plan
   /plan                      show the dashboard/checklist
+  /questions                 show non-discoverable decisions awaiting input
+  /answer ID VALUE           save a durable answer bound into the plan fingerprint
 
 Editable checklist
   /add TEXT :: CRITERIA      add a user-approved task
@@ -406,6 +586,12 @@ Execution
   /auto                      retry/self-prompt without limit until completion or real user input
   /pause / /resume           cooperatively stop or continue
   /history / /status         inspect durable execution state
+  /tree [NODE]               inspect the ULTRA module/submodule/task hierarchy
+  /agents [--all]            inspect active or recent role-isolated agents
+  /memory [SECTION]          inspect/search Project Brain entries
+  /trace [latest|RUN_ID]     show redacted prompts, context, and reasoning summaries
+  /insights [NODE]           show findings, decisions, and lessons
+  /metrics                   show token, agent, node, fix, and concurrency metrics
   /resolve ENTITY_ID applied|not-run NOTE
                               reconcile a crash-window action/worker after inspection
   /cancel CANCEL             explicitly abandon an unfinished goal
@@ -432,6 +618,9 @@ class ConsoleUI:
         self._prompt_session: Any = None
         self.activity: list[str] = []
         self.interaction_mode = InteractionMode.parse(interaction_mode)
+        self.access_level = "normal"
+        self.execution_class = "local"
+        self.active_agents = 0
         self.color_mode = "auto" if color is None else ("on" if color else "off")
         self.color = False
         self.set_color(self.color_mode)
@@ -449,12 +638,24 @@ class ConsoleUI:
         self.cyan = _ansi("\033[36m", self.color)
         self.green = _ansi("\033[32m", self.color)
         self.yellow = _ansi("\033[33m", self.color)
+        self.gold = _ansi("\033[38;5;220m", self.color)
         self.red = _ansi("\033[31m", self.color)
         self.magenta = _ansi("\033[35m", self.color)
         self.reset = _ansi("\033[0m", self.color)
 
     def set_mode(self, mode: str | InteractionMode) -> None:
         self.interaction_mode = InteractionMode.parse(mode)
+
+    def set_runtime_identity(
+        self,
+        *,
+        access_level: str = "normal",
+        execution_class: str = "local",
+        active_agents: int = 0,
+    ) -> None:
+        self.access_level = str(access_level).lower()
+        self.execution_class = str(execution_class).lower()
+        self.active_agents = max(0, int(active_agents))
 
     def write(self, text: str = "", *, end: str = "\n", flush: bool = True) -> None:
         with self._lock:
@@ -464,6 +665,18 @@ class ConsoleUI:
         view.activity = view.activity or self.activity[-4:]
         view.interaction_mode = self.interaction_mode.value
         self.write(render_dashboard(view))
+
+    def show_status(self, view: DashboardView) -> None:
+        view.activity = view.activity or self.activity[-4:]
+        view.interaction_mode = self.interaction_mode.value
+        self.write(
+            render_status(
+                view,
+                access_level=self.access_level,
+                execution_class=self.execution_class,
+                active_agents=self.active_agents,
+            )
+        )
 
     def show_brand(self) -> None:
         for line in BRAND_ART:
@@ -475,30 +688,44 @@ class ConsoleUI:
         kind, message, data = event.kind, event.message, event.data
         with self._lock:
             if kind in {"model_text", "model_thought"}:
-                label = "answer" if kind == "model_text" else "thinking"
-                color = self.cyan if kind == "model_text" else self.magenta
+                label = "Response" if kind == "model_text" else "Thinking…"
+                color = self.gold if self.interaction_mode is InteractionMode.ULTRA else self.cyan
                 if self._stream_kind != kind:
                     if self._stream_kind:
                         print(self.reset, file=self.stream)
                     print(f"{self.bold}{color}{label}{self.reset}", file=self.stream)
                     self._stream_kind = kind
-                print(message, end="", file=self.stream, flush=True)
+                # Provider thought streams may contain private scratch work.
+                # The UI shows activity, while durable traces keep only the
+                # model-authored reasoning summary and explicit insights.
+                if kind == "model_text":
+                    print(message, end="", file=self.stream, flush=True)
                 return
             if self._stream_kind:
                 print(self.reset, file=self.stream)
                 self._stream_kind = None
 
+            accent = self.gold if self.interaction_mode is InteractionMode.ULTRA else self.cyan
             if kind == "step":
                 actor = data.get("actor", "coordinator")
-                print(f"\n{self.dim}{'-' * 58}{self.reset}", file=self.stream)
-                print(f"{self.bold}{self.cyan}> {actor} step {data.get('step', '?')}{self.reset}", file=self.stream)
+                print(
+                    f"{self.bold}{accent}◇ {actor}{self.reset} "
+                    f"{self.dim}step {data.get('step', '?')}{self.reset}",
+                    file=self.stream,
+                )
             elif kind == "tool_call":
                 args = data.get("args", {})
-                compact = json.dumps(args, ensure_ascii=False, default=str)
-                print(f"{self.bold}{self.yellow}tool{self.reset} {message} {self.dim}{compact}{self.reset}", file=self.stream)
+                actor = data.get("actor", "agent")
+                detail = args.get("path") or args.get("command") or ""
+                detail = _fit(detail, 90).rstrip()
+                suffix = f" {self.dim}{detail}{self.reset}" if detail else ""
+                print(f"{self.bold}{accent}[{actor}]{self.reset} {message}{suffix}", file=self.stream)
             elif kind == "tool_result":
                 one_line = " ".join(message.split())
-                print(f"{self.bold}{self.green}result{self.reset} {_fit(one_line, 120).rstrip()}", file=self.stream)
+                failed = one_line.startswith(("Error:", "Permission denied"))
+                color = self.red if failed else self.green
+                mark = "failed" if failed else "updated"
+                print(f"{self.bold}{color}{mark}{self.reset} {_fit(one_line, 120).rstrip()}", file=self.stream)
             elif kind == "usage":
                 print(
                     f"{self.dim}tokens in={data.get('input_tokens', 0)} "
@@ -508,8 +735,21 @@ class ConsoleUI:
             elif kind in {"error", "warning"}:
                 color = self.red if kind == "error" else self.yellow
                 print(f"{self.bold}{color}{kind}{self.reset} {message}", file=self.stream)
-            elif kind in {"phase", "checkpoint", "delegation", "plan", "recovery"}:
-                print(f"{self.bold}{self.cyan}{kind}{self.reset} {message}", file=self.stream)
+            elif kind == "ultra.agent_started":
+                self.active_agents += 1
+                role = data.get("role", "agent")
+                node = data.get("node_id")
+                node_text = f"{node} · " if node else ""
+                print(f"{self.bold}{self.gold}[{node_text}{role}]{self.reset} {data.get('phase', message)}", file=self.stream)
+            elif kind == "ultra.agent":
+                self.active_agents = max(0, self.active_agents - 1)
+                role = data.get("role", "agent")
+                print(f"{self.bold}{self.gold}[{role}]{self.reset} {message}", file=self.stream)
+            elif kind.startswith("ultra."):
+                color = self.green if kind in {"ultra.completed"} else self.gold
+                print(f"{self.bold}{color}{message or kind}{self.reset}", file=self.stream)
+            elif kind in {"phase", "checkpoint", "delegation", "plan", "recovery", "questions"}:
+                print(f"{self.bold}{accent}{message or kind}{self.reset}", file=self.stream)
             elif message:
                 print(message, file=self.stream)
             self.stream.flush()
@@ -549,8 +789,9 @@ class ConsoleUI:
         return answer in {"y", "yes"}
 
     def prompt(self) -> str:
+        accent = self.gold if self.interaction_mode is InteractionMode.ULTRA else self.green
         label = (
-            f"{self.bold}{self.green}GA3BAD{self.reset} "
+            f"{self.bold}{accent}GA3BAD{self.reset} "
             f"{self.dim}[{self.interaction_mode.value.upper()}]{self.reset}> "
         )
         rich_prompt = (
@@ -567,11 +808,14 @@ class ConsoleUI:
                     completer=SlashCommandCompleter(),
                     complete_while_typing=True,
                 )
-            return self._prompt_session.prompt(
-                ANSI(label),
-                complete_style=CompleteStyle.MULTI_COLUMN,
-                reserve_space_for_menu=10,
-            )
+            if patch_stdout is not None:
+                with patch_stdout(raw=True):
+                    return self._prompt_session.prompt(
+                        ANSI(label),
+                        complete_style=CompleteStyle.MULTI_COLUMN,
+                        reserve_space_for_menu=10,
+                    )
+            return self._prompt_session.prompt(ANSI(label))
         return self.input_func(label)
 
 

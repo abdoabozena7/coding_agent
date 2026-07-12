@@ -95,6 +95,54 @@ PROPOSE_PLAN = _fn(
 )
 
 
+REQUEST_PLAN_INPUT = _fn(
+    "request_plan_input",
+    (
+        "Pause planning for one to three high-impact user decisions that cannot be "
+        "discovered from the workspace. Never ask for repository facts that tools can inspect."
+    ),
+    {
+        "type": "object",
+        "properties": {
+            "questions": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "minLength": 1, "maxLength": 64},
+                        "header": {"type": "string", "minLength": 1, "maxLength": 40},
+                        "question": {"type": "string", "minLength": 3, "maxLength": 1_000},
+                        "options": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 3,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {"type": "string", "minLength": 1, "maxLength": 80},
+                                    "description": {"type": "string", "minLength": 3, "maxLength": 500},
+                                    "recommended": {"type": "boolean"},
+                                },
+                                "required": ["label", "description", "recommended"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "allow_freeform": {"type": "boolean"},
+                        "reason": {"type": "string", "minLength": 3, "maxLength": 1_000},
+                    },
+                    "required": ["id", "header", "question", "options", "allow_freeform", "reason"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["questions"],
+        "additionalProperties": False,
+    },
+)
+
+
 SUBMIT_PLAN_REVIEW = _fn(
     "submit_plan_review",
     "Return an independent verdict on whether a proposed plan fully and safely covers the objective.",
@@ -305,7 +353,7 @@ SUBMIT_REVIEW = _fn(
 )
 
 
-PLANNER_SCHEMAS = [PROPOSE_PLAN]
+PLANNER_SCHEMAS = [PROPOSE_PLAN, REQUEST_PLAN_INPUT]
 PLAN_REVIEWER_SCHEMAS = [SUBMIT_PLAN_REVIEW]
 COORDINATOR_SCHEMAS = [UPDATE_TASK, PROPOSE_PLAN_CHANGE, DELEGATE_TASK, INSPECT_TASK, RECORD_MEMORY, REQUEST_USER, FINISH_GOAL]
 WORKER_SCHEMAS = [RETURN_WORK]
