@@ -1,0 +1,4 @@
+[      37ms] [ERROR] Failed to load resource: the server responded with a status of 404 (File not found) @ http://127.0.0.1:8008/%22https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js/%22:0
+[      38ms] [ERROR] Critical Three.js Initialization Error: ReferenceError: THREE is not defined
+    at initScene (http://127.0.0.1:8008/index.html:24:13)
+    at http://127.0.0.1:8008/index.html:66:13 @ http://127.0.0.1:8008/index.html:68

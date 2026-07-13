@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Great Detailed Castle Siege Animation</title>
+    <style>
+        body {
+            background-color: #a0cfa1; /* Sky/Ground gradient feel */
+            margin: 0;
+            overflow: hidden;
+            perspective: 1000px; /* For 3D effects */
+            display: flex;
+            justify-content: center;
+            align-items: flex-end;
+            height: 100vh;
+        }
+
+        #scene {
+            width: 90%;
+            max-width: 1200px;
+            height: 600px;
+            position: relative;
+            border-bottom: 30px solid #7d5c3e; /* Ground level */
+        }
+
+        /* --- Castle Elements --- */
+        #castle {
+            position: absolute;
+            bottom: 20px;
+            left: 0;
+            width: 400px;
+            height: 200px;
+            background-color: #8b6c5e; /* Stone color */
+            border: 10px solid #7d5c3e;
+            box-sizing: border-box;
+            z-index: 10;
+        }
+
+        .wall {
+            position: absolute;
+            height: 100%;
+            background-color: inherit;
+        }
+
+        #gate_area {
+            width: 80px;
+            height: 90%;
+            bottom: 20px;
+            left: 300px; /* Position of the gate */
+            background-color: #7d5c3e;
+            border: 5px solid #6b4d3a;
+            box-sizing: border-box;
+            position: relative;
+        }
+
+        #gate_bars {
+            position: absolute;
+            top: 10%;
+            width: 90%;
+            height: 20px;
+            background-color: #4f3e35;
+            border-radius: 3px;
+            box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.5);
+        }
+
+        /* --- Siege Elements --- */
+        #battering_ram {
+            position: absolute;
+            bottom: 20px;
+            left: 320px; /* Starts just outside the gate */
+            width: 60px;
+            height: 50px;
+            background-color: #6e4c37;
+            transform-origin: left center;
+            z-index: 15;
+        }
+
+        #siege_tower {
+            position: absolute;
+            bottom: 20px;
+            left: 80px; /* Initial position */
+            width: 80px;
+            height: 150px;
+            background-color: #b3997d;
+            border: 4px solid #a08c6e;
+            z-index: 12;
+        }
+
+        #siege_tower::before {
+             content: '';
+             position: absolute;
+             top: -15px;
+             left: 5px;
+             width: 70px;
+             height: 30px;
+             background-color: #a08c6e;
+        }
+
+        .soldier {
+            position: absolute;
+            bottom: 20px;
+            width: 10px;
+            height: 40px;
+            background-color: green; /* Soldier body */
+            z-index: 15;
+        }
+
+        /* Specific soldier placements */
+        #soldier_ram, #soldier_tower {
+            bottom: 20px;
+            opacity: 0.8;
+        }
+
+        #archer_pos {
+            position: absolute;
+            bottom: 20px;
+            left: 150px; /* Position for archers */
+            z-index: 15;
+        }
+
+        #catapult_pos {
+            position: absolute;
+            bottom: 20px;
+            left: 60px; /* Position for catapult */
+            z-index: 15;
+        }
+
+        /* --- Projectiles & Effects --- */
+        .projectile {
+            position: absolute;
+            width: 4px;
+            height: 4px;
+            background-color: red;
+            border-radius: 50%;
+            z-index: 20;
+            opacity: 1;
+        }
+
+        .arrow {
+            /* Arrow will be animated via JS */
+        }
+
+        #impact_effect {
+            position: absolute;
+            width: 40px;
+            height: 40px;
+            background-color: rgba(255, 165, 0, 0.8);
+            border-radius: 50%;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        /* Keyframe Animations */
+
+        /* Battering Ram Swing/Impact */
+        @keyframes ramSwing {
+            0% { transform: rotate(10deg); }
+            50% { transform: rotate(-90deg) translateY(-20px); }
+            100% { transform: rotate(180deg); }
+        }
+
+        .ram-swinging {
+            animation: ramSwing 1s ease-in-out forwards;
+        }
+
+        /* Siege Tower Movement */
+         @keyframes moveTower {
+            0% { left: 80px; transform: translateX(0); }
+            50% { left: calc(300px - 80px); transform: translateX(0); } /* Move towards gate area */
+            100% { left: calc(300px - 80px); transform: translateX(0); }
+        }
+
+        .moving-tower {
+             animation: moveTower 25s linear forwards;
+        }
+
+
+    </style>
+</head>
+<body>
+    <div id="scene">
+        <!-- The Castle -->
+        <div id="castle">
+            <!-- Walls simulation -->
+            <div class="wall" style="left: 0px; width: 300px;"></div>
+            <div class="wall" style="left: 380px; width: 20px;"></div>
+
+            <div id="gate_area">
+                <div id="gate_bars"></div>
+                <!-- Simulate defenders/soldiers on top -->
+                <div class="soldier" style="left: 10px; bottom: 35px; height: 60px; background-color: darkred;"></div>
+            </div>
+        </div>
+
+        <!-- Siege Elements -->
+        <div id="siege_tower">
+            <div id="soldier_tower" class="soldier"></div>
+        </div>
+
+        <div id="battering_ram">
+             <div id="soldier_ram" class="soldier" style="left: 0;"></div>
+             <!-- Ram head visualization -->
+             <div style="position: absolute; top: -15px; left: 20px; width: 30px; height: 15px; background-color: #4b2c22; border-radius: 5px;"></div>
+        </div>
+
+        <!-- Shooting positions -->
+        <div id="archer_pos">
+            <div class="soldier" style="left: 0%; transform: translateX(-20%); bottom: 20px;"></div>
+            <div class="soldier" style="left: 15%; transform: translateX(-20%); bottom: 20px;"></div>
+        </div>
+
+         <div id="catapult_pos">
+            <div class="soldier" style="left: 0%; transform: translateX(-20%); bottom: 20px; background-color: brown;"></div>
+            <!-- Catapult mechanism visualization -->
+            <div style="position: absolute; top:-15px; left: 10px; width: 40px; height: 10px; background-color: #8e6b4c;"></div>
+        </div>
+
+
+    </div>
+
+    <script>
+        const scene = document.getElementById('scene');
+        const ram = document.getElementById('battering_ram');
+        const siegeTower = document.getElementById('siege_tower');
+
+        // --- Helper Function for Projectiles ---
+        function createProjectile(startElement, endX, startY) {
+            const arrow = document.createElement('div');
+            arrow.className = 'projectile arrow';
+            arrow.style.left = `${parseFloat(startElement.style.left) + 5}px`;
+            arrow.style.top = `${startY - 20}px`;
+            arrow.style.backgroundColor = '#6b4d3a'; /* Arrow color */
+            arrow.setAttribute('data-endx', endX);
+
+            // Set initial state for animation loop
+            let currentX = parseFloat(startElement.style.left) + 5;
+            let currentY = startY - 20;
+
+            function animateArrow() {
+                if (currentX > endX && currentY < startY - 20) { // Simple collision detection proxy check
+                    // Simulate impact/disappearance
+                    arrow.style.opacity = '0';
+                    setTimeout(() => arrow.remove(), 500);
+                    return;
+                }
+
+                currentX += 8; // Speed
+                if (currentX > endX) currentX = endX;
+
+                // Basic trajectory calculation (simplified straight line for demo)
+                const progress = Math.min(1, Math.abs(currentX - parseFloat(startElement.style.left)) / 300);
+                
+                arrow.style.transform = `translate(${currentX - parseFloat(startElement.style.left)}px, ${Math.max(20, startY - 20 + progress * 50)}px)`;
+
+
+                if (progress < 1) {
+                    requestAnimationFrame(animateArrow);
+                } else {
+                     arrow.remove();
+                }
+            }
+
+            document.body.appendChild(arrow);
+            // Initial placement refinement for arrow tip appearance on click/trigger
+             setTimeout(() => {
+                 // Start animation after a short delay to let the user see setup
+                 requestAnimationFrame(animateArrow);
+             }, 100);
+        }
+
+
+        // --- Event Handlers & Animations ---
+
+        function animateBatteringRam() {
+            if (ram.classList.contains('ram-swinging')) return; // Prevent double trigger
+
+            console.log("--- Ram Swinging! ---");
+            ram.classList.add('ram-swinging');
+
+            // After the swing animation completes (1s defined in CSS)
+            setTimeout(() => {
+                ram.classList.remove('ram-swinging');
+                document.getElementById('gate_bars').style.backgroundColor = '#2c1f1b'; // Simulate damage
+                alert("The Battering Ram hits! The gate is damaged!");
+                // Trigger a temporary visual impact effect
+                const impact = document.createElement('div');
+                impact.id = 'impact_effect';
+                impact.style.left = '305px';
+                impact.style.top = '25%';
+                scene.appendChild(impact);
+
+                setTimeout(() => {
+                    impact.style.opacity = '1';
+                    setTimeout(() => impact.style.opacity = '0', 500);
+                }, 10);
+
+
+            }, 1100); // Slightly longer than the CSS animation duration (1s)
+        }
+
+        function animateSiegeTower() {
+             if (siegeTower.classList.contains('moving-tower')) return;
+
+             console.log("--- Siege Tower Moving! ---");
+             // Reset position first to ensure consistent animation start point
+             siegeTower.style.animation = 'none';
+             siegeTower.offsetHeight; /* Trigger reflow */
+             siegeTower.style.left = '80px'; 
+
+            setTimeout(() => {
+                siegeTower.classList.add('moving-tower');
+            }, 500); // Wait half a second before starting move
+        }
+
+
+        function simulateFire() {
+            // Randomly determine which character shoots
+            const shooters = [
+                { id: 'archer', posElement: document.getElementById('archer_pos'), startY: 20 },
+                { id: 'catapult', posElement: document.getElementById('catapult_pos'), startY: 20 }
+            ];
+
+            const shooter = shooters[Math.floor(Math.random() * shooters.length)];
+
+            // Random target location (aim for the gate area)
+            let endX;
+             if (shooter.id === 'archer') {
+                endX = 310 + Math.random() * 50; // Target in the gate zone
+             } else {
+                 // Catapult aims further, towards the wall base
+                endX = 280;
+             }
+
+            createProjectile(shooter.posElement, endX, shooter.startY);
+        }
+
+
+        // --- Main Simulation Logic ---
+
+        window.onload = function() {
+            console.log("Siege simulation initialized.");
+
+            // Stage 1: Initial setup and warning shots (2 seconds)
+             setTimeout(() => {
+                setInterval(simulateFire, 800); // Fire projectiles every 0.8 seconds
+            }, 500);
+
+
+            // Stage 2: Tower advances after a longer time (6 seconds delay)
+            setTimeout(animateSiegeTower, 7000);
+
+
+            // Stage 3: The main assault sequence (12 seconds total delay)
+            setTimeout(() => {
+                console.log("--- ASSAULT COMMENCES ---");
+                simulateFire(); // Final volley
+                setTimeout(animateBatteringRam, 1500);
+
+            }, 14000);
+
+
+        };
+    </script>
+</body>
+</html>

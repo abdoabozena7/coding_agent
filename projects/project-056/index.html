@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+    <meta charset=\"UTF-8\">
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
+    <title>NEON RIFT: DRONE ASSAULT</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000000; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+    <!-- Three.js will attach the canvas here -->
+    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js\"></script>
+
+    <script>
+        // Global variables to hold core managers and resources
+        let scene, camera, renderer;
+        const SCREEN_WIDTH = 1280;
+        const SCREEN_HEIGHT = 720;
+
+        function initScene() {
+            // 1. Setup Scene, Camera, Renderer
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, SCREEN_WIDTH / SCREEN_HEIGHT, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+
+            // Set renderer size and dimensions as per contract (16:9)
+            renderer.setSize(SCREEN_WIDTH, SCREEN_HEIGHT);
+            document.body.appendChild(renderer.domElement);
+            camera.position.set(0, 5, 10);
+
+            // Environmental Effects (Fog & Advanced Lighting)
+            scene.fog = new THREE.Fog(0x1a053f, 5, 80); // Deep cyberpunk fog color
+
+            // Refine directional light for mood/canyon effect
+            directionalLight.color.setHex(0xff44cc); // Neon pink/purple key light
+            directionalLight.intensity = 2;
+            directionalLight.position.set(-15, 30, -20);
+
+            // Add secondary colored fill light (e.g., street lamps glow)
+            const spotLight = new THREE.SpotLight(0x44ffaa, 50, 70, Math.PI / 8, 0.5);
+            spotLight.position.set(15, 5, 15);
+            scene.add(spotLight);
+
+            // EnvironmentBuilder: Procedural Canyon Geometry (M003 Implementation)
+            const canyonGroup = new THREE.Group();
+            canyonGroup.name = "CyberCanyon";
+            scene.add(canyonGroup);
+
+            // Layered Base Mesh (The ground level - Updated to Phong/Emissive compatibility)
+            const baseGeometry = new THREE.PlaneGeometry(300, 300, 64, 64);
+            const baseMaterial = new THREE.MeshPhongMaterial({ color: 0x111122, shininess: 15 });
+            const ground = new THREE.Mesh(baseGeometry, baseMaterial);
+            ground.rotation.x = -Math.PI / 2;
+            ground.name = 'ground'; // Must maintain this name for the animate function
+            canyonGroup.add(ground);
+
+            // Procedural Wall/Layering Geometry (Simulating canyon walls and structure)
+            const wallSegments = [
+                { position: [-100, 0, 0], depth: 50, emissiveColor: 0x44aaff }, // West Wall Glow
+                { position: [100, 0, 0], depth: 50, emissiveColor: 0xff44cc }  // East Wall Glow
+            ];
+
+            const canyonMaterial = new THREE.MeshPhongMaterial({
+                color: 0x221133, // Base dark color
+                emissive: 0x221133, // Self-emission base
+                emissiveIntensity: 0.5,
+                shininess: 15
+            });
+
+            wallSegments.forEach(seg => {
+                // Create a box representing a deep wall structure (height 30 units)
+                const geometry = new THREE.BoxGeometry(2, 30, seg.depth);
+                const material = canyonMaterial.clone();
+                material.emissive.setHex(seg.emissiveColor); // Overriding emissive component per segment
+                material.emissiveIntensity = 1.5;
+                const mesh = new THREE.Mesh(geometry, material);
+                mesh.position.set(seg.position[0], seg.position[1] + 15, seg.position[2]);
+                mesh.name = 'canyon_wall';
+                canyonGroup.add(mesh);
+
+            // Initial clock/frame tracking (for debugging loop later)
+            window.clock = new THREE.Clock();
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Placeholder animation logic
+            const elapsedTime = window.clock.getElapsedTime();
+            scene.getObjectByName('ground') ? 
+                scene.getObjectByName('ground').rotation.y += 0.001 * Math.sin(elapsedTime / 5) : null;
+
+
+            renderer.render(scene, camera);
+        }
+
+        // Initialize the entire setup when the script loads
+        try {
+            initScene();
+            animate();
+        } catch (e) {
+            console.error("Critical Three.js Initialization Error:", e);
+        }
+
+    </script>
+</body>
+</html>

@@ -66,9 +66,28 @@ from .ultra_models import (
     assert_child_contract,
     normalize_contract_path,
 )
+from .quality import (
+    ChangeSetStatus,
+    ChangeSetV1,
+    FindingSeverity,
+    FindingStatus,
+    QualityCategory,
+    QualityCycleKind,
+    QualityCycleV1,
+    QualityFindingV1,
+    QualityPolicyV1,
+)
+from .swarm_protocol import (
+    ConsensusRoundV1,
+    ConsensusStatus,
+    ConsensusVoteV1,
+    SwarmMessageType,
+    SwarmMessageV1,
+)
+from .workflow import AgentRegistryEntryV1, AgentState
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 7
 
 DEFAULT_TRACE_MAX_BYTES = 256_000
 MAX_TRACE_MAX_BYTES = 2_000_000
@@ -364,6 +383,33 @@ class StateStore:
                     existing = 2
                 if existing < 3:
                     self._migrate_v3()
+                    existing = 3
+                if existing < 4:
+                    self._migrate_v4()
+                    existing = 4
+                if existing < 5:
+                    self._migrate_v5()
+                    existing = 5
+                if existing < 6:
+                    self._migrate_v6()
+                    existing = 6
+                if existing < 7:
+                    self._migrate_v7()
+                self._connection.execute(
+                    "UPDATE managed_resources SET status='stale',updated_at=? WHERE status IN ('running','ready')",
+                    (_iso(utc_now()),),
+                )
+                self._connection.execute(
+                    "UPDATE session_actions SET status='uncertain',result_summary=?,completed_at=? WHERE status='running'",
+                    ("Interrupted before the harness recorded a terminal result; inspect workspace state before retrying.", _iso(utc_now())),
+                )
+                # Sleep authorization is intentionally process-scoped. Durable
+                # findings/cycles remain, but a restart always requires Full
+                # Docker access to be selected and Sleep enabled again.
+                self._connection.execute(
+                    "UPDATE workflow_sessions SET sleep_state='off',ultra_profile='standard' "
+                    "WHERE sleep_state<>'off' OR ultra_profile<>'standard'"
+                )
                 self._fts5_available = self._ensure_brain_fts()
                 check = self._connection.execute("PRAGMA quick_check").fetchone()[0]
                 if check != "ok":
@@ -663,6 +709,282 @@ class StateStore:
         CREATE INDEX IF NOT EXISTS idx_memory_access_run ON memory_access(ultra_run_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_leases_active ON resource_leases(ultra_run_id, status, normalized_path, expires_at);
         PRAGMA user_version=3;
+        COMMIT;
+        """
+        self._connection.executescript(schema)
+
+    def _migrate_v4(self) -> None:
+        """Add quality/change-set state without rewriting legacy Plan/Goal rows."""
+
+        schema = """
+        BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS workflow_sessions (
+            id TEXT PRIMARY KEY,
+            goal_id TEXT REFERENCES goals(id) ON DELETE CASCADE,
+            session_mode TEXT NOT NULL,
+            plan_state TEXT NOT NULL,
+            run_state TEXT NOT NULL,
+            ultra_profile TEXT NOT NULL,
+            sleep_state TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS quality_policies (
+            ultra_run_id TEXT PRIMARY KEY REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            version INTEGER NOT NULL,
+            master_plan_fingerprint TEXT NOT NULL,
+            policy_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS agent_registry (
+            runtime_id TEXT PRIMARY KEY,
+            ultra_run_id TEXT REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            display_index INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            assigned_id TEXT,
+            state TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            parent_runtime_id TEXT REFERENCES agent_registry(runtime_id) ON DELETE SET NULL,
+            message_stream_json TEXT NOT NULL,
+            prompt_trace_refs_json TEXT NOT NULL,
+            tool_call_refs_json TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL,
+            blocker TEXT,
+            failure_reason TEXT,
+            usage_json TEXT NOT NULL,
+            started_at TEXT,
+            ended_at TEXT,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS change_sets (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            responsible_agent_id TEXT NOT NULL,
+            parent_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            changed_files_json TEXT NOT NULL,
+            pre_hashes_json TEXT NOT NULL,
+            post_hashes_json TEXT NOT NULL,
+            diff TEXT NOT NULL,
+            mutation_commands_json TEXT NOT NULL,
+            shell_created_files_json TEXT NOT NULL,
+            verification_evidence_json TEXT NOT NULL,
+            review_status_json TEXT NOT NULL,
+            integration_status TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS mutation_ledger (
+            id TEXT PRIMARY KEY,
+            change_set_id TEXT NOT NULL REFERENCES change_sets(id) ON DELETE CASCADE,
+            mutation_kind TEXT NOT NULL,
+            path TEXT,
+            command TEXT,
+            pre_hash TEXT,
+            post_hash TEXT,
+            status TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS quality_findings (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            version INTEGER NOT NULL,
+            principle_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            path TEXT NOT NULL,
+            location TEXT NOT NULL,
+            file_hash TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            remediation TEXT NOT NULL,
+            acceptance_json TEXT NOT NULL,
+            verification_json TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            status TEXT NOT NULL,
+            repair_node_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(ultra_run_id, fingerprint)
+        );
+        CREATE TABLE IF NOT EXISTS quality_cycles (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            version INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            approach_fingerprint TEXT NOT NULL,
+            inputs_json TEXT NOT NULL,
+            outputs_json TEXT NOT NULL,
+            metrics_json TEXT NOT NULL,
+            result TEXT NOT NULL,
+            blocker TEXT,
+            started_at TEXT NOT NULL,
+            ended_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_change_sets_run_status ON change_sets(ultra_run_id,status,updated_at);
+        CREATE INDEX IF NOT EXISTS idx_agent_registry_run_state ON agent_registry(ultra_run_id,state,display_index);
+        CREATE INDEX IF NOT EXISTS idx_mutation_change_set ON mutation_ledger(change_set_id,created_at);
+        CREATE INDEX IF NOT EXISTS idx_findings_run_status ON quality_findings(ultra_run_id,status,severity);
+        CREATE INDEX IF NOT EXISTS idx_cycles_run_kind ON quality_cycles(ultra_run_id,kind,started_at);
+        PRAGMA user_version=4;
+        COMMIT;
+        """
+        self._connection.executescript(schema)
+
+    def _migrate_v5(self) -> None:
+        """Add durable ordinary-Chat messages, artifacts, actions, and resources."""
+
+        schema = """
+        BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES workflow_sessions(id) ON DELETE CASCADE,
+            message_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id,sequence);
+        CREATE TABLE IF NOT EXISTS chat_artifacts (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES workflow_sessions(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL,
+            language TEXT NOT NULL,
+            suggested_name TEXT NOT NULL,
+            content_blob BLOB NOT NULL,
+            compression TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            byte_size INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(session_id,content_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_artifacts_session ON chat_artifacts(session_id,created_at);
+        CREATE TABLE IF NOT EXISTS session_actions (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES workflow_sessions(id) ON DELETE CASCADE,
+            tool_name TEXT NOT NULL,
+            args_hash TEXT NOT NULL,
+            args_json TEXT NOT NULL,
+            risk TEXT NOT NULL,
+            mutating INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            result_summary TEXT,
+            changed_paths_json TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_actions ON session_actions(session_id,started_at);
+        CREATE TABLE IF NOT EXISTS managed_resources (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES workflow_sessions(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        PRAGMA user_version=5;
+        COMMIT;
+        """
+        self._connection.executescript(schema)
+
+    def _migrate_v6(self) -> None:
+        """Add project-wide learning memory and first-class benchmark records."""
+
+        schema = """
+        BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS project_memories (
+            id TEXT PRIMARY KEY,
+            source_ultra_run_id TEXT REFERENCES ultra_runs(id) ON DELETE SET NULL,
+            source_brain_entry_id TEXT REFERENCES brain_entries(id) ON DELETE SET NULL,
+            goal_fingerprint TEXT NOT NULL,
+            section TEXT NOT NULL,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            evidence_refs_json TEXT NOT NULL,
+            reuse_count INTEGER NOT NULL DEFAULT 0,
+            superseded_by TEXT REFERENCES project_memories(id) ON DELETE SET NULL,
+            metadata_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(section,title,goal_fingerprint)
+        );
+        CREATE INDEX IF NOT EXISTS idx_project_memories_lookup ON project_memories(section,updated_at);
+        CREATE INDEX IF NOT EXISTS idx_project_memories_confidence ON project_memories(confidence,reuse_count,updated_at);
+        CREATE TABLE IF NOT EXISTS benchmark_runs (
+            id TEXT PRIMARY KEY,
+            suite_name TEXT NOT NULL,
+            scenario_name TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            ultra_run_id TEXT REFERENCES ultra_runs(id) ON DELETE SET NULL,
+            inputs_json TEXT NOT NULL,
+            metrics_json TEXT NOT NULL,
+            scores_json TEXT NOT NULL,
+            result TEXT NOT NULL,
+            artifact_refs_json TEXT NOT NULL,
+            blocker TEXT,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_benchmark_runs_suite ON benchmark_runs(suite_name,scenario_name,created_at);
+        CREATE INDEX IF NOT EXISTS idx_benchmark_runs_model ON benchmark_runs(provider,model,created_at);
+        PRAGMA user_version=6;
+        COMMIT;
+        """
+        self._connection.executescript(schema)
+
+    def _migrate_v7(self) -> None:
+        """Add formal swarm messaging, voting, and consensus records."""
+
+        schema = """
+        BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS swarm_messages (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            protocol_version INTEGER NOT NULL,
+            sender_agent_id TEXT NOT NULL,
+            recipient_agent_id TEXT NOT NULL,
+            message_type TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            correlation_id TEXT NOT NULL,
+            parent_message_id TEXT REFERENCES swarm_messages(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL,
+            consumed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_swarm_messages_inbox ON swarm_messages(ultra_run_id,recipient_agent_id,created_at);
+        CREATE INDEX IF NOT EXISTS idx_swarm_messages_topic ON swarm_messages(ultra_run_id,topic,created_at);
+        CREATE TABLE IF NOT EXISTS consensus_rounds (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            topic TEXT NOT NULL,
+            leader_agent_id TEXT NOT NULL,
+            quorum INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            decision_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            closed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_consensus_rounds_run ON consensus_rounds(ultra_run_id,status,created_at);
+        CREATE TABLE IF NOT EXISTS consensus_votes (
+            round_id TEXT NOT NULL REFERENCES consensus_rounds(id) ON DELETE CASCADE,
+            voter_agent_id TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            rationale TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(round_id,voter_agent_id)
+        );
+        PRAGMA user_version=7;
         COMMIT;
         """
         self._connection.executescript(schema)
@@ -2584,6 +2906,645 @@ class StateStore:
             for row in rows
         )
 
+    def _goal_fingerprint_for_run(self, run: UltraRun) -> str:
+        if run.goal_spec is not None:
+            return run.goal_spec.fingerprint
+        goal = self.get_goal(run.goal_id)
+        return hashlib.sha256(
+            _json(
+                {
+                    "objective": goal.objective,
+                    "constraints": list(goal.constraints),
+                    "success_criteria": list(goal.success_criteria),
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _bounded_project_confidence(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    @classmethod
+    def _effective_project_confidence(
+        cls,
+        confidence: float,
+        reuse_count: int,
+        metadata: Mapping[str, Any],
+    ) -> float:
+        positive = int(metadata.get("positive_outcomes") or 0)
+        negative = int(metadata.get("negative_outcomes") or 0)
+        reuse_boost = min(max(0, reuse_count), 20) * 0.01
+        outcome_signal = min(positive, 20) * 0.015 - min(negative, 20) * 0.05
+        return cls._bounded_project_confidence(float(confidence) + reuse_boost + outcome_signal)
+
+    def _project_memory_payload(
+        self,
+        row: sqlite3.Row,
+        *,
+        relevance_score: float | None = None,
+    ) -> dict[str, Any]:
+        metadata = _loads(row["metadata_json"], {})
+        effective_confidence = self._effective_project_confidence(
+            float(row["confidence"]),
+            int(row["reuse_count"]),
+            metadata,
+        )
+        payload = {
+            **dict(row),
+            "evidence_refs": _loads(row["evidence_refs_json"], ()),
+            "metadata": metadata,
+            "effective_confidence": effective_confidence,
+        }
+        if relevance_score is not None:
+            payload["relevance_score"] = relevance_score
+        return payload
+
+    def promote_brain_entry_to_project_memory(
+        self,
+        brain_entry_id: str,
+        *,
+        confidence: float,
+        evidence_refs: Iterable[str] = (),
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Promote a run-local lesson into project-wide reusable memory."""
+
+        entry = self.get_brain_entry(brain_entry_id)
+        run = self.get_ultra_run(entry.ultra_run_id)
+        confidence_value = self._bounded_project_confidence(confidence)
+        evidence = tuple(str(item) for item in evidence_refs if str(item).strip())
+        now = utc_now()
+        memory_id = new_id("pmem")
+        goal_fingerprint = self._goal_fingerprint_for_run(run)
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM project_memories WHERE section=? AND title=? AND goal_fingerprint=?",
+                (entry.section.value, entry.title, goal_fingerprint),
+            ).fetchone()
+            if existing is None:
+                memory_metadata = {
+                    **dict(metadata or {}),
+                    "promotion_count": 1,
+                    "confidence_history": [
+                        {
+                            "event": "promoted",
+                            "confidence": confidence_value,
+                            "evidence_refs": list(evidence),
+                            "at": _iso(now),
+                        }
+                    ],
+                }
+                connection.execute(
+                    "INSERT INTO project_memories("
+                    "id,source_ultra_run_id,source_brain_entry_id,goal_fingerprint,section,title,content,"
+                    "confidence,evidence_refs_json,reuse_count,superseded_by,metadata_json,created_at,updated_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        memory_id,
+                        entry.ultra_run_id,
+                        entry.id,
+                        goal_fingerprint,
+                        entry.section.value,
+                        entry.title,
+                        entry.content,
+                        confidence_value,
+                        _json(evidence),
+                        0,
+                        None,
+                        _json(memory_metadata),
+                        _iso(now),
+                        _iso(now),
+                    ),
+                )
+            else:
+                existing_metadata = _loads(existing["metadata_json"], {})
+                merged_evidence = tuple(
+                    dict.fromkeys(
+                        [
+                            *(_loads(existing["evidence_refs_json"], ()) or ()),
+                            *evidence,
+                        ]
+                    )
+                )
+                history = list(existing_metadata.get("confidence_history") or ())
+                promotion_count = int(existing_metadata.get("promotion_count") or 1) + 1
+                reinforced_confidence = max(float(existing["confidence"]), confidence_value)
+                if confidence_value >= float(existing["confidence"]):
+                    reinforced_confidence = self._bounded_project_confidence(
+                        reinforced_confidence + min(0.04, 0.01 * promotion_count)
+                    )
+                history.append(
+                    {
+                        "event": "reinforced",
+                        "input_confidence": confidence_value,
+                        "confidence": reinforced_confidence,
+                        "evidence_refs": list(evidence),
+                        "at": _iso(now),
+                    }
+                )
+                merged_metadata = {
+                    **existing_metadata,
+                    **dict(metadata or {}),
+                    "promotion_count": promotion_count,
+                    "confidence_history": history[-50:],
+                    "last_reinforced_at": _iso(now),
+                }
+                connection.execute(
+                    "UPDATE project_memories SET "
+                    "source_ultra_run_id=?,source_brain_entry_id=?,content=?,confidence=?,"
+                    "evidence_refs_json=?,metadata_json=?,updated_at=? "
+                    "WHERE id=?",
+                    (
+                        entry.ultra_run_id,
+                        entry.id,
+                        entry.content,
+                        reinforced_confidence,
+                        _json(merged_evidence),
+                        _json(merged_metadata),
+                        _iso(now),
+                        existing["id"],
+                    ),
+                )
+            row = connection.execute(
+                "SELECT * FROM project_memories WHERE section=? AND title=? AND goal_fingerprint=?",
+                (entry.section.value, entry.title, goal_fingerprint),
+            ).fetchone()
+        assert row is not None
+        return self._project_memory_payload(row)
+
+    def search_project_memory(
+        self,
+        query: str,
+        *,
+        section: BrainSection | str | None = None,
+        min_confidence: float = 0.0,
+        limit: int = 20,
+    ) -> tuple[dict[str, Any], ...]:
+        query_text = str(query or "").strip()
+        terms = [term.casefold() for term in re.findall(r"[\w-]+", query_text)]
+        confidence_floor = self._bounded_project_confidence(min_confidence)
+        filters = ["confidence>=?", "superseded_by IS NULL"]
+        params: list[Any] = [max(0.0, confidence_floor - 0.25)]
+        if section is not None:
+            filters.append("section=?")
+            params.append(BrainSection(section).value)
+        sql = "SELECT * FROM project_memories WHERE " + " AND ".join(filters)
+        with self._lock:
+            rows = self._connection.execute(sql, tuple(params)).fetchall()
+        scored: list[tuple[float, sqlite3.Row]] = []
+        for row in rows:
+            metadata = _loads(row["metadata_json"], {})
+            effective_confidence = self._effective_project_confidence(
+                float(row["confidence"]),
+                int(row["reuse_count"]),
+                metadata,
+            )
+            if effective_confidence < confidence_floor:
+                continue
+            haystack = f"{row['title']} {row['content']}".casefold()
+            term_score = sum(1.0 for term in terms if term in haystack) if terms else 0.0
+            if terms and term_score == 0:
+                continue
+            evidence_score = min(len(_loads(row["evidence_refs_json"], ()) or ()), 10) * 0.01
+            score = term_score + effective_confidence + evidence_score
+            scored.append((score, row))
+        result = []
+        for _score, row in sorted(
+            scored,
+            key=lambda item: (
+                -item[0],
+                -self._effective_project_confidence(
+                    float(item[1]["confidence"]),
+                    int(item[1]["reuse_count"]),
+                    _loads(item[1]["metadata_json"], {}),
+                ),
+                -int(item[1]["reuse_count"]),
+                item[1]["updated_at"],
+            ),
+        )[: max(1, min(limit, 100))]:
+            result.append(self._project_memory_payload(row, relevance_score=_score))
+        return tuple(result)
+
+    def record_project_memory_use(self, memory_id: str) -> None:
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM project_memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"project memory not found: {memory_id}")
+            metadata = _loads(row["metadata_json"], {})
+            now = utc_now()
+            metadata["last_used_at"] = _iso(now)
+            metadata["use_count_observed"] = int(metadata.get("use_count_observed") or 0) + 1
+            cursor = connection.execute(
+                "UPDATE project_memories SET reuse_count=reuse_count+1,metadata_json=?,updated_at=? WHERE id=?",
+                (_json(metadata), _iso(now), memory_id),
+            )
+            if not cursor.rowcount:
+                raise NotFoundError(f"project memory not found: {memory_id}")
+
+    def record_project_memory_outcome(
+        self,
+        memory_id: str,
+        *,
+        succeeded: bool,
+        evidence_ref: str = "",
+        reason: str = "",
+        weight: float = 1.0,
+    ) -> dict[str, Any]:
+        """Update project-memory confidence from downstream evidence.
+
+        Success nudges confidence upward slowly; failures penalize more strongly
+        because stale or harmful lessons are dangerous for weak-model orchestration.
+        """
+
+        bounded_weight = max(0.1, min(3.0, float(weight)))
+        now = utc_now()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM project_memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"project memory not found: {memory_id}")
+            metadata = _loads(row["metadata_json"], {})
+            old_confidence = float(row["confidence"])
+            delta = (0.035 if succeeded else -0.12) * bounded_weight
+            new_confidence = self._bounded_project_confidence(old_confidence + delta)
+            positive = int(metadata.get("positive_outcomes") or 0)
+            negative = int(metadata.get("negative_outcomes") or 0)
+            if succeeded:
+                positive += 1
+            else:
+                negative += 1
+            history = list(metadata.get("confidence_history") or ())
+            event = {
+                "event": "outcome",
+                "succeeded": bool(succeeded),
+                "delta": delta,
+                "old_confidence": old_confidence,
+                "confidence": new_confidence,
+                "evidence_ref": str(evidence_ref or ""),
+                "reason": str(reason or "")[:1_000],
+                "at": _iso(now),
+            }
+            history.append(event)
+            metadata.update(
+                {
+                    "positive_outcomes": positive,
+                    "negative_outcomes": negative,
+                    "last_outcome": event,
+                    "confidence_history": history[-50:],
+                }
+            )
+            evidence = list(_loads(row["evidence_refs_json"], ()) or ())
+            if evidence_ref and evidence_ref not in evidence:
+                evidence.append(str(evidence_ref))
+            connection.execute(
+                "UPDATE project_memories SET confidence=?,evidence_refs_json=?,metadata_json=?,updated_at=? WHERE id=?",
+                (
+                    new_confidence,
+                    _json(tuple(evidence)),
+                    _json(metadata),
+                    _iso(now),
+                    memory_id,
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM project_memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+        assert updated is not None
+        return self._project_memory_payload(updated)
+
+    def record_benchmark_result(
+        self,
+        *,
+        suite_name: str,
+        scenario_name: str,
+        provider: str,
+        model: str,
+        inputs: Mapping[str, Any] | None = None,
+        metrics: Mapping[str, Any] | None = None,
+        scores: Mapping[str, Any] | None = None,
+        result: str = "unknown",
+        artifact_refs: Iterable[str] = (),
+        ultra_run_id: str | None = None,
+        blocker: str | None = None,
+        started_at: datetime | None = None,
+        ended_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        if not suite_name.strip() or not scenario_name.strip():
+            raise ValueError("benchmark requires suite and scenario names")
+        benchmark_id = new_id("bench")
+        started = started_at or utc_now()
+        ended = ended_at or utc_now()
+        created = utc_now()
+        with self.transaction() as connection:
+            if ultra_run_id and connection.execute("SELECT 1 FROM ultra_runs WHERE id=?", (ultra_run_id,)).fetchone() is None:
+                raise NotFoundError(f"ULTRA run not found: {ultra_run_id}")
+            connection.execute(
+                "INSERT INTO benchmark_runs("
+                "id,suite_name,scenario_name,provider,model,ultra_run_id,inputs_json,metrics_json,"
+                "scores_json,result,artifact_refs_json,blocker,started_at,ended_at,created_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    benchmark_id,
+                    suite_name,
+                    scenario_name,
+                    provider,
+                    model,
+                    ultra_run_id,
+                    _json(inputs or {}),
+                    _json(metrics or {}),
+                    _json(scores or {}),
+                    str(result),
+                    _json(tuple(str(item) for item in artifact_refs)),
+                    blocker,
+                    _iso(started),
+                    _iso(ended),
+                    _iso(created),
+                ),
+            )
+        return self.list_benchmark_results(limit=1)[0]
+
+    def list_benchmark_results(
+        self,
+        *,
+        suite_name: str | None = None,
+        scenario_name: str | None = None,
+        limit: int = 100,
+    ) -> tuple[dict[str, Any], ...]:
+        filters: list[str] = []
+        params: list[Any] = []
+        if suite_name is not None:
+            filters.append("suite_name=?")
+            params.append(suite_name)
+        if scenario_name is not None:
+            filters.append("scenario_name=?")
+            params.append(scenario_name)
+        sql = "SELECT * FROM benchmark_runs"
+        if filters:
+            sql += " WHERE " + " AND ".join(filters)
+        sql += " ORDER BY created_at DESC,id DESC LIMIT ?"
+        params.append(max(1, min(limit, 10_000)))
+        with self._lock:
+            rows = self._connection.execute(sql, tuple(params)).fetchall()
+        return tuple(
+            {
+                **dict(row),
+                "inputs": _loads(row["inputs_json"], {}),
+                "metrics": _loads(row["metrics_json"], {}),
+                "scores": _loads(row["scores_json"], {}),
+                "artifact_refs": _loads(row["artifact_refs_json"], ()),
+            }
+            for row in rows
+        )
+
+    def post_swarm_message(self, message: SwarmMessageV1 | None = None, **kwargs: Any) -> dict[str, Any]:
+        item = message or SwarmMessageV1(**kwargs)
+        with self.transaction() as connection:
+            if connection.execute("SELECT 1 FROM ultra_runs WHERE id=?", (item.ultra_run_id,)).fetchone() is None:
+                raise NotFoundError(f"ULTRA run not found: {item.ultra_run_id}")
+            connection.execute(
+                "INSERT INTO swarm_messages("
+                "id,ultra_run_id,protocol_version,sender_agent_id,recipient_agent_id,message_type,topic,"
+                "payload_json,confidence,correlation_id,parent_message_id,created_at,consumed_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    item.id,
+                    item.ultra_run_id,
+                    item.protocol_version,
+                    item.sender_agent_id,
+                    item.recipient_agent_id,
+                    item.message_type.value,
+                    item.topic,
+                    _json(item.payload),
+                    item.confidence,
+                    item.correlation_id,
+                    item.parent_message_id,
+                    _iso(item.created_at),
+                    None,
+                ),
+            )
+        return self.get_swarm_message(item.id)
+
+    def get_swarm_message(self, message_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute("SELECT * FROM swarm_messages WHERE id=?", (message_id,)).fetchone()
+        if row is None:
+            raise NotFoundError(f"swarm message not found: {message_id}")
+        return {
+            **dict(row),
+            "payload": _loads(row["payload_json"], {}),
+            "message_type": SwarmMessageType(row["message_type"]).value,
+        }
+
+    def list_swarm_messages(
+        self,
+        ultra_run_id: str,
+        *,
+        recipient_agent_id: str | None = None,
+        topic: str | None = None,
+        include_consumed: bool = False,
+        limit: int = 100,
+    ) -> tuple[dict[str, Any], ...]:
+        filters = ["ultra_run_id=?"]
+        params: list[Any] = [ultra_run_id]
+        if recipient_agent_id is not None:
+            filters.append("recipient_agent_id=?")
+            params.append(recipient_agent_id)
+        if topic is not None:
+            filters.append("topic=?")
+            params.append(topic)
+        if not include_consumed:
+            filters.append("consumed_at IS NULL")
+        sql = "SELECT id FROM swarm_messages WHERE " + " AND ".join(filters)
+        sql += " ORDER BY created_at,id LIMIT ?"
+        params.append(max(1, min(limit, 10_000)))
+        with self._lock:
+            rows = self._connection.execute(sql, tuple(params)).fetchall()
+        return tuple(self.get_swarm_message(row["id"]) for row in rows)
+
+    def mark_swarm_message_consumed(self, message_id: str) -> dict[str, Any]:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE swarm_messages SET consumed_at=COALESCE(consumed_at, ?) WHERE id=?",
+                (_iso(utc_now()), message_id),
+            )
+            if not cursor.rowcount:
+                raise NotFoundError(f"swarm message not found: {message_id}")
+        return self.get_swarm_message(message_id)
+
+    def elect_consensus_leader(
+        self,
+        ultra_run_id: str,
+        *,
+        candidates: Iterable[str] = (),
+    ) -> str:
+        candidate_set = {str(item) for item in candidates if str(item).strip()}
+        registry = [
+            item for item in self.list_agent_registry(ultra_run_id)
+            if item.state not in {AgentState.CANCELLED, AgentState.FAILED}
+            and (not candidate_set or item.runtime_id in candidate_set)
+        ]
+        if not registry:
+            if candidate_set:
+                return sorted(candidate_set)[0]
+            raise NotFoundError(f"no eligible agents for consensus leader in run {ultra_run_id}")
+        return sorted(registry, key=lambda item: (item.display_index, item.runtime_id))[0].runtime_id
+
+    def open_consensus_round(
+        self,
+        *,
+        ultra_run_id: str,
+        topic: str,
+        quorum: int,
+        leader_agent_id: str | None = None,
+        candidates: Iterable[str] = (),
+    ) -> dict[str, Any]:
+        leader = leader_agent_id or self.elect_consensus_leader(ultra_run_id, candidates=candidates)
+        item = ConsensusRoundV1(
+            ultra_run_id=ultra_run_id,
+            topic=topic,
+            leader_agent_id=leader,
+            quorum=quorum,
+        )
+        with self.transaction() as connection:
+            if connection.execute("SELECT 1 FROM ultra_runs WHERE id=?", (ultra_run_id,)).fetchone() is None:
+                raise NotFoundError(f"ULTRA run not found: {ultra_run_id}")
+            connection.execute(
+                "INSERT INTO consensus_rounds("
+                "id,ultra_run_id,topic,leader_agent_id,quorum,status,decision_json,created_at,updated_at,closed_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    item.id,
+                    item.ultra_run_id,
+                    item.topic,
+                    item.leader_agent_id,
+                    item.quorum,
+                    item.status.value,
+                    _json(item.decision),
+                    _iso(item.created_at),
+                    _iso(item.updated_at),
+                    None,
+                ),
+            )
+        return self.get_consensus_round(item.id)
+
+    def get_consensus_round(self, round_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute("SELECT * FROM consensus_rounds WHERE id=?", (round_id,)).fetchone()
+        if row is None:
+            raise NotFoundError(f"consensus round not found: {round_id}")
+        return {
+            **dict(row),
+            "decision": _loads(row["decision_json"], {}),
+            "votes": self.list_consensus_votes(round_id),
+        }
+
+    def list_consensus_rounds(
+        self,
+        ultra_run_id: str,
+        *,
+        status: ConsensusStatus | str | None = None,
+        topic_prefix: str | None = None,
+        limit: int = 1_000,
+    ) -> tuple[dict[str, Any], ...]:
+        filters = ["ultra_run_id=?"]
+        params: list[Any] = [ultra_run_id]
+        if status is not None:
+            filters.append("status=?")
+            params.append(ConsensusStatus(status).value)
+        if topic_prefix:
+            filters.append("topic LIKE ?")
+            params.append(f"{topic_prefix}%")
+        sql = "SELECT id FROM consensus_rounds WHERE " + " AND ".join(filters)
+        sql += " ORDER BY created_at,id LIMIT ?"
+        params.append(max(1, min(limit, 10_000)))
+        with self._lock:
+            rows = self._connection.execute(sql, tuple(params)).fetchall()
+        return tuple(self.get_consensus_round(row["id"]) for row in rows)
+
+    def list_consensus_votes(self, round_id: str) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM consensus_votes WHERE round_id=? ORDER BY created_at,voter_agent_id",
+                (round_id,),
+            ).fetchall()
+        return tuple(
+            {
+                **dict(row),
+                "evidence": _loads(row["evidence_json"], {}),
+            }
+            for row in rows
+        )
+
+    def record_consensus_vote(self, vote: ConsensusVoteV1 | None = None, **kwargs: Any) -> dict[str, Any]:
+        item = vote or ConsensusVoteV1(**kwargs)
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT status FROM consensus_rounds WHERE id=?",
+                (item.round_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"consensus round not found: {item.round_id}")
+            if ConsensusStatus(row["status"]) is not ConsensusStatus.OPEN:
+                raise StateStoreError("cannot vote on a closed consensus round")
+            connection.execute(
+                "INSERT INTO consensus_votes(round_id,voter_agent_id,verdict,confidence,rationale,evidence_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(round_id,voter_agent_id) DO UPDATE SET "
+                "verdict=excluded.verdict,confidence=excluded.confidence,rationale=excluded.rationale,"
+                "evidence_json=excluded.evidence_json,created_at=excluded.created_at",
+                (
+                    item.round_id,
+                    item.voter_agent_id,
+                    item.verdict,
+                    item.confidence,
+                    item.rationale,
+                    _json(item.evidence),
+                    _iso(item.created_at),
+                ),
+            )
+        return self.tally_consensus_round(item.round_id)
+
+    def tally_consensus_round(self, round_id: str) -> dict[str, Any]:
+        round_item = self.get_consensus_round(round_id)
+        if ConsensusStatus(round_item["status"]) is not ConsensusStatus.OPEN:
+            return round_item
+        votes = round_item["votes"]
+        quorum = int(round_item["quorum"])
+        decisive = [item for item in votes if item["verdict"] in {"accept", "reject"}]
+        if len(decisive) < quorum:
+            return round_item
+        accept_score = sum(float(item["confidence"]) for item in decisive if item["verdict"] == "accept")
+        reject_score = sum(float(item["confidence"]) for item in decisive if item["verdict"] == "reject")
+        if accept_score > reject_score:
+            status = ConsensusStatus.ACCEPTED
+            verdict = "accept"
+        elif reject_score > accept_score:
+            status = ConsensusStatus.REJECTED
+            verdict = "reject"
+        else:
+            status = ConsensusStatus.TIED
+            verdict = "tie"
+        decision = {
+            "verdict": verdict,
+            "accept_score": accept_score,
+            "reject_score": reject_score,
+            "quorum": quorum,
+            "votes": len(decisive),
+        }
+        now = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE consensus_rounds SET status=?,decision_json=?,updated_at=?,closed_at=? WHERE id=?",
+                (status.value, _json(decision), _iso(now), _iso(now), round_id),
+            )
+        return self.get_consensus_round(round_id)
+
     @staticmethod
     def _artifact_from_row(row: sqlite3.Row) -> Artifact:
         return Artifact(
@@ -3170,4 +4131,436 @@ class StateStore:
             work_node_ids=tuple(row["id"] for row in node_rows),
             agent_run_ids=tuple(row["id"] for row in agent_rows),
             lease_ids=tuple(row["id"] for row in lease_rows),
+        )
+
+    # ------------------------------------------------------------------
+    # Schema v4: workflow, Change Sets, mutation ledger, and quality state
+
+    def save_quality_policy(
+        self,
+        ultra_run_id: str,
+        policy: QualityPolicyV1,
+        *,
+        master_plan_fingerprint: str,
+    ) -> None:
+        if not master_plan_fingerprint.strip():
+            raise ValueError("quality policy must be bound to a Master Plan fingerprint")
+        now = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO quality_policies(ultra_run_id,version,master_plan_fingerprint,policy_json,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(ultra_run_id) DO UPDATE SET "
+                "version=excluded.version,master_plan_fingerprint=excluded.master_plan_fingerprint,"
+                "policy_json=excluded.policy_json,updated_at=excluded.updated_at",
+                (ultra_run_id, policy.version, master_plan_fingerprint, _json(policy.to_dict()), _iso(now), _iso(now)),
+            )
+
+    def get_quality_policy(self, ultra_run_id: str) -> tuple[QualityPolicyV1, str]:
+        row = self._connection.execute(
+            "SELECT policy_json,master_plan_fingerprint FROM quality_policies WHERE ultra_run_id=?",
+            (ultra_run_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"quality policy not found for run {ultra_run_id}")
+        value = _loads(row["policy_json"], {})
+        return QualityPolicyV1(
+            version=int(value.get("version", 1)),
+            principles=tuple(value.get("principles", ())),
+            blocking_severities=tuple(value.get("blocking_severities", ())),
+            required_reviews=tuple(value.get("required_reviews", ())),
+            performance_requires_measurement=bool(value.get("performance_requires_measurement", True)),
+        ), str(row["master_plan_fingerprint"])
+
+    def save_change_set(self, item: ChangeSetV1) -> ChangeSetV1:
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO change_sets(id,ultra_run_id,responsible_agent_id,parent_id,version,status,"
+                "changed_files_json,pre_hashes_json,post_hashes_json,diff,mutation_commands_json,"
+                "shell_created_files_json,verification_evidence_json,review_status_json,integration_status,"
+                "metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET status=excluded.status,changed_files_json=excluded.changed_files_json,"
+                "pre_hashes_json=excluded.pre_hashes_json,post_hashes_json=excluded.post_hashes_json,diff=excluded.diff,"
+                "mutation_commands_json=excluded.mutation_commands_json,shell_created_files_json=excluded.shell_created_files_json,"
+                "verification_evidence_json=excluded.verification_evidence_json,review_status_json=excluded.review_status_json,"
+                "integration_status=excluded.integration_status,metadata_json=excluded.metadata_json,updated_at=excluded.updated_at",
+                (
+                    item.id, item.ultra_run_id, item.responsible_agent_id, item.parent_id, item.version,
+                    item.status.value, _json(item.changed_files), _json(item.pre_hashes), _json(item.post_hashes),
+                    item.diff, _json(item.mutation_commands), _json(item.shell_created_files),
+                    _json(item.verification_evidence_ids), _json(item.review_status), item.integration_status,
+                    _json(item.metadata), _iso(item.created_at), _iso(item.updated_at),
+                ),
+            )
+        return item
+
+    @staticmethod
+    def _change_set_from_row(row: sqlite3.Row) -> ChangeSetV1:
+        return ChangeSetV1(
+            id=row["id"], ultra_run_id=row["ultra_run_id"], responsible_agent_id=row["responsible_agent_id"],
+            parent_id=row["parent_id"], version=int(row["version"]), status=ChangeSetStatus(row["status"]),
+            changed_files=tuple(_loads(row["changed_files_json"], [])), pre_hashes=_loads(row["pre_hashes_json"], {}),
+            post_hashes=_loads(row["post_hashes_json"], {}), diff=row["diff"],
+            mutation_commands=tuple(_loads(row["mutation_commands_json"], [])),
+            shell_created_files=tuple(_loads(row["shell_created_files_json"], [])),
+            verification_evidence_ids=tuple(_loads(row["verification_evidence_json"], [])),
+            review_status=_loads(row["review_status_json"], {}), integration_status=row["integration_status"],
+            metadata=_loads(row["metadata_json"], {}), created_at=_dt(row["created_at"]) or utc_now(),
+            updated_at=_dt(row["updated_at"]) or utc_now(),
+        )
+
+    def list_change_sets(self, ultra_run_id: str) -> tuple[ChangeSetV1, ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM change_sets WHERE ultra_run_id=? ORDER BY created_at,id", (ultra_run_id,)
+        ).fetchall()
+        return tuple(self._change_set_from_row(row) for row in rows)
+
+    def record_mutation(
+        self,
+        change_set_id: str,
+        mutation_kind: str,
+        *,
+        path: str | None = None,
+        command: str | None = None,
+        pre_hash: str | None = None,
+        post_hash: str | None = None,
+        status: str = "applied",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> str:
+        mutation_id = new_id("mutation")
+        with self.transaction() as connection:
+            if connection.execute("SELECT 1 FROM change_sets WHERE id=?", (change_set_id,)).fetchone() is None:
+                raise NotFoundError(f"Change Set not found: {change_set_id}")
+            connection.execute(
+                "INSERT INTO mutation_ledger(id,change_set_id,mutation_kind,path,command,pre_hash,post_hash,status,metadata_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (mutation_id, change_set_id, mutation_kind, path, command, pre_hash, post_hash, status, _json(metadata or {}), _iso(utc_now())),
+            )
+        return mutation_id
+
+    def list_mutations(self, change_set_id: str) -> tuple[dict[str, Any], ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM mutation_ledger WHERE change_set_id=? ORDER BY created_at,id", (change_set_id,)
+        ).fetchall()
+        return tuple({**dict(row), "metadata": _loads(row["metadata_json"], {})} for row in rows)
+
+    def put_quality_finding(self, item: QualityFindingV1) -> QualityFindingV1:
+        """Insert or return the existing fingerprint-equivalent finding."""
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM quality_findings WHERE ultra_run_id=? AND fingerprint=?",
+                (item.ultra_run_id, item.fingerprint),
+            ).fetchone()
+            if existing is not None:
+                return self._quality_finding_from_row(existing)
+            connection.execute(
+                "INSERT INTO quality_findings(id,ultra_run_id,version,principle_id,category,severity,path,location,"
+                "file_hash,evidence_json,remediation,acceptance_json,verification_json,fingerprint,status,repair_node_id,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (item.id, item.ultra_run_id, item.version, item.principle_id, item.category.value, item.severity.value,
+                 item.path, item.location, item.file_hash, _json(item.evidence), item.remediation,
+                 _json(item.acceptance_criteria), _json(item.verification), item.fingerprint, item.status.value,
+                 item.repair_node_id, _iso(item.created_at), _iso(item.updated_at)),
+            )
+        return item
+
+    @staticmethod
+    def _quality_finding_from_row(row: sqlite3.Row) -> QualityFindingV1:
+        return QualityFindingV1(
+            id=row["id"], ultra_run_id=row["ultra_run_id"], version=int(row["version"]),
+            principle_id=row["principle_id"], category=QualityCategory(row["category"]),
+            severity=FindingSeverity(row["severity"]), path=row["path"], location=row["location"],
+            file_hash=row["file_hash"], evidence=_loads(row["evidence_json"], {}), remediation=row["remediation"],
+            acceptance_criteria=tuple(_loads(row["acceptance_json"], [])), verification=tuple(_loads(row["verification_json"], [])),
+            fingerprint=row["fingerprint"], status=FindingStatus(row["status"]), repair_node_id=row["repair_node_id"],
+            created_at=_dt(row["created_at"]) or utc_now(), updated_at=_dt(row["updated_at"]) or utc_now(),
+        )
+
+    def list_quality_findings(self, ultra_run_id: str) -> tuple[QualityFindingV1, ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM quality_findings WHERE ultra_run_id=? ORDER BY created_at,id", (ultra_run_id,)
+        ).fetchall()
+        return tuple(self._quality_finding_from_row(row) for row in rows)
+
+    def transition_quality_finding(
+        self,
+        finding_id: str,
+        status: FindingStatus | str,
+        *,
+        repair_node_id: str | None = None,
+        remediation_change_set_id: str | None = None,
+        verification_evidence_ids: Iterable[str] = (),
+    ) -> QualityFindingV1:
+        row = self._connection.execute("SELECT * FROM quality_findings WHERE id=?", (finding_id,)).fetchone()
+        if row is None:
+            raise NotFoundError(f"quality finding not found: {finding_id}")
+        item = self._quality_finding_from_row(row)
+        target = FindingStatus(status)
+        evidence_ids = tuple(verification_evidence_ids)
+        if target is FindingStatus.RESOLVED:
+            if not repair_node_id or not remediation_change_set_id or not evidence_ids:
+                raise CompletionGateError(
+                    "resolving a finding requires a repair node, remediation Change Set, and fresh verification evidence"
+                )
+            change = self._connection.execute(
+                "SELECT status FROM change_sets WHERE id=? AND ultra_run_id=?",
+                (remediation_change_set_id, item.ultra_run_id),
+            ).fetchone()
+            if change is None or change["status"] not in {
+                ChangeSetStatus.APPROVED.value,
+                ChangeSetStatus.INTEGRATED.value,
+            }:
+                raise CompletionGateError("finding remediation Change Set has not passed fresh reviews")
+        now = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE quality_findings SET status=?,repair_node_id=?,updated_at=? WHERE id=?",
+                (target.value, repair_node_id or item.repair_node_id, _iso(now), finding_id),
+            )
+            self._event(
+                connection,
+                "quality.finding_status_changed",
+                entity_type="quality_finding",
+                entity_id=finding_id,
+                payload={
+                    "from": item.status.value,
+                    "to": target.value,
+                    "remediation_change_set_id": remediation_change_set_id,
+                    "verification_evidence_ids": list(evidence_ids),
+                },
+            )
+        return replace(item, status=target, repair_node_id=repair_node_id or item.repair_node_id, updated_at=now)
+
+    def save_quality_cycle(self, item: QualityCycleV1) -> QualityCycleV1:
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO quality_cycles(id,ultra_run_id,version,kind,attempt,approach_fingerprint,inputs_json,outputs_json,"
+                "metrics_json,result,blocker,started_at,ended_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET outputs_json=excluded.outputs_json,metrics_json=excluded.metrics_json,"
+                "result=excluded.result,blocker=excluded.blocker,ended_at=excluded.ended_at",
+                (item.id, item.ultra_run_id, item.version, item.kind.value, item.attempt, item.approach_fingerprint,
+                 _json(item.inputs), _json(item.outputs), _json(item.metrics), item.result, item.blocker,
+                 _iso(item.started_at), _iso(item.ended_at)),
+            )
+        return item
+
+    def list_quality_cycles(self, ultra_run_id: str) -> tuple[QualityCycleV1, ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM quality_cycles WHERE ultra_run_id=? ORDER BY started_at,id", (ultra_run_id,)
+        ).fetchall()
+        return tuple(
+            QualityCycleV1(
+                id=row["id"], ultra_run_id=row["ultra_run_id"], version=int(row["version"]),
+                kind=QualityCycleKind(row["kind"]), attempt=int(row["attempt"]),
+                approach_fingerprint=row["approach_fingerprint"], inputs=_loads(row["inputs_json"], {}),
+                outputs=_loads(row["outputs_json"], {}), metrics=_loads(row["metrics_json"], {}),
+                result=row["result"], blocker=row["blocker"], started_at=_dt(row["started_at"]) or utc_now(),
+                ended_at=_dt(row["ended_at"]),
+            )
+            for row in rows
+        )
+
+    def save_workflow_session(
+        self,
+        session_id: str,
+        *,
+        goal_id: str | None,
+        session_mode: str,
+        plan_state: str,
+        run_state: str,
+        ultra_profile: str = "standard",
+        sleep_state: str = "off",
+        state: Mapping[str, Any] | None = None,
+    ) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO workflow_sessions(id,goal_id,session_mode,plan_state,run_state,ultra_profile,sleep_state,state_json,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET goal_id=excluded.goal_id,"
+                "session_mode=excluded.session_mode,plan_state=excluded.plan_state,run_state=excluded.run_state,"
+                "ultra_profile=excluded.ultra_profile,sleep_state=excluded.sleep_state,state_json=excluded.state_json,updated_at=excluded.updated_at",
+                (session_id, goal_id, session_mode, plan_state, run_state, ultra_profile, sleep_state, _json(state or {}), _iso(utc_now())),
+            )
+
+    def get_workflow_session(self, session_id: str) -> dict[str, Any]:
+        row = self._connection.execute("SELECT * FROM workflow_sessions WHERE id=?", (session_id,)).fetchone()
+        if row is None:
+            raise NotFoundError(f"workflow session not found: {session_id}")
+        return {**dict(row), "state": _loads(row["state_json"], {})}
+
+    def append_chat_message(self, session_id: str, message: Mapping[str, Any]) -> int:
+        encoded = _json(dict(message))
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "INSERT INTO chat_messages(session_id,message_json,created_at) VALUES(?,?,?)",
+                (session_id, encoded, _iso(utc_now())),
+            )
+            return int(cursor.lastrowid)
+
+    def list_chat_messages(self, session_id: str, *, limit: int = 200) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            rows = list(reversed(self._connection.execute(
+                "SELECT message_json FROM chat_messages WHERE session_id=? ORDER BY sequence DESC LIMIT ?",
+                (session_id, max(1, min(int(limit), 2_000))),
+            ).fetchall()))
+        return tuple(_loads(row["message_json"], {}) for row in rows)
+
+    def add_chat_artifact(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        kind: str = "code",
+        language: str = "text",
+        suggested_name: str = "generated.txt",
+    ) -> dict[str, Any]:
+        raw = str(content).encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM chat_artifacts WHERE session_id=? AND content_hash=?",
+                (session_id, digest),
+            ).fetchone()
+            if existing is None:
+                artifact_id = new_id("chat_artifact")
+                connection.execute(
+                    "INSERT INTO chat_artifacts(id,session_id,kind,language,suggested_name,content_blob,compression,content_hash,byte_size,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        artifact_id, session_id, str(kind), str(language), str(suggested_name),
+                        sqlite3.Binary(zlib.compress(raw, level=9)), "zlib", digest, len(raw), _iso(utc_now()),
+                    ),
+                )
+                row = connection.execute("SELECT * FROM chat_artifacts WHERE id=?", (artifact_id,)).fetchone()
+            else:
+                row = existing
+        assert row is not None
+        return self._chat_artifact_from_row(row, include_content=True)
+
+    @staticmethod
+    def _chat_artifact_from_row(row: sqlite3.Row, *, include_content: bool) -> dict[str, Any]:
+        result = dict(row)
+        blob = bytes(result.pop("content_blob"))
+        if include_content:
+            result["content"] = zlib.decompress(blob).decode("utf-8")
+        return result
+
+    def get_chat_artifact(self, artifact_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute("SELECT * FROM chat_artifacts WHERE id=?", (artifact_id,)).fetchone()
+        if row is None:
+            raise NotFoundError(f"Chat artifact not found: {artifact_id}")
+        return self._chat_artifact_from_row(row, include_content=True)
+
+    def list_chat_artifacts(self, session_id: str) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM chat_artifacts WHERE session_id=? ORDER BY created_at,id", (session_id,)
+            ).fetchall()
+        return tuple(self._chat_artifact_from_row(row, include_content=False) for row in rows)
+
+    def begin_session_action(
+        self,
+        session_id: str,
+        tool_name: str,
+        args: Mapping[str, Any],
+        *,
+        risk: str,
+        mutating: bool,
+    ) -> str:
+        action_id = new_id("session_action")
+        encoded = _json(dict(args))
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO session_actions(id,session_id,tool_name,args_hash,args_json,risk,mutating,status,result_summary,changed_paths_json,started_at,completed_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    action_id, session_id, tool_name, hashlib.sha256(encoded.encode()).hexdigest(), encoded,
+                    risk, int(mutating), "running", None, "[]", _iso(utc_now()), None,
+                ),
+            )
+        return action_id
+
+    def complete_session_action(
+        self,
+        action_id: str,
+        result_summary: str,
+        *,
+        status: str,
+        changed_paths: Iterable[str] = (),
+    ) -> None:
+        if status not in {"completed", "failed", "denied"}:
+            raise ValueError("invalid session action status")
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE session_actions SET status=?,result_summary=?,changed_paths_json=?,completed_at=? WHERE id=? AND status='running'",
+                (status, result_summary, _json(list(changed_paths)), _iso(utc_now()), action_id),
+            )
+
+    def list_session_actions(self, session_id: str) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM session_actions WHERE session_id=? ORDER BY started_at,id", (session_id,)
+            ).fetchall()
+        return tuple({**dict(row), "changed_paths": _loads(row["changed_paths_json"], [])} for row in rows)
+
+    def save_managed_resource(
+        self,
+        resource_id: str,
+        session_id: str,
+        *,
+        kind: str,
+        status: str,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        now = _iso(utc_now())
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO managed_resources(id,session_id,kind,status,metadata_json,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,"
+                "metadata_json=excluded.metadata_json,updated_at=excluded.updated_at",
+                (resource_id, session_id, str(kind), str(status), _json(dict(metadata)), now, now),
+            )
+
+    def list_managed_resources(self, session_id: str) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM managed_resources WHERE session_id=? ORDER BY created_at,id", (session_id,)
+            ).fetchall()
+        return tuple({**dict(row), "metadata": _loads(row["metadata_json"], {})} for row in rows)
+
+    def save_agent_registry_entry(self, item: AgentRegistryEntryV1) -> AgentRegistryEntryV1:
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO agent_registry(runtime_id,ultra_run_id,display_index,role,assigned_id,state,provider,model,"
+                "parent_runtime_id,message_stream_json,prompt_trace_refs_json,tool_call_refs_json,evidence_refs_json,"
+                "blocker,failure_reason,usage_json,started_at,ended_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(runtime_id) DO UPDATE SET state=excluded.state,message_stream_json=excluded.message_stream_json,"
+                "prompt_trace_refs_json=excluded.prompt_trace_refs_json,tool_call_refs_json=excluded.tool_call_refs_json,"
+                "evidence_refs_json=excluded.evidence_refs_json,blocker=excluded.blocker,failure_reason=excluded.failure_reason,"
+                "usage_json=excluded.usage_json,started_at=excluded.started_at,ended_at=excluded.ended_at,updated_at=excluded.updated_at",
+                (item.runtime_id, item.ultra_run_id, item.display_index, item.role, item.assigned_id, item.state.value,
+                 item.provider, item.model, item.parent_runtime_id, _json(item.message_stream), _json(item.prompt_trace_refs),
+                 _json(item.tool_call_refs), _json(item.evidence_refs), item.blocker, item.failure_reason, _json(item.usage),
+                 _iso(item.started_at), _iso(item.ended_at), _iso(item.updated_at)),
+            )
+        return item
+
+    def list_agent_registry(self, ultra_run_id: str | None = None) -> tuple[AgentRegistryEntryV1, ...]:
+        if ultra_run_id is None:
+            rows = self._connection.execute("SELECT * FROM agent_registry ORDER BY display_index,runtime_id").fetchall()
+        else:
+            rows = self._connection.execute(
+                "SELECT * FROM agent_registry WHERE ultra_run_id=? ORDER BY display_index,runtime_id", (ultra_run_id,)
+            ).fetchall()
+        return tuple(
+            AgentRegistryEntryV1(
+                runtime_id=row["runtime_id"], ultra_run_id=row["ultra_run_id"], display_index=int(row["display_index"]),
+                role=row["role"], assigned_id=row["assigned_id"], state=AgentState(row["state"]), provider=row["provider"],
+                model=row["model"], parent_runtime_id=row["parent_runtime_id"],
+                message_stream=tuple(_loads(row["message_stream_json"], [])),
+                prompt_trace_refs=tuple(_loads(row["prompt_trace_refs_json"], [])),
+                tool_call_refs=tuple(_loads(row["tool_call_refs_json"], [])), evidence_refs=tuple(_loads(row["evidence_refs_json"], [])),
+                blocker=row["blocker"], failure_reason=row["failure_reason"], usage=_loads(row["usage_json"], {}),
+                started_at=_dt(row["started_at"]), ended_at=_dt(row["ended_at"]), updated_at=_dt(row["updated_at"]) or utc_now(),
+            )
+            for row in rows
         )

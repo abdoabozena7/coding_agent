@@ -428,6 +428,14 @@ def _secret_free_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
             continue
         if isinstance(item, Mapping):
             result[str(key)] = _secret_free_metadata(item)
+        elif isinstance(item, (list, tuple)):
+            result[str(key)] = [
+                _secret_free_metadata(entry)
+                if isinstance(entry, Mapping)
+                else entry
+                for entry in item
+                if isinstance(entry, (str, int, float, bool, Mapping)) or entry is None
+            ]
         elif isinstance(item, (str, int, float, bool)) or item is None:
             result[str(key)] = item
     return result

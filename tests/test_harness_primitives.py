@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import io
 import unittest
+from unittest import mock
 
 from agent.commands import CommandKind, CommandParseError, parse_command
 from agent.context import maybe_compact
+from agent.config import ReasoningEffort
 from agent.control import ControlValidationError, validate_control_call
 from agent.events import UIEvent
 from agent.safety import ProgressWatchdog, redact_data, redact_text
 from agent.ui import (
+    CODEX_SLASH_COMMANDS,
     SLASH_COMMANDS,
     ConsoleUI,
     DashboardView,
     SlashCommandCompleter,
     TaskView,
     WorkerView,
+    prompt_receipt,
     render_agents,
     render_brand,
     render_dashboard,
@@ -26,6 +30,12 @@ from agent.ui import (
 
 
 class CommandTests(unittest.TestCase):
+    def test_reasoning_effort_aliases_and_validation(self):
+        self.assertIs(ReasoningEffort.parse("max"), ReasoningEffort.XHIGH)
+        self.assertIs(ReasoningEffort.parse("MEDIUM"), ReasoningEffort.MEDIUM)
+        with self.assertRaisesRegex(ValueError, "low, medium, high, or xhigh"):
+            ReasoningEffort.parse("infinite")
+
     def test_plain_text_and_plan_edit_commands(self):
         self.assertEqual(parse_command("build it").kind, CommandKind.TEXT)
         add = parse_command(":add Harden paths :: traversal tests pass")
@@ -113,6 +123,47 @@ class ControlSchemaTests(unittest.TestCase):
                 "update_task",
                 {"task_id": "T001", "status": "done", "note": "done"},
             )
+
+    def test_structured_task_evidence_is_canonicalized_without_a_retry(self):
+        value = validate_control_call(
+            "update_task",
+            {
+                "task_id": "T001",
+                "status": "done",
+                "note": "verified",
+                "evidence": [
+                    {
+                        "summary": "hello.txt contains the requested text",
+                        "path": "hello.txt",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(
+            value["evidence"],
+            ["hello.txt contains the requested text [source: hello.txt]"],
+        )
+
+    def test_control_validation_reports_independent_defects_together(self):
+        with self.assertRaises(ControlValidationError) as caught:
+            validate_control_call(
+                "propose_plan",
+                {
+                    "summary": "A complete plan is required.",
+                    "applicability_evidence": [{}],
+                    "execution_strategy": "Inspect, implement, and verify the requested change.",
+                    "expected_changes": [{}],
+                    "tasks": [{}],
+                },
+            )
+
+        message = str(caught.exception)
+        self.assertIn("applicability_evidence[0].fact is required", message)
+        self.assertIn("applicability_evidence[0].supports_tasks is required", message)
+        self.assertIn("expected_changes[0].intent is required", message)
+        self.assertIn("tasks[0].title is required", message)
+        self.assertIn("tasks[0].verification is required", message)
 
 
 class ContextTests(unittest.TestCase):
@@ -248,6 +299,31 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("EXPECTED WORKSPACE CHANGES", output)
         self.assertIn("agent/runtime.py", output)
 
+    def test_approved_plan_groups_used_completed_and_unused_work(self):
+        output = render_plan(
+            DashboardView(
+                objective="Ship the feature",
+                status="running",
+                plan_revision=2,
+                approved_revision=2,
+                plan_applicability=[{"fact": "internal planning detail"}],
+                expected_changes=[{"path": "internal planning detail"}],
+                tasks=[
+                    TaskView("T001", "Active work", "in_progress"),
+                    TaskView("T002", "Finished work", "done"),
+                    TaskView("T003", "Excluded work", "skipped"),
+                ],
+            ),
+            width=90,
+        )
+
+        self.assertIn("EXECUTION PLAN", output)
+        self.assertIn("IN USE (1)", output)
+        self.assertIn("COMPLETED (1)", output)
+        self.assertIn("NOT USED (1)", output)
+        self.assertNotIn("APPLICABILITY EVIDENCE", output)
+        self.assertNotIn("EXPECTED WORKSPACE CHANGES", output)
+
     def test_dashboard_respects_narrow_terminal_width(self):
         output = render_dashboard(
             DashboardView(
@@ -263,6 +339,304 @@ class DashboardTests(unittest.TestCase):
 
 
 class TerminalUITests(unittest.TestCase):
+    def test_long_prompt_receipt_is_compact_without_mutating_content(self):
+        content = "requirement\n" * 1000
+        receipt = prompt_receipt(content)
+
+        self.assertEqual(receipt, f"[Pasted Content {len(content)} chars]")
+        self.assertEqual(content, "requirement\n" * 1000)
+
+    def test_short_prompt_receipt_stays_readable(self):
+        self.assertEqual(prompt_receipt("fix the loader"), "fix the loader")
+
+    def test_colored_prompt_style_uses_supported_color_values(self):
+        console = ConsoleUI(stream=io.StringIO(), color=True)
+        style = console._prompt_style()
+
+        self.assertIsNotNone(style)
+
+    def test_thoughts_stream_live_then_collapse_into_session_history(self):
+        class TTY(io.StringIO):
+            encoding = "utf-8"
+
+            def isatty(self):
+                return True
+
+        output = TTY()
+        console = ConsoleUI(stream=output, color=False, reduced_motion=True)
+        with mock.patch.object(console._live_activity, "start") as start, mock.patch.object(
+            console._live_activity, "stop"
+        ), mock.patch.object(console._live_activity, "update_label") as update_label:
+            console.on_event(UIEvent("step", data={"actor": "planner", "step": 1}))
+            console.on_event(UIEvent("model_thought", "Inspect the empty workspace first."))
+            console.on_event(
+                UIEvent("model_text", "\n{\"tool\":\"list_files\"}", {"actor": "planner"})
+            )
+            console.on_event(UIEvent("usage", data={"input_tokens": 1, "output_tokens": 1}))
+
+        start.assert_called_with("plan", "Planner · step 1")
+        update_label.assert_any_call("Inspect the empty workspace first.")
+        self.assertIn("Inspect the empty workspace first.", output.getvalue())
+        self.assertIn("collapsed", output.getvalue())
+        self.assertNotIn("Response", output.getvalue())
+        self.assertIn("Inspect the empty workspace first.", console.thought_blocks()[0]["text"])
+        self.assertIn("list_files", console.thought_blocks()[0]["text"])
+
+    def test_visible_thinking_keeps_prose_rows_but_filters_code(self):
+        output = io.StringIO()
+        console = ConsoleUI(stream=output, color=False, plain=True)
+        console.on_event(UIEvent("step", data={"actor": "planner", "step": 1}))
+        console.on_event(UIEvent("model_thought", "Inspect files\nCompare results\n```python\nprint('hidden')\n```"))
+        console.on_event(UIEvent("usage"))
+
+        rendered = output.getvalue()
+        self.assertIn("Inspect files", rendered)
+        self.assertIn("Compare results", rendered)
+        self.assertNotIn("print('hidden')", rendered)
+
+    def test_live_thinking_uses_codex_working_row(self):
+        class TTY(io.StringIO):
+            encoding = "utf-8"
+
+            def isatty(self):
+                return True
+
+        output = TTY()
+        console = ConsoleUI(stream=output, color=True, reduced_motion=True)
+        activity = console._live_activity
+        activity._state = "plan"
+        activity._label = "Inspecting the workspace"
+        activity._started = 0.0
+        with mock.patch("agent.ui.time.monotonic", return_value=2.0), mock.patch.object(
+            activity, "_supports_esc_interrupt", return_value=True
+        ):
+            activity._draw(0)
+
+        rendered = output.getvalue()
+        self.assertIn("Working", rendered)
+        self.assertIn("esc to interrupt", rendered)
+        self.assertNotIn("Inspecting the workspace", rendered)
+        self.assertEqual(rendered.count("\n"), 1)
+
+    def test_chat_code_is_response_not_thinking(self):
+        output = io.StringIO()
+        console = ConsoleUI(stream=output, color=False, plain=True)
+        console.on_event(UIEvent("step", data={"actor": "chat", "step": 1}))
+        console.on_event(UIEvent("model_thought", "I will implement the function."))
+        console.on_event(UIEvent("model_text", "```python\nprint('ok')\n```", {"actor": "chat"}))
+
+        self.assertIn("Response", output.getvalue())
+        self.assertIn("print('ok')", output.getvalue())
+        self.assertNotIn("print('ok')", console.thought_blocks()[0]["text"])
+
+    def test_live_activity_hides_unreviewed_plan_attempts_and_coalesces_duplicates(self):
+        class TTY(io.StringIO):
+            encoding = "utf-8"
+
+            def isatty(self):
+                return True
+
+        output = TTY()
+        console = ConsoleUI(stream=output, color=False, reduced_motion=True)
+        with mock.patch.object(console._live_activity, "start"), mock.patch.object(
+            console._live_activity, "stop"
+        ):
+            for call_id in ("one", "two"):
+                console.on_event(
+                    UIEvent(
+                        "tool_call",
+                        "list_files",
+                        {"args": {"path": "."}, "actor": "planner", "id": call_id},
+                    )
+                )
+                console.on_event(
+                    UIEvent(
+                        "tool_result",
+                        "(no files under '.')",
+                        {"tool": "list_files", "actor": "planner"},
+                    )
+                )
+
+            console.on_event(
+                UIEvent("tool_call", "propose_plan", {"args": {}, "actor": "planner"})
+            )
+            console.on_event(
+                UIEvent(
+                    "tool_result",
+                    "Plan proposal captured for independent critique.",
+                    {"tool": "propose_plan", "actor": "planner"},
+                )
+            )
+            self.assertNotIn("Prepared plan", output.getvalue())
+
+            console.on_event(UIEvent("plan", "Plan r1 is ready for approval."))
+
+        rendered = output.getvalue()
+        self.assertEqual(rendered.count("Inspected workspace"), 1)
+        self.assertIn("Plan r1 is ready", rendered)
+
+    def test_full_screen_modal_buffers_background_events_until_picker_closes(self):
+        class TTY(io.StringIO):
+            encoding = "utf-8"
+
+            def isatty(self):
+                return True
+
+        output = TTY()
+        console = ConsoleUI(stream=output, color=False, reduced_motion=True)
+        with mock.patch.object(console._live_activity, "stop"):
+            with console.full_screen_modal():
+                console.on_event(UIEvent("warning", "Worker reached a checkpoint."))
+                self.assertEqual(output.getvalue(), "")
+
+        self.assertIn("Worker reached a checkpoint", output.getvalue())
+
+    def test_full_screen_modal_preserves_every_buffered_event_in_order(self):
+        console = ConsoleUI(stream=io.StringIO(), color=False)
+        rendered: list[str] = []
+        with mock.patch.object(
+            console,
+            "_render_event",
+            side_effect=lambda event: rendered.append(event.message),
+        ):
+            with console.full_screen_modal():
+                for index in range(600):
+                    console.on_event(UIEvent("warning", f"event-{index:03d}"))
+
+        self.assertEqual(rendered, [f"event-{index:03d}" for index in range(600)])
+
+    def test_plain_activity_pairs_tools_and_suppresses_internal_plan_retries(self):
+        output = io.StringIO()
+        console = ConsoleUI(stream=output, color=False, plain=True, reduced_motion=True)
+        for call_id in ("one", "two"):
+            console.on_event(
+                UIEvent(
+                    "tool_call",
+                    "list_files",
+                    {"args": {"path": "."}, "actor": "planner", "id": call_id},
+                )
+            )
+            console.on_event(
+                UIEvent(
+                    "tool_result",
+                    "(no files under '.')",
+                    {"tool": "list_files", "actor": "planner"},
+                )
+            )
+        console.on_event(
+            UIEvent("tool_call", "propose_plan", {"args": {}, "actor": "planner"})
+        )
+        console.on_event(
+            UIEvent(
+                "tool_result",
+                "Plan proposal captured for independent critique.",
+                {"tool": "propose_plan", "actor": "planner"},
+            )
+        )
+
+        rendered = output.getvalue()
+        self.assertEqual(rendered.count("Inspected workspace"), 1)
+        self.assertNotIn("list_files", rendered)
+        self.assertNotIn("Prepared plan", rendered)
+
+    def test_concurrent_tool_results_keep_their_node_specific_details(self):
+        class TTY(io.StringIO):
+            encoding = "utf-8"
+
+            def isatty(self):
+                return True
+
+        output = TTY()
+        console = ConsoleUI(stream=output, color=False, reduced_motion=True)
+        with mock.patch.object(console._live_activity, "start"), mock.patch.object(
+            console._live_activity, "stop"
+        ):
+            for node, path in (("node-a", "a.py"), ("node-b", "b.py")):
+                console.on_event(
+                    UIEvent(
+                        "tool_call",
+                        "edit_file",
+                        {
+                            "args": {"path": path},
+                            "actor": "implementer",
+                            "node_id": node,
+                        },
+                    )
+                )
+            for node in ("node-a", "node-b"):
+                console.on_event(
+                    UIEvent(
+                        "tool_result",
+                        "Updated file.",
+                        {
+                            "tool": "edit_file",
+                            "actor": "implementer",
+                            "node_id": node,
+                        },
+                    )
+                )
+
+        rendered = output.getvalue()
+        self.assertIn("Edited file · a.py", rendered)
+        self.assertIn("Edited file · b.py", rendered)
+
+    def test_terminal_plan_failure_resets_visual_retry_counter(self):
+        class TTY(io.StringIO):
+            encoding = "utf-8"
+
+            def isatty(self):
+                return True
+
+        console = ConsoleUI(stream=TTY(), color=False, reduced_motion=True)
+        with mock.patch.object(console._live_activity, "start"), mock.patch.object(
+            console._live_activity, "stop"
+        ):
+            console.on_event(
+                UIEvent("tool_call", "propose_plan", {"args": {}, "actor": "planner"})
+            )
+            console.on_event(
+                UIEvent(
+                    "tool_result",
+                    "Error: invalid plan proposal; fields are missing",
+                    {"tool": "propose_plan", "actor": "planner"},
+                )
+            )
+            self.assertEqual(console._plan_format_retries, 1)
+            console.on_event(
+                UIEvent(
+                    "error",
+                    "Plan could not be prepared.",
+                    {"attempts": 4},
+                )
+            )
+
+        self.assertEqual(console._plan_format_retries, 0)
+
+    def test_every_terminal_planning_pause_resets_visual_retry_state(self):
+        class TTY(io.StringIO):
+            encoding = "utf-8"
+
+            def isatty(self):
+                return True
+
+        console = ConsoleUI(stream=TTY(), color=False, reduced_motion=True)
+        with mock.patch.object(console._live_activity, "start"), mock.patch.object(
+            console._live_activity, "stop"
+        ):
+            for terminal_event in (
+                UIEvent(
+                    "warning",
+                    "The planner reached its bounded slice without a valid plan.",
+                    {"planning_terminal": True},
+                ),
+                UIEvent("questions", "Planning needs one decision."),
+            ):
+                console._plan_format_retries = 2
+                console._plan_recovered_retries = 1
+                console.on_event(terminal_event)
+                self.assertEqual(console._plan_format_retries, 0)
+                self.assertEqual(console._plan_recovered_retries, 0)
+
     def test_live_slash_completer_covers_every_palette_command_and_settings(self):
         if SlashCommandCompleter is None:
             self.skipTest("prompt-toolkit is not installed")
@@ -270,7 +644,9 @@ class TerminalUITests(unittest.TestCase):
 
         completer = SlashCommandCompleter()
         top = list(completer.get_completions(Document("/"), None))
-        self.assertEqual({item.text for item in top}, {command for command, _ in SLASH_COMMANDS})
+        from agent.ui import ALL_SLASH_COMMANDS
+
+        self.assertEqual({item.text for item in top}, {command for command, _ in ALL_SLASH_COMMANDS})
         self.assertTrue(all(item.start_position == -1 for item in top))
 
         modes = list(completer.get_completions(Document("/mode g"), None))
@@ -312,12 +688,14 @@ class TerminalUITests(unittest.TestCase):
         rendered = render_slash_menu()
         rendered.encode("ascii")
 
-        self.assertIn("/mode", rendered)
-        self.assertIn("/settings", rendered)
         self.assertIn("/model", rendered)
+        self.assertIn("/ide", rendered)
+        self.assertIn("/keymap", rendered)
+        self.assertIn("/sandbox-add-read-dir", rendered)
         self.assertIn("/mode plan", rendered)
         self.assertIn("/mode goal", rendered)
         self.assertIn("/mode ultra", rendered)
+        self.assertIn("/settings", rendered)
         self.assertIn("/trace", rendered)
         self.assertIn("Legacy :commands remain supported.", rendered)
 
@@ -399,6 +777,20 @@ class TerminalUITests(unittest.TestCase):
         )
         self.assertIn("\033[38;5;220m", output.getvalue())
         self.assertIn("[Physics · coder]", output.getvalue())
+
+    def test_sparse_status_keeps_long_goal_and_input_on_single_bounded_rows(self):
+        view = DashboardView(
+            objective="Build a detailed animation " + "with many requirements " * 20,
+            status="paused",
+            waiting_question="The planner needs guidance " + "before retrying " * 20,
+        )
+        with mock.patch("agent.ui.shutil.get_terminal_size") as terminal_size:
+            terminal_size.return_value.columns = 64
+            rendered = render_status(view)
+
+        self.assertTrue(all(len(line) <= 64 for line in rendered.splitlines()))
+        self.assertEqual(sum(line.startswith("goal") for line in rendered.splitlines()), 1)
+        self.assertEqual(sum(line.startswith("input") for line in rendered.splitlines()), 1)
 
     def test_agents_view_shows_role_phase_and_node_title(self):
         rendered = render_agents(

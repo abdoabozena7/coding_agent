@@ -6,6 +6,8 @@ workspace tools: the runtime validates each request and owns the transition.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -23,17 +25,15 @@ TASK_SCHEMA: dict[str, Any] = {
             "type": "array", "minItems": 1, "maxItems": 12,
             "items": {"type": "string", "minLength": 3, "maxLength": 600},
         },
-        "verification": {
-            "type": "array", "minItems": 1, "maxItems": 12,
-            "items": {"type": "string", "minLength": 2, "maxLength": 600},
-        },
-        "depends_on": {
-            "type": "array", "maxItems": 20,
-            "items": {"type": "string", "minLength": 1, "maxLength": 24},
-        },
+        # Scalar/list variance and numeric dependencies are normalized by the
+        # harness before validation; provider schemas intentionally stay loose
+        # for those mechanically repairable fields.
+        "verification": {},
+        "depends_on": {},
+        "expected_changes": {},
         "risk": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
     },
-    "required": ["id", "title", "description", "acceptance_criteria", "verification", "depends_on", "risk"],
+    "required": ["title", "description", "acceptance_criteria", "verification"],
     "additionalProperties": False,
 }
 
@@ -48,7 +48,10 @@ APPLICABILITY_EVIDENCE_SCHEMA: dict[str, Any] = {
             "items": {"type": "string", "minLength": 1, "maxLength": 24},
         },
     },
-    "required": ["fact", "source", "supports_tasks"],
+    # ``source`` is optional at the provider boundary.  The runtime binds it
+    # to a stable harness inspection reference before persistence; requiring a
+    # backend-generated tool-call id is impossible on providers such as Ollama.
+    "required": ["fact"],
     "additionalProperties": False,
 }
 
@@ -63,32 +66,37 @@ EXPECTED_CHANGE_SCHEMA: dict[str, Any] = {
             "items": {"type": "string", "minLength": 1, "maxLength": 24},
         },
     },
-    "required": ["path", "intent", "supports_tasks"],
+    "required": ["path", "intent"],
     "additionalProperties": False,
 }
 
 
 PROPOSE_PLAN = _fn(
     "propose_plan",
-    "Submit an inspected, evidence-backed implementation plan for explicit user approval. This does not modify files.",
+    (
+        "Submit one concise inspected plan for explicit approval. Do not invent task ids, "
+        "database ids, supports_tasks, or global references; the harness owns them. Each task "
+        "contains title, description, expected changes, acceptance criteria, verification, "
+        "optional dependencies as earlier task numbers, and optional risk. Use one to three "
+        "tasks for a simple artifact. This call never modifies files."
+    ),
     {
         "type": "object",
         "properties": {
             "summary": {"type": "string", "minLength": 3, "maxLength": 2_000},
             "applicability_evidence": {
-                "type": "array", "minItems": 1, "maxItems": 40,
+                "type": "array", "maxItems": 40,
                 "items": APPLICABILITY_EVIDENCE_SCHEMA,
             },
-            "execution_strategy": {"type": "string", "minLength": 10, "maxLength": 8_000},
+            "execution_strategy": {"type": "string", "maxLength": 8_000},
             "expected_changes": {
-                "type": "array", "minItems": 1, "maxItems": 80,
+                "type": "array", "maxItems": 80,
                 "items": EXPECTED_CHANGE_SCHEMA,
             },
             "tasks": {"type": "array", "minItems": 1, "maxItems": 80, "items": TASK_SCHEMA},
         },
         "required": [
-            "summary", "applicability_evidence", "execution_strategy",
-            "expected_changes", "tasks",
+            "summary", "tasks",
         ],
         "additionalProperties": False,
     },
@@ -367,8 +375,23 @@ class ControlValidationError(ValueError):
     pass
 
 
-def validate_schema(value: Any, schema: dict[str, Any], path: str = "arguments") -> None:
-    """Validate the portable JSON-Schema subset used by all harness tools."""
+def _schema_errors(
+    value: Any,
+    schema: dict[str, Any],
+    path: str,
+    errors: list[str],
+    *,
+    limit: int = 24,
+) -> None:
+    """Collect useful schema defects in one pass instead of teaching by retry.
+
+    Small tool-calling models often repair exactly the first validation error
+    they see.  Returning all independent defects from a malformed control call
+    lets them repair the whole payload in one turn and keeps the UI from showing
+    a long field-by-field failure ladder.
+    """
+    if len(errors) >= limit:
+        return
     expected = schema.get("type")
     type_ok = {
         "object": lambda item: isinstance(item, dict),
@@ -379,47 +402,130 @@ def validate_schema(value: Any, schema: dict[str, Any], path: str = "arguments")
         "boolean": lambda item: isinstance(item, bool),
     }
     if expected in type_ok and not type_ok[expected](value):
-        raise ControlValidationError(f"{path} must be {expected}, got {type(value).__name__}")
+        errors.append(f"{path} must be {expected}, got {type(value).__name__}")
+        return
     if "enum" in schema and value not in schema["enum"]:
-        raise ControlValidationError(f"{path} must be one of {schema['enum']}")
+        errors.append(f"{path} must be one of {schema['enum']}")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if "minimum" in schema and value < schema["minimum"]:
-            raise ControlValidationError(f"{path} must be at least {schema['minimum']}")
+            errors.append(f"{path} must be at least {schema['minimum']}")
         if "maximum" in schema and value > schema["maximum"]:
-            raise ControlValidationError(f"{path} must be at most {schema['maximum']}")
+            errors.append(f"{path} must be at most {schema['maximum']}")
 
     if isinstance(value, str):
         if len(value) < schema.get("minLength", 0):
-            raise ControlValidationError(f"{path} is too short")
+            errors.append(f"{path} is too short")
         if len(value) > schema.get("maxLength", 1_000_000_000):
-            raise ControlValidationError(f"{path} is too long")
+            errors.append(f"{path} is too long")
     elif isinstance(value, list):
         if len(value) < schema.get("minItems", 0):
-            raise ControlValidationError(f"{path} has too few items")
+            errors.append(f"{path} has too few items")
         if len(value) > schema.get("maxItems", 1_000_000_000):
-            raise ControlValidationError(f"{path} has too many items")
+            errors.append(f"{path} has too many items")
         item_schema = schema.get("items")
         if item_schema:
             for index, item in enumerate(value):
-                validate_schema(item, item_schema, f"{path}[{index}]")
+                _schema_errors(item, item_schema, f"{path}[{index}]", errors, limit=limit)
+                if len(errors) >= limit:
+                    break
     elif isinstance(value, dict):
         required = schema.get("required", [])
         for key in required:
             if key not in value:
-                raise ControlValidationError(f"{path}.{key} is required")
+                errors.append(f"{path}.{key} is required")
+                if len(errors) >= limit:
+                    return
         properties = schema.get("properties", {})
         if schema.get("additionalProperties") is False:
             extras = sorted(set(value) - set(properties))
             if extras:
-                raise ControlValidationError(f"{path} has unknown fields: {', '.join(extras)}")
+                errors.append(f"{path} has unknown fields: {', '.join(extras)}")
         for key, item in value.items():
             if key in properties:
-                validate_schema(item, properties[key], f"{path}.{key}")
+                _schema_errors(item, properties[key], f"{path}.{key}", errors, limit=limit)
+                if len(errors) >= limit:
+                    return
+
+
+def validate_schema(value: Any, schema: dict[str, Any], path: str = "arguments") -> None:
+    """Validate the portable JSON-Schema subset used by all harness tools."""
+
+    errors: list[str] = []
+    _schema_errors(value, schema, path, errors)
+    if errors:
+        suffix = "; additional defects omitted" if len(errors) >= 24 else ""
+        raise ControlValidationError("; ".join(errors) + suffix)
 
 
 def validate_control_call(name: str, args: Any) -> dict[str, Any]:
     schema = _BY_NAME.get(name)
     if schema is None:
         raise ControlValidationError(f"unknown control tool '{name}'")
-    validate_schema(args, schema["function"]["parameters"])
-    return args
+    normalized = args
+    if name == "update_task" and isinstance(args, dict):
+        # Tool-capable models commonly emit semantically equivalent evidence
+        # objects even when the portable schema requests strings.  Canonicalize
+        # that harmless provider variance here; state-transition validation
+        # still enforces task ids, statuses, and evidence requirements.
+        evidence = args.get("evidence")
+        if isinstance(evidence, Mapping):
+            evidence = [evidence]
+        if isinstance(evidence, list) and any(isinstance(item, Mapping) for item in evidence):
+            normalized = dict(args)
+            normalized["evidence"] = [_canonical_evidence_text(item) for item in evidence]
+    schema_error: ControlValidationError | None = None
+    try:
+        validate_schema(normalized, schema["function"]["parameters"])
+    except ControlValidationError as exc:
+        schema_error = exc
+    # Compatibility validation for persisted/legacy planner clients.  The
+    # provider-facing schema no longer asks for these cross references, but a
+    # caller that opts into the old id-bearing shape must still supply a
+    # complete, internally checkable legacy payload.
+    if name == "propose_plan" and isinstance(normalized, dict):
+        tasks = normalized.get("tasks", ())
+        legacy = bool(normalized.get("applicability_evidence") or normalized.get("expected_changes")) or any(
+            isinstance(item, Mapping) and "id" in item for item in tasks if isinstance(tasks, list)
+        )
+        if legacy:
+            errors: list[str] = []
+            if "expected_changes" not in normalized:
+                errors.append("arguments.expected_changes is required")
+            for index, item in enumerate(normalized.get("applicability_evidence", ())):
+                if isinstance(item, Mapping) and "supports_tasks" not in item:
+                    errors.append(f"arguments.applicability_evidence[{index}].supports_tasks is required")
+            for index, item in enumerate(normalized.get("expected_changes", ())):
+                if isinstance(item, Mapping) and "supports_tasks" not in item:
+                    errors.append(f"arguments.expected_changes[{index}].supports_tasks is required")
+            if errors:
+                prefix = f"{schema_error}; " if schema_error else ""
+                raise ControlValidationError(prefix + "; ".join(errors))
+    if schema_error is not None:
+        raise schema_error
+    return normalized
+
+
+def _canonical_evidence_text(value: Any) -> Any:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, Mapping):
+        return value
+    summary = next(
+        (
+            str(value[key]).strip()
+            for key in ("summary", "fact", "evidence", "result", "note")
+            if str(value.get(key, "")).strip()
+        ),
+        "",
+    )
+    source = next(
+        (
+            str(value[key]).strip()
+            for key in ("source", "path", "artifact", "command")
+            if str(value.get(key, "")).strip()
+        ),
+        "",
+    )
+    if summary:
+        return f"{summary} [source: {source}]" if source else summary
+    return json.dumps(dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))

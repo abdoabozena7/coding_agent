@@ -8,17 +8,24 @@ limits, and the final completion gate.
 from __future__ import annotations
 
 import copy
+import difflib
+import hashlib
 import json
+import importlib.util
 import os
 import platform
+import re
 import time
-from dataclasses import dataclass
+import shutil
+import shlex
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import context, tools
 from .commands import CommandKind, UserCommand
+from .chat_runtime import ChatIntentV1, corrective_prompt
 from .config import RuntimeConfig
 from .control import (
     CONTROL_NAMES,
@@ -32,6 +39,7 @@ from .control import (
     validate_control_call,
 )
 from .events import EventBus
+from .hardware import probe_local_gpu
 from .models import (
     Delegation,
     DelegationStatus,
@@ -47,6 +55,7 @@ from .models import (
     validate_task_dag,
 )
 from .prompts import (
+    CHAT_SYSTEM_PROMPT,
     COORDINATOR_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
     PLAN_REVIEWER_SYSTEM_PROMPT,
@@ -58,6 +67,25 @@ from .providers.base import AssistantTurn, ToolCall
 from .safety import ProgressWatchdog, redact_data, redact_text
 from .store import NotFoundError, StateStore, StateStoreError
 from .ui import DashboardView, TaskView, WorkerView
+from .workflow import (
+    PlanDraftError,
+    RetryKind,
+    RetryLedger,
+    first_ready_task,
+    is_unambiguous_plan_approval,
+    normalize_plan_draft,
+    validate_normalized_plan,
+    SessionMode,
+    PlanState,
+    RunState,
+)
+from .sleep_profile import SleepController
+from .quality import ChangeSetStatus
+from .run_context import GoalContractV1, is_goal_escalation_approval
+from .weak_model import WeakModelPolicy
+from .repository_index import RepositoryIndex
+from .diagnostics import ErrorSignature, FailureDomain, normalize_error_message
+from .local_provider import extract_first_json_object, normalize_action_proposal
 
 try:
     from .model_catalog import ExecutionClass, ModelDescriptor
@@ -68,9 +96,9 @@ except ImportError:  # pragma: no cover - direct-script compatibility
 
 ApprovalCallback = Callable[[str, dict[str, Any], str], bool]
 
-READ_ONLY_TOOLS = frozenset({"read_file", "list_files", "grep"})
-MUTATING_TOOLS = frozenset({"write_file", "edit_file", "run_bash"})
-TOOL_RISK = {"read_file": "low", "list_files": "low", "grep": "low", "write_file": "high", "edit_file": "high", "run_bash": "critical"}
+READ_ONLY_TOOLS = tools.names(categories={"read"})
+MUTATING_TOOLS = tools.names(mutating=True)
+TOOL_RISK = tools.risk_map()
 
 
 class RuntimeErrorBase(RuntimeError):
@@ -166,13 +194,49 @@ class AgentRuntime:
         self.model_descriptor = model_descriptor
         self.permission_adapter = permission_adapter
         self.ultra_session: Any | None = None
+        self._closed = False
         self._lock = RLock()
         self._work_conversation: list[dict[str, Any]] = []
         self._watchdog = ProgressWatchdog(self.config.repeated_action_limit)
         self._delegations_this_slice = 0
         self._provider_input_tokens = 0
         self._provider_output_tokens = 0
+        self.retry_ledger = RetryLedger()
+        self._chat_conversation: list[dict[str, Any]] = []
+        self.session_id = "workspace-session"
+        self.sleep_controller = SleepController()
+        self.weak_model_policy = WeakModelPolicy()
+        self.repository_index = RepositoryIndex(
+            self.workspace,
+            cache_path=self.workspace / ".coding-agent" / "repository-index-v1.json",
+        )
+        self.repository_index_warmup_error = ""
+        if self.config.repository_index_warmup_files > 0:
+            try:
+                self.repository_index.update_all(
+                    max_files=self.config.repository_index_warmup_files,
+                )
+            except (OSError, UnicodeError, ValueError) as exc:
+                self.repository_index_warmup_error = f"{type(exc).__name__}: {exc}"
+        try:
+            self.store.get_workflow_session(self.session_id)
+        except NotFoundError:
+            self.store.save_workflow_session(
+                self.session_id,
+                goal_id=None,
+                session_mode=SessionMode.CHAT.value,
+                plan_state=PlanState.NONE.value,
+                run_state=RunState.IDLE.value,
+            )
+        self._chat_conversation = [dict(item) for item in self.store.list_chat_messages(self.session_id)]
+        tools.register_artifact_provider(self.workspace, self.store.get_chat_artifact)
         tools.configure_workspace(self.workspace)
+
+        active_policy_goal = self.store.load_active_goal()
+        if active_policy_goal is not None:
+            persisted_policy = active_policy_goal.metadata.get("weak_model_policy")
+            if isinstance(persisted_policy, Mapping):
+                self.weak_model_policy = WeakModelPolicy.from_dict(persisted_policy)
 
         recovery = self.store.recover_inflight()
         if recovery.changed:
@@ -185,6 +249,29 @@ class AgentRuntime:
             )
             goal = self.store.load_active_goal()
             if goal and goal.status == GoalStatus.RECOVERING:
+                uncertain_sets = list(goal.metadata.get("goal_change_sets", ()))
+                for action_id in recovery.action_ids:
+                    uncertain_sets.append({
+                        "id": f"goal-changeset-uncertain-{action_id}",
+                        "version": 1,
+                        "responsible_agent": "interrupted-runtime",
+                        "parent_task": None,
+                        "changed_files": [],
+                        "pre_hashes": {},
+                        "post_hashes": {},
+                        "diff": "",
+                        "tool_action_ids": [action_id],
+                        "review_status": "uncertain",
+                        "integration_status": "uncertain",
+                        "mutation_sequence": goal.metadata.get("mutation_sequence", 0),
+                    })
+                if uncertain_sets:
+                    self.store.update_goal_metadata(
+                        goal.id,
+                        goal_change_sets=uncertain_sets,
+                        convergence_state="reverifying",
+                        latest_evaluation_stale=True,
+                    )
                 resume_status = (
                     GoalStatus.RUNNING.value
                     if goal.active_plan_revision is not None
@@ -293,6 +380,22 @@ class AgentRuntime:
         return str(getattr(self.provider, "model", "unknown"))
 
     @property
+    def reasoning_effort(self) -> str:
+        return str(getattr(self.provider, "reasoning_effort", "medium"))
+
+    def set_reasoning_effort(self, effort: str) -> str:
+        from .config import ReasoningEffort
+
+        selected = ReasoningEffort.parse(effort).value
+        goal = self.active_goal()
+        if goal is not None and goal.status in {
+            GoalStatus.RUNNING, GoalStatus.VERIFYING, GoalStatus.REVIEWING, GoalStatus.RECOVERING,
+        }:
+            raise RuntimeStateError("reasoning effort can change only at a safe checkpoint")
+        setattr(self.provider, "reasoning_effort", selected)
+        return selected
+
+    @property
     def execution_class(self) -> str:
         if self.model_descriptor is not None:
             return self.model_descriptor.execution_class.value
@@ -388,6 +491,25 @@ class AgentRuntime:
                 capabilities=("tools",),
                 source="runtime",
             )
+        if (
+            self.config.require_local_gpu
+            and self.model_descriptor.execution_class is ExecutionClass.LOCAL
+        ):
+            probe = probe_local_gpu()
+            if not probe.gpu_available:
+                raise RuntimeStateError(
+                    "Local ULTRA is configured as GPU-required, but no usable GPU was detected. "
+                    f"Probe source={probe.source}; {probe.message or 'no GPU evidence'}. "
+                    "Set AGENT_REQUIRE_LOCAL_GPU=0 only if CPU fallback is intentional."
+                )
+            self.model_descriptor = replace(
+                self.model_descriptor,
+                metadata={
+                    **dict(self.model_descriptor.metadata),
+                    "gpu_required": True,
+                    "hardware_probe": probe.to_dict(),
+                },
+            )
         if self.permission_adapter is None:
             raise RuntimeStateError(
                 "ULTRA permissions are not initialized; restart interactively or use /permissions"
@@ -416,10 +538,14 @@ class AgentRuntime:
                 max_concurrency=8,
                 provider_retries=self.config.max_provider_retries,
                 role_memory_ttl_hours=self.config.role_memory_ttl_hours,
-                context_chars=min(self.config.conversation_chars, 120_000),
+                context_chars=min(
+                    self.config.conversation_chars,
+                    120_000 if descriptor.execution_class is ExecutionClass.CLOUD else self.weak_model_policy.max_context_characters,
+                ),
                 prompt_trace_chars=self.config.prompt_trace_chars,
             ),
             agent_steps=self.config.subagent_steps,
+            reasoning_effort=self.reasoning_effort,
         )
 
     def start_ultra(self, objective: str) -> Any:
@@ -480,6 +606,11 @@ class AgentRuntime:
             )
         return self.ultra_session.approve(revision)
 
+    def wait_for_ultra(self) -> Any:
+        if self.ultra_session is None:
+            raise RuntimeStateError("the ULTRA engine is not live in this process")
+        return self.ultra_session.wait()
+
     def restore_ultra(self, run_id: str) -> Any:
         self.ultra_session = self._make_ultra_session()
         return self.ultra_session.restore(run_id)
@@ -534,9 +665,21 @@ class AgentRuntime:
 
     def close(self) -> None:
         """Checkpoint background ULTRA work before the SQLite connection closes."""
-
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
         if self.ultra_session is not None:
             self.ultra_session.close()
+        tools.shutdown_workspace_resources(self.workspace)
+        for resource in self.store.list_managed_resources(self.session_id):
+            if resource.get("status") in {"running", "ready"}:
+                metadata = dict(resource.get("metadata", {}))
+                metadata["closed_by_runtime"] = True
+                self.store.save_managed_resource(
+                    str(resource["id"]), self.session_id,
+                    kind=str(resource["kind"]), status="stopped", metadata=metadata,
+                )
 
     def active_goal(self) -> Goal | None:
         return self.store.load_active_goal()
@@ -544,6 +687,41 @@ class AgentRuntime:
     def latest_plan(self) -> Plan | None:
         goal = self.active_goal()
         return self.store.get_latest_plan(goal.id) if goal else None
+
+    def transition_mode(self, mode: str) -> str:
+        """Persist a policy change without replacing the active run or its memory."""
+        target = SessionMode(str(getattr(mode, "value", mode)).casefold())
+        session = self.store.get_workflow_session(self.session_id)
+        previous = SessionMode(str(session["session_mode"]))
+        state = dict(session.get("state", {}))
+        goal = self.active_goal()
+        if goal is not None:
+            state.update({
+                "run_id": goal.metadata.get("run_id", goal.id),
+                "goal_contract_fingerprint": goal.metadata.get("goal_contract_fingerprint"),
+                "mutation_sequence": goal.metadata.get("mutation_sequence", 0),
+                "convergence_state": goal.metadata.get("convergence_state", "not_evaluated"),
+            })
+        self.store.save_workflow_session(
+            self.session_id,
+            goal_id=goal.id if goal else session.get("goal_id"),
+            session_mode=target.value,
+            plan_state=str(session["plan_state"]),
+            run_state=str(session["run_state"]),
+            ultra_profile=str(session.get("ultra_profile", "standard")),
+            sleep_state=str(session.get("sleep_state", "off")),
+            state=state,
+        )
+        if goal is not None and target is not previous:
+            self.store.append_event(
+                "mode.transition", goal_id=goal.id,
+                payload={
+                    "from": previous.value, "to": target.value,
+                    "run_id": goal.metadata.get("run_id", goal.id),
+                    "reason": "execution policy changed; durable run context preserved",
+                },
+            )
+        return target.value
 
     def _emit_usage(self, turn: AssistantTurn) -> None:
         if not turn.usage:
@@ -565,8 +743,64 @@ class AgentRuntime:
         *,
         actor: str,
         step: int,
+        stream_text: bool = True,
     ) -> AssistantTurn:
         self.events.publish("step", actor=actor, step=step)
+        current_goal = self.active_goal()
+        if current_goal is not None:
+            contract_data = current_goal.metadata.get("goal_contract")
+            if isinstance(contract_data, Mapping):
+                contract = GoalContractV1.from_dict(contract_data)
+                projection = contract.projection(actor=actor)
+                contract_envelope = state_envelope(projection, "GOAL_CONTRACT_PROJECTION", max_chars=12_000)
+                conversation = [dict(message) for message in conversation]
+                if conversation and conversation[0].get("role") == "user":
+                    conversation[0]["content"] = contract_envelope + "\n\n" + str(conversation[0].get("content", ""))
+                else:
+                    conversation.insert(0, {"role": "user", "content": contract_envelope})
+                self.store.append_event(
+                    "goal_contract.projected",
+                    goal_id=current_goal.id,
+                    payload={
+                        "actor": actor,
+                        "fingerprint": contract.fingerprint,
+                        "policy_version": self.weak_model_policy.version,
+                        "rules": self.weak_model_policy.applied_rules("provider_call"),
+                    },
+                )
+        ensure_capabilities = getattr(self.provider, "_ensure_capabilities", None)
+        if callable(ensure_capabilities):
+            ensure_capabilities()
+        capability_profile = getattr(self.provider, "capability_profile", None)
+        native_tools = bool(getattr(capability_profile, "tool_call_support", True))
+        if current_goal is not None and capability_profile is not None:
+            self.store.append_event(
+                "provider.capability_selected", goal_id=current_goal.id,
+                payload={
+                    "actor": actor,
+                    "provider": getattr(capability_profile, "provider", self.provider_name),
+                    "model": getattr(capability_profile, "model_name", self.model_name),
+                    "protocol": getattr(capability_profile, "api_protocol", "unknown"),
+                    "endpoint": getattr(capability_profile, "endpoint", ""),
+                    "tools": native_tools,
+                    "structured_output": bool(getattr(capability_profile, "structured_output_support", False)),
+                    "vision": bool(getattr(capability_profile, "vision_support", False)),
+                    "health": getattr(capability_profile, "health_status", "unknown"),
+                },
+            )
+        if not native_tools and schemas:
+            names = [_tool_name(schema) for schema in schemas if _tool_name(schema)]
+            system = (
+                system
+                + "\n\nNATIVE TOOLS ARE UNAVAILABLE. Make exactly one bounded action proposal as "
+                + '{"name":"AVAILABLE_NAME","args":{...}} with no lifecycle IDs. '
+                + f"Available names: {', '.join(names)}. The harness validates and executes it."
+            )
+            if current_goal is not None:
+                self.store.append_event(
+                    "provider.request_adapter_selected", goal_id=current_goal.id,
+                    payload={"actor": actor, "adapter": "constrained_json_action", "native_tools": False},
+                )
         last_error: Exception | None = None
         for attempt in range(self.config.max_provider_retries + 1):
             try:
@@ -574,7 +808,10 @@ class AgentRuntime:
                     conversation,
                     list(schemas),
                     system,
-                    on_text=lambda fragment: self.events.publish("model_text", str(fragment), actor=actor),
+                    on_text=(
+                        (lambda fragment: self.events.publish("model_text", str(fragment), actor=actor))
+                        if stream_text else None
+                    ),
                     on_thought=lambda fragment: self.events.publish("model_thought", str(fragment), actor=actor),
                 )
                 if not isinstance(turn, AssistantTurn):
@@ -582,6 +819,20 @@ class AgentRuntime:
                 for call in turn.tool_calls:
                     if not isinstance(call.args, dict):
                         call.args = {}
+                if not turn.tool_calls and not native_tools and turn.text:
+                    candidate = extract_first_json_object(turn.text)
+                    proposal = normalize_action_proposal(candidate) if candidate is not None else None
+                    if proposal is not None:
+                        name, args = proposal
+                        allowed = {_tool_name(schema) for schema in schemas}
+                        if name in allowed:
+                            generated_id = f"harness-{actor.replace(':', '-')}-{step}-{attempt}"
+                            turn.tool_calls.append(ToolCall(id=generated_id, name=name, args=args))
+                            if current_goal is not None:
+                                self.store.append_event(
+                                    "tool_action.proposal_normalized", goal_id=current_goal.id,
+                                    payload={"actor": actor, "tool": name, "generated_id": generated_id},
+                                )
                 self._emit_usage(turn)
                 return turn
             except (KeyboardInterrupt, SystemExit):
@@ -589,6 +840,35 @@ class AgentRuntime:
             except Exception as exc:
                 last_error = exc
                 message = redact_text(exc, 500)
+                retry_record = self.retry_ledger.record(
+                    RetryKind.PROVIDER_TRANSPORT,
+                    stage=actor,
+                    reason=message,
+                    input_value={"step": step, "conversation_messages": len(conversation)},
+                    output_value={"error_type": type(exc).__name__},
+                    next_action=(
+                        "retry_same_provider"
+                        if not isinstance(exc, (AssertionError, TypeError, ValueError))
+                        and attempt < self.config.max_provider_retries
+                        else "stop"
+                    ),
+                )
+                current_goal = self.active_goal()
+                if current_goal is not None:
+                    self.store.append_event(
+                        "workflow.retry",
+                        goal_id=current_goal.id,
+                        payload={
+                            "kind": retry_record.kind.value,
+                            "stage": retry_record.stage,
+                            "reason": retry_record.reason,
+                            "attempt": retry_record.attempt,
+                            "input_fingerprint": retry_record.input_fingerprint,
+                            "output_fingerprint": retry_record.output_fingerprint,
+                            "progress": False,
+                            "next_action": retry_record.next_action,
+                        },
+                    )
                 if isinstance(exc, (AssertionError, TypeError, ValueError)) or attempt >= self.config.max_provider_retries:
                     break
                 delay = self.config.retry_base_ms * (2**attempt) / 1_000
@@ -606,7 +886,53 @@ class AgentRuntime:
 
     def start_goal(self, objective: str) -> Plan | None:
         with self._lock:
-            goal = self.store.create_goal(redact_text(objective, 20_000))
+            safe_objective = redact_text(objective, 20_000)
+            prior_session = self.store.get_workflow_session(self.session_id)
+            prior_state = dict(prior_session.get("state", {}))
+            continuation = prior_state.get("below_target_continuation")
+            continuing_chat_candidate = bool(
+                isinstance(continuation, Mapping) and is_goal_escalation_approval(safe_objective)
+            )
+            if continuing_chat_candidate:
+                safe_objective = str(continuation.get("objective") or prior_state.get("original_objective") or safe_objective)
+            run_id = (
+                str(prior_state.get("run_id"))
+                if continuing_chat_candidate and prior_state.get("run_id")
+                else f"run-{hashlib.sha256((safe_objective + str(time.time_ns())).encode()).hexdigest()[:20]}"
+            )
+            preserved_artifacts = tuple(continuation.get("artifacts", ())) if continuing_chat_candidate else ()
+            contract = GoalContractV1(
+                run_id=run_id,
+                original_objective=safe_objective,
+                interpreted_objective=safe_objective,
+                forbidden_shortcuts=("prose-only completion", "model-declared completion without fresh evidence", "automatic acceptance of the first syntactically valid result"),
+                completion_conditions=("all accepted tasks complete", "required executable evidence is fresh", "independent evaluation passes", "quality target is converged"),
+                artifact_expectations=preserved_artifacts,
+            )
+            goal = self.store.create_goal(
+                safe_objective,
+                metadata={
+                    "run_id": run_id,
+                    "weak_model_policy": self.weak_model_policy.to_dict(),
+                    "goal_contract": contract.to_dict(),
+                    "goal_contract_fingerprint": contract.fingerprint,
+                    "convergence_state": "not_evaluated",
+                    "mutation_sequence": 0,
+                    "continued_from_chat": continuing_chat_candidate,
+                    "chat_candidate": dict(continuation) if continuing_chat_candidate else {},
+                },
+            )
+            self.store.append_event(
+                "goal_contract.created", goal_id=goal.id,
+                payload={"run_id": run_id, "fingerprint": contract.fingerprint, "policy_version": self.weak_model_policy.version},
+            )
+            self.store.save_workflow_session(
+                self.session_id,
+                goal_id=goal.id,
+                session_mode=SessionMode.PLAN.value,
+                plan_state=PlanState.INSPECTING.value,
+                run_state=RunState.PLANNING.value,
+            )
             self.store.transition_goal(goal.id, GoalStatus.DISCOVERING, reason="planning started")
             self._work_conversation.clear()
             self.events.publish("phase", "Discovering the workspace and drafting a plan.", goal_id=goal.id)
@@ -619,6 +945,15 @@ class AgentRuntime:
 
     def _planner_tools(self) -> list[dict[str, Any]]:
         return [*_schemas(READ_ONLY_TOOLS), *PLANNER_SCHEMAS]
+
+    @staticmethod
+    def _plan_requires_critic(candidate: Mapping[str, Any]) -> bool:
+        tasks = tuple(candidate.get("tasks", ()))
+        return len(tasks) > 3 or any(
+            str(item.get("risk", "medium")).lower() in {"high", "critical"}
+            for item in tasks
+            if isinstance(item, Mapping)
+        )
 
     def _review_plan_candidate(
         self,
@@ -687,10 +1022,17 @@ class AgentRuntime:
         task_ids = {task.id for task in tasks}
         evidence_coverage: set[str] = set()
         for item in proposed["applicability_evidence"]:
-            source = str(item["source"]).strip()
-            if not source.startswith("tool:") or source[5:] not in successful_inspection_ids:
+            source = str(item.get("source") or "").strip()
+            if source.startswith("inspection:"):
+                source_id = source[len("inspection:") :]
+            elif source.startswith("tool:"):  # legacy persisted/test plans
+                source_id = source[len("tool:") :]
+            else:
+                source_id = ""
+            if source_id not in successful_inspection_ids:
                 raise ValueError(
-                    "each applicability fact must cite a successful earlier inspection as tool:CALL_ID"
+                    f"applicability source {source!r} does not match a successful earlier "
+                    "inspection; cite the stable inspection:I001-style reference"
                 )
             supports = {str(task_id).upper() for task_id in item["supports_tasks"]}
             unknown = supports - task_ids
@@ -718,6 +1060,42 @@ class AgentRuntime:
             change_coverage.update(supports)
         if not change_coverage:
             raise ValueError("the plan must identify a concrete workspace change")
+
+    @staticmethod
+    def _bind_plan_inspection_sources(
+        proposed: dict[str, Any],
+        inspection_records: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Canonicalize provider-specific/placeholder citations to harness refs."""
+
+        records = dict(inspection_records)
+        aliases: dict[str, str] = {}
+        for reference, record in records.items():
+            canonical = f"inspection:{reference}"
+            aliases[canonical.casefold()] = canonical
+            aliases[f"tool:{reference}".casefold()] = canonical
+            call_id = str(record.get("call_id") or "").strip()
+            if call_id:
+                aliases[f"tool:{call_id}".casefold()] = canonical
+        only_reference = next(iter(records), None) if len(records) == 1 else None
+        placeholder = re.compile(
+            r"^(?:tool|inspection):(?:call(?:_id|_\d+)?|\d+)$",
+            re.IGNORECASE,
+        )
+        bound = dict(proposed)
+        evidence = [dict(item) for item in proposed.get("applicability_evidence", ())]
+        for item in evidence:
+            source = str(item.get("source") or "").strip()
+            canonical = aliases.get(source.casefold())
+            if canonical is None and only_reference is not None:
+                record = records[only_reference]
+                tool_alias = f"tool:{record.get('tool', '')}".casefold()
+                if not source or placeholder.fullmatch(source) or source.casefold() == tool_alias:
+                    canonical = f"inspection:{only_reference}"
+            if canonical is not None:
+                item["source"] = canonical
+        bound["applicability_evidence"] = evidence
+        return bound
 
     def _pause_planning(self, goal: Goal, question: str, reason: str) -> None:
         """Checkpoint a bounded/failed planning pass as an explicit user-visible pause."""
@@ -957,8 +1335,12 @@ class AgentRuntime:
             }
         ]
         revisions = 0
+        invalid_plan_calls = 0
+        last_plan_format_error = ""
+        plan_format_exhausted = False
         successful_inspection_ids: set[str] = set()
         inspection_records: dict[str, dict[str, Any]] = {}
+        inspection_cache: dict[str, str] = {}
         for step in range(1, self.config.planning_steps + 1):
             inspections_before_turn = frozenset(successful_inspection_ids)
             turn = self._call_provider(
@@ -973,12 +1355,56 @@ class AgentRuntime:
             requested_questions: list[dict[str, Any]] | None = None
             for call in turn.tool_calls:
                 self.events.publish("tool_call", call.name, args=redact_data(call.args), actor="planner")
+                conversation_result: str | None = None
                 if call.name == "propose_plan":
                     try:
-                        proposed = validate_control_call(call.name, call.args)
-                        result = "Plan proposal captured for independent critique."
-                    except ControlValidationError as exc:
-                        result = f"Error: invalid plan proposal: {exc}"
+                        proposed, normalization_actions = normalize_plan_draft(call.args)
+                        validate_normalized_plan(proposed)
+                        for task in proposed["tasks"]:
+                            task.pop("_unresolved_dependencies", None)
+                        result = "Plan proposal normalized and captured for harness validation."
+                        if normalization_actions:
+                            self.store.append_event(
+                                "planning.normalized",
+                                goal_id=goal.id,
+                                payload={"actions": list(normalization_actions)},
+                            )
+                    except (ControlValidationError, PlanDraftError, ValueError) as exc:
+                        proposed = None
+                        invalid_plan_calls += 1
+                        last_plan_format_error = redact_text(exc, 1_000)
+                        gross_format_failure = isinstance(exc, PlanDraftError) and all(
+                            any(token in issue.path for token in ("/title", "/description", "/acceptance_criteria", "/verification"))
+                            for issue in exc.issues
+                        )
+                        retry_record = self.retry_ledger.record(
+                            RetryKind.PLAN_SEMANTIC_REPAIR if isinstance(exc, PlanDraftError) else RetryKind.PLAN_FORMAT_REPAIR,
+                            stage=getattr(exc, "stage", "plan_normalization"),
+                            reason=last_plan_format_error,
+                            input_value=call.args,
+                            next_action="targeted_repair" if invalid_plan_calls == 1 else "stop",
+                        )
+                        self.store.append_event(
+                            "workflow.retry",
+                            goal_id=goal.id,
+                            entity_type="plan",
+                            payload={
+                                "kind": retry_record.kind.value,
+                                "stage": retry_record.stage,
+                                "reason": retry_record.reason,
+                                "attempt": retry_record.attempt,
+                                "input_fingerprint": retry_record.input_fingerprint,
+                                "output_fingerprint": retry_record.output_fingerprint,
+                                "progress": retry_record.progress,
+                                "next_action": retry_record.next_action,
+                            },
+                        )
+                        result = (
+                            "Error: plan validation failed at exact field(s); submit one targeted "
+                            f"repair using the same simplified contract: {last_plan_format_error}"
+                        )
+                        if invalid_plan_calls >= (4 if gross_format_failure else 2):
+                            plan_format_exhausted = True
                 elif call.name == "request_plan_input":
                     try:
                         request = validate_control_call(call.name, call.args)
@@ -994,25 +1420,114 @@ class AgentRuntime:
                     except ControlValidationError as exc:
                         result = f"Error: invalid plan question request: {exc}"
                 elif call.name in READ_ONLY_TOOLS:
-                    result = self._execute_workspace_tool(goal, call, task_id=None, actor="planner")
+                    normalized_args = dict(call.args)
+                    if call.name == "list_files" and not str(normalized_args.get("path") or "").strip():
+                        normalized_args["path"] = "."
+                    inspection_key = f"{call.name}:{json.dumps(normalized_args, ensure_ascii=False, sort_keys=True, default=str)}"
+                    existing_reference = inspection_cache.get(inspection_key)
+                    if existing_reference is not None:
+                        record = inspection_records[existing_reference]
+                        result = str(record["result"])
+                        reference = existing_reference
+                    else:
+                        call.args = normalized_args
+                        result = self._execute_workspace_tool(goal, call, task_id=None, actor="planner")
+                        reference = ""
                     if not result.startswith("Error:") and not result.startswith("Permission denied"):
-                        successful_inspection_ids.add(call.id)
-                        inspection_records[call.id] = {
-                            "call_id": call.id,
-                            "tool": call.name,
-                            "arguments": redact_data(call.args),
-                            "result": redact_text(result, 4_000),
-                        }
+                        if not reference:
+                            reference = f"I{len(inspection_records) + 1:03d}"
+                            inspection_cache[inspection_key] = reference
+                            inspection_records[reference] = {
+                                "reference": f"inspection:{reference}",
+                                "call_id": call.id,
+                                "tool": call.name,
+                                "arguments": redact_data(normalized_args),
+                                "result": redact_text(result, 4_000),
+                            }
+                            self.store.append_event(
+                                "planning.inspection_recorded",
+                                goal_id=goal.id,
+                                payload={
+                                    "reference": f"inspection:{reference}",
+                                    "call_id": call.id,
+                                    "tool": call.name,
+                                    "arguments": redact_data(normalized_args),
+                                    "result": redact_text(result, 4_000),
+                                },
+                            )
+                        successful_inspection_ids.add(reference)
+                        conversation_result = (
+                            f"Stable inspection reference: inspection:{reference}. "
+                            "Use this exact source in applicability_evidence.\n"
+                            f"{result}"
+                        )
                 else:
                     result = f"Error: planning is read-only; tool '{call.name}' is unavailable before approval."
-                conversation.append({"role": "tool", "id": call.id, "name": call.name, "content": result})
+                conversation.append(
+                    {
+                        "role": "tool",
+                        "id": call.id,
+                        "name": call.name,
+                        "content": conversation_result or result,
+                    }
+                )
                 self.events.publish("tool_result", result, tool=call.name, actor="planner")
+                if plan_format_exhausted:
+                    # A single model turn may contain several proposals.  The
+                    # retry budget is global to this planning run, so stop at
+                    # the fourth rejected proposal instead of processing an
+                    # arbitrary remainder from the same response.
+                    break
+
+            if plan_format_exhausted:
+                break
 
             if requested_questions is not None and proposed is None:
                 self._pause_for_plan_questions(goal, requested_questions)
                 return None
 
             if proposed is not None:
+                # Inspection provenance and persistence-only cross references
+                # are harness data, not fields the model must manufacture.
+                task_ids = [str(item["id"]) for item in proposed["tasks"]]
+                if not proposed.get("applicability_evidence"):
+                    proposed["applicability_evidence"] = [
+                        {
+                            "fact": (
+                                "Repository exists; no project files were found; the project will be created from scratch."
+                                if not str(record.get("result", "")).strip()
+                                or "No files" in str(record.get("result", ""))
+                                else f"Workspace inspection completed with {record.get('tool', 'read-only tool')}."
+                            ),
+                            "source": str(record["reference"]),
+                            "supports_tasks": task_ids,
+                        }
+                        for record in inspection_records.values()
+                    ]
+                if not proposed.get("expected_changes"):
+                    proposed["expected_changes"] = [
+                        {
+                            "path": (
+                                re.search(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+", str(item["description"])).group(0)
+                                if re.search(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+", str(item["description"]))
+                                else "."
+                            ),
+                            "intent": str(item["description"]),
+                            "supports_tasks": [str(item["id"])],
+                        }
+                        for item in proposed["tasks"]
+                    ]
+                for change in proposed.get("expected_changes", ()):
+                    if str(change.get("path", "")).startswith("<"):
+                        match = re.search(
+                            r"[A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+",
+                            str(change.get("intent", "")),
+                        )
+                        change["path"] = match.group(0) if match else "."
+                if not str(proposed.get("execution_strategy", "")).strip():
+                    proposed["execution_strategy"] = (
+                        "Execute ready tasks in dependency order and run each task's required verification."
+                    )
                 if planning_answers:
                     proposed = dict(proposed)
                     proposed["execution_strategy"] = (
@@ -1025,6 +1540,10 @@ class AgentRuntime:
                             separators=(",", ":"),
                         )
                     )
+                proposed = self._bind_plan_inspection_sources(
+                    proposed,
+                    inspection_records,
+                )
                 try:
                     if len(json.dumps(proposed, ensure_ascii=False, default=str)) > 120_000:
                         raise ValueError(
@@ -1042,18 +1561,32 @@ class AgentRuntime:
                         successful_inspection_ids=inspections_before_turn,
                     )
                 except (ValueError, DomainError) as exc:
+                    invalid_plan_calls += 1
+                    last_plan_format_error = redact_text(exc, 1_000)
                     conversation.append(
                         {
                             "role": "user",
                             "content": (
                                 "Harness plan validation rejected the proposal: "
-                                f"{redact_text(exc, 1_000)}. Repair the IDs/dependencies/criteria and call propose_plan again."
+                                f"{last_plan_format_error}. Repair every listed ID, dependency, "
+                                "evidence citation, and criterion in one complete proposal."
                             ),
                         }
                     )
                     proposed = None
+                    if invalid_plan_calls >= 4:
+                        plan_format_exhausted = True
+                        break
                     continue
-                critique = self._review_plan_candidate(goal, proposed, inspection_records)
+                critique = (
+                    self._review_plan_candidate(goal, proposed, inspection_records)
+                    if self._plan_requires_critic(proposed)
+                    else {
+                        "verdict": "pass",
+                        "summary": "Deterministic validation passed; independent criticism is not required for this low-complexity plan.",
+                        "issues": [],
+                    }
+                )
                 if critique["verdict"] == "pass" and not critique["issues"]:
                     plan = self.store.create_plan(
                         goal.id,
@@ -1092,6 +1625,14 @@ class AgentRuntime:
                         plan_questions=[],
                         waiting_question="",
                     )
+                    self.store.save_workflow_session(
+                        self.session_id,
+                        goal_id=goal.id,
+                        session_mode=SessionMode.PLAN.value,
+                        plan_state=PlanState.AWAITING_APPROVAL.value,
+                        run_state=RunState.PLANNING.value,
+                        state={"plan_revision": plan.revision, "plan_fingerprint": plan.fingerprint},
+                    )
                     return plan
                 revisions += 1
                 conversation.append(
@@ -1106,7 +1647,7 @@ class AgentRuntime:
                         ),
                     }
                 )
-                if revisions >= 3:
+                if revisions >= 1:
                     break
             elif not turn.tool_calls:
                 conversation.append(
@@ -1116,23 +1657,53 @@ class AgentRuntime:
                     }
                 )
 
+        checkpoint_reason = (
+            (
+                "planner repeatedly returned an invalid structured plan; exact field validation is recorded"
+                if invalid_plan_calls >= 4
+                else "plan validation and its single targeted repair failed"
+            )
+            if plan_format_exhausted
+            else "planner did not produce a critic-approved structured plan"
+        )
         self.store.append_event(
             "planning.checkpoint",
             goal_id=goal.id,
-            payload={"reason": "planner did not produce a critic-approved structured plan"},
+            payload={
+                "reason": checkpoint_reason,
+                "format_attempts": invalid_plan_calls,
+                "technical_detail": last_plan_format_error,
+            },
         )
-        self.events.publish(
-            "warning",
-            "The planner reached its bounded slice without a valid plan. The goal remains durable; use /replan with guidance.",
-        )
+        if plan_format_exhausted:
+            self.events.publish(
+                "error",
+                (
+                    "Plan could not be prepared after one targeted repair. "
+                    f"Stage/field detail: {last_plan_format_error}. Edit the request or use /replan."
+                ),
+                technical_detail=last_plan_format_error,
+                attempts=invalid_plan_calls,
+                planning_terminal=True,
+            )
+        else:
+            self.events.publish(
+                "warning",
+                "Planning stopped before a valid plan was produced. Inspect the planning checkpoint for the exact stage and use /replan with guidance.",
+                planning_terminal=True,
+            )
         self._pause_planning(
             goal,
-            "The planner did not produce a critic-approved structured plan in its bounded pass. Add guidance, then use /resume or /replan.",
-            "bounded planning pass produced no valid plan",
+            (
+                f"Plan validation failed after one targeted repair: {last_plan_format_error}. Add guidance, then use /replan."
+                if plan_format_exhausted
+                else "The planner did not produce a critic-approved structured plan in its bounded pass. Add guidance, then use /resume or /replan."
+            ),
+            checkpoint_reason,
         )
         return None
 
-    def approve_plan(self, revision: int | None = None) -> Plan:
+    def approve_plan(self, revision: int | None = None, *, approved_by: str = "user") -> Plan:
         goal = self.active_goal()
         plan = self.latest_plan()
         if goal is None or plan is None:
@@ -1143,16 +1714,128 @@ class AgentRuntime:
         accepted, _approval = self.store.approve_plan(
             goal.id,
             requested,
-            approved_by="user",
+            approved_by=approved_by,
             expected_fingerprint=plan.fingerprint if requested == plan.revision else None,
         )
+        current = self.store.get_goal(goal.id)
+        contract_data = current.metadata.get("goal_contract")
+        if isinstance(contract_data, Mapping):
+            contract = GoalContractV1.from_dict(contract_data)
+            criteria = tuple(dict.fromkeys(
+                criterion for task in accepted.tasks for criterion in task.acceptance_criteria
+            ))
+            verification = tuple(dict.fromkeys(
+                check for task in accepted.tasks for check in task.verification
+            ))
+            artifact_paths = tuple(dict.fromkeys(
+                str(change.get("path") or change.get("artifact") or "").strip()
+                for change in accepted.expected_changes if isinstance(change, Mapping)
+            ))
+            artifact_paths = tuple(dict.fromkeys((*contract.artifact_expectations, *(path for path in artifact_paths if path))))
+            standard_dimensions = [
+                ("requirement-completeness", "Every explicit requested outcome is implemented", True, 1.0),
+                ("functional-correctness", "Required behavior works under authoritative execution", True, 1.0),
+                ("runtime-stability", "No relevant runtime, provider, browser, or console error remains", True, 1.0),
+                ("integration-correctness", "The change is integrated without breaking existing contracts", True, 1.0),
+                ("regression-safety", "Impacted focused checks and appropriate broader regression checks pass", True, 1.0),
+                ("maintainability", "The implementation is coherent, bounded, and avoids unnecessary complexity", False, 0.8),
+            ]
+            objective_lower = contract.interpreted_objective.casefold()
+            castle_dimensions = []
+            artifact_dimensions = []
+            if any(path.casefold().endswith((".html", ".htm")) for path in artifact_paths):
+                artifact_dimensions = [
+                    ("visual-quality", "Visual composition, hierarchy, detail, and polish meet the requested quality", False, 0.8),
+                    ("interaction-quality", "Interactive and animated behavior is understandable, stable, and appropriately varied", False, 0.8),
+                ]
+            if "castle" in objective_lower and "siege" in objective_lower:
+                castle_dimensions = [
+                    ("castle-recognizable", "Castle is visually recognizable and more detailed than placeholder rectangles", False, 0.8),
+                    ("main-gate-visible", "Main gate is visible and not hidden by overlap", True, 1.0),
+                    ("ram-soldiers", "Soldiers visibly attempt to breach the gate with a battering ram", False, 0.8),
+                    ("ram-motion", "Battering ram has repeated understandable motion", False, 0.8),
+                    ("siege-tower", "Siege tower is clearly represented and participates in the scene", False, 0.8),
+                    ("moving-arrows", "Archers visibly release moving arrows", False, 0.8),
+                    ("catapult-projectiles", "Catapults visibly launch moving projectiles", False, 0.8),
+                    ("projectile-distinction", "Projectiles are distinguishable from static decoration", False, 0.8),
+                    ("animation-variety", "Actors do not all use identical synchronized animation", False, 0.8),
+                    ("scene-depth", "Scene has meaningful layering, depth, and a non-empty composition", False, 0.8),
+                    ("self-contained", "The requested single HTML artifact is self-contained with no unexpected network requests", True, 1.0),
+                    ("extended-stability", "Animation remains stable during an extended run without JavaScript errors", True, 1.0),
+                    ("responsive-usability", "Wide and narrow viewports remain usable without harmful overflow", True, 1.0),
+                ]
+            generated_dimensions = [
+                {
+                    "id": dimension_id,
+                    "description": description,
+                    "hard_gate": hard_gate,
+                    "minimum_score": minimum,
+                    "required_evidence": list(verification),
+                    "evaluation_method": (
+                        "vision_and_runtime" if dimension_id in {item[0] for item in (*artifact_dimensions, *castle_dimensions)} and not hard_gate
+                        else "deterministic_then_independent_review"
+                    ),
+                    "confidence": "medium",
+                    "latest_artifact_hash": None,
+                    "latest_mutation_sequence": None,
+                }
+                for dimension_id, description, hard_gate, minimum in (*standard_dimensions, *artifact_dimensions, *castle_dimensions)
+            ]
+            updated_contract = GoalContractV1(
+                **{
+                    **contract.to_dict(),
+                    "required_outcomes": tuple(task.title for task in accepted.tasks),
+                    "acceptance_criteria": criteria,
+                    "required_verification": verification,
+                    "artifact_expectations": artifact_paths,
+                    "completion_conditions": (*contract.completion_conditions, *criteria),
+                }
+            )
+            target = {
+                "version": 1,
+                "id": f"quality-{goal.id}",
+                "objective": updated_contract.interpreted_objective,
+                "artifact_ids": artifact_paths or ("workspace",),
+                "minimum_overall_score": 0.8,
+                "hard_gates": list(verification),
+                "dimensions": [
+                    {
+                        "id": f"criterion-{index:03d}",
+                        "description": criterion,
+                        "hard_gate": True,
+                        "minimum_score": 1.0,
+                        "required_evidence": list(verification),
+                    }
+                    for index, criterion in enumerate(criteria, 1)
+                ] + generated_dimensions,
+            }
+            updated_contract = GoalContractV1(**{**updated_contract.to_dict(), "quality_target_id": target["id"]})
+            self.store.update_goal_metadata(
+                goal.id,
+                goal_contract=updated_contract.to_dict(),
+                goal_contract_fingerprint=updated_contract.fingerprint,
+                quality_target=target,
+                convergence_state="not_evaluated",
+            )
+            self.store.append_event(
+                "quality_target.created", goal_id=goal.id,
+                payload={"target_id": target["id"], "dimensions": len(target["dimensions"]), "hard_gates": len(target["hard_gates"])},
+            )
         self._work_conversation = [
             {
                 "role": "user",
                 "content": f"The user approved plan r{accepted.revision}. Begin the first ready task and keep the checklist current.",
             }
         ]
-        self.events.publish("phase", f"Plan r{accepted.revision} approved; execution is active.")
+        self.events.publish("phase", f"Plan r{accepted.revision} approved by {approved_by}; execution is active.")
+        self.store.save_workflow_session(
+            self.session_id,
+            goal_id=goal.id,
+            session_mode=SessionMode.GOAL.value,
+            plan_state=PlanState.APPROVED.value,
+            run_state=RunState.EXECUTING.value,
+            state={"plan_revision": accepted.revision, "plan_fingerprint": accepted.fingerprint},
+        )
         return accepted
 
     def reject_plan(self, feedback: str) -> Plan | None:
@@ -1470,6 +2153,112 @@ class AgentRuntime:
             summary=redact_text(text, 4_000),
             created_by="user",
         )
+        latest = self.store.get_goal(goal.id)
+        feedback = item.summary
+        lowered = feedback.casefold()
+        if (
+            latest.status is GoalStatus.PAUSED
+            and latest.metadata.get("convergence_state") == "user_review_required"
+            and lowered.strip().rstrip(".! ") in {"yes", "y", "accept", "accepted", "approve", "approved", "looks good", "ship it"}
+        ):
+            plan = self.store.get_accepted_plan(goal.id)
+            blocker = self._completion_precheck(latest, plan) if plan is not None else "no accepted plan"
+            if blocker:
+                self.store.append_event("completion.rejected", goal_id=goal.id, payload={"reason": blocker, "source": "user_visual_acceptance"})
+                raise RuntimeStateError(f"visual acceptance cannot bypass completion blocker: {blocker}")
+            evaluation = dict(latest.metadata.get("latest_evaluation", {}))
+            evaluation["user_visual_acceptance_evidence_id"] = item.id
+            evaluation["confidence"] = "user_accepted_subjective"
+            evaluation["accepted_artifact_hashes"] = self._current_artifact_hashes(
+                latest.metadata.get("quality_target", {}).get("artifact_ids", ())
+            )
+            self.store.update_goal_metadata(
+                goal.id,
+                convergence_state="converged",
+                latest_evaluation=evaluation,
+                waiting_question="",
+            )
+            self.store.transition_goal(goal.id, GoalStatus.REVIEWING, reason="user accepted only the unresolved subjective visual dimension")
+            self.store.transition_goal(goal.id, GoalStatus.COMPLETED, reason="correctness gates and independent review passed; user accepted subjective visual quality")
+            self.store.append_event(
+                "quality_convergence.decided", goal_id=goal.id,
+                payload={"state": "converged", "source": "explicit_user_visual_acceptance", "evidence_id": item.id},
+            )
+            return item
+        dimensions = []
+        for dimension, words in {
+            "visual_quality": ("graphic", "visual", "detail", "empty", "color", "castle", "catapult"),
+            "interaction_quality": ("animation", "motion", "basic", "slow", "fast"),
+            "functional_correctness": ("error", "broken", "still happening", "doesn't", "does not"),
+        }.items():
+            if any(word in lowered for word in words):
+                dimensions.append(dimension)
+        if not dimensions:
+            dimensions.append("requirement_completeness")
+
+        contract_data = latest.metadata.get("goal_contract")
+        components: list[dict[str, Any]] = []
+        if isinstance(contract_data, Mapping):
+            contract = GoalContractV1.from_dict(contract_data)
+            artifact_paths = contract.artifact_expectations
+            for path in artifact_paths:
+                candidate = (self.workspace / path).resolve(strict=False)
+                if candidate.is_file() and candidate.is_relative_to(self.workspace):
+                    self.repository_index.update(candidate.relative_to(self.workspace).as_posix())
+            retrieval_query = feedback
+            if "visual_quality" in dimensions:
+                retrieval_query += " style css color lighting scene castle component"
+            if "interaction_quality" in dimensions:
+                retrieval_query += " keyframe animation event movement timing"
+            context_slice = self.repository_index.context_slice(
+                retrieval_query,
+                max_entries=30,
+                budget_chars=30_000,
+            )
+            components = [
+                {"path": entry.path, "kind": entry.kind, "name": entry.name, "start": entry.start, "end": entry.end, "file_hash": entry.file_hash}
+                for entry in context_slice.entries
+            ]
+            context_summary = {
+                "query": retrieval_query,
+                "size_chars": context_slice.size_chars,
+                "omitted_entries": context_slice.omitted_entries,
+                "callers": {key: list(value) for key, value in context_slice.callers.items()},
+                "callees": {key: list(value) for key, value in context_slice.callees.items()},
+                "dependencies": {key: list(value) for key, value in context_slice.dependencies.items()},
+            }
+            updated_contract = GoalContractV1(**{
+                **contract.to_dict(),
+                "user_feedback": (*contract.user_feedback, feedback),
+                "file_symbol_scope": tuple(dict.fromkeys(
+                    (*contract.file_symbol_scope, *(f"{entry['path']}:{entry['kind']}:{entry['name']}" for entry in components))
+                )),
+            })
+            target = dict(latest.metadata.get("quality_target", {}))
+            target["explicit_feedback"] = [*target.get("explicit_feedback", []), feedback]
+            actions = list(latest.metadata.get("refinement_actions", ()))
+            action = {
+                "id": f"refinement-{len(actions) + 1:03d}",
+                "feedback": feedback,
+                "affected_dimensions": dimensions,
+                "affected_components": components,
+                "repository_context_slice": context_summary,
+                "objective": f"Improve {', '.join(dimensions)} while preserving previously verified functionality.",
+                "status": "pending",
+            }
+            actions.append(action)
+            self.store.update_goal_metadata(
+                goal.id,
+                goal_contract=updated_contract.to_dict(),
+                goal_contract_fingerprint=updated_contract.fingerprint,
+                quality_target=target,
+                refinement_actions=actions,
+                convergence_state="refining",
+            )
+            self.store.append_event(
+                "refinement_action.created", goal_id=goal.id,
+                payload={"action_id": action["id"], "dimensions": dimensions, "components": len(components), "feedback_evidence_id": item.id},
+            )
         self._work_conversation.append({"role": "user", "content": f"User guidance: {item.summary}"})
         if goal.status == GoalStatus.PAUSED and goal.metadata.get("waiting_question"):
             self.store.update_goal_metadata(goal.id, user_answer=item.summary)
@@ -1724,7 +2513,7 @@ class AgentRuntime:
             goal = self.pause("user interrupted the current work slice")
         self.events.publish(
             "checkpoint",
-            "Interrupt checkpoint saved. No unfinished side effect was replayed.",
+            "Interrupt checkpoint saved. No unfinished side effect was replayed. Use /resume to continue.",
             uncertain_tasks=list(recovery.task_ids),
             uncertain_actions=list(recovery.action_ids),
         )
@@ -1830,6 +2619,40 @@ class AgentRuntime:
                 return task.id
         return None
 
+    def _activate_ready_task(self, goal: Goal, plan: Plan) -> tuple[Plan, Task | None]:
+        """Bind the slice to one dependency-ready task without model cooperation.
+
+        Weak models frequently start using workspace tools before emitting the
+        bookkeeping-only ``update_task(in_progress)`` call.  That used to leave
+        otherwise authoritative tool evidence unscoped (``task_id=None``), so a
+        later completion attempt could never satisfy the evidence gate.  Task
+        selection is a deterministic scheduler decision and belongs here.
+        """
+
+        active_id = self._current_task_id(plan)
+        if active_id is not None:
+            return plan, next(item for item in plan.tasks if item.id == active_id)
+        selected = first_ready_task(plan.tasks)
+        if selected is None:
+            return plan, None
+        activated = self.store.transition_task(
+            goal.id,
+            plan.revision,
+            selected.id,
+            TaskStatus.IN_PROGRESS,
+            note="selected automatically by the dependency-ready harness scheduler",
+            actor="harness",
+        )
+        refreshed = self.store.get_latest_plan(goal.id)
+        self.store.append_event(
+            "execution.task_selected",
+            goal_id=goal.id,
+            entity_type="task",
+            entity_id=activated.id,
+            payload={"reason": "all dependencies are complete; first ready task in plan order", "activated": True},
+        )
+        return refreshed, next(item for item in refreshed.tasks if item.id == activated.id)
+
     def _execute_workspace_tool(
         self,
         goal: Goal,
@@ -1840,16 +2663,40 @@ class AgentRuntime:
     ) -> str:
         if call.name not in _external_schema_map():
             return f"Error: unknown workspace tool '{call.name}'"
+        goal = self.store.get_goal(goal.id)
         args = call.args if isinstance(call.args, dict) else {}
+        if call.name == "list_files" and not str(args.get("path") or "").strip():
+            # Omitted, empty, and explicit-root paths mean the same operation.
+            # Canonicalizing here lets retry detection see them as identical.
+            args = {**args, "path": "."}
         scoped_name = f"{actor}:{call.name}"
         journal_args = {
             "_harness_actor": actor,
             "_harness_plan_revision": goal.active_plan_revision,
             "arguments": redact_data(args),
         }
+        approach_fingerprint = hashlib.sha256(
+            json.dumps({"tool": call.name, "args": redact_data(args)}, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        persisted_failures = tuple(goal.metadata.get("failed_attempts", ()))
+        equivalent_count = sum(
+            1 for attempt in persisted_failures
+            if isinstance(attempt, Mapping) and attempt.get("approach_fingerprint") == approach_fingerprint
+        )
+        if equivalent_count >= self.weak_model_policy.max_equivalent_failed_approaches:
+            self.store.append_event(
+                "approach.change_forced", goal_id=goal.id,
+                payload={
+                    "approach_fingerprint": approach_fingerprint,
+                    "equivalent_failures": equivalent_count,
+                    "reason": "maximum equivalent failed approaches reached; reinspection or a materially different mechanism is required",
+                    "rules": self.weak_model_policy.applied_rules("retry"),
+                },
+            )
+            return "Error: equivalent failed approach limit reached; re-inspect, split the task, or use a materially different implementation strategy."
         if actor == "planner":
             journal_args["_harness_goal_attempt"] = int(goal.metadata.get("goal_attempt", 0))
-        if self.store.count_recent_identical_actions(
+        if equivalent_count == 0 and self.store.count_recent_identical_actions(
             goal.id,
             call.name,
             journal_args,
@@ -1860,7 +2707,7 @@ class AgentRuntime:
                 "action across checkpoints; inspect prior results and choose a different approach."
             )
         decision = self._watchdog.check(scoped_name, args)
-        if decision.stalled:
+        if decision.stalled and equivalent_count == 0:
             return f"Error: {decision.reason}"
         risk = TOOL_RISK.get(call.name, "unknown")
         normal_requirement = tools.requires_approval(call.name, args)
@@ -1869,6 +2716,10 @@ class AgentRuntime:
             if self.permission_adapter is not None
             else normal_requirement
         )
+        if call.name == "open_path" or (call.name == "preview_html" and bool(args.get("open_browser", True))):
+            # Full only relaxes sandboxed workspace actions. Host GUI launch
+            # still needs direct user intent/approval.
+            needs_approval = True
         action_id: str | None = None
         if needs_approval and not self.approval(call.name, copy.deepcopy(args), risk):
             action_id = self.store.begin_action(
@@ -1892,21 +2743,165 @@ class AgentRuntime:
             risk=risk,
             mutating=call.name in MUTATING_TOOLS,
         )
+        pre_path = str(args.get("path", "")).strip() if call.name in {"write_file", "edit_file", "materialize_artifact"} else ""
+        pre_bytes: bytes | None = None
+        pre_hash: str | None = None
+        mutation_before = (
+            self._chat_workspace_hashes(self.workspace)
+            if call.name in MUTATING_TOOLS else {}
+        )
+        if pre_path:
+            pre_candidate = (self.workspace / pre_path).resolve(strict=False)
+            if pre_candidate.is_file() and pre_candidate.is_relative_to(self.workspace):
+                pre_bytes = pre_candidate.read_bytes()
+                pre_hash = hashlib.sha256(pre_bytes).hexdigest()
         try:
             with tools.workspace_context(self.workspace):
-                if call.name == "run_bash" and self.permission_adapter is not None:
+                if call.name in {"run_bash", "run_command"} and self.permission_adapter is not None:
+                    shell_command = str(args.get("command", ""))
+                    if (
+                        call.name == "run_command"
+                        and str(args.get("cwd", ".")).strip() not in {"", "."}
+                        and self.permission_adapter.access_level.value == "full"
+                    ):
+                        shell_command = f"cd -- {shlex.quote(str(args['cwd']))} && {shell_command}"
                     raw_result = self.permission_adapter.run_shell(
-                        str(args.get("command", "")),
+                        shell_command,
                         self.workspace,
                         normal_runner=lambda command: tools.run_tool(
-                            "run_bash", {"command": command}
+                            call.name, {**args, "command": command}
                         ),
                     )
                 else:
                     raw_result = tools.run_tool(call.name, args)
             result = redact_text(raw_result, 50_000)
+            if call.name in {"run_bash", "run_command"}:
+                shell_exit = re.search(r"(?im)^exit code:\s*(-?\d+)", result)
+                if shell_exit and int(shell_exit.group(1)) != 0:
+                    result = "Error: shell command failed; " + result
             terminal = "failed" if result.startswith("Error:") else "completed"
             self.store.complete_action(action_id, redact_text(result, 2_000), status=terminal)
+            mutation_after = (
+                self._chat_workspace_hashes(self.workspace)
+                if terminal == "completed" and call.name in MUTATING_TOOLS else mutation_before
+            )
+            actual_changed_files = [
+                path for path in sorted(set(mutation_before) | set(mutation_after))
+                if mutation_before.get(path) != mutation_after.get(path)
+            ]
+            if terminal == "completed" and call.name in MUTATING_TOOLS and actual_changed_files:
+                refreshed = self.store.get_goal(goal.id)
+                sequence = int(refreshed.metadata.get("mutation_sequence", 0)) + 1
+                self.store.update_goal_metadata(
+                    goal.id,
+                    mutation_sequence=sequence,
+                    convergence_state="reverifying",
+                    latest_evaluation_stale=True,
+                )
+                self.store.append_event(
+                    "quality_evaluation.invalidated", goal_id=goal.id,
+                    payload={
+                        "mutation_sequence": sequence,
+                        "action_id": action_id,
+                        "rules": self.weak_model_policy.applied_rules("mutation"),
+                    },
+                )
+                post_hash: str | None = None
+                diff = ""
+                if pre_path:
+                    post_candidate = (self.workspace / pre_path).resolve(strict=False)
+                    if post_candidate.is_file() and post_candidate.is_relative_to(self.workspace):
+                        post_bytes = post_candidate.read_bytes()
+                        post_hash = hashlib.sha256(post_bytes).hexdigest()
+                        before_text = (pre_bytes or b"").decode("utf-8", errors="replace").splitlines()
+                        after_text = post_bytes.decode("utf-8", errors="replace").splitlines()
+                        diff = "\n".join(difflib.unified_diff(before_text, after_text, fromfile=f"a/{pre_path}", tofile=f"b/{pre_path}", lineterm=""))
+                latest_for_change = self.store.get_goal(goal.id)
+                changes = list(latest_for_change.metadata.get("goal_change_sets", ()))
+                active_refinements = [
+                    action.get("id") for action in latest_for_change.metadata.get("refinement_actions", ())
+                    if isinstance(action, Mapping) and action.get("status") == "pending"
+                ]
+                change_set = {
+                    "id": f"goal-changeset-{len(changes) + 1:04d}",
+                    "version": 1,
+                    "responsible_agent": actor,
+                    "parent_task": task_id,
+                    "refinement_actions": active_refinements,
+                    "quality_target_id": latest_for_change.metadata.get("quality_target", {}).get("id") if isinstance(latest_for_change.metadata.get("quality_target"), Mapping) else None,
+                    "affected_quality_dimensions": sorted({
+                        dimension
+                        for action in latest_for_change.metadata.get("refinement_actions", ())
+                        if isinstance(action, Mapping) and action.get("id") in active_refinements
+                        for dimension in action.get("affected_dimensions", ())
+                    }),
+                    "changed_files": actual_changed_files,
+                    "pre_hashes": {path: mutation_before.get(path) for path in actual_changed_files},
+                    "post_hashes": {path: mutation_after.get(path) for path in actual_changed_files},
+                    "diff": redact_text(diff, 30_000),
+                    "tool_action_ids": [action_id],
+                    "verification_evidence_ids": [],
+                    "review_status": "pending",
+                    "integration_status": "pending",
+                    "mutation_sequence": sequence,
+                }
+                changes.append(change_set)
+                self.store.update_goal_metadata(goal.id, goal_change_sets=changes)
+                self.store.append_event(
+                    "change_set.created", goal_id=goal.id,
+                    entity_type="change_set", entity_id=change_set["id"],
+                    payload={"task_id": task_id, "files": change_set["changed_files"], "mutation_sequence": sequence},
+                )
+                path_value = str(args.get("path", "")).strip()
+                if path_value:
+                    candidate = (self.workspace / path_value).resolve(strict=False)
+                    if candidate.is_file() and candidate.is_relative_to(self.workspace):
+                        indexed = self.repository_index.update(candidate.relative_to(self.workspace).as_posix())
+                        snapshot = {
+                            candidate.relative_to(self.workspace).as_posix(): [
+                                {
+                                    "kind": item.kind, "name": item.name, "start": item.start,
+                                    "end": item.end, "file_hash": item.file_hash,
+                                }
+                                for item in indexed
+                            ]
+                        }
+                        latest = self.store.get_goal(goal.id)
+                        previous = dict(latest.metadata.get("artifact_index", {}))
+                        previous.update(snapshot)
+                        self.store.update_goal_metadata(goal.id, artifact_index=previous)
+                        self.store.append_event(
+                            "artifact_index.updated", goal_id=goal.id,
+                            payload={"path": path_value, "entries": len(indexed), "file_hash": indexed[0].file_hash},
+                        )
+            if terminal == "completed" and actor != "planner":
+                evidence_data: dict[str, Any] = {
+                    "action_id": action_id,
+                    "tool": call.name,
+                    "arguments": redact_data(args),
+                    "result": redact_text(result, 4_000),
+                }
+                path_value = str(args.get("path", "")).strip()
+                if path_value:
+                    candidate = (self.workspace / path_value).resolve(strict=False)
+                    if candidate.is_file() and candidate.is_relative_to(self.workspace):
+                        evidence_data.update(
+                            {
+                                "path": candidate.relative_to(self.workspace).as_posix(),
+                                "file_hash": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+                                "file_exists": True,
+                            }
+                        )
+                self.store.add_evidence(
+                    goal_id=goal.id,
+                    plan_revision=goal.active_plan_revision,
+                    task_id=task_id,
+                    kind="tool_result",
+                    summary=f"{call.name} completed with authoritative harness evidence",
+                    data=evidence_data,
+                    created_by="harness",
+                    verified=True,
+                )
         except (KeyboardInterrupt, SystemExit):
             # Deliberately leave the action running; restart recovery will mark
             # the crash-window side effect uncertain instead of replaying it.
@@ -1914,6 +2909,90 @@ class AgentRuntime:
         except Exception as exc:
             result = f"Error: tool harness failure: {type(exc).__name__}: {redact_text(exc, 500)}"
             self.store.complete_action(action_id, result, status="failed")
+        if result.startswith("Error:"):
+            domain = (
+                FailureDomain.PERMISSION if "permission" in result.casefold()
+                else FailureDomain.SYNTAX if "syntax" in result.casefold()
+                else FailureDomain.TEST if "assert" in result.casefold() or "test" in result.casefold()
+                else FailureDomain.RUNTIME
+            )
+            mentioned_paths = tuple(dict.fromkeys(
+                match.replace("\\", "/")
+                for match in re.findall(r"(?i)([A-Za-z0-9_./\\-]+\.(?:py|js|ts|tsx|jsx|html|css|json|toml|yaml|yml))(?::\d+)?", result)
+            ))
+            explicit_path = str(args.get("path", "")).strip()
+            signature_paths = tuple(dict.fromkeys(filter(None, (explicit_path, *mentioned_paths))))
+            file_hashes: dict[str, str] = {}
+            for relative in signature_paths:
+                candidate = (self.workspace / relative).resolve(strict=False)
+                if candidate.is_file() and candidate.is_relative_to(self.workspace):
+                    file_hashes[relative] = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            exit_match = re.search(r"(?i)(?:exit(?:\s+code)?|returned)\s*[:=]?\s*(-?\d+)", result)
+            signature = ErrorSignature(
+                domain=domain,
+                operation=call.name,
+                command=str(args.get("command", "")),
+                exit_code=int(exit_match.group(1)) if exit_match else None,
+                normalized_message=normalize_error_message(result),
+                paths=signature_paths,
+                file_hashes=file_hashes,
+            )
+            latest = self.store.get_goal(goal.id)
+            failures = list(latest.metadata.get("failed_hypotheses", ()))
+            failures.append({"signature": signature.fingerprint, "operation": call.name, "message": signature.normalized_message})
+            attempts = list(latest.metadata.get("failed_attempts", ()))
+            attempts.append({
+                "signature": signature.fingerprint,
+                "approach_fingerprint": approach_fingerprint,
+                "operation": call.name,
+            })
+            metadata_update: dict[str, Any] = {
+                "failed_hypotheses": failures[-20:], "failed_attempts": attempts[-50:]
+            }
+            contract_data = latest.metadata.get("goal_contract")
+            if isinstance(contract_data, Mapping):
+                contract = GoalContractV1.from_dict(contract_data)
+                for relative in signature_paths:
+                    candidate = (self.workspace / relative).resolve(strict=False)
+                    if candidate.is_file() and candidate.is_relative_to(self.workspace):
+                        self.repository_index.update(candidate.relative_to(self.workspace).as_posix())
+                context_slice = self.repository_index.context_slice(
+                    signature.normalized_message,
+                    max_entries=20,
+                    budget_chars=20_000,
+                )
+                related = context_slice.entries
+                updated_contract = GoalContractV1(**{
+                    **contract.to_dict(),
+                    "failed_hypotheses": (*contract.failed_hypotheses, signature.normalized_message)[-20:],
+                    "file_symbol_scope": tuple(dict.fromkeys((
+                        *contract.file_symbol_scope,
+                        *(f"{entry.path}:{entry.kind}:{entry.name}" for entry in related),
+                        *signature_paths,
+                    ))),
+                    "task_boundaries": (
+                        f"Diagnose {signature.domain.value} failure {signature.fingerprint[:12]}",
+                        "Change only components implicated by authoritative failure evidence",
+                        "Rerun the narrow failing check before broader regression verification",
+                    ),
+                })
+                metadata_update.update(
+                    goal_contract=updated_contract.to_dict(),
+                    goal_contract_fingerprint=updated_contract.fingerprint,
+                    error_context_slice={
+                        "query": signature.normalized_message,
+                        "size_chars": context_slice.size_chars,
+                        "omitted_entries": context_slice.omitted_entries,
+                        "callers": {key: list(value) for key, value in context_slice.callers.items()},
+                        "callees": {key: list(value) for key, value in context_slice.callees.items()},
+                        "dependencies": {key: list(value) for key, value in context_slice.dependencies.items()},
+                    },
+                )
+            self.store.update_goal_metadata(goal.id, **metadata_update)
+            self.store.append_event(
+                "error_signature.created", goal_id=goal.id,
+                payload={"fingerprint": signature.fingerprint, "domain": domain.value, "operation": call.name},
+            )
         self._watchdog.record(scoped_name, args, result)
         return result
 
@@ -1951,6 +3030,18 @@ class AgentRuntime:
         target = mapping[args["status"]]
         if target == TaskStatus.COMPLETED and not args["evidence"]:
             return "Error: done requires concrete evidence; verify the work first."
+        if target == TaskStatus.COMPLETED:
+            task_evidence = [
+                item
+                for item in self.store.list_evidence(goal.id, task_id=args["task_id"])
+                if item.plan_revision == plan.revision
+                and (item.verified or item.created_by == "user")
+            ]
+            if not task_evidence:
+                return (
+                    "Error: done requires authoritative evidence bound to this task. "
+                    "Keep it in_progress and run its required workspace verification first."
+                )
         if target == TaskStatus.BLOCKED and not args["note"].strip():
             return "Error: blocked requires a concrete blocker note."
         try:
@@ -2183,6 +3274,11 @@ class AgentRuntime:
         return report
 
     def _completion_precheck(self, goal: Goal, plan: Plan) -> str | None:
+        quality_state = str(goal.metadata.get("convergence_state", ""))
+        if goal.metadata.get("quality_target") and quality_state in {"below_target", "refining"}:
+            return f"quality target is {quality_state}; concrete refinement and fresh verification are required"
+        if goal.metadata.get("latest_evaluation_stale") and quality_state == "converged":
+            return "the claimed converged evaluation predates the latest mutation"
         if plan.status != PlanStatus.ACCEPTED or goal.active_plan_revision != plan.revision:
             return "the latest plan revision is not accepted"
         incomplete = [
@@ -2193,11 +3289,15 @@ class AgentRuntime:
         if incomplete:
             return f"unfinished checklist items: {', '.join(incomplete)}"
         for task in plan.tasks:
-            if task.status == TaskStatus.COMPLETED and not any(
-                item.plan_revision == plan.revision
-                for item in self.store.list_evidence(goal.id, task_id=task.id)
-            ):
-                return f"completed task {task.id} has no evidence"
+            if task.status == TaskStatus.COMPLETED:
+                task_evidence = [
+                    item for item in self.store.list_evidence(goal.id, task_id=task.id)
+                    if item.plan_revision == plan.revision
+                ]
+                if not task_evidence:
+                    return f"completed task {task.id} has no evidence"
+                if not any(item.verified or item.created_by == "user" for item in task_evidence):
+                    return f"completed task {task.id} has only unverified model-authored prose; authoritative harness or user evidence is required"
         uncertain = self.store.list_actions(goal.id, status="uncertain")
         if uncertain:
             return f"{len(uncertain)} action(s) have uncertain crash-window state"
@@ -2209,6 +3309,26 @@ class AgentRuntime:
         if uncertain_workers:
             return f"{len(uncertain_workers)} delegation(s) have uncertain crash-window state"
         return None
+
+    def _current_artifact_hashes(self, artifact_ids: Iterable[str]) -> dict[str, str]:
+        hashes: dict[str, str] = {}
+        for artifact_id in artifact_ids:
+            relative = str(artifact_id).strip() or "workspace"
+            candidate = self.workspace if relative == "workspace" else (self.workspace / relative).resolve(strict=False)
+            if not candidate.exists() or not candidate.is_relative_to(self.workspace):
+                hashes[relative] = "MISSING"
+                continue
+            if candidate.is_file():
+                hashes[relative] = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                continue
+            members = []
+            for path in sorted(candidate.rglob("*")):
+                if not path.is_file() or any(part in {".git", ".coding-agent", "__pycache__", ".pytest_cache"} for part in path.parts):
+                    continue
+                member = path.relative_to(self.workspace).as_posix()
+                members.append((member, hashlib.sha256(path.read_bytes()).hexdigest()))
+            hashes[relative] = hashlib.sha256(json.dumps(members, separators=(",", ":")).encode("utf-8")).hexdigest()
+        return hashes
 
     def _review_completion(
         self,
@@ -2334,6 +3454,15 @@ class AgentRuntime:
     def _finish_goal(self, goal: Goal, plan: Plan, args: dict[str, Any]) -> str:
         blocked = self._completion_precheck(goal, plan)
         if blocked:
+            self.store.append_event(
+                "completion.rejected", goal_id=goal.id,
+                payload={
+                    "reason": blocked,
+                    "convergence_state": goal.metadata.get("convergence_state"),
+                    "mutation_sequence": goal.metadata.get("mutation_sequence", 0),
+                    "rules": self.weak_model_policy.applied_rules("completion"),
+                },
+            )
             return f"Error: completion gate rejected: {blocked}. Continue the goal."
         self.store.transition_goal(goal.id, GoalStatus.VERIFYING, reason="completion requested; deterministic gate passed")
         self.store.transition_goal(goal.id, GoalStatus.REVIEWING, reason="fresh-context independent review started")
@@ -2356,11 +3485,130 @@ class AgentRuntime:
             verified=verdict["verdict"] == "pass",
         )
         if verdict["verdict"] == "pass":
+            fresh_goal = self.store.get_goal(goal.id)
+            mutation_sequence = int(fresh_goal.metadata.get("mutation_sequence", 0))
+            evidence = self.store.list_evidence(goal.id)
+            hashes = {
+                str(item.data.get("path")): str(item.data.get("file_hash"))
+                for item in evidence
+                if item.data.get("path") and item.data.get("file_hash")
+            }
+            target = fresh_goal.metadata.get("quality_target", {})
+            target_artifacts = tuple(target.get("artifact_ids", ())) if isinstance(target, Mapping) else ()
+            current_hashes = self._current_artifact_hashes(target_artifacts)
+            hashes.update(current_hashes)
+            visual_target = any(str(path).casefold().endswith((".html", ".htm")) for path in target_artifacts)
+            provider_profile = getattr(self.provider, "capability_profile", None)
+            vision_available = bool(
+                getattr(provider_profile, "vision_support", False)
+                or getattr(getattr(self.provider, "capabilities", None), "supports_vision", False)
+            )
+            evaluator_profile = {
+                "version": 1,
+                "test_runner_available": bool(shutil.which("pytest") or (self.workspace / ".venv" / "Scripts" / "pytest.exe").exists()),
+                "static_analyzer_available": bool(shutil.which("ruff") or shutil.which("mypy")),
+                "browser_available": importlib.util.find_spec("playwright") is not None,
+                "screenshot_available": importlib.util.find_spec("playwright") is not None,
+                "vision_evaluator_available": vision_available,
+                "accessibility_checker_available": bool(shutil.which("axe")),
+                "performance_profiler_available": bool(shutil.which("py-spy")),
+                "user_review_required": visual_target and not vision_available,
+                "routing_order": [
+                    "deterministic_verification", "static_analysis", "runtime_integration",
+                    "artifact_structure", "independent_review",
+                    "vision_evaluation" if vision_available else "user_review",
+                ],
+            }
+            convergence_state = "user_review_required" if visual_target and not vision_available else "converged"
+            authoritative_ids = [item.id for item in evidence if item.verified or item.created_by == "user"]
+            dimensions = [dict(item) for item in target.get("dimensions", ())] if isinstance(target, Mapping) else []
+            dimension_scores = []
+            for dimension in dimensions:
+                requires_vision = dimension.get("evaluation_method") == "vision_and_runtime"
+                proven = not requires_vision or vision_available
+                score = 1.0 if proven else 0.0
+                dimension_scores.append({
+                    "dimension_id": dimension.get("id"),
+                    "score": score,
+                    "passed": score >= float(dimension.get("minimum_score", 0.8)),
+                    "evidence_ids": authoritative_ids,
+                    "confidence": "high" if proven else "low",
+                    "finding": None if proven else "subjective visual quality is not provable with available evaluators",
+                })
+                dimension["latest_artifact_hash"] = hashlib.sha256(
+                    json.dumps(hashes, sort_keys=True).encode("utf-8")
+                ).hexdigest() if hashes else None
+                dimension["latest_mutation_sequence"] = mutation_sequence
+            overall_score = (
+                sum(item["score"] for item in dimension_scores) / len(dimension_scores)
+                if dimension_scores else 0.0
+            )
+            target = {**dict(target), "dimensions": dimensions}
+            previous_evaluation = fresh_goal.metadata.get("latest_evaluation")
+            evaluation_record = {
+                "version": 1,
+                "target_id": target.get("id"),
+                "rubric_version": target.get("version", 1),
+                "mutation_sequence": mutation_sequence,
+                "artifact_hashes": hashes,
+                "change_set_ids": [item.get("id") for item in fresh_goal.metadata.get("goal_change_sets", ()) if isinstance(item, Mapping)],
+                "evaluators": ["authoritative_tool_evidence", "independent-reviewer"] + (["vision"] if vision_available else []),
+                "evaluator_capability_profile": evaluator_profile,
+                "evidence_ids": authoritative_ids,
+                "hard_gate_results": {str(gate): True for gate in target.get("hard_gates", ())},
+                "scores": dimension_scores,
+                "overall_score": overall_score,
+                "confidence": "low" if convergence_state == "user_review_required" else "high",
+                "previous_overall_score": previous_evaluation.get("overall_score") if isinstance(previous_evaluation, Mapping) else None,
+                "evaluated_at_unix": time.time(),
+                "contract_fingerprint": fresh_goal.metadata.get("goal_contract_fingerprint"),
+            }
+            reviewed_change_sets = []
+            for change_set in fresh_goal.metadata.get("goal_change_sets", ()):
+                if not isinstance(change_set, Mapping):
+                    continue
+                reviewed_change_sets.append({
+                    **dict(change_set),
+                    "verification_evidence_ids": [item.id for item in evidence if item.verified],
+                    "review_status": "passed",
+                    "integration_status": "integrated",
+                })
+            self.store.update_goal_metadata(
+                goal.id,
+                convergence_state=convergence_state,
+                latest_evaluation_stale=False,
+                latest_evaluation=evaluation_record,
+                quality_target=target,
+                evaluator_capability_profile=evaluator_profile,
+                goal_change_sets=reviewed_change_sets,
+            )
+            self.store.append_event(
+                "quality_convergence.decided", goal_id=goal.id,
+                payload={"state": convergence_state, "mutation_sequence": mutation_sequence, "artifact_hashes": hashes},
+            )
+            if convergence_state == "user_review_required":
+                self.store.transition_goal(
+                    goal.id, GoalStatus.PAUSED,
+                    reason="deterministic and independent checks passed, but subjective visual quality lacks a trustworthy evaluator",
+                    metadata={
+                        "waiting_question": "Review the latest visual artifact and explicitly accept it or provide refinement feedback.",
+                        "resume_status": GoalStatus.RUNNING.value,
+                    },
+                )
+                return "Candidate verified structurally, but subjective visual quality requires user review; it was not released as a verified final result."
             self.store.transition_goal(
                 goal.id,
                 GoalStatus.COMPLETED,
                 reason="all checklist evidence passed independent final review",
                 metadata={"completion_summary": redact_text(args["summary"], 4_000)},
+            )
+            self.store.save_workflow_session(
+                self.session_id,
+                goal_id=goal.id,
+                session_mode=SessionMode.GOAL.value,
+                plan_state=PlanState.APPROVED.value,
+                run_state=RunState.COMPLETED.value,
+                state={"plan_revision": plan.revision, "completion": "evidence_gate_passed"},
             )
             self.events.publish("phase", "Goal completed after evidence gate and independent review.")
             return "Goal completed. The harness accepted the independent review."
@@ -2393,12 +3641,40 @@ class AgentRuntime:
                     "origin": "reviewer",
                 }
             )
-        self.revise_plan(
+        new_plan = self.revise_plan(
             reason=f"independent review failed: {verdict['summary']}",
             add=repair_tasks,
             proposed_by="reviewer",
         )
-        return "Independent review failed. Repair tasks were added as a new revision pending user approval."
+        refreshed = self.store.get_goal(goal.id)
+        actions = list(refreshed.metadata.get("refinement_actions", ()))
+        for repair in repair_tasks:
+            actions.append({
+                "id": f"refinement-{len(actions) + 1:03d}",
+                "feedback": verdict["summary"],
+                "affected_dimensions": ["functional_correctness", "regression_safety"],
+                "affected_components": [],
+                "objective": repair["description"],
+                "acceptance_criteria": repair["acceptance_criteria"],
+                "verification": repair["verification"],
+                "status": "pending",
+                "source": "independent-reviewer",
+            })
+        self.store.update_goal_metadata(
+            goal.id,
+            refinement_actions=actions,
+            convergence_state="refining",
+        )
+        self.store.append_event(
+            "refinement_cycle.started", goal_id=goal.id,
+            payload={"source_evaluation": "independent-reviewer", "repair_tasks": [item["id"] for item in repair_tasks], "plan_revision": new_plan.revision},
+        )
+        accepted_repair = self.approve_plan(new_plan.revision, approved_by="harness-quality-convergence")
+        self.store.update_goal_metadata(goal.id, refinement_actions=actions, convergence_state="refining")
+        return (
+            f"Independent review found {len(repair_tasks)} deficiency task(s). "
+            f"Harness-approved in-scope repair plan r{accepted_repair.revision}; Goal refinement continues autonomously."
+        )
 
     def _handle_control_call(self, goal: Goal, plan: Plan, call: ToolCall) -> str:
         try:
@@ -2462,9 +3738,19 @@ class AgentRuntime:
                 plan = self.store.get_latest_plan(goal.id)
                 if goal.status != GoalStatus.RUNNING or plan is None or plan.status != PlanStatus.ACCEPTED:
                     break
+                plan, selected = self._activate_ready_task(goal, plan)
                 request_conversation = [
                     *self._work_conversation,
-                    {"role": "user", "content": state_envelope(self._state_payload(goal, plan))},
+                    {
+                        "role": "user",
+                        "content": state_envelope(
+                            {
+                                **self._state_payload(goal, plan),
+                                "harness_selected_task": None if selected is None else _task_dict(selected),
+                                "selection_rule": "Work only on the harness-selected first dependency-ready task.",
+                            }
+                        ),
+                    },
                 ]
                 try:
                     turn = self._call_provider(
@@ -2529,11 +3815,19 @@ class AgentRuntime:
                     if not result.startswith("Error:") and not result.startswith("Permission denied"):
                         made_progress = True
 
-                self._work_conversation = context.maybe_compact(
+                durable_checkpoint = state_envelope(self._state_payload(
+                    self.store.get_goal(goal.id),
+                    self.store.get_latest_plan(goal.id),
+                ))
+                self._work_conversation = context.suspend_and_revive(
                     self._work_conversation,
+                    durable_checkpoint,
                     self.provider.summarize,
                     max_chars=self.config.conversation_chars,
-                    on_compact=lambda count: self.events.publish("checkpoint", f"Compacted {count} older messages; durable state was retained."),
+                    on_suspend=lambda count: self.events.publish(
+                        "checkpoint",
+                        f"Suspended {count} transient messages and revived a fresh model context from durable goal memory.",
+                    ),
                 )
                 if self.store.get_goal(goal.id).status != GoalStatus.RUNNING:
                     break
@@ -2682,5 +3976,435 @@ class AgentRuntime:
             text = args["text"]
             if not text:
                 return None
+            goal, plan = self.active_goal(), self.latest_plan()
+            if (
+                goal is not None
+                and plan is not None
+                and goal.status is GoalStatus.AWAITING_PLAN_APPROVAL
+                and plan.status is PlanStatus.PENDING_APPROVAL
+                and is_unambiguous_plan_approval(text)
+            ):
+                self.store.append_event(
+                    "plan.natural_language_approval",
+                    goal_id=goal.id,
+                    entity_type="plan",
+                    entity_id=plan.id,
+                    payload={"utterance": redact_text(text, 200)},
+                )
+                return self.approve_plan(plan.revision)
             return self.start_goal(text) if self.active_goal() is None else self.add_guidance(text)
         return None
+
+    @staticmethod
+    def _chat_path_hash(workspace: Path, relative: str) -> str | None:
+        if not relative or relative == ".":
+            return None
+        try:
+            candidate = (workspace / relative).resolve(strict=True)
+            candidate.relative_to(workspace)
+            if candidate.is_file():
+                return hashlib.sha256(candidate.read_bytes()).hexdigest()
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return None
+
+    @staticmethod
+    def _chat_workspace_hashes(workspace: Path) -> dict[str, str]:
+        ignored = {".coding-agent", ".git", ".venv", "node_modules", "__pycache__", ".pytest_cache"}
+        result: dict[str, str] = {}
+        for candidate in workspace.rglob("*"):
+            try:
+                relative = candidate.relative_to(workspace)
+                if any(part in ignored for part in relative.parts) or not candidate.is_file():
+                    continue
+                if candidate.stat().st_size > 10_000_000:
+                    continue
+                result[relative.as_posix()] = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                if len(result) >= 5_000:
+                    break
+            except OSError:
+                continue
+        return result
+
+    def _artifactize_chat_text(self, text: str) -> tuple[str, tuple[dict[str, Any], ...]]:
+        """Persist large generated code and replace provider history with stable handles."""
+
+        original = str(text or "")
+        artifacts: list[dict[str, Any]] = []
+        pattern = re.compile(r"```([\w.+-]*)\s*\n([\s\S]*?)```", re.MULTILINE)
+
+        def replace(match: re.Match[str]) -> str:
+            language = (match.group(1) or "text").casefold()
+            content = match.group(2)
+            if len(content) < 2_048 and "<!doctype html" not in content.casefold():
+                return match.group(0)
+            names = {
+                "html": "index.html", "javascript": "generated.js", "js": "generated.js",
+                "python": "generated.py", "py": "generated.py", "css": "styles.css",
+            }
+            artifact = self.store.add_chat_artifact(
+                self.session_id, content, language=language,
+                suggested_name=names.get(language, "generated.txt"),
+            )
+            artifacts.append(artifact)
+            return (
+                f"<CHAT_ARTIFACT id=\"{artifact['id']}\" language=\"{language}\" "
+                f"suggested_name=\"{artifact['suggested_name']}\" sha256=\"{artifact['content_hash']}\" "
+                f"bytes=\"{artifact['byte_size']}\" />"
+            )
+
+        compact = pattern.sub(replace, original)
+        if not artifacts and len(original) >= 2_048 and "<!doctype html" in original.casefold():
+            start = original.casefold().find("<!doctype html")
+            content = original[start:]
+            artifact = self.store.add_chat_artifact(
+                self.session_id, content, language="html", suggested_name="index.html",
+            )
+            artifacts.append(artifact)
+            compact = (
+                f"<CHAT_ARTIFACT id=\"{artifact['id']}\" language=\"html\" suggested_name=\"index.html\" "
+                f"sha256=\"{artifact['content_hash']}\" bytes=\"{artifact['byte_size']}\" />"
+            )
+        return compact, tuple(artifacts)
+
+    def _execute_chat_tool(
+        self,
+        call: ToolCall,
+        intent: ChatIntentV1,
+    ) -> tuple[tools.ToolExecutionResult, tuple[str, ...]]:
+        spec = tools.get_spec(call.name)
+        args = call.args if isinstance(call.args, dict) else {}
+        if spec is None:
+            return tools.ToolExecutionResult(False, f"Error: unknown chat tool {call.name!r}"), ()
+        risk = spec.risk
+        normal_requirement = tools.requires_approval(call.name, args)
+        needs_approval = (
+            self.permission_adapter.requires_approval(normal_requirement)
+            if self.permission_adapter is not None else normal_requirement
+        )
+        if call.name == "open_path" or (call.name == "preview_html" and bool(args.get("open_browser", True))):
+            needs_approval = True
+        if intent.authorizes(call.name):
+            needs_approval = False
+        action_id = self.store.begin_session_action(
+            self.session_id, call.name, redact_data(args), risk=risk,
+            mutating=spec.mutates_workspace,
+        )
+        self.events.publish("tool_call", call.name, args=redact_data(args), actor="chat", id=call.id)
+        if needs_approval and not self.approval(call.name, dict(args), risk):
+            result = tools.ToolExecutionResult(False, "Permission denied by the user.", error_code="permission")
+            self.store.complete_session_action(action_id, result.output, status="denied")
+            return result, ()
+
+        candidate_paths = [
+            str(args.get(field, "")).strip()
+            for field in spec.path_fields
+            if str(args.get(field, "")).strip() not in {"", "."}
+        ]
+        if call.name == "apply_patch":
+            for match in re.finditer(r"(?m)^\+\+\+\s+(?:b/)?([^\t\r\n]+)", str(args.get("patch", ""))):
+                if match.group(1) != "/dev/null":
+                    candidate_paths.append(match.group(1).strip())
+        before = {path: self._chat_path_hash(self.workspace, path) for path in candidate_paths}
+        workspace_before = (
+            self._chat_workspace_hashes(self.workspace)
+            if call.name in {"run_bash", "run_command", "install_dependencies"}
+            else {}
+        )
+        try:
+            with tools.workspace_context(self.workspace):
+                if call.name in {"run_bash", "run_command"} and self.permission_adapter is not None:
+                    command = str(args.get("command", ""))
+                    if (
+                        call.name == "run_command"
+                        and str(args.get("cwd", ".")).strip() not in {"", "."}
+                        and self.permission_adapter.access_level.value == "full"
+                    ):
+                        command = f"cd -- {shlex.quote(str(args['cwd']))} && {command}"
+                    detailed = self.permission_adapter.run_shell(
+                        command,
+                        self.workspace,
+                        normal_runner=lambda value: tools.run_tool(
+                            call.name,
+                            {**args, "command": value},
+                        ),
+                    )
+                    result = tools.ToolExecutionResult.from_output(detailed)
+                elif (
+                    call.name in {"start_process", "install_dependencies"}
+                    and self.permission_adapter is not None
+                    and self.permission_adapter.access_level.value == "full"
+                ):
+                    result = tools.ToolExecutionResult(
+                        False,
+                        f"Error: {call.name} cannot run as a persistent host action in Full Docker mode; use run_command inside Docker or switch to Normal.",
+                        error_code="sandbox",
+                    )
+                else:
+                    result = tools.run_tool_detailed(call.name, args)
+            if call.name in {"run_bash", "run_command"} and result.ok:
+                shell_exit = re.search(r"(?im)^exit code:\s*(-?\d+)", result.output)
+                if shell_exit and int(shell_exit.group(1)) != 0:
+                    result = tools.ToolExecutionResult(
+                        False,
+                        "Error: shell command failed; " + result.output,
+                        error_code="nonzero_exit",
+                    )
+            if call.name == "preview_html" and result.ok:
+                try:
+                    preview_result = json.loads(result.output)
+                    incomplete = (
+                        (bool(args.get("open_browser", True)) and not preview_result.get("browser_opened"))
+                        or (
+                            bool(args.get("verify", True))
+                            and preview_result.get("verification") in {None, "unavailable", "not_requested"}
+                        )
+                    )
+                    if incomplete:
+                        result = tools.ToolExecutionResult(
+                            False,
+                            "Error: HTML preview started but the requested browser open/verification capability was unavailable: "
+                            + result.output,
+                            error_code="browser_unavailable",
+                        )
+                except (TypeError, json.JSONDecodeError):
+                    result = tools.ToolExecutionResult(False, "Error: preview_html returned malformed evidence", error_code="invalid_result")
+            if call.name == "start_process" and result.ok:
+                try:
+                    process_result = json.loads(result.output)
+                    if not process_result.get("ready") or process_result.get("status") != "running":
+                        result = tools.ToolExecutionResult(
+                            False,
+                            "Error: managed process did not reach its requested ready state: " + result.output,
+                            error_code="process_not_ready",
+                        )
+                except (TypeError, json.JSONDecodeError):
+                    result = tools.ToolExecutionResult(False, "Error: start_process returned malformed evidence", error_code="invalid_result")
+            result = tools.ToolExecutionResult(
+                result.ok,
+                redact_text(result.output, 50_000),
+                data=result.data,
+                changed_paths=result.changed_paths,
+                error_code=result.error_code,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            result = tools.ToolExecutionResult(
+                False,
+                f"Error: Chat tool harness failure: {type(exc).__name__}: {redact_text(exc, 500)}",
+                error_code="harness",
+            )
+        after = {path: self._chat_path_hash(self.workspace, path) for path in candidate_paths}
+        changed_list = [path for path in candidate_paths if result.ok and before.get(path) != after.get(path)]
+        if workspace_before and result.ok:
+            workspace_after = self._chat_workspace_hashes(self.workspace)
+            changed_list.extend(
+                path for path in sorted(set(workspace_before) | set(workspace_after))
+                if workspace_before.get(path) != workspace_after.get(path)
+            )
+        changed = tuple(dict.fromkeys(changed_list))
+        self.store.complete_session_action(
+            action_id,
+            redact_text(result.output, 2_000),
+            status="completed" if result.ok else "failed",
+            changed_paths=changed,
+        )
+        if result.ok and call.name in {
+            "start_process", "poll_process", "stop_process",
+            "preview_html", "inspect_preview", "stop_preview",
+        }:
+            try:
+                resource = json.loads(result.output)
+                resource_id = str(resource.get("process_id") or resource.get("preview_id") or "")
+                if resource_id:
+                    self.store.save_managed_resource(
+                        resource_id,
+                        self.session_id,
+                        kind="preview" if resource_id.startswith("preview-") else "process",
+                        status=str(resource.get("status") or ("stopped" if resource.get("stopped") else "running")),
+                        metadata=resource,
+                    )
+            except (TypeError, json.JSONDecodeError):
+                pass
+        return result, changed
+
+    @staticmethod
+    def _chat_evidence(outputs: list[tuple[str, str]]) -> str:
+        evidence: list[str] = []
+        for name, output in outputs[-5:]:
+            if name == "preview_html":
+                try:
+                    payload = json.loads(output)
+                    evidence.append(
+                        f"preview {payload.get('url')} · HTTP {payload.get('http_status')} · "
+                        f"verification {payload.get('verification')} · browser_opened={payload.get('browser_opened')}"
+                    )
+                    continue
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            evidence.append(f"{name}: {' '.join(output.split())[:240]}")
+        return "\n".join(f"- {item}" for item in evidence)
+
+    def chat(self, text: str, *, steps: int = 12) -> SliceResult:
+        """Run ordinary Chat with durable artifacts and action postcondition gates."""
+
+        prompt = str(text).strip()
+        if not prompt:
+            return SliceResult("idle", "", 0)
+        user_message = {"role": "user", "content": prompt}
+        self._chat_conversation.append(user_message)
+        self.store.append_chat_message(self.session_id, user_message)
+        session = self.store.get_workflow_session(self.session_id)
+        session_state = dict(session.get("state", {}))
+        session_state.setdefault("run_id", f"run-{hashlib.sha256((prompt + str(time.time_ns())).encode()).hexdigest()[:20]}")
+        session_state.setdefault("original_objective", prompt)
+        session_state.setdefault("user_messages", [])
+        session_state["user_messages"] = [*session_state["user_messages"], prompt][-50:]
+
+        intent = ChatIntentV1.parse(prompt)
+        known_artifacts = self.store.list_chat_artifacts(self.session_id)
+        latest_html = next((item for item in reversed(known_artifacts) if item.get("language") == "html"), None)
+        if intent.requires_run and latest_html is not None:
+            suggested = str(latest_html.get("suggested_name") or "index.html")
+            if not (self.workspace / suggested).exists():
+                intent = ChatIntentV1(prompt, requires_write=True, requires_run=True, requires_install=intent.requires_install)
+
+        capability_rows = tools.capability_report()
+        capabilities = json.dumps(capability_rows, ensure_ascii=False)
+        artifact_rows = [
+            {key: item.get(key) for key in ("id", "language", "suggested_name", "content_hash", "byte_size")}
+            for item in known_artifacts[-10:]
+        ]
+        system = CHAT_SYSTEM_PROMPT + "\n\nRUNTIME CAPABILITIES:\n" + capabilities
+        if artifact_rows:
+            system += "\n\nDURABLE CHAT ARTIFACTS:\n" + json.dumps(artifact_rows, ensure_ascii=False)
+
+        executed = 0
+        changed_paths: list[str] = []
+        successful_tools: list[str] = []
+        successful_outputs: list[tuple[str, str]] = []
+        failure_outputs: list[str] = []
+        no_action_attempts = 0
+        final_text = ""
+
+        for step in range(1, max(1, steps) + 1):
+            turn = self._call_provider(
+                self._chat_conversation,
+                list(tools.TOOL_SCHEMAS),
+                system,
+                actor="chat",
+                step=step,
+                stream_text=False,
+            )
+            message = turn.to_message()
+            display_text = turn.text or ""
+            if turn.text:
+                compact_text, created = self._artifactize_chat_text(turn.text)
+                message["content"] = compact_text
+                if created:
+                    session_state["chat_artifact_ids"] = list(dict.fromkeys([
+                        *session_state.get("chat_artifact_ids", []), *(item["id"] for item in created)
+                    ]))
+            self._chat_conversation.append(message)
+            self.store.append_chat_message(self.session_id, message)
+
+            if turn.tool_calls:
+                for call in turn.tool_calls:
+                    result, changed = self._execute_chat_tool(call, intent)
+                    executed += 1
+                    tool_message = {"role": "tool", "id": call.id, "name": call.name, "content": result.output}
+                    self._chat_conversation.append(tool_message)
+                    self.store.append_chat_message(self.session_id, tool_message)
+                    self.events.publish("tool_result", result.output, tool=call.name, actor="chat", id=call.id)
+                    if result.ok:
+                        successful_tools.append(call.name)
+                        successful_outputs.append((call.name, result.output))
+                        changed_paths.extend(changed)
+                    else:
+                        failure_outputs.append(result.output)
+                continue
+
+            missing = intent.missing(successful_tools)
+            if missing:
+                if intent.requires_run and "?" in display_text and latest_html is None:
+                    candidates = [
+                        path for path in self.workspace.rglob("*.htm*")
+                        if ".coding-agent" not in path.parts
+                    ]
+                    if len(candidates) != 1:
+                        # A real target choice is allowed; capability denial is not.
+                        final_text = display_text
+                        break
+                no_action_attempts += 1
+                if no_action_attempts >= self.config.no_action_limit:
+                    detail = failure_outputs[-1] if failure_outputs else "the model repeatedly returned prose without using the available tools"
+                    final_text = f"Action could not be completed: {detail}"
+                    break
+                correction = corrective_prompt(intent, missing, capabilities)
+                correction_message = {"role": "user", "content": correction}
+                self._chat_conversation.append(correction_message)
+                self.store.append_chat_message(self.session_id, correction_message)
+                continue
+
+            final_text = display_text or "Completed the requested action."
+            break
+
+        if not final_text:
+            final_text = f"Chat turn checkpointed after {executed} tool action(s); execution can continue in the same session."
+        if successful_outputs and intent.actionable:
+            final_text = final_text.rstrip() + "\n\nEvidence:\n" + self._chat_evidence(successful_outputs)
+
+        artifacts = list(dict.fromkeys(changed_paths))
+        if artifacts:
+            session_state["below_target_continuation"] = {
+                "status": "below_target",
+                "objective": session_state["original_objective"],
+                "target": "evidence-backed convergence",
+                "weaknesses": ["candidate has not passed independent evaluation"],
+                "expected_refinement_scope": artifacts,
+                "artifacts": artifacts,
+                "recommended_action": "continue the same run in Goal mode",
+                "memory_preserved": True,
+            }
+            final_text += (
+                "\n\nQuality status: BELOW_TARGET (not independently evaluated). "
+                "The artifact and action evidence are preserved for Goal mode."
+            )
+        self.store.save_workflow_session(
+            self.session_id, goal_id=None, session_mode=SessionMode.CHAT.value,
+            plan_state=PlanState.NONE.value, run_state=RunState.IDLE.value, state=session_state,
+        )
+        return SliceResult("chat", final_text, executed)
+
+    def sleep_profile(self, action: str, mode: Any) -> Mapping[str, Any]:
+        """Control session-scoped Sleep without weakening Ultra/Docker gates."""
+
+        from .config import InteractionMode
+        from .sandbox import AccessLevel
+
+        normalized = str(action).strip().lower()
+        if normalized == "status":
+            return self.sleep_controller.status()
+        if normalized == "off":
+            self.sleep_controller.disable()
+            return self.sleep_controller.status()
+        selected = InteractionMode.parse(mode)
+        access = self.permission_adapter.access_level if self.permission_adapter else AccessLevel.NORMAL
+        goal = self.active_goal() or self.store.get_latest_goal()
+        run_id = str(goal.metadata.get("ultra_run_id", "")) if goal else ""
+        uncertain = bool(
+            run_id
+            and any(
+                item.status is ChangeSetStatus.UNCERTAIN
+                for item in self.store.list_change_sets(run_id)
+            )
+        )
+        self.sleep_controller.enable(
+            mode=selected,
+            access_level=access,
+            docker_ready=access is AccessLevel.FULL,
+            safe_checkpoint=bool(self.ultra_session and self.ultra_session.safe_for_reconfiguration),
+            active_uncertain_mutation=uncertain,
+        )
+        return self.sleep_controller.status()

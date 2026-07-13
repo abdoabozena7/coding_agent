@@ -44,8 +44,9 @@ class OpenAIProvider:
         native_replay=False,
     )
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, reasoning_effort: str = "medium"):
         self.model = model or os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
+        self.reasoning_effort = str(reasoning_effort)
         self._client = None
 
     def _client_(self) -> OpenAI:
@@ -143,6 +144,7 @@ class OpenAIProvider:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        request["reasoning_effort"] = self.reasoning_effort
         if tools:
             request["tools"] = tools
         stream = self._client_().chat.completions.create(**request)

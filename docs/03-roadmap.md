@@ -8,6 +8,10 @@ harness. Every checked phase has offline regression coverage.
 - [x] Provider-neutral streaming tool loop (OpenAI, Gemini, Ollama)
 - [x] Contained read/list/grep and atomic edit/write tools
 - [x] Fully approval-gated shell with explicit workspace and scrubbed environment
+- [x] Typed central tool registry and shared Chat workspace/permission execution boundary
+- [x] Durable generated-code artifacts and action-oriented prose-refusal recovery
+- [x] Project-local dependency install, managed processes, and secure loopback HTML preview
+- [x] Playwright browser verification with console/page/network evidence and screenshots
 - [x] Sensitive-file and private-key exfiltration policy
 - [x] Typed goal/plan/task/evidence/delegation domain model
 - [x] Transactional workspace-local SQLite state and event/action journal
@@ -26,6 +30,7 @@ harness. Every checked phase has offline regression coverage.
 - [x] Deterministic completion precheck and independent final review
 - [x] Review failures converted to approval-gated repair revisions
 - [x] Responsive ASCII dashboard, history, commands, pause/resume, auto mode
+- [x] Full-screen keyboard-first setup, contextual command palette, and semantic activity motion
 - [x] Import-safe package/CLI and deterministic `ScriptedProvider` tests
 
 ## High-value future extensions
@@ -39,7 +44,8 @@ single-process harness:
 - Provider-native structured-output/forced-tool modes where uniformly available.
 - Token/cost budgets and interactive rate-limit dashboards.
 - Searchable artifact indexes for multi-million-line repositories.
-- Full-screen `prompt_toolkit` renderer; the event bus already decouples UI/runtime.
+- Persistent full-screen activity/composer renderer; startup and nested pickers
+  already use the alternate-screen `prompt_toolkit` UI.
 - MCP/server tools, web research, and external connectors behind the same policy API.
 - Benchmarks comparing task success, cost, and recovery across small/large models.
 

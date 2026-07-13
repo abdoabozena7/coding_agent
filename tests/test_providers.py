@@ -12,6 +12,7 @@ from agent.providers import AssistantTurn, ProviderCapabilities, ToolCall, Usage
 from agent.providers.base import coerce_tool_args
 from agent.providers.gemini_provider import GeminiProvider
 from agent.providers.ollama_provider import OllamaProvider
+from agent.local_provider import ProviderFailureKind, ProviderRequestError
 from agent.providers.openai_provider import OpenAIProvider
 from agent.testing import ScriptedProvider, ScriptedTurn
 
@@ -259,6 +260,59 @@ class GeminiProviderTests(unittest.TestCase):
 
 
 class OllamaProviderTests(unittest.TestCase):
+    def test_local_context_is_bounded_in_every_chat_request(self):
+        provider = OllamaProvider(model="offline", context_size=16_384, num_gpu=0, max_output_tokens=2048, force_json=True)
+        provider.capability_profile = __import__("agent.local_provider", fromlist=["ModelCapabilityProfile"]).ModelCapabilityProfile(
+            "offline", tool_call_support=True, thinking_support=True, health_status="reachable"
+        )
+        provider._post_json = Mock(return_value=io.BytesIO(b'{"message":{"content":"ok"},"done":true}\n'))
+
+        provider.call([], [], "system")
+
+        payload = provider._post_json.call_args.args[1]
+        self.assertEqual(payload["options"]["num_ctx"], 16_384)
+        self.assertEqual(payload["options"]["num_gpu"], 0)
+        self.assertEqual(payload["options"]["num_predict"], 2048)
+        self.assertEqual(payload["think"], "medium")
+        self.assertEqual(payload["format"], "json")
+
+    def test_internal_off_reasoning_maps_to_ollama_think_false(self):
+        provider = OllamaProvider(model="offline", reasoning_effort="off")
+        provider.capability_profile = __import__("agent.local_provider", fromlist=["ModelCapabilityProfile"]).ModelCapabilityProfile(
+            "offline", thinking_support=True, health_status="reachable"
+        )
+        provider._post_json = Mock(return_value=io.BytesIO(b'{"message":{"content":"ok"},"done":true}\n'))
+
+        provider.call([], [], "system")
+
+        self.assertIs(provider._post_json.call_args.args[1]["think"], False)
+
+    def test_unsupported_tools_rejection_is_adapted_once_without_faking_connectivity_failure(self):
+        provider = OllamaProvider(model="offline")
+        provider.capability_profile = __import__("agent.local_provider", fromlist=["ModelCapabilityProfile"]).ModelCapabilityProfile(
+            "offline", tool_call_support=True, health_status="reachable"
+        )
+        rejection = ProviderRequestError(__import__("agent.local_provider", fromlist=["ProviderDiagnostic"]).ProviderDiagnostic(
+            True, ProviderFailureKind.UNSUPPORTED_TOOLS, "POST", 400,
+            "tools are not supported", "/api/chat", "tools",
+        ))
+        valid = io.BytesIO(b'{"message":{"content":"fallback"},"done":true}\n')
+        provider._post_json = Mock(side_effect=[rejection, valid])
+
+        turn = provider.call([], [{"type":"function","function":{"name":"x"}}], "system")
+
+        self.assertEqual(turn.text, "fallback")
+        self.assertEqual(provider._post_json.call_count, 2)
+        self.assertIn("tools", provider.capability_profile.known_unsupported_parameters)
+        self.assertNotIn("tools", provider._post_json.call_args_list[1].args[1])
+
+    def test_completely_malformed_stream_is_classified_not_silently_accepted(self):
+        provider = OllamaProvider(model="offline")
+        provider._post_json = Mock(return_value=io.BytesIO(b"not-json\n{broken\n"))
+        with self.assertRaises(ProviderRequestError) as raised:
+            provider.call([], [], "system")
+        self.assertEqual(raised.exception.diagnostic.kind, ProviderFailureKind.MALFORMED_STREAM)
+
     def test_thinking_tool_name_and_bad_ndjson_are_robust(self):
         lines = [
             b"not-json\n",

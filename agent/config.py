@@ -11,6 +11,7 @@ from typing import Any
 class InteractionMode(str, Enum):
     """Session input policy; separate from durable goal/task lifecycle state."""
 
+    CHAT = "chat"
     PLAN = "plan"
     GOAL = "goal"
     ULTRA = "ultra"
@@ -21,8 +22,8 @@ class InteractionMode(str, Enum):
             return value
         normalized = str(value).strip().lower()
         aliases = {
-            "manual": cls.PLAN.value,
-            "default": cls.PLAN.value,
+            "manual": cls.CHAT.value,
+            "default": cls.CHAT.value,
             "auto": cls.GOAL.value,
             "agent": cls.GOAL.value,
             "deep": cls.ULTRA.value,
@@ -32,18 +33,37 @@ class InteractionMode(str, Enum):
         try:
             return cls(normalized)
         except ValueError as exc:
-            raise ValueError("mode must be 'plan', 'goal', or 'ultra'") from exc
+            raise ValueError("mode must be 'chat', 'plan', 'goal', or 'ultra'") from exc
+
+
+class ReasoningEffort(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+
+    @classmethod
+    def parse(cls, value: str | "ReasoningEffort") -> "ReasoningEffort":
+        if isinstance(value, cls):
+            return value
+        normalized = str(value).strip().lower().replace("-", "")
+        aliases = {"minimal": "low", "default": "medium", "max": "xhigh", "extra_high": "xhigh"}
+        normalized = aliases.get(normalized, normalized)
+        try:
+            return cls(normalized)
+        except ValueError as exc:
+            raise ValueError("reasoning effort must be low, medium, high, or xhigh") from exc
 
 
 @dataclass
 class SessionPreferences:
     """Mutable UI preferences that intentionally last only for this process."""
 
-    mode: InteractionMode = InteractionMode.PLAN
+    mode: InteractionMode = InteractionMode.CHAT
 
     @classmethod
     def from_env(cls, mode: str | None = None) -> "SessionPreferences":
-        return cls(mode=InteractionMode.parse(mode or os.getenv("AGENT_MODE", "plan")))
+        return cls(mode=InteractionMode.parse(mode or os.getenv("AGENT_MODE", "chat")))
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -57,6 +77,18 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     if not minimum <= value <= maximum:
         raise ValueError(f"{name} must be between {minimum} and {maximum}")
     return value
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    normalized = raw.strip().casefold()
+    if normalized in {"1", "true", "yes", "on", "required", "gpu"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "optional", "cpu"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
 
 
 @dataclass(frozen=True)
@@ -85,6 +117,8 @@ class RuntimeConfig:
     ultra_fix_attempts: int = 3
     prompt_trace_chars: int = 256_000
     role_memory_ttl_hours: int = 168
+    require_local_gpu: bool = False
+    repository_index_warmup_files: int = 200
 
     @classmethod
     def from_env(cls) -> "RuntimeConfig":
@@ -111,6 +145,8 @@ class RuntimeConfig:
             ultra_fix_attempts=_env_int("AGENT_ULTRA_FIX_ATTEMPTS", 3, 1, 20),
             prompt_trace_chars=_env_int("AGENT_PROMPT_TRACE_CHARS", 256_000, 16_000, 2_000_000),
             role_memory_ttl_hours=_env_int("AGENT_ROLE_MEMORY_TTL_HOURS", 168, 1, 8_760),
+            require_local_gpu=_env_bool("AGENT_REQUIRE_LOCAL_GPU", False),
+            repository_index_warmup_files=_env_int("AGENT_REPOSITORY_INDEX_WARMUP_FILES", 200, 0, 100_000),
         )
         if config.goal_retry_base_ms > config.goal_retry_max_ms:
             raise ValueError("AGENT_GOAL_RETRY_BASE_MS cannot exceed AGENT_GOAL_RETRY_MAX_MS")
@@ -142,6 +178,11 @@ RUNTIME_SETTING_BOUNDS: dict[str, tuple[int, int]] = {
     "ultra_fix_attempts": (1, 20),
     "prompt_trace_chars": (16_000, 2_000_000),
     "role_memory_ttl_hours": (1, 8_760),
+    "repository_index_warmup_files": (0, 100_000),
+}
+
+RUNTIME_BOOL_SETTINGS: set[str] = {
+    "require_local_gpu",
 }
 
 RUNTIME_SETTING_ALIASES: dict[str, str] = {
@@ -159,6 +200,12 @@ RUNTIME_SETTING_ALIASES: dict[str, str] = {
     "ultra_depth": "ultra_max_depth",
     "ultra_nodes": "ultra_max_nodes",
     "fix_attempts": "ultra_fix_attempts",
+    "gpu": "require_local_gpu",
+    "require_gpu": "require_local_gpu",
+    "local_gpu": "require_local_gpu",
+    "repo_index_warmup": "repository_index_warmup_files",
+    "repository_index_warmup": "repository_index_warmup_files",
+    "index_warmup": "repository_index_warmup_files",
 }
 
 
@@ -179,6 +226,8 @@ def update_runtime_config(config: RuntimeConfig, key: str, raw_value: str) -> Ru
     """Return a validated session config with one integer setting replaced."""
 
     normalized = normalize_runtime_setting_name(key)
+    if normalized in RUNTIME_BOOL_SETTINGS:
+        return replace(config, **{normalized: _parse_bool_value(normalized, raw_value)})
     if normalized not in RUNTIME_SETTING_BOUNDS:
         available = ", ".join(runtime_setting_names())
         raise ValueError(f"unknown setting {key!r}; available runtime settings: {available}")
@@ -195,3 +244,12 @@ def update_runtime_config(config: RuntimeConfig, key: str, raw_value: str) -> Ru
     if updated.ultra_top_modules_min > updated.ultra_top_modules_max:
         raise ValueError("ultra_top_modules_min cannot exceed ultra_top_modules_max")
     return updated
+
+
+def _parse_bool_value(name: str, raw_value: str) -> bool:
+    normalized = str(raw_value).strip().casefold()
+    if normalized in {"1", "true", "yes", "on", "required", "gpu"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "optional", "cpu"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")

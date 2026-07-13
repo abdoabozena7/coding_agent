@@ -501,6 +501,13 @@ class DeterministicWaveScheduler:
                     error="a dependency did not complete successfully",
                 )
 
+            # Recompute failed IDs on the next pass so blocked state cascades
+            # through an arbitrarily deep dependency chain. Without this, a
+            # failure at M001 blocks M002 and is then misreported as a cycle in
+            # M003+.
+            if newly_blocked:
+                continue
+
             ready = [
                 item
                 for item in ordered

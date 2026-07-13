@@ -413,6 +413,7 @@ def atomic_write_bytes(
     """
 
     workspace = get_workspace()
+    reject_sensitive_path(path)
     parent = path.parent
     try:
         parent.mkdir(parents=True, exist_ok=True)

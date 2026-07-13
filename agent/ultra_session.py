@@ -9,9 +9,11 @@ legacy master-plan approval, file hashes, and resource leases.
 from __future__ import annotations
 
 import fnmatch
+import difflib
 import hashlib
 import json
 import re
+import shlex
 import threading
 from concurrent.futures import Future
 from dataclasses import asdict, replace
@@ -20,8 +22,13 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import tools
 from .events import EventBus
+from .evaluation import (
+    learn_from_benchmark_trend,
+    record_benchmark_trend,
+    record_single_file_3d_html_benchmark,
+)
 from .model_catalog import ExecutionClass, ModelDescriptor
-from .models import DomainError, GoalStatus, Plan, RoleProfile, TaskStatus
+from .models import DomainError, GoalStatus, Plan, RoleProfile, TaskStatus, utc_now
 from .providers.base import AssistantTurn, ToolCall
 from .project_brain import ProjectBrain
 from .safety import redact_data, redact_text
@@ -29,6 +36,8 @@ from .sandbox import AccessLevel, PermissionAdapter
 from .scheduler import ResourceLease as RuntimeLease
 from .scheduler import AdaptiveConcurrency, RateLimitError, ResourceLeaseManager, StaleWriteError
 from .store import NotFoundError, StateStore, StateStoreError
+from .swarm_coordinator import SwarmCoordinator
+from .swarm_protocol import SwarmMessageType, SwarmMessageV1
 from .ultra import (
     AgentRequest,
     AgentResponse,
@@ -73,18 +82,27 @@ from .ultra_models import (
     WorkNodeKind,
     WorkNodeStatus,
 )
+from .workflow import AgentRegistryEntryV1, AgentState
+from .quality import (
+    ChangeSetStatus,
+    ChangeSetV1,
+    FindingSeverity,
+    QualityCategory,
+    QualityCycleKind,
+    QualityCycleV1,
+    QualityFindingV1,
+    QualityPolicyV1,
+)
+from .reasoning import (
+    evaluate_reasoning_artifact,
+    reasoning_debate_protocol_for,
+    reasoning_scaffold_for,
+)
 
 
-_READ_TOOLS = frozenset({"read_file", "list_files", "grep"})
-_WRITE_TOOLS = frozenset({"write_file", "edit_file", "run_bash"})
-_TOOL_RISK = {
-    "read_file": "low",
-    "list_files": "low",
-    "grep": "low",
-    "write_file": "high",
-    "edit_file": "high",
-    "run_bash": "critical",
-}
+_READ_TOOLS = tools.names(categories={"read"})
+_WRITE_TOOLS = tools.names(categories={"write", "command", "install"})
+_TOOL_RISK = tools.risk_map()
 
 
 def _schema_name(schema: Mapping[str, Any]) -> str:
@@ -312,23 +330,169 @@ class WorkspaceUltraAgent:
         if self.role in {AgentRole.CODER, AgentRole.INTEGRATOR}:
             return _READ_TOOLS | _WRITE_TOOLS
         if self.role in {AgentRole.TESTER, AgentRole.RESEARCHER}:
-            return _READ_TOOLS | {"run_bash"}
+            return _READ_TOOLS | {"run_bash", "preview_html"}
         return _READ_TOOLS
 
+    @staticmethod
+    def _html_write_target(request: AgentRequest) -> str | None:
+        contract = dict(request.task.get("contract", {})) if isinstance(request.task, Mapping) else {}
+        for path in contract.get("write_paths", ()) or ():
+            text = str(path).strip()
+            if text.casefold().endswith((".html", ".htm")):
+                return text
+        return None
+
+    def _harness_html_preview(self, request: AgentRequest) -> dict[str, Any] | None:
+        if request.phase != InnerPhase.TEST.value or self.role is not AgentRole.TESTER:
+            return None
+        target = self._html_write_target(request)
+        if not target:
+            return None
+        result = str(
+            self.executor(
+                ToolCall(
+                    "harness-html-preview",
+                    "preview_html",
+                    {"path": target, "open_browser": False, "verify": True, "settle_ms": 750},
+                ),
+                request,
+            )
+        )
+        if result.startswith("Error:"):
+            return {
+                "status": "failed",
+                "error": result,
+                "console_errors": [result],
+                "page_errors": [],
+                "network_errors": [],
+            }
+        try:
+            payload = json.loads(result)
+        except Exception:
+            return {
+                "status": "failed",
+                "error": f"preview_html returned malformed JSON: {redact_text(result, 500)}",
+                "console_errors": [],
+                "page_errors": [],
+                "network_errors": [],
+            }
+        return payload if isinstance(payload, Mapping) else {"status": "failed", "error": "preview_html returned non-object payload"}
+
     def execute(self, request: AgentRequest) -> AgentResponse:
+        configured_effort = str(getattr(self.provider, "reasoning_effort", "medium"))
+        deterministic_roles = {
+            AgentRole.GOAL_UNDERSTANDING,
+            AgentRole.ARCHITECT,
+            AgentRole.PLANNER,
+            AgentRole.DECOMPOSER,
+            AgentRole.MEMORY,
+            AgentRole.QUALITY_TRIAGER,
+        }
+        effective_effort = configured_effort
+        if self.provider_name == "ollama" and configured_effort == "low" and self.role in deterministic_roles:
+            effective_effort = "off"
+            setattr(self.provider, "reasoning_effort", effective_effort)
+        deterministic_budgets = {
+            AgentRole.GOAL_UNDERSTANDING: 2048,
+            AgentRole.ARCHITECT: 3072,
+            AgentRole.PLANNER: 4096,
+            AgentRole.DECOMPOSER: 4096,
+            AgentRole.MEMORY: 768,
+            AgentRole.QUALITY_TRIAGER: 1024,
+        }
+        if self.provider_name == "ollama" and self.role in deterministic_budgets:
+            setattr(self.provider, "max_output_tokens", deterministic_budgets[self.role])
+        if self.provider_name == "ollama":
+            # JSON mode helps schema-only roles, but constraining tool-using
+            # coders/integrators to JSON makes Ollama embed large source files
+            # in a JSON string instead of issuing write tools, often producing
+            # invalid escaping before any workspace mutation.
+            setattr(self.provider, "force_json", self.role in deterministic_roles)
+        self.events.publish(
+            "ultra.reasoning_routed",
+            f"[{self.role.value}] reasoning {configured_effort} -> {effective_effort}",
+            run_id=request.run_id,
+            node_id=request.node_id,
+            role=self.role.value,
+            phase=request.phase,
+            configured=configured_effort,
+            effective=effective_effort,
+            max_output_tokens=getattr(self.provider, "max_output_tokens", None),
+        )
         contract = _PHASE_CONTRACTS.get(
             request.phase,
             {"payload": {"success": True, "findings": [], "evidence": []}},
         )
+        inspection_observed = False
+        harness_inspection: str | None = None
+        harness_preview = self._harness_html_preview(request)
+        debate_protocol = reasoning_debate_protocol_for(
+            self.role.value,
+            request.phase,
+            request.task,
+        )
+        if request.phase == "goal_spec":
+            inspection_call = ToolCall(
+                "harness-goal-inspection",
+                "list_files",
+                {"path": "."},
+            )
+            harness_inspection = str(self.executor(inspection_call, request))
+            if harness_inspection.startswith("Error:"):
+                raise RuntimeError(
+                    "GoalSpecV1 requires a successful harness workspace inspection: "
+                    + harness_inspection
+                )
+            inspection_observed = True
         user_payload = {
             "task": request.task,
             "focused_context": request.context,
+            "harness_workspace_inspection": harness_inspection,
+            "harness_html_preview": harness_preview,
+            "harness_reasoning_scaffold": reasoning_scaffold_for(
+                self.role.value,
+                request.phase,
+                request.task,
+            ).to_dict(),
+            "harness_debate_protocol": debate_protocol.to_dict(),
             "response_contract": {
                 **contract,
                 "summary": "brief factual result summary",
                 "reasoning_summary": (
                     "brief conclusion, decisions, and evidence only; never hidden chain-of-thought"
                 ),
+                "reasoning_artifact": {
+                    "claim": "short external claim being made",
+                    "supporting_evidence": ["observable/tool/hash/browser/test evidence"],
+                    "counterarguments": ["short objection or likely failure mode"],
+                    "rejected_alternatives": ["alternative considered and why rejected"],
+                    "verification_plan": ["concrete verification still required or already run"],
+                    "reasoning_graph": {
+                        "nodes": [
+                            {
+                                "id": "chosen",
+                                "type": "decision",
+                                "summary": "chosen external decision",
+                                "status": "chosen",
+                                "evidence_refs": ["tool/test/hash/browser evidence"],
+                            },
+                            {
+                                "id": "rejected",
+                                "type": "option",
+                                "summary": "rejected alternative",
+                                "status": "rejected",
+                                "evidence_refs": [],
+                            },
+                        ],
+                        "edges": [
+                            {
+                                "from": "chosen",
+                                "to": "rejected",
+                                "relation": "rejects",
+                            }
+                        ],
+                    },
+                },
                 "insights": [
                     {
                         "summary": "durable insight",
@@ -341,9 +505,8 @@ class WorkspaceUltraAgent:
         conversation: list[dict[str, Any]] = [
             {"role": "user", "content": _json(user_payload)}
         ]
-        schemas = _schemas(self._allowed_tools())
+        schemas = [] if request.phase == "goal_spec" else _schemas(self._allowed_tools())
         totals = {"input_tokens": 0, "cached_tokens": 0, "output_tokens": 0}
-        inspection_observed = False
         self.events.publish(
             "ultra.agent_started",
             f"[{self.role.value}] {request.phase}",
@@ -353,6 +516,7 @@ class WorkspaceUltraAgent:
             phase=request.phase,
         )
         last_error: Exception | None = None
+        invalid_json_attempts = 0
         for step in range(1, self.max_steps + 1):
             try:
                 turn = self.provider.call(conversation, schemas, request.system_prompt)
@@ -368,10 +532,21 @@ class WorkspaceUltraAgent:
                     totals[key] += int(getattr(turn.usage, key, 0) or 0)
             conversation.append(turn.to_message())
             if turn.tool_calls:
+                if not schemas:
+                    conversation.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Workspace inspection is already satisfied and tools are disabled for this phase. "
+                                "Return the single JSON object required by response_contract now."
+                            ),
+                        }
+                    )
+                    continue
                 for call in turn.tool_calls:
-                    if call.name in _READ_TOOLS:
-                        inspection_observed = True
                     result = self.executor(call, request)
+                    if call.name in _READ_TOOLS and not str(result).startswith("Error:"):
+                        inspection_observed = True
                     conversation.append(
                         {
                             "role": "tool",
@@ -390,6 +565,25 @@ class WorkspaceUltraAgent:
                     model=self.model,
                     usage=totals,
                 )
+                reasoning_evaluation = evaluate_reasoning_artifact(
+                    response.payload.get("reasoning_artifact"),
+                    debate_protocol,
+                )
+                if debate_protocol.required:
+                    payload = dict(response.payload)
+                    payload["harness_reasoning_evaluation"] = reasoning_evaluation.to_dict()
+                    response = AgentResponse.from_mapping(
+                        {
+                            "payload": payload,
+                            "summary": response.summary,
+                            "reasoning_summary": response.reasoning_summary,
+                            "insights": [asdict(insight) for insight in response.insights],
+                        },
+                        node_id=request.node_id,
+                        provider=self.provider_name,
+                        model=self.model,
+                        usage=totals,
+                    )
                 if request.phase == "goal_spec" and not inspection_observed:
                     last_error = RuntimeError(
                         "GoalSpecV1 requires repository inspection before questions or planning"
@@ -404,9 +598,65 @@ class WorkspaceUltraAgent:
                         }
                     )
                     continue
+                if harness_preview and request.phase == InnerPhase.TEST.value:
+                    preview_status = str(harness_preview.get("verification") or harness_preview.get("status") or "").casefold()
+                    browser_failed = preview_status not in {"passed", "ok", "success"}
+                    browser_findings = [
+                        *[str(item) for item in harness_preview.get("console_errors", ())],
+                        *[str(item) for item in harness_preview.get("page_errors", ())],
+                        *[str(item) for item in harness_preview.get("network_errors", ())],
+                    ]
+                    if browser_failed:
+                        payload = dict(response.payload)
+                        payload["passed"] = False
+                        existing_results = list(payload.get("test_results", ()) or ())
+                        existing_results.append(
+                            {
+                                "name": "harness_html_preview",
+                                "passed": False,
+                                "status": preview_status or "failed",
+                                "screenshot_path": harness_preview.get("screenshot_path"),
+                            }
+                        )
+                        payload["test_results"] = existing_results
+                        existing_evidence = list(payload.get("evidence", ()) or ())
+                        existing_evidence.append(
+                            {
+                                "kind": "browser_preview",
+                                "status": preview_status or "failed",
+                                "title": harness_preview.get("title"),
+                                "screenshot_path": harness_preview.get("screenshot_path"),
+                            }
+                        )
+                        payload["evidence"] = existing_evidence
+                        existing_issues = list(payload.get("issues", ()) or ())
+                        existing_issues.append(
+                            "Harness browser verification failed for HTML output."
+                        )
+                        payload["issues"] = existing_issues
+                        existing_findings = list(payload.get("findings", ()) or ())
+                        existing_findings.extend(browser_findings or ["Harness browser verification failed."])
+                        payload["findings"] = existing_findings
+                        response = AgentResponse(
+                            payload=payload,
+                            summary=response.summary or "Harness browser verification failed",
+                            insights=response.insights,
+                            reasoning_summary=response.reasoning_summary,
+                            usage=response.usage,
+                            provider=response.provider,
+                            model=response.model,
+                        )
                 return response
             except Exception as exc:
-                last_error = exc
+                content_preview = redact_text(str(turn.text or ""), 800)
+                last_error = RuntimeError(
+                    f"{exc}; content_preview={content_preview!r}"
+                )
+                invalid_json_attempts += 1
+                if invalid_json_attempts >= 2:
+                    raise RuntimeError(
+                        f"{self.role.value} returned invalid structured JSON twice: {last_error}"
+                    ) from exc
                 conversation.append(
                     {
                         "role": "user",
@@ -430,11 +680,13 @@ class WorkspaceUltraAgentFactory:
         events: EventBus,
         *,
         max_steps: int,
+        reasoning_effort: str = "medium",
     ) -> None:
         self.descriptor = descriptor
         self.executor = executor
         self.events = events
         self.max_steps = max_steps
+        self.reasoning_effort = str(reasoning_effort)
 
     def create(
         self,
@@ -444,8 +696,10 @@ class WorkspaceUltraAgentFactory:
         node_id: str | None = None,
     ) -> WorkspaceUltraAgent:
         del run_id, node_id
+        provider = self.descriptor.create_provider()
+        setattr(provider, "reasoning_effort", self.reasoning_effort)
         return WorkspaceUltraAgent(
-            self.descriptor.create_provider(),
+            provider,
             role=role,
             provider_name=self.descriptor.provider,
             model=self.descriptor.model,
@@ -537,7 +791,10 @@ def _store_run_status(phase: EnginePhase) -> UltraRunStatus:
 def _store_node_status(status: NodeStatus) -> WorkNodeStatus:
     return {
         NodeStatus.PENDING: WorkNodeStatus.PENDING,
-        NodeStatus.PLANNING: WorkNodeStatus.IN_PROGRESS,
+        # Foundation expansion plans every module before execution waves.
+        # Marking PLANNING as IN_PROGRESS trips the durable dependency gate for
+        # M002+ while M001 is intentionally not executed yet.
+        NodeStatus.PLANNING: WorkNodeStatus.PENDING,
         NodeStatus.READY: WorkNodeStatus.READY,
         NodeStatus.RUNNING: WorkNodeStatus.IN_PROGRESS,
         NodeStatus.COMPLETED: WorkNodeStatus.COMPLETED,
@@ -577,6 +834,7 @@ class StateStoreUltraAdapter(InMemoryUltraState):
         descriptor: ModelDescriptor,
         access_level: AccessLevel,
         config: UltraConfig,
+        workspace: Path | None = None,
     ) -> None:
         super().__init__()
         self.store = store
@@ -584,6 +842,7 @@ class StateStoreUltraAdapter(InMemoryUltraState):
         self.descriptor = descriptor
         self.access_level = access_level
         self.config = config
+        self.workspace = workspace
         self.run_id: str | None = None
         self.plan: Plan | None = None
         self.approved = False
@@ -598,6 +857,7 @@ class StateStoreUltraAdapter(InMemoryUltraState):
         self._lease_ids: dict[str, list[str]] = {}
         self._lease_scopes: dict[str, tuple[str, ...]] = {}
         self._lease_hashes: dict[str, dict[str, str | None]] = {}
+        self._used_project_lessons: dict[str, dict[str, Any]] = {}
         self._adapter_lock = threading.RLock()
 
     def _run_config(self, run: UltraRunV1) -> dict[str, Any]:
@@ -651,6 +911,296 @@ class StateStoreUltraAdapter(InMemoryUltraState):
                 config=self._run_config(run),
                 error=("ULTRA execution failed" if run.phase is EnginePhase.FAILED else None),
             )
+
+    def foundation_project_lessons(
+        self,
+        run_id: str,
+        query: str,
+        *,
+        phase: str,
+        limit: int = 8,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if self.run_id != run_id:
+            return ()
+        lesson_memories = self.store.search_project_memory(
+            query,
+            section=BrainSection.LESSON,
+            min_confidence=0.4,
+            limit=limit,
+        )
+        knowledge_memories = self.store.search_project_memory(
+            query,
+            section=BrainSection.KNOWLEDGE,
+            min_confidence=0.4,
+            limit=limit,
+        )
+        memories = tuple(
+            sorted(
+                (*lesson_memories, *knowledge_memories),
+                key=lambda item: (
+                    -float(item.get("effective_confidence", item.get("confidence", 0.0)) or 0.0),
+                    -int(item.get("reuse_count", 0) or 0),
+                    str(item.get("title") or ""),
+                ),
+            )[: max(1, int(limit))]
+        )
+        result: list[Mapping[str, Any]] = []
+        for memory in memories:
+            self.store.record_project_memory_use(str(memory["id"]))
+            with self._adapter_lock:
+                tracked = self._used_project_lessons.setdefault(
+                    str(memory["id"]),
+                    {
+                        "id": str(memory["id"]),
+                        "title": memory["title"],
+                        "phases": [],
+                        "queries": [],
+                        "initial_confidence": memory["confidence"],
+                        "initial_effective_confidence": memory.get("effective_confidence"),
+                    },
+                )
+                if phase not in tracked["phases"]:
+                    tracked["phases"].append(phase)
+                query_text = str(query or "")[:500]
+                if query_text and query_text not in tracked["queries"]:
+                    tracked["queries"].append(query_text)
+            result.append(
+                {
+                    "id": memory["id"],
+                    "section": memory["section"],
+                    "phase": phase,
+                    "title": memory["title"],
+                    "content": memory["content"],
+                    "confidence": memory["confidence"],
+                    "effective_confidence": memory.get("effective_confidence", memory["confidence"]),
+                    "reuse_count": memory["reuse_count"],
+                    "evidence_refs": memory["evidence_refs"],
+                }
+            )
+        return tuple(result)
+
+    def _record_project_lesson_evaluation_outcomes(
+        self,
+        *,
+        passed: bool,
+        benchmark_id: str,
+        html_benchmark_id: str | None = None,
+        blocker: str = "",
+    ) -> tuple[Mapping[str, Any], ...]:
+        with self._adapter_lock:
+            lessons = tuple(dict(item) for item in self._used_project_lessons.values())
+        if not lessons:
+            return ()
+        evidence_ref = f"benchmark:{benchmark_id}"
+        if html_benchmark_id:
+            evidence_ref = f"{evidence_ref};html:{html_benchmark_id}"
+        outcomes: list[Mapping[str, Any]] = []
+        weight = 1.0 if passed else 1.5
+        reason_prefix = "ULTRA global evaluation passed" if passed else "ULTRA global evaluation failed"
+        for lesson in lessons:
+            try:
+                updated = self.store.record_project_memory_outcome(
+                    str(lesson["id"]),
+                    succeeded=passed,
+                    evidence_ref=evidence_ref,
+                    reason=(
+                        f"{reason_prefix}; phases={','.join(lesson.get('phases', ()))}; "
+                        f"blocker={blocker or 'none'}"
+                    ),
+                    weight=weight,
+                )
+            except (StateStoreError, ValueError) as exc:
+                outcomes.append(
+                    {
+                        "id": lesson.get("id"),
+                        "updated": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            outcomes.append(
+                {
+                    "id": updated["id"],
+                    "updated": True,
+                    "confidence": updated["confidence"],
+                    "effective_confidence": updated.get("effective_confidence"),
+                    "positive_outcomes": updated.get("metadata", {}).get("positive_outcomes", 0),
+                    "negative_outcomes": updated.get("metadata", {}).get("negative_outcomes", 0),
+                    "phases": lesson.get("phases", ()),
+                }
+            )
+        return tuple(outcomes)
+
+    @staticmethod
+    def _remediation_steps_for_global_blocker(blocker: str) -> tuple[str, ...]:
+        normalized = str(blocker or "").casefold()
+        steps: list[str] = []
+        if "consensus" in normalized:
+            steps.extend(
+                [
+                    "Inspect every rejected, tied, or open quality vote and convert each rationale into a concrete fix task.",
+                    "Do not accept the run until the same voters produce a fresh accepted consensus round.",
+                ]
+            )
+        if "durable evidence" in normalized or "final evidence" in normalized:
+            steps.extend(
+                [
+                    "Re-run the final evidence phase with concrete artifacts, test results, and observable proof instead of summaries.",
+                    "Attach browser/runtime/test evidence that can be independently inspected after the run.",
+                ]
+            )
+        if "html" in normalized or "3d" in normalized or "webgl" in normalized:
+            steps.extend(
+                [
+                    "Run the single-file 3D HTML benchmark before completion and treat low visual/runtime scores as blocking.",
+                    "Improve scene depth, lighting, interaction coverage, animation density, HUD clarity, and runtime error handling before retesting.",
+                ]
+            )
+        if "regressed" in normalized or "regression" in normalized:
+            steps.extend(
+                [
+                    "Compare the latest benchmark against the previous baseline and target the exact regressed score dimensions.",
+                    "Prefer a smaller verified remediation over broad rewrites that risk new regressions.",
+                ]
+            )
+        if "module" in normalized:
+            steps.append("Re-open the failed module nodes and rerun their fix loop before global integration.")
+        if not steps:
+            steps.extend(
+                [
+                    "Treat the global evaluation blocker as a first-class remediation requirement, not a final summary.",
+                    "Create a focused fix plan, rerun the relevant quality gate, then rerun global evaluation.",
+                ]
+            )
+        return tuple(dict.fromkeys(steps))
+
+    def _record_global_remediation_knowledge(
+        self,
+        *,
+        passed: bool,
+        benchmark_id: str,
+        blocker: str,
+        metrics: Mapping[str, Any],
+        scores: Mapping[str, Any],
+        html_benchmark: Mapping[str, Any] | None = None,
+        global_trend: Mapping[str, Any] | None = None,
+        html_trend: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any] | None:
+        if passed or not self.run_id:
+            return None
+        blocker_text = str(blocker or "global evaluation gate failed").strip()
+        title_seed = re.sub(r"[^a-z0-9]+", " ", blocker_text.casefold()).strip()
+        title_seed = re.sub(r"\s+", " ", title_seed)[:90] or "global evaluation gate failed"
+        steps = self._remediation_steps_for_global_blocker(blocker_text)
+        evidence_refs = [f"benchmark:{benchmark_id}"]
+        if html_benchmark and html_benchmark.get("id"):
+            evidence_refs.append(f"html-benchmark:{html_benchmark['id']}")
+        if global_trend and global_trend.get("id"):
+            evidence_refs.append(f"trend:{global_trend['id']}")
+        if html_trend and html_trend.get("id"):
+            evidence_refs.append(f"html-trend:{html_trend['id']}")
+        data = {
+            "kind": "automatic_global_remediation",
+            "blocker": blocker_text,
+            "benchmark_id": benchmark_id,
+            "html_benchmark_id": html_benchmark.get("id") if html_benchmark else None,
+            "benchmark_trend_id": global_trend.get("id") if global_trend else None,
+            "html_benchmark_trend_id": html_trend.get("id") if html_trend else None,
+            "metrics": dict(metrics),
+            "scores": dict(scores),
+            "remediation_steps": steps,
+            "reuse_policy": (
+                "Inject this knowledge into future foundation planning whenever a similar "
+                "goal, quality gate, benchmark, browser, evidence, or consensus query appears."
+            ),
+        }
+        content = (
+            f"Global evaluation failed because: {blocker_text}\n"
+            "Required remediation steps:\n"
+            + "\n".join(f"- {step}" for step in steps)
+            + "\nEvidence and scores:\n"
+            + _json(
+                {
+                    "benchmark_id": benchmark_id,
+                    "html_benchmark_id": data["html_benchmark_id"],
+                    "benchmark_trend_id": data["benchmark_trend_id"],
+                    "html_benchmark_trend_id": data["html_benchmark_trend_id"],
+                    "scores": dict(scores),
+                    "metrics": dict(metrics),
+                }
+            )
+        )
+        try:
+            entry = ProjectBrain(self.store, self.run_id).record_knowledge(
+                f"Global remediation: {title_seed}",
+                content,
+                data=data,
+                confidence=0.82,
+                evidence_refs=tuple(evidence_refs),
+                promote=True,
+            )
+        except (StateStoreError, DomainError, ValueError) as exc:
+            return {
+                "recorded": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "blocker": blocker_text,
+                "remediation_steps": steps,
+            }
+        return {
+            "recorded": True,
+            "brain_entry_id": entry.id,
+            "title": entry.title,
+            "blocker": blocker_text,
+            "remediation_steps": steps,
+            "evidence_refs": tuple(evidence_refs),
+        }
+
+    def _record_benchmark_trend_if_possible(
+        self,
+        *,
+        suite_name: str,
+        scenario_name: str,
+    ) -> Mapping[str, Any] | None:
+        history = self.store.list_benchmark_results(
+            suite_name=suite_name,
+            scenario_name=scenario_name,
+            limit=2,
+        )
+        if len(history) < 2:
+            return None
+        try:
+            trend = record_benchmark_trend(
+                self.store,
+                suite_name=suite_name,
+                scenario_name=scenario_name,
+                provider=self.descriptor.provider,
+                model=self.descriptor.model,
+            )
+            learning = learn_from_benchmark_trend(
+                self.store,
+                trend,
+                ultra_run_id=self.run_id,
+            )
+            return {**dict(trend), "learning": learning}
+        except (DomainError, StateStoreError, ValueError):
+            return None
+
+    @staticmethod
+    def _trend_quality_regression(trend: Mapping[str, Any] | None) -> bool:
+        if not trend or str(trend.get("result") or "") != "failed":
+            return False
+        metrics = trend.get("metrics")
+        if not isinstance(metrics, Mapping):
+            return False
+        for key, value in metrics.items():
+            if not str(key).startswith("score_delta:"):
+                continue
+            try:
+                if float(value) < -0.01:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     @staticmethod
     def _goal_spec(value: EngineGoalSpec) -> GoalSpecV1:
@@ -790,7 +1340,10 @@ class StateStoreUltraAdapter(InMemoryUltraState):
             goal_spec=self._goal_spec(goal_spec),
             architecture_spec=self._architecture(architecture),
             config={
-                "master_plan_fingerprint": master.fingerprint,
+                # Approval is performed against the persisted Plan record, so
+                # this is the canonical fingerprint for every approval-bound
+                # quality artifact as well.
+                "master_plan_fingerprint": self.plan.fingerprint,
                 "module_count": len(master.modules),
             },
         )
@@ -1081,6 +1634,49 @@ class StateStoreUltraAdapter(InMemoryUltraState):
                 actor="ultra-quality-gate",
             )
 
+    def _record_swarm_run_update(
+        self,
+        item: Any,
+        previous_registry: AgentRegistryEntryV1 | None = None,
+    ) -> None:
+        if item.status == "running":
+            return
+        if previous_registry is not None and previous_registry.state.value == item.status:
+            return
+        message_type = (
+            SwarmMessageType.INFORM
+            if item.status == "completed"
+            else SwarmMessageType.BLOCKER
+        )
+        payload = {
+            "agent_run_id": item.id,
+            "node_id": item.node_id,
+            "role": item.role.value,
+            "phase": item.phase,
+            "status": item.status,
+            "summary": item.summary,
+            "error": item.error,
+            "usage": dict(item.usage),
+            "prompt_trace_id": item.prompt_trace_id,
+        }
+        try:
+            self.store.post_swarm_message(
+                SwarmMessageV1(
+                    ultra_run_id=item.run_id,
+                    sender_agent_id=item.id,
+                    recipient_agent_id="ultra-orchestrator",
+                    message_type=message_type,
+                    topic=f"agent_run:{item.node_id or '__global__'}:{item.role.value}:{item.phase}",
+                    payload=payload,
+                    confidence=1.0 if item.status == "completed" else 0.0,
+                    correlation_id=item.node_id or item.phase or item.id,
+                )
+            )
+        except StateStoreError:
+            # Agent run persistence is the source of truth; swarm messages are
+            # an auditable communication layer and must not make recovery worse.
+            return
+
     def save_agent_run(self, item: Any) -> None:
         super().save_agent_run(item)
         with self._adapter_lock:
@@ -1092,6 +1688,53 @@ class StateStoreUltraAdapter(InMemoryUltraState):
                 "rate_limited": AgentRunStatus.RATE_LIMITED,
                 "uncertain": AgentRunStatus.UNCERTAIN,
             }.get(item.status, AgentRunStatus.FAILED)
+            registry_state = {
+                "running": AgentState.RUNNING,
+                "completed": AgentState.COMPLETED,
+                "failed": AgentState.FAILED,
+                "cancelled": AgentState.CANCELLED,
+                "rate_limited": AgentState.BLOCKED,
+                "uncertain": AgentState.BLOCKED,
+            }.get(item.status, AgentState.FAILED)
+            existing_registry = {
+                entry.runtime_id: entry
+                for entry in self.store.list_agent_registry(item.run_id)
+            }
+            previous_registry = existing_registry.get(item.id)
+            self.store.save_agent_registry_entry(
+                AgentRegistryEntryV1(
+                    runtime_id=item.id,
+                    ultra_run_id=item.run_id,
+                    display_index=(
+                        previous_registry.display_index
+                        if previous_registry is not None
+                        else len(existing_registry) + 1
+                    ),
+                    role=item.role.value,
+                    assigned_id=item.node_id,
+                    state=registry_state,
+                    provider=item.provider or self.descriptor.provider,
+                    model=item.model or self.descriptor.model,
+                    prompt_trace_refs=(item.prompt_trace_id,) if item.prompt_trace_id else (),
+                    failure_reason=(item.error or None) if registry_state is AgentState.FAILED else None,
+                    blocker=(item.error or None) if registry_state is AgentState.BLOCKED else None,
+                    usage=item.usage,
+                    started_at=(previous_registry.started_at if previous_registry else utc_now()),
+                    ended_at=utc_now() if registry_state in {AgentState.COMPLETED, AgentState.FAILED, AgentState.CANCELLED} else None,
+                )
+            )
+            self._record_swarm_run_update(item, previous_registry)
+            if item.status == "completed":
+                change_sets = self.store.list_change_sets(item.run_id)
+                if item.role in {AgentRole.CODER, AgentRole.INTEGRATOR}:
+                    for change_set in change_sets:
+                        if (
+                            change_set.responsible_agent_id == item.id
+                            and change_set.status is ChangeSetStatus.OPEN
+                        ):
+                            self.store.save_change_set(
+                                replace(change_set, status=ChangeSetStatus.CLOSED, updated_at=utc_now())
+                            )
             if item.id in self._persisted_agents:
                 self.store.update_agent_run(
                     item.id,
@@ -1119,6 +1762,402 @@ class StateStoreUltraAdapter(InMemoryUltraState):
                 )
             )
             self._persisted_agents.add(item.id)
+
+    def record_quality_review(self, node_id: str, category: str, passed: bool) -> None:
+        if not self.run_id:
+            return
+        for change_set in self.store.list_change_sets(self.run_id):
+            if change_set.parent_id != node_id or change_set.status not in {
+                ChangeSetStatus.CLOSED,
+                ChangeSetStatus.REVIEWING,
+                ChangeSetStatus.APPROVED,
+                ChangeSetStatus.BLOCKED,
+            }:
+                continue
+            reviews = {**dict(change_set.review_status), category: "passed" if passed else "failed"}
+            if any(value == "failed" for value in reviews.values()):
+                target = ChangeSetStatus.BLOCKED
+            elif all(reviews.get(key) == "passed" for key in ("clean_code", "security", "test_quality")):
+                target = ChangeSetStatus.APPROVED
+            else:
+                target = ChangeSetStatus.REVIEWING
+            self.store.save_change_set(
+                replace(change_set, review_status=reviews, status=target, updated_at=utc_now())
+            )
+            if target is ChangeSetStatus.APPROVED:
+                attempt = 1 + sum(
+                    cycle.kind is QualityCycleKind.DELTA
+                    for cycle in self.store.list_quality_cycles(self.run_id)
+                )
+                approach = hashlib.sha256(
+                    _json({"change_set": change_set.id, "post_hashes": change_set.post_hashes, "reviews": reviews}).encode("utf-8")
+                ).hexdigest()
+                cycle = QualityCycleV1(
+                    ultra_run_id=self.run_id,
+                    kind=QualityCycleKind.DELTA,
+                    attempt=attempt,
+                    approach_fingerprint=approach,
+                    inputs={"change_set_id": change_set.id, "post_hashes": dict(change_set.post_hashes)},
+                    outputs={"reviews": reviews},
+                    metrics={"changed_files": len(change_set.changed_files)},
+                    result="passed",
+                    ended_at=utc_now(),
+                )
+                self.store.save_quality_cycle(cycle)
+                brain = ProjectBrain(self.store, self.run_id)
+                brain.write(
+                    BrainSection.CHANGE_SETS,
+                    f"Change Set {change_set.id}",
+                    f"Fresh clean-code, security, and test-quality reviews passed for {len(change_set.changed_files)} file(s).",
+                    data={"change_set_id": change_set.id, "review_status": reviews, "cycle_id": cycle.id},
+                )
+
+    def record_quality_findings(
+        self,
+        node_id: str,
+        category: str,
+        records: Iterable[Mapping[str, Any]],
+    ) -> None:
+        if not self.run_id:
+            return
+        for record in records:
+            path = str(record.get("path", "")).strip()
+            file_hash = str(record.get("file_hash", "")).strip()
+            principle = str(record.get("principle_id", "")).strip().lower()
+            evidence = record.get("evidence", {})
+            if not path or not file_hash or not principle or not isinstance(evidence, Mapping):
+                continue  # unconfirmed prose is not a durable finding
+            try:
+                finding = QualityFindingV1(
+                    ultra_run_id=self.run_id,
+                    principle_id=principle,
+                    category=QualityCategory(category),
+                    severity=FindingSeverity(str(record.get("severity", "medium")).lower()),
+                    path=path,
+                    location=str(record.get("location", "")),
+                    file_hash=file_hash,
+                    evidence=dict(evidence),
+                    remediation=str(record.get("remediation", "")).strip(),
+                    acceptance_criteria=tuple(str(value) for value in record.get("acceptance_criteria", ()) if str(value).strip()),
+                    verification=tuple(str(value) for value in record.get("verification", ()) if str(value).strip()),
+                    repair_node_id=str(record.get("repair_node_id") or "") or None,
+                )
+            except (ValueError, DomainError):
+                continue
+            stored = self.store.put_quality_finding(finding)
+            ProjectBrain(self.store, self.run_id).write(
+                BrainSection.QUALITY_FINDINGS,
+                f"Finding {stored.fingerprint[:12]}",
+                f"{stored.severity.value} {stored.principle_id} finding at {stored.path}:{stored.location}",
+                data={
+                    "finding_id": stored.id,
+                    "fingerprint": stored.fingerprint,
+                    "status": stored.status.value,
+                    "remediation": stored.remediation,
+                },
+            )
+
+    def record_quality_consensus(
+        self,
+        node_id: str,
+        votes: Iterable[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        if not self.run_id:
+            return {}
+        vote_items = tuple(dict(item) for item in votes if isinstance(item, Mapping))
+        if not vote_items:
+            return {}
+
+        def voter_id_for(item: Mapping[str, Any]) -> str:
+            return str(item.get("voter_agent_id") or item.get("role") or "unknown")
+
+        decisive = [
+            item for item in vote_items if str(item.get("verdict", "")).casefold() in {"accept", "reject"}
+        ]
+        voter_ids = tuple(dict.fromkeys(voter_id_for(item) for item in vote_items))
+        decisive_voter_ids = tuple(dict.fromkeys(voter_id_for(item) for item in decisive))
+        topic = f"quality-gate:{node_id}"
+        quorum = max(1, len(decisive_voter_ids) or len(voter_ids))
+        coordinator = SwarmCoordinator(self.store)
+        workflow = coordinator.propose(
+            ultra_run_id=self.run_id,
+            proposer_agent_id="ultra-orchestrator",
+            topic=topic,
+            proposal={
+                "gate": "ultra-quality-consensus",
+                "node_id": node_id,
+                "vote_count": len(vote_items),
+                "decisive_vote_count": len(decisive),
+                "quorum": quorum,
+            },
+            voters=voter_ids,
+            quorum=quorum,
+            leader_agent_id="ultra-orchestrator",
+        )
+        current: Mapping[str, Any] = self.store.get_consensus_round(workflow.consensus_round_id)
+
+        ordered_votes = tuple(item for item in vote_items if item not in decisive) + tuple(decisive)
+        for item in ordered_votes:
+            if current.get("status") in {"accepted", "rejected", "tied"}:
+                break
+            try:
+                confidence = float(item.get("confidence", 1.0))
+            except (TypeError, ValueError):
+                confidence = 1.0
+            current = coordinator.submit_vote(
+                round_id=workflow.consensus_round_id,
+                voter_agent_id=voter_id_for(item),
+                verdict=str(item.get("verdict") or "abstain"),
+                confidence=max(0.0, min(1.0, confidence)),
+                rationale=str(item.get("rationale") or item.get("summary") or "")[:2_000],
+                evidence={
+                    "node_id": node_id,
+                    "role": item.get("role"),
+                    "passed": item.get("passed"),
+                    **(
+                        dict(item.get("evidence", {}))
+                        if isinstance(item.get("evidence"), Mapping)
+                        else {}
+                    ),
+                },
+            )
+        if current.get("status") in {"accepted", "rejected", "tied"}:
+            self.store.post_swarm_message(
+                SwarmMessageV1(
+                    ultra_run_id=self.run_id,
+                    sender_agent_id="ultra-orchestrator",
+                    recipient_agent_id="ultra-orchestrator",
+                    message_type=SwarmMessageType.DECISION,
+                    topic=topic,
+                    payload={
+                        "consensus_round_id": current["id"],
+                        "status": current["status"],
+                        "decision": current.get("decision", {}),
+                        "votes": current.get("votes", ()),
+                        "swarm_workflow": {
+                            "proposal_message_id": workflow.proposal_message_id,
+                            "request_message_ids": workflow.request_message_ids,
+                            "leader_agent_id": workflow.leader_agent_id,
+                            "voter_agent_ids": workflow.voter_agent_ids,
+                        },
+                    },
+                    confidence=1.0 if current.get("status") == "accepted" else 0.0,
+                    correlation_id=node_id,
+                )
+            )
+        return current
+
+    def record_global_evaluation_gate(
+        self,
+        global_result: EngineResult,
+        node_results: Iterable[EngineResult],
+    ) -> Mapping[str, Any]:
+        if not self.run_id:
+            return {}
+        nodes = tuple(node_results)
+        agents = self.store.list_agent_runs(self.run_id)
+        consensus_rounds = self.store.list_consensus_rounds(
+            self.run_id,
+            topic_prefix="quality-gate:",
+        )
+
+        def usage_total(*keys: str) -> float:
+            total = 0.0
+            for agent in agents:
+                for key in keys:
+                    try:
+                        total += float(agent.usage.get(key, 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+            return total
+
+        accepted = sum(1 for item in consensus_rounds if item.get("status") == "accepted")
+        rejected = sum(1 for item in consensus_rounds if item.get("status") == "rejected")
+        tied = sum(1 for item in consensus_rounds if item.get("status") == "tied")
+        open_rounds = sum(1 for item in consensus_rounds if item.get("status") == "open")
+        node_successes = sum(1 for item in nodes if item.success)
+        final_evidence = len(global_result.evidence)
+        final_tests = len(global_result.test_results)
+        metrics = {
+            "agent_runs": float(len(agents)),
+            "completed_agent_runs": float(sum(1 for item in agents if item.status is AgentRunStatus.COMPLETED)),
+            "input_tokens": usage_total("input_tokens", "prompt_tokens"),
+            "output_tokens": usage_total("output_tokens", "completion_tokens"),
+            "cached_tokens": usage_total("cached_tokens"),
+            "node_results": float(len(nodes)),
+            "node_successes": float(node_successes),
+            "final_evidence_items": float(final_evidence),
+            "final_test_results": float(final_tests),
+            "quality_consensus_rounds": float(len(consensus_rounds)),
+            "quality_consensus_accepted": float(accepted),
+            "quality_consensus_rejected": float(rejected),
+            "quality_consensus_tied": float(tied),
+            "quality_consensus_open": float(open_rounds),
+        }
+        scores = {
+            "node_success_ratio": (node_successes / len(nodes)) if nodes else 0.0,
+            "consensus_accept_ratio": (accepted / len(consensus_rounds)) if consensus_rounds else 1.0,
+            "final_evidence_score": 1.0 if (final_evidence or final_tests) else 0.0,
+            "global_success": 1.0 if global_result.success else 0.0,
+        }
+        blocker = ""
+        if not global_result.success:
+            blocker = "global integration/review/final evidence did not pass"
+        elif nodes and node_successes != len(nodes):
+            blocker = "not every module result succeeded"
+        elif rejected or tied or open_rounds:
+            blocker = "quality consensus is not unanimously accepted"
+        elif not final_evidence and not final_tests:
+            blocker = "final evidence gate produced no durable evidence or test results"
+        html_benchmark: Mapping[str, Any] | None = self._record_html_benchmark_if_applicable(global_result, nodes)
+        if html_benchmark and html_benchmark.get("result") != "passed":
+            html_blocker = str(html_benchmark.get("blocker") or "single-file 3D HTML benchmark failed")
+            blocker = blocker or html_blocker
+            scores["html_3d_overall"] = float(html_benchmark.get("scores", {}).get("overall", 0.0))
+            metrics["html_3d_benchmark_ran"] = 1.0
+        elif html_benchmark:
+            scores["html_3d_overall"] = float(html_benchmark.get("scores", {}).get("overall", 0.0))
+            metrics["html_3d_benchmark_ran"] = 1.0
+        html_trend = (
+            self._record_benchmark_trend_if_possible(
+                suite_name="weak-model-html",
+                scenario_name="threejs-single-file",
+            )
+            if html_benchmark
+            else None
+        )
+        if self._trend_quality_regression(html_trend):
+            blocker = blocker or "HTML benchmark quality regressed against the previous baseline"
+        passed = not blocker
+        artifact_refs: list[str] = []
+        for artifact in global_result.artifacts:
+            if isinstance(artifact, Mapping):
+                artifact_refs.append(str(artifact.get("uri") or artifact.get("path") or artifact))
+            else:
+                artifact_refs.append(str(artifact))
+        recorded = self.store.record_benchmark_result(
+            suite_name="ultra-automatic-evaluation",
+            scenario_name="global-completion-gate",
+            provider=self.descriptor.provider,
+            model=self.descriptor.model,
+            ultra_run_id=self.run_id,
+            inputs={
+                "global_result_status": global_result.status,
+                "node_ids": [item.node_id for item in nodes],
+            },
+            metrics=metrics,
+            scores=scores,
+            result="passed" if passed else "failed",
+            artifact_refs=artifact_refs,
+            blocker=blocker or None,
+        )
+        global_trend = self._record_benchmark_trend_if_possible(
+            suite_name="ultra-automatic-evaluation",
+            scenario_name="global-completion-gate",
+        )
+        if passed and self._trend_quality_regression(global_trend):
+            blocker = "global evaluation quality regressed against the previous baseline"
+            passed = False
+        lesson_outcomes = self._record_project_lesson_evaluation_outcomes(
+            passed=passed,
+            benchmark_id=str(recorded["id"]),
+            html_benchmark_id=str(html_benchmark.get("id")) if html_benchmark else None,
+            blocker=blocker,
+        )
+        remediation_knowledge = self._record_global_remediation_knowledge(
+            passed=passed,
+            benchmark_id=str(recorded["id"]),
+            blocker=blocker,
+            metrics=metrics,
+            scores=scores,
+            html_benchmark=html_benchmark,
+            global_trend=global_trend,
+            html_trend=html_trend,
+        )
+        return {
+            "passed": passed,
+            "metrics": metrics,
+            "scores": scores,
+            "benchmark_id": recorded["id"],
+            "html_benchmark_id": html_benchmark.get("id") if html_benchmark else None,
+            "benchmark_trend_id": global_trend.get("id") if global_trend else None,
+            "html_benchmark_trend_id": html_trend.get("id") if html_trend else None,
+            "benchmark_trend_learning": global_trend.get("learning") if global_trend else None,
+            "html_benchmark_trend_learning": html_trend.get("learning") if html_trend else None,
+            "blocker": blocker,
+            "project_lesson_outcomes": lesson_outcomes,
+            "remediation_knowledge": remediation_knowledge,
+        }
+
+    def _record_html_benchmark_if_applicable(
+        self,
+        global_result: EngineResult,
+        node_results: Iterable[EngineResult],
+    ) -> Mapping[str, Any] | None:
+        if not self.run_id or self.workspace is None:
+            return None
+        candidates: list[str] = []
+        for artifact in global_result.artifacts:
+            if isinstance(artifact, Mapping):
+                candidates.extend(str(artifact.get(key) or "") for key in ("path", "uri"))
+            else:
+                candidates.append(str(artifact))
+        for result in node_results:
+            for artifact in result.artifacts:
+                if isinstance(artifact, Mapping):
+                    candidates.extend(str(artifact.get(key) or "") for key in ("path", "uri"))
+                else:
+                    candidates.append(str(artifact))
+        prompt = str(self.store.get_ultra_run(self.run_id).config.get("prompt", ""))
+        should_check = any(value.casefold().endswith((".html", ".htm")) or "index.html" in value.casefold() for value in candidates)
+        should_check = should_check or any(term in prompt.casefold() for term in ("html", "browser game", "three.js", "threejs", "3d game", "single-file"))
+        index_path = (self.workspace / "index.html").resolve(strict=False)
+        try:
+            index_path.relative_to(self.workspace)
+        except ValueError:
+            return None
+        if not should_check and not index_path.exists():
+            return None
+        if not index_path.is_file():
+            recorded = self.store.record_benchmark_result(
+                suite_name="weak-model-html",
+                scenario_name="threejs-single-file",
+                provider=self.descriptor.provider,
+                model=self.descriptor.model,
+                ultra_run_id=self.run_id,
+                inputs={"artifact_hash": ""},
+                metrics={"missing_index_html": 1.0},
+                scores={"overall": 0.0},
+                result="failed",
+                artifact_refs=("workspace:index.html",),
+                blocker="HTML benchmark target index.html was not created",
+            )
+            return recorded
+        try:
+            html = index_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            recorded = self.store.record_benchmark_result(
+                suite_name="weak-model-html",
+                scenario_name="threejs-single-file",
+                provider=self.descriptor.provider,
+                model=self.descriptor.model,
+                ultra_run_id=self.run_id,
+                inputs={"artifact_hash": ""},
+                metrics={"read_error": 1.0},
+                scores={"overall": 0.0},
+                result="failed",
+                artifact_refs=("workspace:index.html",),
+                blocker=f"HTML benchmark could not read index.html: {type(exc).__name__}",
+            )
+            return recorded
+        return record_single_file_3d_html_benchmark(
+            self.store,
+            html,
+            provider=self.descriptor.provider,
+            model=self.descriptor.model,
+            ultra_run_id=self.run_id,
+            artifact_ref="workspace:index.html",
+        )
 
     def save_prompt_trace(self, trace: EnginePromptTrace) -> None:
         super().save_prompt_trace(trace)
@@ -1356,6 +2395,7 @@ class UltraSession:
         events: EventBus,
         config: UltraConfig,
         agent_steps: int,
+        reasoning_effort: str = "medium",
     ) -> None:
         self.store = store
         self.workspace = workspace
@@ -1365,15 +2405,32 @@ class UltraSession:
         self.events = events
         self.config = config
         self.agent_steps = agent_steps
+        self.reasoning_effort = str(reasoning_effort)
         self.goal_id: str | None = None
         self.adapter: StateStoreUltraAdapter | None = None
         self.orchestrator: UltraOrchestrator | None = None
         self.future: Future[UltraRunResult] | None = None
         self.answers: dict[str, str] = {}
 
+    def _workspace_hashes(self) -> dict[str, str]:
+        values: dict[str, str] = {}
+        for path in self.workspace.rglob("*"):
+            if not path.is_file() or ".coding-agent" in path.parts:
+                continue
+            relative = path.relative_to(self.workspace).as_posix()
+            try:
+                values[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                continue
+        return values
+
     @property
     def running(self) -> bool:
         return bool(self.future and not self.future.done())
+
+    def wait(self) -> UltraRunResult | None:
+        """Wait for a live approved ULTRA run instead of closing its process."""
+        return self.future.result() if self.future is not None else None
 
     @property
     def safe_for_reconfiguration(self) -> bool:
@@ -1408,7 +2465,18 @@ class UltraSession:
             return f"Error: role {request.role.value} cannot use {call.name}"
         args = call.args if isinstance(call.args, dict) else {}
         node = self._node(request.node_id)
-        if call.name in {"write_file", "edit_file"}:
+        if call.name == "apply_patch":
+            patch_paths = [
+                match.group(1).strip()
+                for match in re.finditer(
+                    r"(?m)^\+\+\+\s+(?:b/)?([^\t\r\n]+)", str(args.get("patch", ""))
+                )
+                if match.group(1).strip() != "/dev/null"
+            ]
+            scopes = node.write_paths if node else ()
+            if not patch_paths or not scopes or any(not _within_scope(path, scopes) for path in patch_paths):
+                return "Error: apply_patch contains a path outside this node's approved write scope"
+        if call.name in {"write_file", "edit_file", "materialize_artifact"}:
             path = str(args.get("path", ""))
             scopes = node.write_paths if node else ()
             if not scopes or not _within_scope(path, scopes):
@@ -1459,20 +2527,40 @@ class UltraSession:
         if needs_approval and not self.approval(call.name, dict(args), risk):
             result = "Permission denied by the user. Do not repeat the same action."
             self.store.complete_action(action_id, result, status="denied")
-            self.events.publish("tool_result", result, tool=call.name, actor=request.role.value)
+            self.events.publish(
+                "tool_result",
+                result,
+                tool=call.name,
+                actor=request.role.value,
+                node_id=request.node_id,
+            )
             return result
-        path = str(args.get("path", "")) if call.name in {"write_file", "edit_file"} else ""
+        path = str(args.get("path", "")) if call.name in {"write_file", "edit_file", "materialize_artifact"} else ""
         pre_hash = _hash_file(self.workspace, path) if path else None
+        pre_text = ""
+        if path:
+            try:
+                pre_text = (self.workspace / path).read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                pre_text = ""
+        before_workspace = self._workspace_hashes() if call.name in _WRITE_TOOLS and not path else {}
         try:
             with tools.workspace_context(self.workspace):
-                if call.name == "run_bash":
+                if call.name in {"run_bash", "run_command"}:
                     assert self.orchestrator
                     with self.orchestrator.scheduler.leases.mutating_shell(request.node_id or request.role.value):
+                        shell_command = str(args.get("command", ""))
+                        if (
+                            call.name == "run_command"
+                            and str(args.get("cwd", ".")).strip() not in {"", "."}
+                            and self.permission_adapter.access_level.value == "full"
+                        ):
+                            shell_command = f"cd -- {shlex.quote(str(args['cwd']))} && {shell_command}"
                         result = self.permission_adapter.run_shell(
-                            str(args.get("command", "")),
+                            shell_command,
                             self.workspace,
                             normal_runner=lambda command: tools.run_tool(
-                                "run_bash", {"command": command}
+                                call.name, {**args, "command": command}
                             ),
                         )
                 else:
@@ -1496,6 +2584,81 @@ class UltraSession:
             )
             if request.node_id:
                 self.adapter.advance_lease_hash(request.node_id, path, post_hash)
+        if call.name in _WRITE_TOOLS and not result.startswith("Error:") and self.run_id:
+            after_workspace = self._workspace_hashes()
+            if path:
+                current_post_hash = _hash_file(self.workspace, path)
+                changed_files = (path,) if pre_hash != current_post_hash else ()
+                pre_hashes = {path: pre_hash}
+                post_hashes = {path: current_post_hash}
+                try:
+                    post_text = (self.workspace / path).read_text(encoding="utf-8")
+                except (OSError, UnicodeError):
+                    post_text = ""
+                diff = "".join(
+                    difflib.unified_diff(
+                        pre_text.splitlines(keepends=True),
+                        post_text.splitlines(keepends=True),
+                        fromfile=f"a/{path}",
+                        tofile=f"b/{path}",
+                    )
+                )
+                shell_created: tuple[str, ...] = ()
+            else:
+                changed_files = tuple(
+                    sorted(
+                        key
+                        for key in set(before_workspace) | set(after_workspace)
+                        if before_workspace.get(key) != after_workspace.get(key)
+                    )
+                )
+                pre_hashes = {key: before_workspace.get(key) for key in changed_files}
+                post_hashes = {key: after_workspace.get(key) for key in changed_files}
+                shell_created = tuple(key for key in changed_files if key not in before_workspace)
+                diff = "\n".join(
+                    f"{key}: {pre_hashes[key] or '<absent>'} -> {post_hashes[key] or '<deleted>'}"
+                    for key in changed_files
+                )
+            if not changed_files:
+                self.events.publish(
+                    "tool_result", result, tool=call.name,
+                    actor=request.role.value, node_id=request.node_id,
+                )
+                return result
+            responsible = request.agent_run_id or f"{request.role.value}:{request.node_id or request.phase}"
+            existing = next(
+                (
+                    item for item in reversed(self.store.list_change_sets(self.run_id))
+                    if item.responsible_agent_id == responsible and item.status is ChangeSetStatus.OPEN
+                ),
+                None,
+            )
+            change_set = existing or ChangeSetV1(
+                ultra_run_id=self.run_id,
+                responsible_agent_id=responsible,
+                parent_id=request.node_id or request.phase,
+            )
+            combined_files = tuple(dict.fromkeys((*change_set.changed_files, *changed_files)))
+            change_set = replace(
+                change_set,
+                changed_files=combined_files,
+                pre_hashes={**dict(pre_hashes), **dict(change_set.pre_hashes)},
+                post_hashes={**dict(change_set.post_hashes), **dict(post_hashes)},
+                diff=(change_set.diff + ("\n" if change_set.diff and diff else "") + diff),
+                mutation_commands=tuple(dict.fromkeys((*change_set.mutation_commands, str(args.get("command", call.name))))),
+                shell_created_files=tuple(dict.fromkeys((*change_set.shell_created_files, *shell_created))),
+                updated_at=utc_now(),
+            )
+            self.store.save_change_set(change_set)
+            self.store.record_mutation(
+                change_set.id,
+                call.name,
+                path=path or None,
+                command=str(args.get("command", "")) or None,
+                pre_hash=pre_hash,
+                post_hash=_hash_file(self.workspace, path) if path else None,
+                metadata={"action_id": action_id, "changed_files": list(changed_files)},
+            )
         self.events.publish(
             "tool_result",
             result,
@@ -1530,12 +2693,14 @@ class UltraSession:
             self.descriptor,
             self.permission_adapter.access_level,
             self.config,
+            workspace=self.workspace,
         )
         factory = WorkspaceUltraAgentFactory(
             self.descriptor,
             self._execute_tool,
             self.events,
             max_steps=self.agent_steps,
+            reasoning_effort=self.reasoning_effort,
         )
         self.orchestrator = UltraOrchestrator(
             factory,
@@ -1561,6 +2726,58 @@ class UltraSession:
             self.orchestrator.goal_spec,
             self.orchestrator.architecture,
             plan,
+        )
+        assert self.adapter.run_id
+        durable_run = self.store.get_ultra_run(self.adapter.run_id)
+        # The dedicated column is populated only when the user approves the
+        # persisted master plan.  The policy baseline is created before that
+        # approval boundary, so bind it to the generated (and persisted)
+        # fingerprint in run configuration.  Falling back to the in-memory
+        # master keeps older stores readable without conflating generation
+        # with approval.
+        durable_master_fingerprint = (
+            durable_run.master_plan_fingerprint
+            or str(durable_run.config.get("master_plan_fingerprint", ""))
+            or plan.fingerprint
+        )
+        policy = QualityPolicyV1()
+        self.store.save_quality_policy(
+            self.adapter.run_id,
+            policy,
+            master_plan_fingerprint=durable_master_fingerprint,
+        )
+        inventory = sorted(
+            path.relative_to(self.workspace).as_posix()
+            for path in self.workspace.rglob("*")
+            if path.is_file() and ".coding-agent" not in path.parts
+        )
+        baseline = QualityCycleV1(
+            ultra_run_id=self.adapter.run_id,
+            kind=QualityCycleKind.BASELINE,
+            attempt=1,
+            approach_fingerprint=hashlib.sha256(
+                _json({"inventory": inventory, "master_plan": durable_master_fingerprint}).encode("utf-8")
+            ).hexdigest(),
+            inputs={"inventory": inventory, "master_plan_fingerprint": durable_master_fingerprint},
+            outputs={"confirmed_findings": [], "quality_checklist": list(policy.required_reviews)},
+            metrics={"project_files": len(inventory)},
+            result="clean" if not inventory else "baseline_complete",
+            ended_at=utc_now(),
+        )
+        self.store.save_quality_cycle(baseline)
+        brain = ProjectBrain(self.store, self.adapter.run_id)
+        brain.write(
+            BrainSection.QUALITY_POLICY,
+            "Quality Policy V1",
+            "Approval-bound Ultra quality policy and completion severities.",
+            data=policy.to_dict(),
+            metadata={"master_plan_fingerprint": durable_master_fingerprint},
+        )
+        brain.write(
+            BrainSection.QUALITY_CYCLES,
+            "Goal-scoped baseline",
+            f"Inspected {len(inventory)} project file(s); only confirmed evidence may become findings.",
+            data={"cycle_id": baseline.id, "inventory": inventory},
         )
         return plan
 
@@ -1632,6 +2849,7 @@ class UltraSession:
             self.descriptor,
             self.permission_adapter.access_level,
             self.config,
+            workspace=self.workspace,
         )
         self.adapter.run_id = run.id
         self.adapter.plan = plan
@@ -1646,6 +2864,7 @@ class UltraSession:
             self._execute_tool,
             self.events,
             max_steps=self.agent_steps,
+            reasoning_effort=self.reasoning_effort,
         )
         self.orchestrator = UltraOrchestrator(
             factory,
@@ -1956,6 +3175,32 @@ class UltraSession:
         try:
             goal = self.store.get_goal(self.goal_id)
             if result.successful:
+                if self.run_id:
+                    blocking_findings = [
+                        item for item in self.store.list_quality_findings(self.run_id)
+                        if item.severity.blocks_completion and item.status.value != "resolved"
+                    ]
+                    change_sets = self.store.list_change_sets(self.run_id)
+                    unreviewed = [
+                        item for item in change_sets
+                        if item.status not in {ChangeSetStatus.APPROVED, ChangeSetStatus.INTEGRATED}
+                    ]
+                    if blocking_findings or unreviewed:
+                        details = []
+                        if blocking_findings:
+                            details.append(f"{len(blocking_findings)} blocking quality finding(s)")
+                        if unreviewed:
+                            details.append(f"{len(unreviewed)} unreviewed Change Set(s)")
+                        if goal.status is GoalStatus.RUNNING:
+                            self.store.transition_goal(
+                                self.goal_id,
+                                GoalStatus.BLOCKED,
+                                reason="ULTRA completion gate rejected: " + ", ".join(details),
+                            )
+                        return
+                    for change_set in change_sets:
+                        if change_set.status is ChangeSetStatus.APPROVED:
+                            self.store.save_change_set(change_set.integrate())
                 if goal.status is GoalStatus.RUNNING:
                     self.store.transition_goal(self.goal_id, GoalStatus.VERIFYING, reason="ULTRA module waves completed")
                 goal = self.store.get_goal(self.goal_id)

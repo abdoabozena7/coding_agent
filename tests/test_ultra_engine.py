@@ -64,6 +64,25 @@ class FakeFactory:
         return FakeAgent(execute)
 
 
+class ProjectMemoryState(InMemoryUltraState):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lookups: list[tuple[str, str]] = []
+
+    def foundation_project_lessons(self, run_id: str, query: str, *, phase: str):
+        self.lookups.append((phase, query))
+        return (
+            {
+                "id": f"lesson-{phase}",
+                "title": "Avoid shallow visual acceptance",
+                "content": "Require browser/runtime evidence before planning completion.",
+                "confidence": 0.91,
+                "reuse_count": 3,
+                "evidence_refs": ["bench:visual"],
+            },
+        )
+
+
 def module(module_id: str, path: str, depends_on=()):
     return {
         "id": module_id,
@@ -162,6 +181,18 @@ def prepared_engine(
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_cross_run_lessons_are_injected_into_foundation_planning(self):
+        state = ProjectMemoryState()
+        engine, factory, _plan = prepared_engine(state=state)
+        del engine
+        by_phase = {request.phase: request for request in factory.requests}
+
+        for phase in ("goal_spec", "architecture", "master_plan"):
+            lessons = by_phase[phase].context["cross_run_project_lessons"]
+            self.assertEqual(lessons[0]["title"], "Avoid shallow visual acceptance")
+            self.assertEqual(lessons[0]["confidence"], 0.91)
+        self.assertEqual([phase for phase, _query in state.lookups], ["goal_spec", "architecture", "master_plan"])
+
     def test_waves_are_dependency_safe_and_write_disjoint(self):
         items = [
             Item("A", write_paths=("src/shared",), order=1),
@@ -261,7 +292,7 @@ class UltraEngineTests(unittest.TestCase):
 
         def contained(request: AgentRequest) -> AgentResponse:
             response = standard_handler(request, modules=parent_module)
-            if request.phase == InnerPhase.DECOMPOSE.value and request.node_id == "M1":
+            if request.phase == InnerPhase.DECOMPOSE.value and request.node_id == "M001":
                 return AgentResponse(
                     payload={
                         "children": [
@@ -276,13 +307,13 @@ class UltraEngineTests(unittest.TestCase):
         result = engine.run()
         self.assertTrue(result.successful)
         child = engine.nodes["M1.child"]
-        self.assertEqual(child.parent_id, "M1")
+        self.assertEqual(child.parent_id, "M001")
         self.assertIn("do not change public scope", child.contract.forbidden_changes)
-        self.assertIn("M1.child", engine.nodes["M1"].depends_on)
+        self.assertIn("M1.child", engine.nodes["M001"].depends_on)
 
         def escaped(request: AgentRequest) -> AgentResponse:
             response = standard_handler(request, modules=parent_module)
-            if request.phase == InnerPhase.DECOMPOSE.value and request.node_id == "M1":
+            if request.phase == InnerPhase.DECOMPOSE.value and request.node_id == "M001":
                 return AgentResponse(
                     payload={"children": [module("M1.escape", "outside/file.py")]},
                     summary="bad child",

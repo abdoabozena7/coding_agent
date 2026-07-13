@@ -9,7 +9,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import BinaryIO
 
-from ._security import get_workspace, safe_os_error
+from ._security import get_workspace, resolve_workspace_path, safe_os_error
 
 
 TIMEOUT_SECONDS = 120
@@ -160,7 +160,7 @@ def _format_result(returncode: int, stdout: _Capture, stderr: _Capture) -> str:
     return _truncate("\n".join(parts))
 
 
-def run(command: str) -> str:
+def run_with_timeout(command: str, timeout_seconds: int = TIMEOUT_SECONDS, cwd: str = ".") -> str:
     if not isinstance(command, str):
         return "Error: command must be a string"
     if not command.strip():
@@ -171,6 +171,12 @@ def run(command: str) -> str:
         return f"Error: command exceeds the {MAX_COMMAND_CHARS}-character limit"
 
     workspace = get_workspace()
+    try:
+        working_directory = workspace if str(cwd).strip() in {"", "."} else resolve_workspace_path(cwd, must_exist=True)
+        if not working_directory.is_dir():
+            return "Error: command cwd must be a directory"
+    except (OSError, ValueError) as exc:
+        return f"Error: invalid command cwd: {safe_os_error(exc) if isinstance(exc, OSError) else exc}"
     process_options: dict[str, object] = {}
     if os.name == "nt":
         process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -181,7 +187,7 @@ def run(command: str) -> str:
         process = subprocess.Popen(
             command,
             shell=True,
-            cwd=str(workspace),
+            cwd=str(working_directory),
             env=_scrubbed_environment(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -201,8 +207,9 @@ def run(command: str) -> str:
     for reader in readers:
         reader.start()
 
+    timeout_seconds = max(1, min(int(timeout_seconds), 3_600))
     try:
-        returncode = process.wait(timeout=TIMEOUT_SECONDS)
+        returncode = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         _terminate(process)
         try:
@@ -211,7 +218,7 @@ def run(command: str) -> str:
             pass
         for reader in readers:
             reader.join(timeout=2)
-        return f"Error: command timed out after {TIMEOUT_SECONDS} seconds"
+        return f"Error: command timed out after {timeout_seconds} seconds"
     except KeyboardInterrupt:
         _terminate(process)
         try:
@@ -225,3 +232,7 @@ def run(command: str) -> str:
     for reader in readers:
         reader.join(timeout=2)
     return _format_result(returncode, stdout, stderr)
+
+
+def run(command: str) -> str:
+    return run_with_timeout(command, TIMEOUT_SECONDS)

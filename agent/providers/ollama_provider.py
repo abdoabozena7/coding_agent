@@ -6,6 +6,8 @@ import json
 import os
 import urllib.error
 import urllib.request
+import socket
+from dataclasses import replace
 from collections.abc import Mapping
 from typing import Any
 
@@ -20,12 +22,22 @@ from .base import (
     render_for_summary,
     unique_tool_call_id,
 )
+from ..local_provider import (
+    ModelCapabilityProfile,
+    OllamaRequestCompiler,
+    OllamaHandshake,
+    ProviderDiagnostic,
+    ProviderFailureKind,
+    ProviderRequestError,
+    redact_provider_message,
+)
 
 MODEL_NAME = "gpt-oss:120b-cloud"
 DEFAULT_HOST = "http://localhost:11434"
 
 
 class OllamaProvider:
+    _capability_cache: dict[tuple[str, str], ModelCapabilityProfile] = {}
     capabilities = ProviderCapabilities(
         streaming=True,
         tool_calling=True,
@@ -36,9 +48,41 @@ class OllamaProvider:
         native_replay=True,
     )
 
-    def __init__(self, model: str | None = None, host: str | None = None):
+    def __init__(self, model: str | None = None, host: str | None = None, capability_profile: ModelCapabilityProfile | None = None, reasoning_effort: str = "medium", context_size: int | None = None, num_gpu: int | None = None, max_output_tokens: int | None = None, force_json: bool = False):
         self.model = model or os.getenv("OLLAMA_MODEL") or MODEL_NAME
         self.host = (host or os.getenv("OLLAMA_HOST", DEFAULT_HOST)).rstrip("/")
+        self.capability_profile = capability_profile or ModelCapabilityProfile(
+            model_name=self.model, base_url=self.host, endpoint="/api/chat",
+            tool_call_support=False, structured_output_support=False,
+            health_status="unprobed",
+        )
+        self.request_compiler = OllamaRequestCompiler()
+        self.reasoning_effort = str(reasoning_effort)
+        raw_context = context_size if context_size is not None else os.getenv("OLLAMA_CONTEXT_SIZE", "16384")
+        try:
+            parsed_context = int(raw_context)
+        except (TypeError, ValueError):
+            parsed_context = 16_384
+        self.context_size = min(131_072, max(2_048, parsed_context))
+        raw_num_gpu = num_gpu if num_gpu is not None else os.getenv("OLLAMA_NUM_GPU")
+        try:
+            self.num_gpu = None if raw_num_gpu in {None, ""} else max(0, int(raw_num_gpu))
+        except (TypeError, ValueError):
+            self.num_gpu = None
+        self.max_output_tokens = (
+            None if max_output_tokens is None else min(65_536, max(128, int(max_output_tokens)))
+        )
+        self.force_json = bool(force_json)
+
+    def _ensure_capabilities(self) -> None:
+        if self.model == "offline" or self.capability_profile.health_status != "unprobed":
+            return
+        key = (self.host, self.model)
+        cached = self._capability_cache.get(key)
+        if cached is None:
+            cached = OllamaHandshake(self.host).probe(self.model)
+            self._capability_cache[key] = cached
+        self.capability_profile = cached
 
     def _post_json(self, path: str, payload: dict):
         data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
@@ -50,8 +94,51 @@ class OllamaProvider:
         )
         try:
             return urllib.request.urlopen(request, timeout=300)
+        except urllib.error.HTTPError as error:
+            try:
+                body = error.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = str(error.reason or "")
+            safe_body = redact_provider_message(body)
+            status = int(error.code)
+            lowered = safe_body.casefold()
+            kind = ProviderFailureKind.HTTP_4XX if 400 <= status < 500 else ProviderFailureKind.HTTP_5XX
+            if status == 404:
+                kind = ProviderFailureKind.MODEL_NOT_INSTALLED if "model" in lowered else ProviderFailureKind.ENDPOINT_NOT_FOUND
+            elif ("load model" in lowered or "loading model" in lowered or "unable to load" in lowered):
+                kind = ProviderFailureKind.MODEL_LOAD_FAILED
+            elif "context" in lowered and ("limit" in lowered or "length" in lowered):
+                kind = ProviderFailureKind.CONTEXT_LIMIT
+            elif "tool" in lowered and ("support" in lowered or "invalid" in lowered):
+                kind = ProviderFailureKind.UNSUPPORTED_TOOLS
+            elif "format" in lowered or "response_format" in lowered:
+                kind = ProviderFailureKind.UNSUPPORTED_STRUCTURED_OUTPUT
+            elif "unknown field" in lowered or "unsupported parameter" in lowered:
+                kind = ProviderFailureKind.UNSUPPORTED_PARAMETER
+            elif "does not support" in lowered or "not supported" in lowered:
+                kind = ProviderFailureKind.UNSUPPORTED_PARAMETER
+            elif "invalid" in lowered and ("json" in lowered or "payload" in lowered or "request" in lowered):
+                kind = ProviderFailureKind.INVALID_PAYLOAD
+            field = None
+            match = __import__("re").search(r"(?:field|parameter)\s+['\"]?([\w.-]+)", safe_body, __import__("re").I)
+            if match:
+                field = match.group(1)
+            elif "thinking" in lowered or " think" in lowered:
+                field = "think"
+            elif kind is ProviderFailureKind.UNSUPPORTED_TOOLS:
+                field = "tools"
+            elif kind is ProviderFailureKind.UNSUPPORTED_STRUCTURED_OUTPUT:
+                field = "format"
+            raise ProviderRequestError(ProviderDiagnostic(
+                reachable=True, kind=kind, operation="POST", status_code=status,
+                provider_message=safe_body, endpoint=f"{self.host}{path}", incompatible_field=field,
+            )) from error
+        except (TimeoutError, socket.timeout) as error:
+            raise ProviderRequestError(ProviderDiagnostic(False, ProviderFailureKind.TIMEOUT, "POST", provider_message=str(error), endpoint=f"{self.host}{path}")) from error
         except urllib.error.URLError as error:
-            raise RuntimeError(f"Could not reach Ollama at {self.host}: {error}") from error
+            reason = error.reason
+            kind = ProviderFailureKind.CONNECTION_REFUSED if isinstance(reason, ConnectionRefusedError) else ProviderFailureKind.DNS_OR_SOCKET
+            raise ProviderRequestError(ProviderDiagnostic(False, kind, "POST", provider_message=redact_provider_message(str(reason)), endpoint=f"{self.host}{path}")) from error
 
     def _to_messages(self, conversation, system):
         messages = [{"role": "system", "content": str(system or "")}]
@@ -104,20 +191,60 @@ class OllamaProvider:
         return messages
 
     def call(self, conversation, tools, system, on_text=None, on_thought=None) -> AssistantTurn:
-        payload = {
-            "model": self.model,
-            "messages": self._to_messages(conversation, system),
-            "tools": tools or [],
-            "stream": True,
-            "think": True,
-        }
+        self._ensure_capabilities()
+        payload = self.request_compiler.compile(
+            self.capability_profile,
+            messages=self._to_messages(conversation, system), tools=tools or (),
+            stream=True,
+            options=(
+                {
+                    "think": (
+                        False
+                        if self.reasoning_effort.casefold() in {"off", "none", "false"}
+                        else "high" if self.reasoning_effort == "xhigh" else self.reasoning_effort
+                    )
+                }
+                if self.capability_profile.thinking_support else {}
+            ),
+        )
+        if self.force_json and "format" not in self.capability_profile.known_unsupported_parameters:
+            payload["format"] = "json"
+        # Model metadata may advertise a 128K+ default even when the harness
+        # sends a deliberately narrow weak-model context.  Explicitly bound the
+        # KV cache so local inference does not waste memory or fail at startup.
+        payload["options"] = {"num_ctx": self.context_size}
+        if self.num_gpu is not None:
+            payload["options"]["num_gpu"] = self.num_gpu
+        if self.max_output_tokens is not None:
+            payload["options"]["num_predict"] = self.max_output_tokens
 
         text_parts: list[str] = []
         thought_parts: list[str] = []
         raw_tool_calls: list[Mapping[str, Any]] = []
         usage = None
+        malformed_chunks = 0
+        valid_chunks = 0
 
-        with self._post_json("/api/chat", payload) as response:
+        try:
+            response = self._post_json("/api/chat", payload)
+        except ProviderRequestError as error:
+            field = error.diagnostic.incompatible_field
+            adaptable = field in {"think", "tools", "format"} and field in payload
+            if not adaptable:
+                raise
+            unsupported = tuple(dict.fromkeys((*self.capability_profile.known_unsupported_parameters, field)))
+            self.capability_profile = replace(
+                self.capability_profile,
+                tool_call_support=False if field == "tools" else self.capability_profile.tool_call_support,
+                structured_output_support=False if field == "format" else self.capability_profile.structured_output_support,
+                thinking_support=False if field == "think" else self.capability_profile.thinking_support,
+                known_unsupported_parameters=unsupported,
+            )
+            adapted_payload = dict(payload)
+            adapted_payload.pop(field, None)
+            response = self._post_json("/api/chat", adapted_payload)
+
+        with response:
             for raw_line in response:
                 if not raw_line or not raw_line.strip():
                     continue
@@ -126,9 +253,12 @@ class OllamaProvider:
                 except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
                     # A truncated NDJSON line should not take down a long run;
                     # later chunks may still contain a complete answer/call.
+                    malformed_chunks += 1
                     continue
                 if not isinstance(chunk, Mapping):
+                    malformed_chunks += 1
                     continue
+                valid_chunks += 1
                 if chunk.get("error"):
                     raise RuntimeError(f"Ollama error: {chunk['error']}")
                 message = chunk.get("message")
@@ -160,6 +290,13 @@ class OllamaProvider:
                         input_tokens=chunk.get("prompt_eval_count", 0) or 0,
                         output_tokens=chunk.get("eval_count", 0) or 0,
                     )
+
+        if malformed_chunks and not valid_chunks:
+            raise ProviderRequestError(ProviderDiagnostic(
+                reachable=True, kind=ProviderFailureKind.MALFORMED_STREAM,
+                operation="parse_stream", provider_message="Ollama returned no valid NDJSON chunks",
+                endpoint=f"{self.host}/api/chat",
+            ))
 
         tool_calls = []
         seen_ids: set[str] = set()

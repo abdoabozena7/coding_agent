@@ -8,10 +8,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from agent.cli import choose_workspace, execute_command, main
+from agent.cli import choose_workspace, execute_command, interactive_loop, main
 from agent.commands import CommandKind, parse_command
 from agent.config import InteractionMode, RuntimeConfig, SessionPreferences
 from agent.models import GoalStatus
+from agent.store import StateStore
 from agent.ui import ConsoleUI, DashboardView
 
 
@@ -41,6 +42,27 @@ class CLITests(unittest.TestCase):
     def test_slash_menu_mode_and_settings_commands_are_parsed(self):
         self.assertEqual(parse_command("/").kind, CommandKind.MENU)
         self.assertEqual(parse_command("/   ").kind, CommandKind.MENU)
+        self.assertEqual(parse_command("/thinking").kind, CommandKind.THINKING)
+        self.assertEqual(parse_command("/doctor").kind, CommandKind.DOCTOR)
+        self.assertEqual(parse_command("/readiness").kind, CommandKind.DOCTOR)
+        self.assertEqual(parse_command("/doctor --live").args, {"live": True})
+        self.assertEqual(parse_command("/doctor --record").args, {"record": True})
+        self.assertEqual(parse_command("/doctor --record --live").args, {"record": True, "live": True})
+        self.assertEqual(parse_command("/skills").kind, CommandKind.SKILLS)
+        self.assertEqual(parse_command("/processes").kind, CommandKind.PROCESSES)
+        stopped = parse_command("/stop-process preview-123")
+        self.assertEqual(stopped.kind, CommandKind.STOP_PROCESS)
+        self.assertEqual(stopped.args["resource_id"], "preview-123")
+        self.assertEqual(parse_command("/model gemma4:e4b high").args, {"model": "gemma4:e4b", "effort": "high"})
+        self.assertEqual(parse_command("/model xhigh").args, {"model": None, "effort": "xhigh"})
+        self.assertEqual(parse_command("/ide").kind, CommandKind.IDE)
+        self.assertEqual(parse_command("/keymap").kind, CommandKind.KEYMAP)
+        self.assertEqual(parse_command("/vim on").args, {"state": "on"})
+        self.assertEqual(
+            parse_command("/sandbox-add-read-dir C:\\Users").args,
+            {"path": "C:\\Users"},
+        )
+        self.assertEqual(parse_command("/experimental").args, {"state": "status"})
 
         mode_query = parse_command("/mode")
         self.assertEqual(mode_query.kind, CommandKind.MODE)
@@ -86,6 +108,48 @@ class CLITests(unittest.TestCase):
             self.assertIn("Session settings", rendered)
             self.assertIn("mode       = goal", rendered)
             self.assertNotIn("API_KEY", rendered)
+
+    def test_doctor_record_command_persists_benchmark_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            with mock.patch.dict("os.environ", {"AGENT_REQUIRE_LOCAL_GPU": "0"}, clear=False):
+                with redirect_stdout(output):
+                    code = main(
+                        [
+                            "--workspace",
+                            directory,
+                            "--provider",
+                            "ollama",
+                            "--model",
+                            "gemma4:e4b",
+                            "--command",
+                            "/doctor --record",
+                            "--no-color",
+                            "--plain",
+                        ]
+                    )
+            with StateStore(directory) as store:
+                rows = store.list_benchmark_results(suite_name="agent-readiness", limit=10)
+                trend_rows = store.list_benchmark_results(suite_name="benchmark-trend", limit=10)
+
+        self.assertEqual(code, 0)
+        rendered = output.getvalue()
+        self.assertIn("Agent readiness", rendered)
+        self.assertIn("Recorded benchmark runs", rendered)
+        self.assertIn("Benchmark trends", rendered)
+        scenarios = {row["scenario_name"]: row for row in rows}
+        self.assertIn("structural", scenarios)
+        self.assertIn("behavioral", scenarios)
+        self.assertEqual(scenarios["structural"]["provider"], "ollama")
+        self.assertEqual(scenarios["behavioral"]["model"], "gemma4:e4b")
+        self.assertGreaterEqual(scenarios["behavioral"]["metrics"]["checks"], 4)
+        trend_scenarios = {row["scenario_name"]: row for row in trend_rows}
+        self.assertIn("agent-readiness/structural", trend_scenarios)
+        self.assertIn("agent-readiness/behavioral", trend_scenarios)
+        self.assertEqual(
+            trend_scenarios["agent-readiness/structural"]["inputs"]["trend"]["verdict"],
+            "insufficient_history",
+        )
 
     def test_settings_mutate_and_query_runtime_config_for_this_session(self):
         output = io.StringIO()
@@ -271,6 +335,41 @@ class CLITests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             console.confirm_action("run_bash", {"command": "test"}, "high")
         self.assertIn("checkpointing", output.getvalue())
+
+    def test_prompt_ctrl_c_relies_on_the_single_checkpoint_event(self):
+        runtime = mock.Mock()
+        console = mock.Mock()
+        console.prompt.side_effect = [KeyboardInterrupt(), EOFError()]
+        with mock.patch("agent.cli._show_runtime_state"):
+            interactive_loop(runtime, console, SessionPreferences())
+
+        runtime.checkpoint_interrupt.assert_called_once_with()
+        console.write.assert_called_once_with("\nInput closed. Durable goal state is saved.")
+
+    def test_noninteractive_ctrl_c_does_not_dump_status_after_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()), mock.patch(
+            "agent.cli.execute_command", side_effect=KeyboardInterrupt()
+        ), mock.patch(
+            "agent.cli.AgentRuntime.checkpoint_interrupt"
+        ) as checkpoint, mock.patch(
+            "agent.cli._show_runtime_state"
+        ) as show_state:
+            code = main(
+                [
+                    "--workspace",
+                    directory,
+                    "--provider",
+                    "ollama",
+                    "--command",
+                    "/status",
+                    "--no-color",
+                    "--plain",
+                ]
+            )
+
+        self.assertEqual(code, 130)
+        checkpoint.assert_called_once_with()
+        show_state.assert_not_called()
 
 
 if __name__ == "__main__":

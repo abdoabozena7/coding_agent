@@ -130,7 +130,7 @@ class StateStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(StalePlanError, "lacks fingerprinted applicability evidence"):
             self.store.approve_plan(goal.id, plan.revision)
 
-    def test_v2_state_migrates_to_v3_without_losing_goal_or_plan(self):
+    def test_v2_state_migrates_to_v4_without_losing_goal_or_plan(self):
         goal = self._pending_goal()
         plan = self.store.create_plan(
             goal.id,
@@ -165,7 +165,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get_plan(goal.id, plan.revision).fingerprint, plan.fingerprint)
         migrated = sqlite3.connect(path)
         try:
-            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 7)
             self.assertIsNotNone(
                 migrated.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='ultra_runs'"

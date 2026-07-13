@@ -91,8 +91,9 @@ class GeminiProvider:
         native_replay=True,
     )
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, reasoning_effort: str = "medium"):
         self.model = model or os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
+        self.reasoning_effort = str(reasoning_effort)
         self._client = None
 
     def _client_(self):
@@ -238,7 +239,12 @@ class GeminiProvider:
         config = types.GenerateContentConfig(
             system_instruction=str(system or ""),
             tools=gemini_tools or None,
-            thinking_config=types.ThinkingConfig(include_thoughts=True),
+            thinking_config=types.ThinkingConfig(
+                include_thoughts=True,
+                thinking_budget={"low": 1024, "medium": 4096, "high": 8192, "xhigh": 16384}.get(
+                    str(getattr(self, "reasoning_effort", "medium")), 4096
+                ),
+            ),
         )
         stream = self._client_().models.generate_content_stream(
             model=self.model,

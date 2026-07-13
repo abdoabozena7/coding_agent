@@ -62,6 +62,14 @@ class ToolSecurityTests(unittest.TestCase):
         self.assertEqual((second / "second.txt").read_text(), "two")
         self.assertEqual((self.workspace / "first.txt").read_text(), "one")
 
+    def test_empty_optional_list_path_uses_the_documented_workspace_default(self) -> None:
+        (self.workspace / "example.txt").write_text("safe", encoding="utf-8")
+
+        result = self.call("list_files", path="")
+
+        self.assertIn("example.txt", result)
+        self.assertNotIn("invalid arguments", result)
+
     def test_relative_and_absolute_escape_attempts_are_rejected(self) -> None:
         secret = self.outside / "secret.txt"
         secret.write_text("outside-secret", encoding="utf-8")

@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+  <html lang="en">
+  <head>
+      <meta charset="UTF-8">
+      <title>Crossy 3D Runner</title>
+      <style>
+          body { margin: 0; overflow: hidden; background-color: #111; font-family: 'Arial', sans-serif; }
+          canvas { display: block; }
+          #ui-overlay {
+              position: fixed;
+              top: 0; left: 0; width: 100%; height: 100%;
+              pointer-events: none; /* Allow interaction with canvas underneath */
+              z-index: 10;
+          }
+
+          /* --- Core UI Elements (Score/Info) --- */
+          #score-display {
+              position: absolute;
+              top: 20px;
+              left: 20px;
+              color: #fff;
+              text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
+              padding: 10px 20px;
+              background: rgba(0, 0, 0, 0.3);
+              border-radius: 10px;
+              pointer-events: auto; /* Make it clickable if needed */
+          }
+
+          #high-score-display {
+              position: absolute;
+              top: 20px;
+              right: 20px;
+              color: #ffea00;
+              text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
+              padding: 10px 20px;
+              background: rgba(0, 0, 0, 0.3);
+              border-radius: 10px;
+              pointer-events: auto;
+          }
+
+          /* --- Game State Overlays (Start/Game Over) --- */
+          .game-screen {
+              position: absolute;
+              top: 0; left: 0; width: 100%; height: 100%;
+              background: rgba(0, 0, 0, 0.85);
+              color: white;
+              display: flex;
+              flex-direction: column;
+              justify-content: center;
+              align-items: center;
+              text-align: center;
+              z-index: 20; /* Higher than score/canvas */
+              padding: 20px;
+              box-sizing: border-box;
+          }
+
+          .game-screen h1 { font-size: 3em; margin-bottom: 0.5em; }
+          .game-screen p { font-size: 1.2em; margin-top: 0.5em; }
+          .hidden { display: none !important; }
+
+          /* --- Mobile Controls --- */
+          #mobile-controls {
+              position: fixed;
+              bottom: 0;
+              left: 0;
+              width: 100%;
+              height: 150px;
+              background: rgba(0, 0, 0, 0.5);
+              display: flex;
+              justify-content: space-around;
+              align-items: center;
+              padding: 20px 10px;
+              z-index: 30;
+              flex-wrap: wrap; /* For responsiveness */
+          }
+
+          .control-button {
+              background: rgba(255, 255, 255, 0.8);
+              color: #333;
+              border: none;
+              border-radius: 15px;
+              padding: 15px 30px;
+              font-size: 1.2em;
+              cursor: pointer;
+              user-select: none;
+              margin: 5px;
+              transition: background 0.1s, transform 0.1s;
+              box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
+          }
+
+          .control-button:active {
+              transform: scale(0.95);
+              background: #ddd;
+          }
+
+          /* Hide mobile controls on desktop view (optional, but good practice) */
+          @media screen and not (pointer: coarse) {
+              #mobile-controls { display: none; }
+          }
+
+      </style>
+  </head>
+  <body>
+      <div id="ui-overlay">
+          <!-- Score Display -->
+          <div id="score-display">Score: 0</div>
+          <div id="high-score-display">High Score: 0</div>
+      </div>
+
+      <!-- Start Screen Overlay -->
+      <div id="start-screen" class="game-screen">
+          <h1>CROSSY 3D RUNNER</h1>
+          <p>The grid adventure! Guide the chicken across dangerous lanes.</p>
+          <p>Use Arrow Keys / WASD (Desktop) or Buttons (Mobile)</p>
+          <button id="start-button" class="control-button" style="margin-top: 30px; padding: 15px 40px;">Start Game</button>
+      </div>
+
+      <!-- Game Over Screen Overlay -->
+      <div id="gameover-screen" class="game-screen hidden">
+          <h1>GAME OVER</h1>
+          <p>You hit an obstacle and lost your life!</p>
+          <p style="font-size: 1.5em;">Final Score: <span id="final-score">0</span></p>
+          <p style="font-size: 1.2em;">High Score: <span id="high-score-display-go">0</span></p>
+          <button id="restart-button" class="control-button" style="margin-top: 30px; padding: 15px 40px;">Try Again</button>
+      </div>
+
+      <!-- Mobile Controls -->
+      <div id="mobile-controls">
+          <button class="control-button" id="move-left">&#9664;</button>
+          <button class="control-button" id="hop-up">Up</button>
+          <button class="control-button" id="move-right">&#9654;</button>
+      </div>
+
+      <!-- THREE.JS CDN -->
+      <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+
+      <script>
+          /** ==================================================
+           * CORE GAME MODULES (All logic must be contained here)
+           * Using the structure recommended by the Multi-Agent Workflow.
+           * ==================================================
+           */
+
+          // Global state and constants
+          const PLAYER_SIZE = 1;
+          const LANE_WIDTH = 10; // World units
+          const TILE_SPACING = 15; // Z distance between lanes
+          const GAME_SPEED = 0.08; // Base speed of world scrolling (Z movement)
+          let gameInterval = null;
+
+          // --- Audio Manager (Polish/Juice Agent) ---
+          class AudioManager {
+              constructor() {
+                  this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                  console.log("AudioManager initialized.");
+              }
+
+              playHitSound() {
+                  const oscillator = this.audioContext.createOscillator();
+                  oscillator.type = 'sawtooth';
+                  oscillator.frequency.setValueAtTime(150, this.audioContext.currentTime);
+                  oscillator.connect(this.audioContext.destination);
+                  oscillator.start();
+                  setTimeout(() => oscillator.stop(), 200);
+              }
+
+              playCollectSound() {
+                  const oscillator = this.audioContext.createOscillator();
+                  oscillator.type = 'sine';
+                  oscillator.frequency.setValueAtTime(800, this.audioContext.currentTime);
+                  oscillator.connect(this.audioContext.destination);
+                  oscillator.start();
+                  setTimeout(() => oscillator.stop(), 150);
+              }
+
+              // Note: Web Audio is limited without external files, so we stick to simple tones.
+          }
+
+
+          // --- Player Class (Player Agent) ---
+          class Player {
+              constructor(scene, camera, startX = 0, startY = 0, startZ = 0) {
+                  this.mesh = null;
+                  this.state = 'idle'; // idle, moving_x, moving_z, etc.
+                  this.currentPos = new THREE.Vector3(startX, startY, startZ);
+                  this.targetPos = new THREE.Vector3(startX, startY, startZ);
+                  this.isMoving = false;
+
+                  // Build the character (Low-Poly Chicken/Cube)
+                  const geometry = new THREE.BoxGeometry(PLAYER_SIZE * 0.8, PLAYER_SIZE * 1.2, PLAYER_SIZE * 0.8);
+                  const material = new THREE.MeshStandardMaterial({ color: 0xcc9966 }); // Chicken yellow/brown
+                  this.mesh = new THREE.Mesh(geometry, material);
+
+                  // Simple representation of body components for visual polish
+                  const headGeo = new THREE.BoxGeometry(PLAYER_SIZE * 0.8, PLAYER_SIZE * 0.7, PLAYER_SIZE * 0.8);
+                  const headMat = new THREE.MeshStandardMaterial({ color: 0xffd700 }); // Yellow head/beak
+                  const head = new THREE.Mesh(headGeo, headMat);
+                  this.mesh.add(head);
+
+                  scene.add(this.mesh);
+                  this.mesh.position.copy(this.currentPos);
+
+                  // Setup movement state for physics simulation
+                  this.maxSpeed = 0.1;
+              }
+
+              /** Checks if the proposed move is valid (within bounds, not blocked) */
+              canMoveTo(newX, newZ) {
+                  // Basic boundary check (The game manager should handle tile alignment, but this prevents extreme
+                  drift)
+                  if (Math.abs(newX) > 50 || Math.abs(newZ) > 100) return false;
+
+                  // Check collision with immediate surroundings/static obstacles here later.
+                  return true;
+              }
+
+              /** Attempts to queue a move in the given direction */
+              attemptMove(dx, dz) {
+                  if (this.isMoving || this.state === 'dead') return false;
+
+                  const newX = this.currentPos.x + dx * PLAYER_SIZE;
+                  const newZ = this.currentPos.z + dz * PLAYER_SIZE;
+
+                  if (this.canMoveTo(newX, newZ)) {
+                      this.targetPos.set(newX, this.currentPos.y, newZ);
+                      // Update internal state to queue movement
+                      this.state = 'moving';
+                      this.isMoving = true;
+                      return true;
+                  } else {
+                      console.warn("Cannot move to that position.");
+                      return false;
+                  }
+              }
+
+              /** Updates the player's mesh and internal position towards targetPos */
+              update(deltaTime, worldSpeed) {
+                  if (!this.isMoving || this.state === 'dead') return;
+
+                  const direction = new THREE.Vector3().subVectors(this.targetPos, this.currentPos).normalize();
+
+                  // Calculate actual movement vector (influenced by both player input and world flow)
+                  let moveDistance = Math.min(Math.abs(direction.x) * 0.1, Math.abs(direction.z) * 0.1);
+
+                  if (moveDistance > 0) {
+                      this.currentPos.addScaledVector(direction, moveDistance);
+                      this.mesh.position.copy(this.currentPos);
+                      // Apply visual hop/squash effect on movement initiation or regular tick
+                      this.applyHopVisual();
+                  }
+
+                  // Check if target reached (or close enough)
+                  if (this.currentPos.distanceTo(this.targetPos) < 0.1) {
+                      this.currentPos.copy(this.targetPos); // Snap to target
+                      this.isMoving = false;
+                      this.state = 'idle';
+                  }
+
+                  // Handle water/log physics logic (This is simplified here, real implementation would be in Game
+                  class)
+              }
+
+              applyHopVisual() {
+                   // Simple visual polish: slightly scale up and down when moving
+                  const scaleFactor = Math.sin(Date.now() / 100) * 0.05 + 1;
+                  this.mesh.scale.set(scaleFactor, scaleFactor, scaleFactor);
+              }
+
+              die() {
+                  if (this.state === 'dead') return;
+                  this.state = 'dead';
+                  // Polish: Play death particle effect/animation here
+                  console.log("Player Died.");
+              }
+          }
+
+
+          // --- Lane Class & Manager (Lane, Procedural Generation Agents) ---
+          class Lane {
+              constructor(type, zPos, laneXOffset = 0) {
+                  this.type = type; // 'grass', 'road', 'river', 'highway'
+                  this.z = zPos;
+                  this.xOffset = laneXOffset;
+
+                  let material = new THREE.MeshStandardMaterial({ side: THREE.DoubleSide });
+                  let geometry;
+
+                  if (type === 'grass') {
+                      geometry = new THREE.BoxGeometry(LANE_WIDTH, 0.5, PLAYER_SIZE * 3);
+                      material = new THREE.MeshLambertMaterial({ color: 0x4CAF50 }); // Green grass
+                  } else if (type === 'road') {
+                      geometry = new THREE.BoxGeometry(LANE_WIDTH, 0.5, PLAYER_SIZE * 3);
+                      material = new THREE.MeshStandardMaterial({ color: 0x607d8b }); // Grey road
+                  } else if (type === 'river') {
+                      geometry = new THREE.BoxGeometry(LANE_WIDTH, 0.1, PLAYER_SIZE * 3);
+                      material = new THREE.MeshStandardMaterial({ color: 0x29b6f6 }); // Blue water
+                  } else if (type === 'highway') {
+                       geometry = new THREE.BoxGeometry(LANE_WIDTH, 0.5, PLAYER_SIZE * 3);
+                      material = new THREE.MeshStandardMaterial({ color: 0x795548 }); // Brown/Asphalt mix
+                  }
+
+                  this.mesh = new THREE.Mesh(geometry, material);
+                  this.mesh.position.set(laneXOffset, 0, zPos);
+                  this.isSafe = (type === 'grass');
+              }
+
+              updatePosition(newZ) {
+                   // Move the lane mesh when world scrolls
+                  const dx = new THREE.Vector3(-1 * (newZ - this.mesh.position.z), 0, 0);
+                  this.mesh.position.add(dx);
+              }
+
+              remove() {
+                  // Clean up geometry and remove from scene
+                  this.mesh.geometry.dispose();
+                  if (Array.isArray(this.mesh.material)) {
+                      this.mesh.material.forEach(m => m.dispose());
+                  } else {
+                      this.mesh.material.dispose();
+                  }
+                  return this.mesh;
+              }
+          }
+
+          class LaneManager {
+              constructor(scene) {
+                  this.lanes = [];
+                  this.scene = scene;
+                  this.laneCounter = 0; // Tracks max Z position established
+              }
+
+              generateLanesAhead(playerPositionZ, count = 5) {
+                  let startZ = playerPositionZ + TILE_SPACING * 1.5;
+
+                  for (let i = 0; i < count; i++) {
+                      const zPos = Math.floor(startZ + i * TILE_SPACING);
+                      let type, xOffset;
+                      let obstacles = []; // Placeholder for object generation
+
+                      // Simple procedural logic based on Z index:
+                      if (i % 5 === 0) {
+                          type = 'grass';
+                          xOffset = 0;
+                      } else if (i % 3 === 0 && i > 0) {
+                           // River/Water lane every ~15 units
+                          type = 'river';
+                          xOffset = 0;
+                      } else if (Math.random() < 0.2) {
+                          // Road or Highway randomly
+                          type = Math.random() < 0.7 ? 'road' : 'highway';
+                          xOffset = Math.random() * 15 - 7.5; // Slight side drift
+                      } else {
+                           // Default safe lane
+                          type = 'grass';
+                          xOffset = 0;
+                      }
+
+                      const newLane = new Lane(type, zPos, xOffset);
+                      this.lanes.push(newLane);
+                  }
+
+                  this.laneCounter = Math.max(...this.lanes.map(l => l.z));
+              }
+
+              updateAndCleanUp(playerPositionZ) {
+                  // 1. Update all existing lanes' Z positions based on movement
+                  this.lanes.forEach(lane => {
+                      lane.updatePosition(playerPositionZ);
+                  });
+
+                  // 2. Remove old lanes (if they are far behind the player)
+                  const cullThreshold = playerPositionZ - TILE_SPACING * 3;
+                  this.lanes = this.lanes.filter(lane => {
+                      if (lane.mesh.position.z < cullThreshold) {
+                          this.scene.remove(lane); // Remove from scene graph
+                          return false;
+                      } else {
+                          return true;
+                      }
+                  });
+
+                  // 3. Generate more lanes if needed
+                  const requiredLanes = Math.ceil((playerPositionZ + TILE_SPACING * 5) / TILE_SPACING);
+                  if (this.lanes.length < requiredLanes - this.lanes.filter(l => l.mesh.position.z >=
+                  playerPositionZ).length) {
+                      this.generateLanesAhead(playerPositionZ, 2);
+                  }
+              }
+          }
+
+          // --- Vehicle Class (Vehicle Agent) ---
+          class Vehicle {
+              constructor(scene, laneManager, initialSpeed, startMesh) {
+                  this.mesh = startMesh; // The actual Three.js mesh container
+                  this.lane = laneManager.lanes[0]; // Assume it's attached to a lane initially
+                  this.speed = initialSpeed * (0.8 + Math.random() * 0.4); // Slight speed variance
+                  this.directionMultiplier = -1; // Scrolling/Moving towards player
+
+                  // Position relative to the world center (X, Y)
+                  this.startX = this.mesh.position.x;
+                  this.startZ = this.lane.z + Math.random() * 20;
+              }
+
+              update(deltaTime) {
+                  // Simple horizontal movement simulation (car coming towards the player/camera)
+                  let newX = this.startX + (Math.sin(Date.now() / 1500) * 3); // Gentle side drift
+                  this.mesh.position.x = newX;
+
+                  // Always move relative to Z (since world is scrolling, the vehicle's perceived motion needs
+                  adjustment)
+                  let currentZ = this.lane.z + this.mesh.position.z - this.lane.mesh.position.z; // Relative Z position
+                  of car on lane
+                  this.mesh.position.z += this.speed * deltaTime * 2;
+
+                  // Simple respawn logic: if vehicle passes the player, reset it far away
+                  if (this.mesh.position.z > TILE_SPACING * 10) {
+                      const newZ = this.lane.z - TILE_SPACING * 5; // Respawn behind current action area
+                      this.mesh.position.z = newZ;
+                      this.startX = newX;
+                  }
+              }
+
+              getBoundingBox() {
+                  // Simple bounding box calculation (Approximation)
+                  const p = this.mesh.position;
+                  return new THREE.Box3().setFromObject(this.mesh);
+              }
+          }
+
+
+          // --- Game Class (Game Agent, Loop Manager) ---
+          class Game {
+              constructor() {
+                  // 1. Initialize Core Components
+                  this.scene = new THREE.Scene();
+                  this.camera = null;
+                  this.renderer = null;
+                  this.player = null;
+                  this.laneManager = null;
+
+                  this.score = 0;
+                  this.isPaused = true;
+                  this.highScore = parseInt(localStorage.getItem('crossyHighScore') || '0');
+                  this.currentGameSpeed = GAME_SPEED;
+
+                  // Initialize Utility Systems
+                  this.audioManager = new AudioManager();
+
+                  this.initWorld();
+                  this.setupEventHandlers();
+              }
+
+              initWorld() {
+                  // Setup Camera and Renderer (3.js Rendering Agent)
+                  this.renderer = new THREE.WebGLRenderer({ antialias: true });
+                  this.renderer.setSize(window.innerWidth, window.innerHeight);
+                  this.renderer.setPixelRatio(window.devicePixelRatio);
+                  this.renderer.shadowMap.enabled = true;
+                  document.body.appendChild(this.renderer.domElement);
+
+                  // Ambient and Directional Lights (Polish)
+                  this.scene.add(new THREE.AmbientLight(0x66bb6a, 1)); // Soft fill light
+                  const directionalLight = new THREE.DirectionalLight(0xffffff, 2);
+                  directionalLight.position.set(50, 100, 50);
+                  directionalLight.castShadow = true;
+                  this.scene.add(directionalLight);
+
+                  // Add Sky/Fog (Polish)
+                  this.scene.fog = new THREE.Fog(0xcccccc, 10, 200);
+
+                  // Create the Ground Plane (large plane for world reference)
+                  const floorGeometry = new THREE.PlaneGeometry(300, 300);
+                  const floorMaterial = new THREE.MeshStandardMaterial({ color: 0x8bc34d });
+                  const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+                  floor.rotation.x = -Math.PI / 2;
+                  floor.receiveShadow = true;
+                  this.scene.add(floor);
+
+                  // Camera Setup (Isometric)
+                  this.camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+                  this.camera.position.set(0, 40, 30); // Elevated view
+                  this.camera.lookAt(0, 2, 0);
+
+                  // Initialize Managers
+                  this.player = new Player(this.scene, this.camera);
+                  this.laneManager = new LaneManager(this.scene);
+
+                  // Initial world generation
+                  this.laneManager.generateLanesAhead(0, 10);
+
+                  // Simulate Vehicle setup (Simple car placeholder)
+                  const vehicleGeometry = new THREE.BoxGeometry(2, 1, 1);
+                  const vehicleMaterial = new THREE.MeshStandardMaterial({ color: Math.random() * 0xffffff });
+                  this.vehicles = [];
+                   // Add some initial vehicles for testing
+                  for (let i = 0; i < 5; i++) {
+                      const carMesh = new THREE.Mesh(vehicleGeometry, vehicleMaterial);
+                      carMesh.castShadow = true;
+                      carMesh.receiveShadow = true;
+                      this.scene.add(carMesh);
+
+                      // Link the vehicle to a lane object (simplification)
+                      const placeholderLane = this.laneManager.lanes[0];
+                      if (placeholderLane) {
+                          const car = new Vehicle(this.scene, this.laneManager, 1 + i * 0.5, carMesh);
+                          car.mesh.position.copy(carMesh.position);
+                          this.vehicles.push(car);
+                      } else {
+                           // Fallback positioning
+                          const car = new Vehicle(this.scene, this.laneManager, 1 + i * 0.5, carMesh);
+                          this.vehicles.push(car);
+                      }
+                  }
+
+
+                  window.addEventListener('resize', this.onWindowResize.bind(this));
+              }
+
+              onWindowResize() {
+                  this.camera.aspect = window.innerWidth / window.innerHeight;
+                  this.camera.updateProjectionMatrix();
+                  this.renderer.setSize(window.innerWidth, window.innerHeight);
+              }
+
+
+              // --- GAME LOOP ---
+              animate = (time) => {
+                  if (!this.isPaused) {
+                      const deltaTime = 1 / 60; // Fixed delta time for consistent movement
+                      this.updateWorld(deltaTime);
+                      this.player.update(deltaTime, this.currentGameSpeed);
+
+                      // Update other elements
+                      this.vehicles.forEach(v => v.update(deltaTime));
+                      // Water/Logs update logic goes here...
+
+                      this.checkCollisions();
+                  }
+
+                  this.renderer.render(this.scene, this.camera);
+                  requestAnimationFrame(this.animate);
+              };
+
+              updateWorld(deltaTime) {
+                  const playerZ = this.player.currentPos.z;
+
+                  // 1. World Scroll/Lane Management (Procedural Generation Agent)
+                  this.laneManager.updateAndCleanUp(playerZ);
+
+                  // 2. Score progression and difficulty scaling
+                  if (playerZ > (this.score * TILE_SPACING)) {
+                      this.score++;
+                      this.currentGameSpeed = Math.min(GAME_SPEED + this.score * 0.005, GAME_SPEED + 1);
+                      console.log(`New Score: ${this.score}. Speed increased.`);
+                  }
+
+                  // 3. Camera Follow (Polish)
+                  this.camera.position.x = THREE.MathUtils.lerp(this.camera.position.x, this.player.currentPos.x, 0.1);
+                  this.camera.position.y = THREE.MathUtils.lerp(this.camera.position.y, this.player.currentPos.y + 5,
+                  0.1);
+                  this.camera.position.z = THREE.MathUtils.lerp(this.camera.position.z, this.player.currentPos.z + 30,
+                  0.1);
+                  this.camera.lookAt(this.player.currentPos.x, this.player.currentPos.y + 1, this.player.currentPos.z -
+                  20); // Look slightly ahead
+
+                  // Update UI score display
+                  document.getElementById('score-display').textContent = `Score: ${this.score}`;
+              }
+
+
+              checkCollisions() {
+                  if (this.player.state !== 'moving' && this.player.state !== 'idle') return; // Only check when player
+                  is stable
+
+                  const playerBox = new THREE.Box3().setFromObject(this.player.mesh);
+
+                  // 1. Vehicle Collision Check (Collision Requirements)
+                  for (const vehicle of this.vehicles) {
+                      const vehicleBox = vehicle.getBoundingBox();
+
+                      if (playerBox.intersectsBox(vehicleBox)) {
+                          this.endGame("Hit by a dangerous machine!");
+                          return;
+                      }
+                  }
+
+                  // 2. Water/Boundaries Check (Collision Requirements)
+                  const onWaterLane = this.laneManager.lanes.some(l => l.type === 'river' &&
+                  Math.abs(this.player.currentPos.x - l.mesh.position.x) < 5);
+
+                  if (onWaterLane) {
+                      // Simplified water check: If player is in a river lane and doesn't touch a log... Fail!
+                      // Real implementation requires checking proximity to visible logs mesh coordinates
+                      const hasLogSupport = this.laneManager.lanes.filter(l => l.type === 'river').length > 0;
+
+                      if (hasLogSupport && Math.random() < 0.01) { // Simulate occasional fall/drift failure
+                          this.endGame("Drowned in the deep!");
+                      }
+                  } else if (Math.abs(this.player.currentPos.x) > 40 || Math.abs(this.player.currentPos.z) > 80) {
+                       // Out of world bounds check
+                       this.endGame("Fell off the edge!");
+                  }
+
+              }
+
+
+              // --- GAME FLOW MANAGEMENT ---
+              startGame() {
+                  if (!this.isPaused) return;
+                  document.getElementById('start-screen').classList.add('hidden');
+                  document.getElementById('gameover-screen').classList.add('hidden');
+                  this.resetGameState();
+
+                  this.isPaused = false;
+                  this.animate(0); // Start the loop
+              }
+
+              restartGame() {
+                   // Attempt to restart, relies on `startGame` logic above
+                   if (confirm("Are you sure you want to try again?")) {
+                       this.startGame();
+                   }
+              }
+
+
+              endGame(reason) {
+                  if (this.isPaused === false) { // Only trigger if game was actually running
+                      this.isPaused = true;
+                      cancelAnimationFrame(this.animationFrameId); // Stop the loop
+
+                      // Polish: Play hit sound/particles
+                      this.audioManager.playHitSound();
+
+                      document.getElementById('final-score').textContent = this.score;
+                      document.getElementById('high-score-display-go').textContent = this.highScore;
+                      document.getElementById('gameover-screen').classList.remove('hidden');
+
+                      // Update High Score (localStorage)
+                      if (this.score > this.highScore) {
+                          this.highScore = this.score;
+                          localStorage.setItem('crossyHighScore', this.highScore);
+                          document.getElementById('high-score-display').textContent = `High Score: ${this.highScore}`;
+                      }
+
+                      // Attach restart listener one time
+                      const restartButton = document.getElementById('restart-button');
+                      restartButton.onclick = () => this.restartGame();
+                  }
+              }
+
+
+              resetGameState() {
+                  this.score = 0;
+                  this.currentGameSpeed = GAME_SPEED;
+
+                  // Clear scene of old objects (VERY important for reset)
+                  while(this.scene.children.length > 0){
+                      const object = this.scene.children[0];
+                      if (object.material) {
+                          object.material.dispose();
+                      }
+                      if (object.geometry) {
+                          object.geometry.dispose();
+                      }
+                      this.scene.remove(object);
+                  }
+
+                  // Re-initialize World
+                  document.body.appendChild(this.renderer.domElement); // Ensure canvas is available
+                  // Since we reset everything, re-run init logic steps carefully (omitted for brevity but necessary in
+                  final code)
+                  // We will rely on the full constructor logic to handle cleanup and setup correctly once
+
+                  // Reset Player Position
+                  this.player = new Player(this.scene, this.camera);
+                  this.laneManager = new LaneManager(this.scene);
+                  this.laneManager.generateLanesAhead(0, 10);
+              }
+          }
+
+
+          /* --- INPUT MANAGER & CONTROLS (Input Manager Agent) --- */
+
+          class InputManager {
+              constructor(gameInstance, playerInstance) {
+                  this.game = gameInstance;
+                  this.player = playerInstance;
+                  this.movementQueue = []; // Buffer movements to prevent spamming
+                  this.isKeyDown = {};
+
+                  // Desktop Controls (WASD/Arrows)
+                  window.addEventListener('keydown', this.handleKeyPress.bind(this));
+                  window.addEventListener('keyup', this.handleKeyRelease.bind(this));
+
+                  // Mobile Controls (Event Listeners)
+                  document.getElementById('move-left').addEventListener('click', () => this.enqueueMove(-1, 0));
+                  document.getElementById('hop-up').addEventListener('click', () => this.enqueueMove(0, 1));
+                  document.getElementById('move-right').addEventListener('click', () => this.enqueueMove(1, 0));
+
+                  // Mobile Swipe/Touch listeners (Simplified - requires dedicated logic)
+                   let touchStartX = 0;
+                   let touchStartY = 0;
+
+                   window.addEventListener('touchstart', (e) => {
+                       touchStartX = e.touches[0].clientX;
+                       touchStartY = e.touches[0].clientY;
+                       e.preventDefault();
+                   }, { passive: false });
+
+                   window.addEventListener('touchend', (e) => {
+                      const touchEndX = e.changedTouches[0].clientX;
+                      const touchEndY = e.changedTouches[0].clientY;
+                      const dx = touchEndX - touchStartX;
+                      const dy = touchEndY - touchStartY;
+
+                      if (Math.abs(dx) > Math.abs(dy)) { // Horizontal swipe
+                          enqueueSwipeMove(dx > 0 ? 1 : -1, 0);
+                      } else { // Vertical swipe
+                          enqueueSwipeMove(0, dy > 0 ? 1 : -1);
+                      }
+
+                   }, { passive: false });
+              }
+
+              handleKeyPress(event) {
+                  const key = event.key.toUpperCase();
+                  this.isKeyDown[key] = true;
+
+                  let dx = 0;
+                  let dz = 0;
+
+                  if (['ARROWLEFT', 'A'].includes(key)) { dx = -1; }
+                  else if (['ARROWRIGHT', 'D'].includes(key)) { dx = 1; }
+                  else if (['ARROWUP', 'W'].includes(key)) { dz = 1; } // Positive Z is forward/up in game logic sense
+                  else if (['ARROWDOWN', 'S'].includes(key)) { dz = -1; }
+
+                  if (dx !== 0 || dz !== 0) {
+                      this.enqueueMove(dx, dz);
+                  }
+              }
+
+              handleKeyRelease(event) {
+                  const key = event.key.toUpperCase();
+                  delete this.isKeyDown[key];
+              }
+
+               enqueueSwipeMove(dx, dz) {
+                   // Swipes are treated as single queued inputs
+                   this.enqueueMove(dx, dz);
+              }
+
+
+              /** Core queuing function: adds movement to the queue only if not already moving */
+              enqueueMove(dx, dz) {
+                  if (this.game.player.isMoving || this.game.isPaused) return;
+
+                  // Check directional conflict (cannot move diagonally in one tile step)
+                  if (dx !== 0 && dz !== 0) {
+                      console.warn("Diagonal movement not supported.");
+                      return;
+                  }
+
+                  const newMove = { dx: dx, dz: dz };
+                  // Prevent adding duplicate immediate moves if held down
+                  if (!this.movementQueue.some(m => m.dx === dx && m.dz === dz)) {
+                       this.movementQueue.push(newMove);
+                  }
+              }
+
+              /** Called every frame to process queued inputs */
+              processMovement() {
+                  if (this.movementQueue.length > 0) {
+                      const move = this.movementQueue.shift(); // Process the oldest move first
+
+                      // Attempt movement on the player object
+                      if (this.player.attemptMove(move.dx, move.dz)) {
+                          console.log(`Queued Move: (${move.dx}, ${move.dz})`);
+                      } else {
+                          // If blocked, re-queue or discard? For simplicity, we discard if failed attempt.
+                          console.warn("Movement blocked by environment.");
+                      }
+                  }
+              }
+          }
+
+
+          /* --- UI Manager (UI/UX Agent) --- */
+
+          class UIManager {
+               constructor(gameInstance) {
+                   this.game = gameInstance;
+                   this.setupListeners();
+               }
+
+              setupListeners() {
+                  // Start button listener
+                  document.getElementById('start-button').onclick = () => this.game.startGame();
+
+                  // Restart button is handled dynamically in endGame()
+
+                  // Keyboard restart shortcut (Space/Enter)
+                  window.addEventListener('keydown', (e) => {
+                      if (!this.game.isPaused && (e.key === ' ' || e.key === 'Enter')) {
+                          // Optional: Allow spacebar to trigger movement if needed, but only on game over should we
+                          rely on it for restart.
+                          if (document.getElementById('gameover-screen').classList.contains('hidden') === false) {
+                              this.game.restartGame();
+                          }
+                      }
+                  });
+
+                   // Since the mobile controls are visible initially, they need to be handled carefully.
+                   // The InputManager handles button listeners already.
+              }
+          }
+
+          // Initialize Game
+          const gameInstance = new Game();
+          window.inputManager = new InputManager(gameInstance, gameInstance.player);
+          window.uiManager = new UIManager(gameInstance);
+
+          // Ensure the animation loop runs even if nothing is immediately visible
+          // (It will handle pausing and resuming via requestAnimationFrame)
+          requestAnimationFrame(gameInstance.animate);
+
+      </script>
+  </body>
+  </html>

@@ -38,7 +38,7 @@ SCHEMA = {
             "properties": {
                 "path": {
                     "type": "string",
-                    "minLength": 1,
+                    "minLength": 0,
                     "maxLength": MAX_PATH_CHARS,
                     "description": (
                         "Directory to list, relative to the active workspace. "
@@ -80,6 +80,11 @@ def _render(entries: list[str], truncated: bool) -> str:
 
 
 def run(path: str = ".") -> str:
+    # Several tool-calling APIs serialize an omitted optional string as "".
+    # The schema documents the workspace root as the default, so normalize that
+    # portable representation instead of turning a harmless inspection into an
+    # approval/error/retry cycle.
+    path = path or "."
     reject_sensitive_spelling(path)
     base = resolve_workspace_path(path, allow_workspace=True, must_exist=True)
     reject_sensitive_path(base)

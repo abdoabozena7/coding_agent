@@ -112,6 +112,12 @@ class BrainSection(str, Enum):
     KNOWLEDGE = "knowledge"
     LESSON = "lesson"
     ROLE_MEMORY = "role_memory"
+    QUALITY_POLICY = "quality_policy"
+    QUALITY_FINDINGS = "quality_findings"
+    CHANGE_SETS = "change_sets"
+    QUALITY_CYCLES = "quality_cycles"
+    VERIFIED_DECISIONS = "verified_decisions"
+    ACTIVE_BLOCKERS = "active_blockers"
 
 
 class LeaseStatus(str, Enum):

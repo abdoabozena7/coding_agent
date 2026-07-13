@@ -176,6 +176,35 @@ class ProjectBrain:
             agent_run_id=agent_run_id,
         )
 
+    def record_knowledge(
+        self,
+        title: str,
+        content: str,
+        *,
+        work_node_id: str | None = None,
+        agent_run_id: str | None = None,
+        data: Mapping[str, Any] | None = None,
+        confidence: float = 0.7,
+        evidence_refs: tuple[str, ...] = (),
+        promote: bool = True,
+    ) -> BrainEntry:
+        entry = self.write(
+            BrainSection.KNOWLEDGE,
+            title,
+            content,
+            data=data,
+            work_node_id=work_node_id,
+            agent_run_id=agent_run_id,
+        )
+        if promote:
+            self.store.promote_brain_entry_to_project_memory(
+                entry.id,
+                confidence=confidence,
+                evidence_refs=evidence_refs,
+                metadata={"source": "record_knowledge", "promoted": True},
+            )
+        return entry
+
     def list(
         self,
         *,
@@ -256,6 +285,19 @@ class ProjectBrain:
             "evidence": dict(artifact.evidence),
         }
 
+    @staticmethod
+    def _project_memory_payload(item: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "id": item["id"],
+            "section": item["section"],
+            "title": item["title"],
+            "content": item["content"],
+            "confidence": item["confidence"],
+            "effective_confidence": item.get("effective_confidence", item["confidence"]),
+            "evidence_refs": item["evidence_refs"],
+            "reuse_count": item["reuse_count"],
+        }
+
     def build_context(
         self,
         work_node_id: str,
@@ -302,6 +344,20 @@ class ProjectBrain:
         lessons = self.store.search_brain(
             self.ultra_run_id, focus_query, section=BrainSection.LESSON, limit=20
         )
+        project_lessons = self.store.search_project_memory(
+            focus_query,
+            section=BrainSection.LESSON,
+            min_confidence=0.4,
+            limit=12,
+        )
+        project_knowledge = self.store.search_project_memory(
+            focus_query,
+            section=BrainSection.KNOWLEDGE,
+            min_confidence=0.4,
+            limit=12,
+        )
+        for memory in (*project_lessons, *project_knowledge):
+            self.store.record_project_memory_use(str(memory["id"]))
         candidates: list[tuple[str, Any, tuple[BrainEntry, ...]]] = [
             ("task", self._node_payload(node), ()),
             ("ancestor_contracts", [self._node_payload(item) for item in ancestors], ()),
@@ -317,6 +373,16 @@ class ProjectBrain:
             ("role_memory", [self._entry_payload(item) for item in role_memory], role_memory),
             ("knowledge", [self._entry_payload(item) for item in knowledge], knowledge),
             ("lessons", [self._entry_payload(item) for item in lessons], lessons),
+            (
+                "project_knowledge",
+                [self._project_memory_payload(item) for item in project_knowledge],
+                (),
+            ),
+            (
+                "project_lessons",
+                [self._project_memory_payload(item) for item in project_lessons],
+                (),
+            ),
         ]
         sections: dict[str, Any] = {}
         omitted: list[str] = []
@@ -360,23 +426,45 @@ class ProjectBrain:
     ) -> tuple[BrainEntry, ...]:
         """Persist lessons and structured insights after a node checkpoint."""
         entries: list[BrainEntry] = []
-        entries.append(
-            self.record_lesson(
-                f"Result: {work_node_id}",
-                result.summary,
-                work_node_id=work_node_id,
-                agent_run_id=agent_run_id,
-                data=result.to_dict(),
-            )
+        result_entry = self.record_lesson(
+            f"Result: {work_node_id}",
+            result.summary,
+            work_node_id=work_node_id,
+            agent_run_id=agent_run_id,
+            data=result.to_dict(),
+        )
+        entries.append(result_entry)
+        result_success = not result.issues and all(
+            bool(item.get("passed", True)) for item in result.tests if isinstance(item, Mapping)
+        )
+        evidence_refs = tuple(
+            str(item.get("id") or item.get("path") or item.get("uri") or item)
+            if isinstance(item, Mapping)
+            else str(item)
+            for item in (*result.artifacts, *result.tests)
+            if item
+        )
+        self.store.promote_brain_entry_to_project_memory(
+            result_entry.id,
+            confidence=0.85 if result_success else 0.55,
+            evidence_refs=evidence_refs,
+            metadata={"source": "write_back_result", "success": result_success},
         )
         for insight in result.insights:
-            entries.append(
-                self.record_lesson(
-                    insight.summary,
-                    insight.details or insight.summary,
-                    work_node_id=work_node_id,
-                    agent_run_id=agent_run_id,
-                    data=insight.to_dict(),
-                )
+            insight_entry = self.record_lesson(
+                insight.summary,
+                insight.details or insight.summary,
+                work_node_id=work_node_id,
+                agent_run_id=agent_run_id,
+                data=insight.to_dict(),
+            )
+            entries.append(insight_entry)
+            severity = str(insight.severity).casefold()
+            confidence = 0.75 if severity in {"info", "warning"} else 0.6
+            self.store.promote_brain_entry_to_project_memory(
+                insight_entry.id,
+                confidence=confidence,
+                evidence_refs=evidence_refs,
+                metadata={"source": "insight_writeback", "severity": insight.severity},
             )
         return tuple(entries)

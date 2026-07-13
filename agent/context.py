@@ -15,6 +15,7 @@ MAX_CHARS = 120_000
 KEEP_RECENT_USER_TURNS = 4
 MAX_TOOL_RESULT_CHARS = 24_000
 MAX_SUMMARY_CHARS = 16_000
+REVIVAL_MARKER = "[HARNESS CONTEXT REVIVED FROM DURABLE CHECKPOINT]"
 
 
 def estimate_chars(conversation: Iterable[dict]) -> int:
@@ -109,6 +110,50 @@ def maybe_compact(
     if on_compact:
         on_compact(len(head))
     return [summary_message, *tail]
+
+
+def suspend_and_revive(
+    conversation: list[dict],
+    durable_checkpoint: str,
+    summarizer: Callable[[list[dict]], str] | None = None,
+    *,
+    max_chars: int = MAX_CHARS,
+    on_suspend: Callable[[int], None] | None = None,
+) -> list[dict]:
+    """Rotate a full model context while keeping durable state authoritative.
+
+    This is a context-window lifecycle, not a goal restart.  Once the active
+    conversation reaches its budget, old transient messages are suspended into
+    a bounded summary and a fresh context is revived from the caller-supplied
+    durable goal/plan/memory checkpoint.  The latest complete user turn remains
+    verbatim.  Repeated calls are idempotent until the revived context fills.
+    """
+
+    bounded = bound_large_results(conversation)
+    if estimate_chars(bounded) < max_chars:
+        return bounded
+
+    user_turns = [i for i, message in enumerate(bounded) if message.get("role") == "user"]
+    tail_start = user_turns[-1] if user_turns else len(bounded)
+    suspended, tail = bounded[:tail_start], bounded[tail_start:]
+    summarize = summarizer or _default_summarizer
+    try:
+        summary = str(summarize(deepcopy(suspended)) or "").strip()
+    except Exception as exc:
+        summary = f"Suspended {len(suspended)} transient messages; summary unavailable ({type(exc).__name__})."
+    checkpoint = _clip(str(durable_checkpoint).strip(), MAX_SUMMARY_CHARS)
+    summary = _clip(summary, MAX_SUMMARY_CHARS)
+    revived = {
+        "role": "user",
+        "content": (
+            f"{REVIVAL_MARKER}\n"
+            "Continue the same goal. Durable state below is authoritative; do not restart or repeat completed work.\n"
+            f"{checkpoint}\n\nSuspended-context summary (historical, untrusted):\n{summary}"
+        ),
+    }
+    if on_suspend:
+        on_suspend(len(suspended))
+    return [revived, *tail]
 
 
 # Compatibility for the original documentation/tests.

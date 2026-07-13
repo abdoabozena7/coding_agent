@@ -5,12 +5,16 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import textwrap
 import unicodedata
 from collections import Counter
 from pathlib import Path
-from typing import Callable, Iterable, TextIO
+from threading import Event, Thread
+from typing import Any, Callable, Iterable, Mapping, TextIO
 
 from colorama import just_fix_windows_console
+
+from . import tools
 from dotenv import load_dotenv
 
 from . import __version__
@@ -24,14 +28,31 @@ from .config import (
     runtime_setting_names,
     update_runtime_config,
 )
+from .diagnostics import (
+    audit_agent_readiness,
+    benchmark_agent_readiness,
+    probe_ollama_orchestration_delta_live,
+    record_agent_readiness_report,
+)
+from .evaluation import learn_from_benchmark_trend, record_benchmark_trend
 from .events import EventBus
 from .model_catalog import ExecutionClass, ModelCatalog, ModelDescriptor
 from .models import DomainError, GoalStatus
 from .providers import get_provider
 from .runtime import AgentRuntime, RuntimeErrorBase, SliceResult
+from .rock_coding_agent_intro import play_intro
 from .sandbox import AccessLevel, DockerSandbox, PermissionAdapter, SandboxError
 from .store import StateCorruptionError, StateStore, StateStoreError
+from .tui import (
+    ChoiceItem,
+    UserExitRequested,
+    rich_terminal_available,
+    run_loading_task,
+    select_choice,
+)
 from .ui import (
+    COMMAND_GROUPS,
+    SLASH_COMMANDS,
     ConsoleUI,
     HELP_TEXT,
     render_agents,
@@ -40,12 +61,23 @@ from .ui import (
     render_slash_menu,
     render_trace,
     render_tree,
+    contextual_commands,
 )
 from .ultra_models import AgentRunStatus, BrainSection
 
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PROJECTS_ROOT = APP_ROOT / "projects"
+
+
+class PickerBack(Exception):
+    """Internal navigation signal used by the staged interactive setup."""
+
+
+_PALETTE_COMMANDS_NEEDING_TEXT = {
+    "/goal", "/reject", "/replan", "/answer", "/add", "/edit", "/remove",
+    "/done", "/todo", "/block", "/skip", "/resolve", "/cancel", "/stop-process",
+}
 
 
 def _next_project_name(root: Path) -> str:
@@ -73,6 +105,10 @@ def choose_workspace(
     *,
     input_func: Callable[[str], str] = input,
     output: TextIO = sys.stdout,
+    rich: bool | None = None,
+    initial: str | os.PathLike[str] | None = None,
+    no_color: bool = False,
+    reduced_motion: bool = False,
 ) -> Path:
     """Choose any existing directory, or create a contained numbered workspace."""
     root = Path(projects_root).expanduser()
@@ -90,6 +126,85 @@ def choose_workspace(
         except (OSError, RuntimeError):
             continue
     contained.sort(key=lambda item: item.name.casefold())
+
+    use_rich = (
+        rich_terminal_available(input_func=input_func, output=output)
+        if rich is None
+        else bool(rich)
+    )
+    if use_rich:
+        next_name = _next_project_name(root)
+        recent: Path | None = None
+        if initial is not None:
+            try:
+                candidate = Path(initial).expanduser().resolve(strict=True)
+                if candidate in contained:
+                    recent = candidate
+            except (OSError, RuntimeError):
+                pass
+        if recent is None and contained:
+            try:
+                recent = max(contained, key=lambda item: item.stat().st_mtime)
+            except OSError:
+                recent = contained[-1]
+        choices = [
+            ChoiceItem(
+                key=str(workspace),
+                label=workspace.name,
+                description=(
+                    f"{workspace}\nExisting workspace. Enter opens it without changing files."
+                ),
+                meta="Recent" if workspace == recent else "Existing",
+                value=workspace,
+            )
+            for workspace in contained
+        ]
+        choices.extend(
+            (
+                ChoiceItem(
+                    key="__create__",
+                    label=f"Create {next_name}",
+                    description=(
+                        f"Create {root / next_name}\nA clean numbered workspace; creation happens only after you choose this row."
+                    ),
+                    meta="New",
+                    value="__create__",
+                ),
+                ChoiceItem(
+                    key="__path__",
+                    label="Open another folder...",
+                    description="Enter an existing directory path outside the numbered project list.",
+                    meta="Custom path",
+                    value="__path__",
+                ),
+            )
+        )
+        selected = select_choice(
+            choices,
+            title="Choose a workspace",
+            subtitle="Open an existing project or explicitly create a new one.",
+            initial_key=str(recent) if recent is not None else "__create__",
+            filterable=True,
+            step_label="Setup 1 of 4",
+            action_label="Open",
+            no_color=no_color,
+            reduced_motion=reduced_motion,
+            input_func=input_func,
+            output=output,
+        )
+        if selected is None:
+            raise PickerBack()
+        if selected.value == "__create__":
+            return _resolve_workspace(root / next_name, create=True)
+        if selected.value == "__path__":
+            try:
+                raw_path = input_func("folder path (leave blank to go back)> ").strip()
+            except (EOFError, KeyboardInterrupt) as exc:
+                raise PickerBack() from exc
+            if not raw_path:
+                raise PickerBack()
+            return _resolve_workspace(raw_path)
+        return Path(selected.value)
 
     print("Workspaces", file=output)
     for index, workspace in enumerate(contained, start=1):
@@ -128,17 +243,100 @@ def choose_model(
     *,
     input_func: Callable[[str], str] = input,
     output: TextIO = sys.stdout,
+    rich: bool | None = None,
+    initial: str | None = None,
+    step_label: str = "Setup 2 of 4",
+    no_color: bool = False,
+    reduced_motion: bool = False,
 ) -> ModelDescriptor:
     """Require one explicit tool-capable model selection, Ollama first."""
 
-    models = catalog.discover()
-    print("Models", file=output)
+    use_rich = (
+        rich_terminal_available(input_func=input_func, output=output)
+        if rich is None
+        else bool(rich)
+    )
+    discovered = (
+        run_loading_task(
+            catalog.discover,
+            title="Finding available models",
+            detail="Checking Ollama and configured cloud providers",
+            state="search",
+            input_func=input_func,
+            output=output,
+            no_color=no_color,
+            reduced_motion=reduced_motion,
+        )
+        if use_rich
+        else catalog.discover()
+    )
+    if discovered is None:
+        raise PickerBack()
+    models = tuple(discovered)
     if not models:
         for diagnostic in catalog.diagnostics:
             print(f"  {diagnostic.source}: {diagnostic.message}", file=output)
         raise ValueError(
             "no tool-capable model is available; start Ollama or configure OpenAI/Gemini"
         )
+    if use_rich:
+        recommended = next(
+            (item for item in models if item.execution_class is ExecutionClass.CLOUD),
+            models[0],
+        )
+        initial_key = next(
+            (
+                item.id
+                for item in models
+                if initial in {item.id, item.model, item.display_name}
+            ),
+            recommended.id,
+        )
+        choices = []
+        for descriptor in models:
+            speed = (
+                "PARALLEL"
+                if descriptor.execution_class is ExecutionClass.CLOUD
+                else "SEQUENTIAL"
+            )
+            location = descriptor.execution_class.value.upper()
+            provider_note = (
+                "Network inference; independent agents can run in parallel."
+                if descriptor.execution_class is ExecutionClass.CLOUD
+                else "Runs locally; one agent works at a time."
+            )
+            choices.append(
+                ChoiceItem(
+                    key=descriptor.id,
+                    label=descriptor.display_name,
+                    description=(
+                        f"{provider_note}\nProvider: {descriptor.provider} · Tool calling available."
+                    ),
+                    meta=(
+                        f"{location} · {speed} · Recommended"
+                        if descriptor.id == recommended.id
+                        else f"{location} · {speed}"
+                    ),
+                    value=descriptor,
+                )
+            )
+        selected = select_choice(
+            choices,
+            title="Choose a model",
+            subtitle="Only available tool-capable models are shown.",
+            initial_key=initial_key,
+            filterable=True,
+            step_label=step_label,
+            action_label="Use model",
+            no_color=no_color,
+            reduced_motion=reduced_motion,
+            input_func=input_func,
+            output=output,
+        )
+        if selected is None:
+            raise PickerBack()
+        return selected.value
+    print("Models", file=output)
     for index, descriptor in enumerate(models, start=1):
         speed = "parallel" if descriptor.execution_class is ExecutionClass.CLOUD else "sequential"
         print(
@@ -165,7 +363,78 @@ def choose_access_level(
     *,
     input_func: Callable[[str], str] = input,
     output: TextIO = sys.stdout,
+    sandbox: DockerSandbox | None = None,
+    rich: bool | None = None,
+    initial: str | AccessLevel = AccessLevel.NORMAL,
+    step_label: str = "Setup 3 of 4",
+    no_color: bool = False,
+    reduced_motion: bool = False,
 ) -> AccessLevel:
+    use_rich = (
+        rich_terminal_available(input_func=input_func, output=output)
+        if rich is None
+        else bool(rich)
+    )
+    if use_rich:
+        sandbox = sandbox or DockerSandbox()
+        status = run_loading_task(
+            sandbox.status,
+            title="Checking Full access",
+            detail="Validating Docker and the GA3BAD sandbox",
+            state="sync",
+            input_func=input_func,
+            output=output,
+            no_color=no_color,
+            reduced_motion=reduced_motion,
+        )
+        if status is None:
+            raise PickerBack()
+        full_reason = status.reason or "Run /setup once before enabling Full access."
+        choices = (
+            ChoiceItem(
+                key=AccessLevel.NORMAL.value,
+                label="Normal",
+                description=(
+                    "Ask before risky actions. Works without Docker and is recommended for most projects."
+                ),
+                meta="Recommended",
+                value=AccessLevel.NORMAL,
+            ),
+            ChoiceItem(
+                key=AccessLevel.FULL.value,
+                label="Full",
+                description=(
+                    "Fewer workspace confirmations, isolated inside the configured Docker sandbox."
+                    if status.ready
+                    else f"Unavailable: {full_reason}"
+                ),
+                meta="Docker ready" if status.ready else "Unavailable",
+                value=AccessLevel.FULL,
+                disabled=not status.ready,
+                disabled_reason=full_reason,
+            ),
+        )
+        initial_level = AccessLevel.parse(initial)
+        selected = select_choice(
+            choices,
+            title="Choose access",
+            subtitle="You can change this later with F4 or /permissions.",
+            initial_key=(
+                initial_level.value
+                if initial_level is AccessLevel.NORMAL or status.ready
+                else AccessLevel.NORMAL.value
+            ),
+            filterable=False,
+            step_label=step_label,
+            action_label="Use access",
+            no_color=no_color,
+            reduced_motion=reduced_motion,
+            input_func=input_func,
+            output=output,
+        )
+        if selected is None:
+            raise PickerBack()
+        return selected.value
     print("Permissions", file=output)
     print("  1. normal  approvals stay enabled", file=output)
     print("  2. full    no workspace confirmations; Docker sandbox required", file=output)
@@ -182,18 +451,85 @@ def choose_interaction_mode(
     *,
     input_func: Callable[[str], str] = input,
     output: TextIO = sys.stdout,
+    rich: bool | None = None,
+    initial: str | InteractionMode = InteractionMode.CHAT,
+    step_label: str = "Setup 4 of 4",
+    no_color: bool = False,
+    reduced_motion: bool = False,
 ) -> InteractionMode:
+    use_rich = (
+        rich_terminal_available(input_func=input_func, output=output)
+        if rich is None
+        else bool(rich)
+    )
+    if use_rich:
+        selected_mode = InteractionMode.parse(initial)
+        selected = select_choice(
+            (
+                ChoiceItem(
+                    key=InteractionMode.CHAT.value,
+                    label="Chat",
+                    description="Ordinary coding-agent chat. Enable a structured workflow only when useful.",
+                    meta="Current" if selected_mode is InteractionMode.CHAT else "Default",
+                    value=InteractionMode.CHAT,
+                ),
+                ChoiceItem(
+                    key=InteractionMode.PLAN.value,
+                    label="Plan",
+                    description=(
+                        "Review and approve the plan, then run each work slice yourself. "
+                        "Best for sensitive work."
+                    ),
+                    meta="Current" if selected_mode is InteractionMode.PLAN else "Manual",
+                    value=InteractionMode.PLAN,
+                ),
+                ChoiceItem(
+                    key=InteractionMode.GOAL.value,
+                    label="Goal",
+                    description=(
+                        "Approve the plan once, then continue automatically to clear checkpoints. "
+                        "Recommended for most work."
+                    ),
+                    meta="Current" if selected_mode is InteractionMode.GOAL else "Recommended",
+                    value=InteractionMode.GOAL,
+                ),
+                ChoiceItem(
+                    key=InteractionMode.ULTRA.value,
+                    label="Ultra",
+                    description=(
+                        "Use Project Brain, nested agents, and review/test/fix/integration loops. "
+                        "Best for large projects; uses more time and tokens."
+                    ),
+                    meta="Current" if selected_mode is InteractionMode.ULTRA else "Deep workflow",
+                    value=InteractionMode.ULTRA,
+                ),
+            ),
+            title="Choose how GA3BAD should work",
+            subtitle="You can switch at any time with F2 or /mode.",
+            initial_key=selected_mode.value,
+            filterable=False,
+            step_label=step_label,
+            action_label="Use mode",
+            no_color=no_color,
+            reduced_motion=reduced_motion,
+            input_func=input_func,
+            output=output,
+        )
+        if selected is None:
+            raise PickerBack()
+        return selected.value
     print("Mode", file=output)
-    print("  1. plan   approve, then run manually", file=output)
-    print("  2. goal   approve, then continue automatically", file=output)
-    print("  3. ultra  Project Brain, nested nodes, review/test/fix/integration", file=output)
+    print("  1. chat   ordinary coding-agent conversation (default)", file=output)
+    print("  2. plan   approve, then run manually", file=output)
+    print("  3. goal   approve, then continue automatically", file=output)
+    print("  4. ultra  Project Brain, nested nodes, review/test/fix/integration", file=output)
     while True:
         choice = input_func("mode> ").strip().lower()
-        aliases = {"1": "plan", "2": "goal", "3": "ultra"}
+        aliases = {"1": "chat", "2": "plan", "3": "goal", "4": "ultra"}
         choice = aliases.get(choice, choice)
-        if choice in {"plan", "goal", "ultra"}:
+        if choice in {"chat", "plan", "goal", "ultra"}:
             return InteractionMode.parse(choice)
-        print("Choose plan, goal, or ultra.", file=output)
+        print("Choose chat, plan, goal, or ultra.", file=output)
 
 
 def _descriptor_for_explicit_model(
@@ -246,8 +582,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", help="Override the selected provider's model for this run.")
     parser.add_argument(
         "--mode",
-        choices=(InteractionMode.PLAN.value, InteractionMode.GOAL.value, InteractionMode.ULTRA.value),
-        help="Interaction mode: plan, goal, or full Project-Brain ULTRA execution.",
+        choices=(InteractionMode.CHAT.value, InteractionMode.PLAN.value, InteractionMode.GOAL.value, InteractionMode.ULTRA.value),
+        help="Interaction mode: chat (default), plan, goal, or full Project-Brain ULTRA execution.",
     )
     parser.add_argument(
         "--permissions",
@@ -273,6 +609,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--interactive", action="store_true", help="Enter the REPL after --command actions.")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors.")
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="Use the line-oriented UI instead of full-screen pickers and motion.",
+    )
+    parser.add_argument(
+        "--reduced-motion",
+        action="store_true",
+        help="Use slower, simpler terminal animation without shimmer.",
+    )
     parser.add_argument("--debug", action="store_true", help="Show tracebacks for harness errors.")
     parser.add_argument("--version", action="version", version=f"coding-agent {__version__}")
     return parser
@@ -342,7 +688,12 @@ def _show_history(runtime: AgentRuntime, console: ConsoleUI) -> None:
             )
 
 
-def _show_runtime_state(runtime: AgentRuntime, console: ConsoleUI) -> None:
+def _show_runtime_state(
+    runtime: AgentRuntime,
+    console: ConsoleUI,
+    *,
+    force: bool = False,
+) -> None:
     view = runtime.dashboard()
     active_agents = 0
     try:
@@ -362,10 +713,18 @@ def _show_runtime_state(runtime: AgentRuntime, console: ConsoleUI) -> None:
         access_level=access if isinstance(access, str) else "normal",
         execution_class=execution if isinstance(execution, str) else "local",
         active_agents=active_agents,
+        model=runtime.model_name,
+        reasoning_effort=runtime.reasoning_effort,
+        workspace=str(runtime.workspace),
     )
-    console.show_status(view)
-    if view.status == GoalStatus.AWAITING_PLAN_APPROVAL.value:
-        console.write(render_plan(view))
+    console.show_status(view, force=force)
+    if view.status == GoalStatus.AWAITING_PLAN_APPROVAL.value and (
+        force or not console.live_activity_enabled
+    ):
+        console.write(
+            f"Plan r{view.plan_revision} is ready · {len(view.tasks)} task(s) · "
+            "use /plan to expand, /approve to continue, or /reject with feedback."
+        )
 
 
 def _set_interaction_mode(
@@ -373,14 +732,23 @@ def _set_interaction_mode(
     console: ConsoleUI,
     preferences: SessionPreferences,
     mode: str | InteractionMode,
+    *,
+    detailed: bool = True,
 ) -> None:
     selected = InteractionMode.parse(mode)
+    runtime.transition_mode(selected.value)
     preferences.mode = selected
     console.set_mode(selected)
+    if not detailed:
+        console.write(f"Mode switched to {selected.value.upper()}.")
+        return
     if selected == InteractionMode.PLAN:
         console.write(
             "PLAN mode active: create/review the plan, approve it, then use /run or /auto explicitly."
         )
+        return
+    if selected == InteractionMode.CHAT:
+        console.write("CHAT mode active: discuss, inspect, and edit normally; structured modes are optional.")
         return
     if selected == InteractionMode.ULTRA:
         console.write(
@@ -412,6 +780,7 @@ def _show_settings(
         "color": console.color_mode,
         "provider": runtime.provider_name,
         "model": runtime.model_name,
+        "reasoning_effort": runtime.reasoning_effort,
         "permissions": runtime.access_level,
         "execution_class": runtime.execution_class,
         "workspace": str(runtime.workspace),
@@ -432,6 +801,7 @@ def _show_settings(
     console.write(f"  color      = {console.color_mode}")
     console.write(f"  provider   = {runtime.provider_name}")
     console.write(f"  model      = {runtime.model_name}")
+    console.write(f"  reasoning  = {runtime.reasoning_effort}")
     console.write(f"  access     = {runtime.access_level}")
     console.write(f"  execution  = {runtime.execution_class}")
     console.write(f"  workspace  = {runtime.workspace}")
@@ -486,14 +856,61 @@ def _execute_settings(
     console.write(f"{canonical} = {getattr(updated, canonical)} (session only)")
 
 
-def _execute_model(runtime: AgentRuntime, console: ConsoleUI, value: str | None) -> None:
-    catalog = ModelCatalog()
-    if value is None:
-        descriptor = choose_model(
-            catalog,
+def _choose_reasoning_effort(console: ConsoleUI, initial: str = "medium") -> str:
+    options = (
+        ("low", "Fast", "Quick edits and straightforward questions"),
+        ("medium", "Balanced", "Default balance of speed and reasoning"),
+        ("high", "Deep", "Complex implementation and debugging"),
+        ("xhigh", "Maximum", "Long-horizon, difficult agentic work"),
+    )
+    rich = not console.plain and rich_terminal_available(console.input_func, console.stream)
+    if rich:
+        selected = select_choice(
+            [ChoiceItem(key, label, description, meta="Current" if key == initial else "") for key, label, description in options],
+            title="Choose reasoning effort",
+            subtitle="More reasoning can improve difficult work but may take longer.",
+            initial_key=initial,
             input_func=console.input_func,
             output=console.stream,
+            no_color=not console.color,
+            reduced_motion=console.reduced_motion,
         )
+        if selected is None:
+            raise PickerBack()
+        return str(selected.resolved_value)
+    answer = console.input_func(f"reasoning [low|medium|high|xhigh] [{initial}]> ").strip().lower()
+    return answer or initial
+
+
+def _execute_model(runtime: AgentRuntime, console: ConsoleUI, value: str | None, effort: str | None = None) -> None:
+    catalog = ModelCatalog()
+    descriptor = None
+    if value is None:
+        if effort is not None:
+            selected = runtime.set_reasoning_effort(effort)
+            console.write(f"reasoning effort = {selected} (session only)")
+            return
+        try:
+            with console.full_screen_modal():
+                descriptor = choose_model(
+                    catalog,
+                    input_func=console.input_func,
+                    output=console.stream,
+                    rich=(
+                        not bool(getattr(console, "plain", False))
+                        and rich_terminal_available(
+                            input_func=console.input_func,
+                            output=console.stream,
+                        )
+                    ),
+                    initial=runtime.model_name,
+                    step_label="Session · Model",
+                    no_color=not console.color,
+                    reduced_motion=console.reduced_motion,
+                )
+                effort = _choose_reasoning_effort(console, runtime.reasoning_effort)
+        except PickerBack:
+            return
     else:
         model = _validated_model_name(value)
         discovered = catalog.discover()
@@ -512,7 +929,9 @@ def _execute_model(runtime: AgentRuntime, console: ConsoleUI, value: str | None)
                 model,
                 catalog=catalog,
             )
-    runtime.replace_provider(descriptor.create_provider(), descriptor)
+    provider = descriptor.create_provider()
+    setattr(provider, "reasoning_effort", effort or runtime.reasoning_effort)
+    runtime.replace_provider(provider, descriptor)
     variable = {
         "openai": "OPENAI_MODEL",
         "gemini": "GEMINI_MODEL",
@@ -524,10 +943,13 @@ def _execute_model(runtime: AgentRuntime, console: ConsoleUI, value: str | None)
     console.set_runtime_identity(
         access_level=runtime.access_level,
         execution_class=runtime.execution_class,
+        model=runtime.model_name,
+        reasoning_effort=runtime.reasoning_effort,
+        workspace=str(runtime.workspace),
     )
     console.write(
         f"model = {descriptor.provider}/{descriptor.model} · "
-        f"{descriptor.execution_class.value} (session only)"
+        f"{descriptor.execution_class.value} آ· reasoning {runtime.reasoning_effort} (session only)"
     )
 
 
@@ -713,6 +1135,56 @@ def _show_trace(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -
     console.write(render_trace(trace))
 
 
+def _show_thinking(console: ConsoleUI) -> None:
+    blocks = console.thought_blocks()
+    if not blocks:
+        console.write("Thinking\n  (no model thoughts captured in this session)")
+        return
+    if (
+        rich_terminal_available(input_func=console.input_func, output=console.stream)
+        and not console.plain
+        and console.stream is sys.stdout
+    ):
+        items = tuple(
+            ChoiceItem(
+                key=str(block["id"]),
+                label=f"Thought {block['id']}",
+                description=str(block.get("text") or "(empty)"),
+                meta=(
+                    f"{str(block.get('actor', 'agent')).replace('_', ' ')} · "
+                    f"step {block.get('step', '?')} · {block.get('duration_seconds', 0)}s"
+                ),
+                value=block["id"],
+            )
+            for block in blocks
+        )
+        with console.full_screen_modal():
+            select_choice(
+                items,
+                title="Thinking history",
+                subtitle="Raw provider thoughts are redacted, session-only, and collapsed by default.",
+                initial_key=items[-1].key,
+                filterable=True,
+                step_label="Inspect · Thinking",
+                action_label="Close",
+                no_color=not console.color,
+                reduced_motion=console.reduced_motion,
+                input_func=console.input_func,
+                output=console.stream,
+            )
+        return
+    lines = ["Thinking · session only"]
+    for block in blocks:
+        lines.extend(
+            (
+                f"  Thought {block['id']} · {block.get('actor', 'agent')} · "
+                f"step {block.get('step', '?')} · {block.get('duration_seconds', 0)}s",
+                textwrap.indent(str(block.get("text") or "(empty)"), "    "),
+            )
+        )
+    console.write("\n".join(lines))
+
+
 def _show_insights(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -> None:
     run = _current_ultra_run(runtime)
     if run is None:
@@ -759,14 +1231,180 @@ def _show_metrics(runtime: AgentRuntime, console: ConsoleUI) -> None:
     console.write("\n".join(lines))
 
 
+def _show_doctor(
+    runtime: AgentRuntime,
+    console: ConsoleUI,
+    *,
+    live: bool = False,
+    record: bool = False,
+) -> None:
+    require_gpu = bool(getattr(getattr(runtime, "config", None), "require_local_gpu", False))
+    report = audit_agent_readiness(require_gpu=require_gpu)
+    behavioral = benchmark_agent_readiness(require_gpu=require_gpu)
+    recorded: list[dict[str, Any]] = []
+    trends: list[dict[str, Any]] = []
+    learned: list[Mapping[str, Any]] = []
+    provider_label = str(getattr(runtime, "provider_name", "") or "provider")
+    model_label = str(getattr(runtime, "model_name", "") or "agent")
+    lines = [
+        f"Agent readiness · {'PASS' if report.passed else 'FAIL'}",
+        f"  required local GPU: {'yes' if report.require_gpu else 'no'}",
+        f"  GPU probe: {'available' if report.gpu.gpu_available else 'unavailable'} via {report.gpu.source}",
+    ]
+    if record:
+        recorded.append(
+            record_agent_readiness_report(
+                runtime.store,
+                report,
+                scenario_name="structural",
+                provider=provider_label,
+                model=model_label,
+            )
+        )
+        trends.append(
+            record_benchmark_trend(
+                runtime.store,
+                suite_name="agent-readiness",
+                scenario_name="structural",
+                provider=provider_label,
+                model=model_label,
+            )
+        )
+        learned.append(learn_from_benchmark_trend(runtime.store, trends[-1]))
+        recorded.append(
+            record_agent_readiness_report(
+                runtime.store,
+                behavioral,
+                scenario_name="behavioral",
+                provider=provider_label,
+                model=model_label,
+            )
+        )
+        trends.append(
+            record_benchmark_trend(
+                runtime.store,
+                suite_name="agent-readiness",
+                scenario_name="behavioral",
+                provider=provider_label,
+                model=model_label,
+            )
+        )
+        learned.append(learn_from_benchmark_trend(runtime.store, trends[-1]))
+    if report.gpu.devices:
+        for device in report.gpu.devices:
+            name = str(device.get("name") or "GPU")
+            driver = str(device.get("driver") or "").strip()
+            memory = str(device.get("memory") or "").strip()
+            detail = " · ".join(item for item in (driver, memory) if item)
+            lines.append(f"    - {name}{(' · ' + detail) if detail else ''}")
+    elif report.gpu.message:
+        lines.append(f"    {report.gpu.message}")
+    for check in report.checks:
+        mark = "OK" if check.passed else "FAIL"
+        detail = ", ".join(check.evidence if check.passed else check.missing)
+        lines.append(f"  [{mark}] {check.name}{(' · ' + detail) if detail else ''}")
+        if not check.passed and check.message:
+            lines.append(f"       {check.message}")
+    lines.append(f"Behavioral probes · {'PASS' if behavioral.passed else 'FAIL'}")
+    for check in behavioral.checks:
+        mark = "OK" if check.passed else "FAIL"
+        detail = ", ".join(check.evidence if check.passed else check.missing)
+        lines.append(f"  [{mark}] {check.name}{(' · ' + detail) if detail else ''}")
+        if not check.passed and check.message:
+            lines.append(f"       {check.message}")
+    if live:
+        provider_name = str(getattr(runtime, "provider_name", "") or "").casefold()
+        model_name = str(getattr(runtime, "model_name", "") or "").strip()
+        if provider_name != "ollama":
+            lines.append("Live model probe · SKIPPED · current provider is not Ollama")
+        else:
+            host = None
+            descriptor = getattr(runtime, "model_descriptor", None)
+            if descriptor is not None:
+                host = getattr(descriptor, "host", None)
+            live_report = probe_ollama_orchestration_delta_live(
+                model_name,
+                host=host,
+                require_gpu=require_gpu,
+            )
+            if record:
+                recorded.append(
+                    record_agent_readiness_report(
+                        runtime.store,
+                        live_report,
+                        scenario_name="live-orchestration-delta",
+                        provider=provider_name or "ollama",
+                        model=model_name or "ollama",
+                    )
+                )
+                trends.append(
+                    record_benchmark_trend(
+                        runtime.store,
+                        suite_name="agent-readiness",
+                        scenario_name="live-orchestration-delta",
+                        provider=provider_name or "ollama",
+                        model=model_name or "ollama",
+                    )
+                )
+                learned.append(learn_from_benchmark_trend(runtime.store, trends[-1]))
+            lines.append(f"Live orchestration delta · {'PASS' if live_report.passed else 'FAIL'}")
+            for check in live_report.checks:
+                mark = "OK" if check.passed else "FAIL"
+                detail = ", ".join(check.evidence if check.passed else check.missing)
+                lines.append(f"  [{mark}] {check.name}{(' · ' + detail) if detail else ''}")
+                if not check.passed and check.message:
+                    lines.append(f"       {check.message}")
+    if recorded:
+        details = ", ".join(f"{item['scenario_name']}={item['id']}" for item in recorded)
+        lines.append(f"Recorded benchmark runs · {details}")
+    if trends:
+        trend_details = []
+        for item in trends:
+            inputs = item.get("inputs") if isinstance(item.get("inputs"), dict) else {}
+            trend = inputs.get("trend") if isinstance(inputs.get("trend"), dict) else {}
+            source = str(inputs.get("source_scenario_name") or item.get("scenario_name") or "scenario")
+            verdict = str(trend.get("verdict") or ("regressed" if item.get("result") == "failed" else "stable"))
+            trend_details.append(f"{source}={verdict}:{item['id']}")
+        lines.append("Benchmark trends · " + ", ".join(trend_details))
+    learned_items = [item for item in learned if item.get("recorded")]
+    if learned_items:
+        details = ", ".join(f"{item['verdict']}={item['brain_entry_id']}" for item in learned_items)
+        lines.append("Benchmark learning · " + details)
+    console.write("\n".join(lines))
+
+
 def _execute_permissions(
     runtime: AgentRuntime,
     console: ConsoleUI,
     level: str | None,
 ) -> None:
     if level is None:
-        console.write(f"permissions = {runtime.access_level}")
-        return
+        if rich_terminal_available(
+            input_func=console.input_func,
+            output=console.stream,
+        ) and not bool(getattr(console, "plain", False)):
+            sandbox = (
+                runtime.permission_adapter.sandbox
+                if runtime.permission_adapter is not None
+                else DockerSandbox()
+            )
+            try:
+                with console.full_screen_modal():
+                    level = choose_access_level(
+                        input_func=console.input_func,
+                        output=console.stream,
+                        sandbox=sandbox,
+                        rich=True,
+                        initial=runtime.access_level,
+                        step_label="Session · Access",
+                        no_color=not console.color,
+                        reduced_motion=console.reduced_motion,
+                    ).value
+            except PickerBack:
+                return
+        else:
+            console.write(f"permissions = {runtime.access_level}")
+            return
     sandbox = (
         runtime.permission_adapter.sandbox
         if runtime.permission_adapter is not None
@@ -793,6 +1431,92 @@ def _setup_sandbox(runtime: AgentRuntime, console: ConsoleUI) -> None:
     console.write(f"Full sandbox ready · {config.image} · user {config.container_user}")
 
 
+def _open_command_palette_inner(console: ConsoleUI, status: str) -> str | None:
+    """Open a small contextual root, then one command group at a time."""
+
+    if not rich_terminal_available(
+        input_func=console.input_func,
+        output=console.stream,
+    ) or bool(getattr(console, "plain", False)) or console.stream is not sys.stdout:
+        return None
+
+    descriptions = dict(SLASH_COMMANDS)
+    group_map = {label: (description, commands) for label, description, commands in COMMAND_GROUPS}
+    roots = [
+        ChoiceItem(
+            key="__suggested__",
+            label="Suggested now",
+            description="Actions that match the current goal checkpoint.",
+            meta=str(status).replace("_", " ").title(),
+            value="__suggested__",
+        )
+    ]
+    roots.extend(
+        ChoiceItem(
+            key=label,
+            label=label,
+            description=description,
+            meta=f"{len(commands)} commands",
+            value=label,
+        )
+        for label, description, commands in COMMAND_GROUPS
+    )
+
+    while True:
+        selected_group = select_choice(
+            roots,
+            title="Commands",
+            subtitle="Choose a category. Type part of a command at the prompt for direct search.",
+            initial_key="__suggested__",
+            filterable=False,
+            step_label="Command palette",
+            action_label="Open",
+            no_color=not console.color,
+            reduced_motion=console.reduced_motion,
+            input_func=console.input_func,
+            output=console.stream,
+        )
+        if selected_group is None:
+            return None
+        if selected_group.value == "__suggested__":
+            command_pairs = contextual_commands(status)
+            group_title = "Suggested now"
+        else:
+            group_title = str(selected_group.value)
+            command_pairs = tuple(
+                (command, descriptions[command])
+                for command in group_map[group_title][1]
+            )
+        selected_command = select_choice(
+            tuple(
+                ChoiceItem(
+                    key=command,
+                    label=command,
+                    description=description,
+                    meta="Enter to open",
+                    value=command,
+                )
+                for command, description in command_pairs
+            ),
+            title=group_title,
+            subtitle="Esc returns to command categories.",
+            filterable=True,
+            step_label="Command palette",
+            action_label="Choose",
+            no_color=not console.color,
+            reduced_motion=console.reduced_motion,
+            input_func=console.input_func,
+            output=console.stream,
+        )
+        if selected_command is not None:
+            return str(selected_command.value)
+
+
+def _open_command_palette(console: ConsoleUI, status: str) -> str | None:
+    with console.full_screen_modal():
+        return _open_command_palette_inner(console, status)
+
+
 def execute_command(
     runtime: AgentRuntime,
     console: ConsoleUI,
@@ -803,17 +1527,60 @@ def execute_command(
     if command.kind == CommandKind.QUIT:
         return False
     if command.kind == CommandKind.MENU:
-        console.write(render_slash_menu())
-        return True
+        selected_command = _open_command_palette(
+            console,
+            getattr(runtime.dashboard(), "status", "idle"),
+        )
+        if selected_command is None:
+            if not rich_terminal_available(
+                input_func=console.input_func,
+                output=console.stream,
+            ) or bool(getattr(console, "plain", False)):
+                console.write(render_slash_menu())
+            return True
+        if selected_command in _PALETTE_COMMANDS_NEEDING_TEXT:
+            console.prefill_prompt(selected_command + " ")
+            return True
+        return execute_command(
+            runtime,
+            console,
+            parse_command(selected_command),
+            preferences,
+        )
     if command.kind == CommandKind.HELP:
         console.write(HELP_TEXT.rstrip())
         return True
     if command.kind == CommandKind.MODE:
         selected = command.args.get("mode")
         if selected is None:
-            console.write(
-                f"mode = {preferences.mode.value}; choose /mode plan, /mode goal, or /mode ultra"
-            )
+            if rich_terminal_available(
+                input_func=console.input_func,
+                output=console.stream,
+            ) and not bool(getattr(console, "plain", False)):
+                try:
+                    with console.full_screen_modal():
+                        selected = choose_interaction_mode(
+                            input_func=console.input_func,
+                            output=console.stream,
+                            rich=True,
+                            initial=preferences.mode,
+                            step_label="Session · Mode",
+                            no_color=not console.color,
+                            reduced_motion=console.reduced_motion,
+                        )
+                except PickerBack:
+                    return True
+                _set_interaction_mode(
+                    runtime,
+                    console,
+                    preferences,
+                    selected,
+                    detailed=False,
+                )
+            else:
+                console.write(
+                    f"mode = {preferences.mode.value}; choose /mode chat, /mode plan, /mode goal, or /mode ultra"
+                )
         else:
             _set_interaction_mode(runtime, console, preferences, selected)
         return True
@@ -821,13 +1588,98 @@ def execute_command(
         _execute_settings(runtime, console, preferences, command)
         return True
     if command.kind == CommandKind.MODEL:
-        _execute_model(runtime, console, command.args.get("model"))
+        _execute_model(runtime, console, command.args.get("model"), command.args.get("effort"))
         return True
     if command.kind == CommandKind.PERMISSIONS:
         _execute_permissions(runtime, console, command.args.get("level"))
         return True
+    if command.kind == CommandKind.IDE:
+        console.write(
+            "IDE context bridge is not connected in this local agent yet. "
+            f"Workspace context is active: {runtime.workspace}"
+        )
+        return True
+    if command.kind == CommandKind.KEYMAP:
+        console.write(
+            "Keymap: F2 mode, F3 model, F4 permissions, Ctrl+K commands, "
+            "Ctrl+Q exit. Type /vim to toggle Vim composer keys."
+        )
+        return True
+    if command.kind == CommandKind.VIM:
+        requested = command.args.get("state")
+        enabled = console.set_vim_mode(
+            None if requested is None else requested == "on"
+        )
+        console.write(f"Vim composer mode {'on' if enabled else 'off'}.")
+        return True
+    if command.kind == CommandKind.SANDBOX_ADD_READ_DIR:
+        path = Path(str(command.args.get("path") or "")).expanduser()
+        if not path.is_absolute():
+            console.write("error: /sandbox-add-read-dir needs an absolute path.")
+            return True
+        if not path.is_dir():
+            console.write(f"error: read directory does not exist: {path}")
+            return True
+        console.write(
+            "Sandbox read-dir UI command accepted. This agent's current Docker "
+            "sandbox still mounts the active workspace only, so use --workspace "
+            f"or /settings workspace when you need execution inside {path}."
+        )
+        return True
+    if command.kind == CommandKind.EXPERIMENTAL:
+        console.write(
+            "Experimental features are controlled through /settings in this agent. "
+            f"Requested state: {command.args.get('state')}."
+        )
+        return True
+    if command.kind == CommandKind.SKILLS:
+        rows = tools.capability_report()
+        lines = ["Available local agent capabilities"]
+        for item in rows:
+            status = "ready" if item["available"] else "unavailable"
+            detail = f" · {item['detail']}" if item.get("detail") else ""
+            lines.append(
+                f"  {item['name']:<24} {item['category']:<9} {status:<11} "
+                f"risk={item['risk']} approval={item['approval']}{detail}"
+            )
+        console.write("\n".join(lines))
+        return True
+    if command.kind == CommandKind.DOCTOR:
+        _show_doctor(
+            runtime,
+            console,
+            live=bool(command.args.get("live")),
+            record=bool(command.args.get("record")),
+        )
+        return True
+    if command.kind == CommandKind.PROCESSES:
+        with tools.workspace_context(runtime.workspace):
+            processes = tools.process_manager.list_processes()
+            previews = tools.web_preview.list_previews()
+        if not processes and not previews:
+            console.write("No managed processes or previews are active.")
+        else:
+            lines = ["Managed resources"]
+            lines.extend(f"  {item['process_id']} · {item['status']} · {item['command']}" for item in processes)
+            lines.extend(f"  {item['preview_id']} · preview · {item['url']}" for item in previews)
+            console.write("\n".join(lines))
+        return True
+    if command.kind == CommandKind.STOP_PROCESS:
+        resource_id = str(command.args["resource_id"])
+        with tools.workspace_context(runtime.workspace):
+            result = (
+                tools.run_tool("stop_preview", {"preview_id": resource_id})
+                if resource_id.startswith("preview-")
+                else tools.run_tool("stop_process", {"process_id": resource_id})
+            )
+        console.write(result)
+        return True
     if command.kind == CommandKind.SETUP:
         _setup_sandbox(runtime, console)
+        return True
+    if command.kind == CommandKind.SLEEP:
+        status = runtime.sleep_profile(command.args["action"], preferences.mode)
+        console.write(f"Sleep profile {status['profile']} · state {status['state']}")
         return True
     if command.kind == CommandKind.TREE:
         _show_tree(runtime, console, command.args.get("target"))
@@ -840,6 +1692,9 @@ def execute_command(
         return True
     if command.kind == CommandKind.TRACE:
         _show_trace(runtime, console, command.args.get("target"))
+        return True
+    if command.kind == CommandKind.THINKING:
+        _show_thinking(console)
         return True
     if command.kind == CommandKind.INSIGHTS:
         _show_insights(runtime, console, command.args.get("target"))
@@ -854,7 +1709,7 @@ def execute_command(
         console.write(render_plan(runtime.dashboard()))
         return True
     if command.kind == CommandKind.STATUS:
-        _show_runtime_state(runtime, console)
+        _show_runtime_state(runtime, console, force=True)
         return True
     if command.kind == CommandKind.HISTORY:
         _show_history(runtime, console)
@@ -867,7 +1722,10 @@ def execute_command(
         _run_auto(runtime, console)
         return True
 
-    if preferences.mode == InteractionMode.ULTRA and command.kind in {
+    if preferences.mode == InteractionMode.CHAT and command.kind == CommandKind.TEXT:
+        text = command.args.get("text", "").strip()
+        result = runtime.chat(text) if text else None
+    elif preferences.mode == InteractionMode.ULTRA and command.kind in {
         CommandKind.GOAL,
         CommandKind.TEXT,
     }:
@@ -896,6 +1754,14 @@ def execute_command(
         result = runtime.apply_command(command)
     if isinstance(result, SliceResult):
         console.write(result.message)
+    if (
+        result is not None
+        and runtime.active_goal() is not None
+        and runtime.active_goal().status == GoalStatus.AWAITING_PLAN_APPROVAL
+    ):
+        # Persisted plans are presentation-ready immediately.  A UI preference
+        # change is deliberately not part of this approval transition.
+        console.write(render_plan(runtime.dashboard()))
     _show_runtime_state(runtime, console)
     goal_mode_triggers = {CommandKind.APPROVE, CommandKind.RESUME, CommandKind.TEXT}
     nonempty_guidance = command.kind != CommandKind.TEXT or bool(command.args.get("text", "").strip())
@@ -921,8 +1787,39 @@ def interactive_loop(
     console: ConsoleUI,
     preferences: SessionPreferences,
 ) -> None:
-    _show_runtime_state(runtime, console)
+    _show_runtime_state(runtime, console, force=True)
+    active_work: Thread | None = None
+    work_done = Event()
+    work_errors: list[BaseException] = []
+
+    def work(command: UserCommand) -> None:
+        try:
+            execute_command(runtime, console, command, preferences)
+        except BaseException as exc:
+            work_errors.append(exc)
+        finally:
+            work_done.set()
+
+    background_kinds = {
+        CommandKind.TEXT,
+        CommandKind.GOAL,
+        CommandKind.RUN,
+        CommandKind.AUTO,
+        CommandKind.APPROVE,
+        CommandKind.RESUME,
+    }
     while True:
+        if active_work is not None and work_done.is_set():
+            active_work.join()
+            active_work = None
+            console.set_background_working(False)
+            work_done.clear()
+            if work_errors:
+                exc = work_errors.pop(0)
+                if isinstance(exc, KeyboardInterrupt):
+                    runtime.checkpoint_interrupt()
+                else:
+                    console.write(f"error: {exc}")
         try:
             line = console.prompt()
         except EOFError:
@@ -930,19 +1827,38 @@ def interactive_loop(
             return
         except KeyboardInterrupt:
             runtime.checkpoint_interrupt()
-            console.write(
-                "\nCheckpoint saved; new agents will not launch until /resume. "
-                "Type /quit to exit or / for controls."
-            )
-            _show_runtime_state(runtime, console)
             continue
         try:
             command = parse_command(line)
+            if active_work is not None and command.kind in background_kinds:
+                console.write(
+                    "Work is already running. Use /status, /thinking, /agents, or /pause."
+                )
+                continue
+            if active_work is not None and command.kind == CommandKind.QUIT:
+                console.write("Active work needs a checkpoint first; use /pause, then /quit.")
+                continue
+            if (
+                active_work is None
+                and command.kind in background_kinds
+                and console.live_activity_enabled
+            ):
+                work_done.clear()
+                active_work = Thread(
+                    target=work,
+                    args=(command,),
+                    name="ga3bad-background-work",
+                    daemon=False,
+                )
+                console.set_background_working(True)
+                active_work.start()
+                continue
             if not execute_command(runtime, console, command, preferences):
                 return
         except KeyboardInterrupt:
             runtime.checkpoint_interrupt()
-            _show_runtime_state(runtime, console)
+        except UserExitRequested:
+            return
         except (
             CommandParseError,
             RuntimeErrorBase,
@@ -955,40 +1871,181 @@ def interactive_loop(
             console.write(f"error: {exc}")
 
 
+def _interactive_setup(
+    args: argparse.Namespace,
+    console: ConsoleUI,
+    selected_provider: str,
+) -> tuple[Path, ModelDescriptor, DockerSandbox, AccessLevel, SessionPreferences] | None:
+    """Run the visible setup as a reversible, one-decision-per-screen flow."""
+
+    plain_env = os.getenv("GA3BAD_PLAIN_UI", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    rich = not (bool(getattr(console, "plain", False)) or plain_env) and rich_terminal_available(
+        input_func=console.input_func,
+        output=console.stream,
+    )
+    if rich:
+        play_intro()
+    else:
+        console.show_brand()
+
+    catalog = ModelCatalog()
+    sandbox = DockerSandbox()
+    if args.setup_sandbox:
+        config = sandbox.setup()
+        console.write(f"Full sandbox ready · {config.image} · user {config.container_user}")
+
+    workspace: Path | None = None
+    descriptor: ModelDescriptor | None = None
+    requested_access: AccessLevel | None = None
+    selected_mode: InteractionMode | None = InteractionMode.CHAT
+
+    if args.workspace:
+        workspace = _resolve_workspace(
+            Path(args.workspace).expanduser(),
+            create=args.create_workspace,
+        )
+    elif args.create_workspace:
+        raise ValueError("--create-workspace requires --workspace")
+
+    if args.model is not None:
+        environment_provider = get_provider(selected_provider)
+        selected_model = args.model or str(getattr(environment_provider, "model", ""))
+        descriptor = _descriptor_for_explicit_model(
+            selected_provider,
+            selected_model,
+            catalog=catalog if selected_provider == "ollama" else None,
+        )
+    if args.permissions:
+        requested_access = AccessLevel.parse(args.permissions)
+    if args.mode:
+        selected_mode = InteractionMode.parse(args.mode)
+
+    stages = []
+    if workspace is None:
+        stages.append("workspace")
+    if descriptor is None:
+        stages.append("model")
+    if requested_access is None:
+        stages.append("permissions")
+    # Chat-first startup deliberately has no mandatory mode-selection stage.
+
+    index = 0
+    while index < len(stages):
+        stage = stages[index]
+        try:
+            if stage == "workspace":
+                workspace = choose_workspace(
+                    args.projects_root,
+                    input_func=console.input_func,
+                    output=console.stream,
+                    rich=rich,
+                    initial=workspace,
+                    no_color=not console.color,
+                    reduced_motion=console.reduced_motion,
+                )
+            elif stage == "model":
+                descriptor = choose_model(
+                    catalog,
+                    input_func=console.input_func,
+                    output=console.stream,
+                    rich=rich,
+                    initial=descriptor.model if descriptor is not None else None,
+                    no_color=not console.color,
+                    reduced_motion=console.reduced_motion,
+                )
+            elif stage == "permissions":
+                requested_access = choose_access_level(
+                    input_func=console.input_func,
+                    output=console.stream,
+                    sandbox=sandbox,
+                    rich=rich,
+                    initial=requested_access or AccessLevel.NORMAL,
+                    no_color=not console.color,
+                    reduced_motion=console.reduced_motion,
+                )
+            else:
+                selected_mode = choose_interaction_mode(
+                    input_func=console.input_func,
+                    output=console.stream,
+                    rich=rich,
+                    initial=selected_mode or SessionPreferences.from_env().mode,
+                    no_color=not console.color,
+                    reduced_motion=console.reduced_motion,
+                )
+        except UserExitRequested:
+            return None
+        except PickerBack:
+            if index > 0:
+                index -= 1
+                continue
+            if rich:
+                play_intro()
+            continue
+        index += 1
+
+    assert workspace is not None
+    assert descriptor is not None
+    assert requested_access is not None
+    assert selected_mode is not None
+    return (
+        workspace,
+        descriptor,
+        sandbox,
+        requested_access,
+        SessionPreferences(mode=selected_mode),
+    )
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     just_fix_windows_console()
-    console = ConsoleUI(color=False if args.no_color else None)
+    console = ConsoleUI(
+        color=False if args.no_color else None,
+        plain=bool(args.plain),
+        reduced_motion=bool(args.reduced_motion),
+    )
     preferences = SessionPreferences()
     store: StateStore | None = None
     runtime: AgentRuntime | None = None
     try:
         load_dotenv(APP_ROOT / ".env", override=False)
+        console.plain = console.plain or os.getenv("GA3BAD_PLAIN_UI", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        console.reduced_motion = console.reduced_motion or os.getenv(
+            "GA3BAD_REDUCED_MOTION", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
         selected_provider = _configure_provider_environment(args.provider, args.model)
         interactive_launch = bool(args.interactive or not args.command)
         if interactive_launch:
-            console.show_brand()
-        if args.workspace:
-            workspace_path = Path(args.workspace).expanduser()
-            workspace = _resolve_workspace(
-                workspace_path,
-                create=args.create_workspace,
-            )
+            setup = _interactive_setup(args, console, selected_provider)
+            if setup is None:
+                return 0
+            workspace, descriptor, sandbox, requested_access, preferences = setup
         else:
-            if args.create_workspace:
-                raise ValueError("--create-workspace requires --workspace")
-            if not sys.stdin.isatty():
-                raise ValueError(
-                    "--workspace is required when no interactive terminal is available"
+            if args.workspace:
+                workspace_path = Path(args.workspace).expanduser()
+                workspace = _resolve_workspace(
+                    workspace_path,
+                    create=args.create_workspace,
                 )
-            workspace = choose_workspace(args.projects_root)
+            else:
+                if args.create_workspace:
+                    raise ValueError("--create-workspace requires --workspace")
+                if not sys.stdin.isatty():
+                    raise ValueError(
+                        "--workspace is required when no interactive terminal is available"
+                    )
+                workspace = choose_workspace(
+                    args.projects_root,
+                    rich=False if args.plain else None,
+                )
 
-        catalog = ModelCatalog()
-        if interactive_launch and args.model is None:
-            descriptor = choose_model(catalog, output=console.stream)
-        else:
-            if not interactive_launch and args.model is None:
+            catalog = ModelCatalog()
+            if args.model is None:
                 model_required = args.auto
                 for raw in args.command:
                     try:
@@ -1017,31 +2074,24 @@ def main(argv: Iterable[str] | None = None) -> int:
                 selected_model,
                 catalog=catalog if selected_provider == "ollama" and args.model is not None else None,
             )
+            sandbox = DockerSandbox()
+            if args.setup_sandbox:
+                sandbox.setup()
+                console.write("Full sandbox setup is ready.")
+            requested_access = (
+                AccessLevel.parse(args.permissions)
+                if args.permissions
+                else AccessLevel.NORMAL
+            )
+            preferences = SessionPreferences.from_env(args.mode)
+
         os.environ["LLM_PROVIDER"] = descriptor.provider
         provider = descriptor.create_provider()
         _validated_model_name(str(getattr(provider, "model", "")))
-
-        sandbox = DockerSandbox()
-        if args.setup_sandbox:
-            sandbox.setup()
-            console.write("Full sandbox setup is ready.")
-        requested_access = (
-            AccessLevel.parse(args.permissions)
-            if args.permissions
-            else choose_access_level(output=console.stream)
-            if interactive_launch
-            else AccessLevel.NORMAL
-        )
         permission_adapter = PermissionAdapter(requested_access, sandbox)
         if permission_adapter.selection.reason:
             console.write(permission_adapter.selection.reason)
 
-        if args.mode:
-            preferences = SessionPreferences.from_env(args.mode)
-        elif interactive_launch:
-            preferences = SessionPreferences(mode=choose_interaction_mode(output=console.stream))
-        else:
-            preferences = SessionPreferences.from_env()
         console.set_mode(preferences.mode)
         console.set_runtime_identity(
             access_level=permission_adapter.access_level.value,
@@ -1059,10 +2109,11 @@ def main(argv: Iterable[str] | None = None) -> int:
             model_descriptor=descriptor,
             permission_adapter=permission_adapter,
         )
-        console.write(
-            f"Ready · {runtime.provider_name}/{runtime.model_name} · "
-            f"{runtime.execution_class} · {runtime.access_level} · state .coding-agent/state.db"
-        )
+        if not interactive_launch:
+            console.write(
+                f"Ready · {runtime.provider_name}/{runtime.model_name} · "
+                f"{runtime.execution_class} · {runtime.access_level} · state .coding-agent/state.db"
+            )
 
         for raw in args.command:
             try:
@@ -1070,14 +2121,22 @@ def main(argv: Iterable[str] | None = None) -> int:
                     return 0
             except KeyboardInterrupt:
                 runtime.checkpoint_interrupt()
-                _show_runtime_state(runtime, console)
                 return 130
-        if args.auto and preferences.mode != InteractionMode.ULTRA:
+            except UserExitRequested:
+                return 0
+        if args.auto:
             try:
-                _run_auto(runtime, console)
+                if preferences.mode == InteractionMode.ULTRA:
+                    if runtime.ultra_session is not None and runtime.ultra_session.running:
+                        console.write(
+                            "ULTRA auto-wait is active. The approved run will remain live until completion or a real blocker."
+                        )
+                        runtime.wait_for_ultra()
+                        _show_runtime_state(runtime, console)
+                else:
+                    _run_auto(runtime, console)
             except KeyboardInterrupt:
                 runtime.checkpoint_interrupt()
-                _show_runtime_state(runtime, console)
                 return 130
         if args.interactive or not args.command:
             interactive_loop(runtime, console, preferences)
@@ -1101,6 +2160,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             runtime.close()
         if store is not None:
             store.close()
+        console.close()
 
 
 if __name__ == "__main__":

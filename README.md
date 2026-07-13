@@ -63,15 +63,21 @@ You can also launch the workspace chooser:
 python -m agent
 ```
 
-The interactive terminal opens with a green `GA3BAD` ASCII banner. Type `/` to
-open the live command palette; arrow keys and Tab select completions as you type.
-Legacy `:command` syntax remains accepted for existing scripts.
+The interactive terminal opens on a full-screen `GA3BAD` welcome. Press Enter,
+then use the arrow keys and Enter to choose one workspace, model, access level,
+and interaction mode at a time. The focused row always includes its description;
+Esc moves back without changing the current selection. Model discovery and
+Docker checks use a semantic inline-square activity indicator rather than blocking on
+an unexplained blank screen.
 
-Startup then asks for a workspace, a tool-capable model, `normal` or Docker-only
-`full` access, and `plan`, `goal`, or `ultra` mode. Ollama models are discovered
-first through `/api/tags` and `/api/show`; non-tool models are omitted. Local
-models use one sequential worker, while Ollama cloud/OpenAI/Gemini models run
-independent, write-disjoint nodes concurrently.
+At the prompt, `/` opens a contextual, nested command palette instead of dumping
+every command. F2, F3, and F4 reopen Mode, Model, and Access; Ctrl+Q exits safely.
+Direct commands and legacy `:command` syntax remain available for scripts and
+power users. Use `--plain` for the line-oriented/SSH UI or `--reduced-motion` for
+static, accessible motion. Ollama models are discovered first through `/api/tags`
+and `/api/show`; non-tool models are omitted. Local models use one sequential
+worker, while Ollama cloud/OpenAI/Gemini models run independent, write-disjoint
+nodes concurrently.
 
 ## ULTRA mode
 
@@ -104,14 +110,20 @@ python agent/main.py --workspace /path/to/project
 
 ## Normal workflow
 
-1. Enter a goal in plain language.
-2. The read-only planner must successfully inspect the repository and submit a
+1. The workspace opens directly in ordinary Chat. Discuss, inspect, or edit code
+   without selecting a structured mode. Action requests are evidence-gated: a
+   prose-only refusal is retried, generated code can be saved from a durable
+   content hash, and HTML can be served, browser-verified, and opened locally.
+2. Enable `/mode plan`, `/mode goal`, or `/mode ultra` when approval-bound or
+   durable autonomous execution is useful. The read-only planner then inspects
+   the repository and submits a
    structured plan containing factual applicability evidence, an execution
    strategy, expected workspace changes, and task-bound verification.
-3. A separate plan critic checks coverage and verifiability.
+3. Deterministic validation checks every plan; a separate critic is used only
+   for complex or high-risk work.
 4. Review the sparse status and full `/plan`. Use `/edit`, `/add`, or `/remove`,
    then `/approve`.
-5. Choose `/mode plan` to wait for `/run`, `/mode goal` to continue after
+5. Choose `/mode chat` for ordinary conversation, `/mode plan` to wait for `/run`, `/mode goal` to continue after
    approval, or `/mode ultra` for nested Project-Brain execution. Ctrl-C
    checkpoints automatic work safely.
 6. Add guidance or edit the checklist at any checkpoint. The durable objective is
@@ -134,17 +146,30 @@ GA3BAD [ULTRA]>
 The logo appears once. Normal output is append-only scrollback; detailed trees,
 agents, memory, traces, and metrics appear only when requested.
 
+Live activity is intentionally summarized: a tool call and its result resolve as
+one operation, repeated read-only inspections are coalesced, usage counters and
+recoverable schema details stay folded, and a plan is announced only after the
+independent critic accepts it. Provider thoughts drive a compact single-line
+square loader whose gray-to-white motion changes by activity state and whose
+label reflects the current thought or tool, then collapse at the end of each model step; `/thinking`
+opens the redacted, session-only blocks again. Use `/trace`, `/history`, or
+`/metrics` when durable technical detail is needed.
+
 ## Commands
 
 | Command | Effect |
 |---|---|
 | `/` | Open the interactive slash-command palette |
-| `/mode plan`, `/mode goal`, `/mode ultra` | Select manual, automatic, or Project-Brain execution; no mode bypasses master approval |
+| `/mode chat`, `/mode plan`, `/mode goal`, `/mode ultra` | Select ordinary chat, approval-bound planning, automatic goals, or Project-Brain execution; mode changes never approve a plan |
 | `/settings [NAME [VALUE]]` | Inspect safe session settings or change color/runtime limits; secrets are never displayed |
 | `/model [NAME]` | Reopen the picker or switch models at a safe checkpoint |
 | `/permissions normal\|full`, `/setup` | Select approvals or initialize the fail-closed Docker Full sandbox |
+| `/skills` | Show the real local tool registry, availability, risk, and approval policy |
+| `/processes`, `/stop-process ID` | Inspect or stop agent-owned processes and HTML previews |
+| `/sleep on\|off\|status` | Control the session-scoped Sleep profile; requires Ultra and ready Full Docker access |
 | `/tree [NODE]`, `/agents [--all]` | Inspect hierarchical work and isolated agent runs |
 | `/memory [SECTION]`, `/trace [latest\|RUN_ID]` | Inspect Project Brain and redacted prompts/context/summaries |
+| `/thinking` | Expand redacted provider thoughts captured during this session |
 | `/insights [NODE]`, `/metrics` | Inspect durable findings and execution metrics |
 | `/questions`, `/answer ID VALUE` | Inspect and answer approval-bound planning decisions |
 | plain text / `/goal TEXT` | Start a goal when idle; otherwise add durable user guidance |
@@ -189,6 +214,9 @@ python -m agent --workspace ./project --provider ollama --model qwen2.5-coder:7b
 
 The provider never writes a goal status directly. It requests transitions through
 typed control tools; `AgentRuntime`, the task DAG, and `StateStore` validate them.
+Ordinary Chat uses the same workspace binding, permission adapter, action journal,
+and typed tool results; it cannot bypass Full Docker routing or count a failed
+write as a mutation.
 
 ## Adaptive subtasking
 
@@ -214,6 +242,8 @@ manually. SQLite WAL and
 transactions store goals, plan revisions/fingerprints, applicability evidence,
 expected edits, execution strategies, tasks/DAGs, approvals, evidence,
 delegations, retry attempts, action intents/results, and an append-only event journal.
+Planner inspections receive stable harness references such as `inspection:I001`;
+the harness records and reuses them instead of requiring provider-native call IDs.
 
 Before a tool runs, its intent is recorded. If the process stops after a side
 effect but before its result is journaled, the next launch marks the action and
@@ -286,10 +316,16 @@ Key modules:
 - `runtime.py` — deterministic lifecycle, planning, execution, delegation, review
 - `models.py` / `store.py` — typed domain state and transactional SQLite journal
 - `control.py` / `prompts.py` — validated control protocol and stable cached prompts
-- `tools/` — contained file/search/edit/shell capabilities
+- `tools/` — central registry for contained file/search/edit/patch/shell,
+  dependency, managed-process, and secure browser-preview capabilities
 - `providers/` — OpenAI, Gemini, and Ollama adapters
 - `events.py` / `ui.py` / `commands.py` / `cli.py` — event-driven ASCII interface
 - `testing.py` — deterministic offline provider for lifecycle tests
+
+Weak-model specialization is implemented in `weak_model.py`, `run_context.py`,
+`convergence.py`, `diagnostics.py`, `repository_index.py`, and
+`local_provider.py`. The implementation report and live evidence are in
+[docs/07-local-model-quality-convergence-evidence.md](docs/07-local-model-quality-convergence-evidence.md).
 
 ## Verification
 
@@ -304,6 +340,10 @@ revisions, unbounded self-retry recovery, false completion, dynamic worker
 isolation, failed reviews and repair plans, crash recovery, provider replay
 formats, malformed tool calls, path/symlink/secret attacks, atomic-write failure,
 shell environment/cwd/output bounds, conversation pairing, and ASCII snapshots.
+
+The suite also covers active Goal Contract projections, policy persistence,
+quality-gated completion, fresh artifact hashes, delta refinement, mixed HTML
+indexing, provider capability fallback, and truthful visual-review boundaries.
 
 ## License
 

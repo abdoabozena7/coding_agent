@@ -70,6 +70,20 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+def _with_quality_milestone(
+    milestones: Iterable[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    values = [dict(item) for item in milestones if isinstance(item, Mapping)]
+    label = "Quality Refactor and Global Gate"
+    if not any(
+        str(item.get("title") or item.get("name") or item.get("id") or "").strip().casefold()
+        == label.casefold()
+        for item in values
+    ):
+        values.append({"title": label, "kind": "quality_gate"})
+    return tuple(values)
+
+
 class UltraPhase(str, Enum):
     NEW = "new"
     GOAL_SPEC = "goal_spec"
@@ -162,6 +176,10 @@ class AgentRole(str, Enum):
     INTEGRATOR = "integrator"
     GOAL_CHECKER = "goal_checker"
     MEMORY = "memory"
+    CLEAN_CODE_REVIEWER = "clean_code_reviewer"
+    SECURITY_REVIEWER = "security_reviewer"
+    TEST_QUALITY_REVIEWER = "test_quality_reviewer"
+    QUALITY_TRIAGER = "quality_triager"
 
 
 class NodeKind(str, Enum):
@@ -329,12 +347,20 @@ class TaskContractV1:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any], *, fallback_id: str = "") -> "TaskContractV1":
+        title = str(value.get("title", value.get("name", ""))).strip()
+        objective = str(value.get("objective", value.get("description", ""))).strip()
+        acceptance = _strings(value.get("acceptance_criteria"))
+        verification = _strings(value.get("verification"))
+        if objective and not acceptance:
+            acceptance = (f"Module outcome is implemented: {objective}",)
+        if objective and not verification:
+            verification = (f"Execute or inspect the module outcome against its objective: {objective}",)
         return cls(
             id=str(value.get("id", fallback_id)).strip(),
-            title=str(value.get("title", value.get("name", ""))).strip(),
-            objective=str(value.get("objective", value.get("description", ""))).strip(),
-            acceptance_criteria=_strings(value.get("acceptance_criteria")),
-            verification=_strings(value.get("verification")),
+            title=title,
+            objective=objective,
+            acceptance_criteria=acceptance,
+            verification=verification,
             depends_on=_strings(value.get("depends_on")),
             write_paths=_strings(value.get("write_paths", value.get("paths"))),
             forbidden_changes=_strings(value.get("forbidden_changes")),
@@ -404,10 +430,56 @@ class MasterPlanV1:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "MasterPlanV1":
         data = _mapping(value.get("master_plan", value))
+        raw_modules = [item for item in data.get("modules", ()) if isinstance(item, Mapping)]
+        legacy_ids: dict[str, str] = {}
+        for index, item in enumerate(raw_modules, start=1):
+            generated = f"M{index:03d}"
+            raw_id = str(item.get("id", "")).strip()
+            if raw_id:
+                legacy_ids[raw_id.casefold()] = generated
+            legacy_ids[f"m{index}".casefold()] = generated
+            legacy_ids[f"m{index:02d}".casefold()] = generated
+            legacy_ids[generated.casefold()] = generated
+
+        normalized_modules: list[dict[str, Any]] = []
+        for index, item in enumerate(raw_modules, start=1):
+            normalized = dict(item)
+            normalized["id"] = f"M{index:03d}"
+            title = str(item.get("title", item.get("name", ""))).strip()
+            objective = str(item.get("objective", item.get("description", ""))).strip()
+            acceptance = _strings(item.get("acceptance_criteria"))
+            verification = _strings(item.get("verification"))
+            if not title and (objective or acceptance or verification):
+                title = f"Module M{index:03d}"
+            if not objective:
+                if acceptance:
+                    objective = acceptance[0]
+                elif verification:
+                    objective = verification[0]
+            normalized["title"] = title
+            normalized["objective"] = objective
+            raw_dependencies = item.get("depends_on", ())
+            if raw_dependencies is None:
+                raw_dependencies = ()
+            if not isinstance(raw_dependencies, (list, tuple)):
+                raw_dependencies = (raw_dependencies,)
+            dependencies: list[str] = []
+            for dependency in raw_dependencies:
+                text = str(dependency).strip()
+                resolved = legacy_ids.get(text.casefold())
+                if resolved is None:
+                    # Weak models often copy the human label into a dependency,
+                    # e.g. ``M001: Renderer Core``. The stable ID prefix is the
+                    # dependency; descriptive suffixes must not break the DAG.
+                    match = re.match(r"^[Mm]0*(\d+)(?:\b|\s*[:\-])", text)
+                    resolved = f"M{int(match.group(1)):03d}" if match else text
+                if resolved and resolved not in dependencies:
+                    dependencies.append(resolved)
+            normalized["depends_on"] = dependencies
+            normalized_modules.append(normalized)
         modules = tuple(
             TaskContractV1.from_mapping(item, fallback_id=f"M{index:03d}")
-            for index, item in enumerate(data.get("modules", ()), start=1)
-            if isinstance(item, Mapping)
+            for index, item in enumerate(normalized_modules, start=1)
         )
         return cls(
             summary=str(data.get("summary", "")).strip(),
@@ -465,6 +537,12 @@ class ResultPackageV1:
 
 
 @dataclass(frozen=True, slots=True)
+class QualityGateResultV1:
+    responses: tuple[AgentResponse, ...]
+    consensus: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class BrainEntryV1:
     section: BrainSection
     key: str
@@ -519,6 +597,7 @@ class AgentRequest:
     context: Mapping[str, Any]
     task: Mapping[str, Any]
     node_id: str | None = None
+    agent_run_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1026,7 +1105,8 @@ class UltraOrchestrator:
             node_id=node_id,
         )
         last_error: Exception | None = None
-        for attempt in range(1, self.config.provider_retries + 2):
+        typed_repair_used = False
+        for attempt in range(1, self.config.provider_retries + 3):
             self.control.checkpoint()
             agent_id = _id("agent")
             self.state.save_agent_run(
@@ -1045,7 +1125,26 @@ class UltraOrchestrator:
                 agent = self.agent_factory.create(
                     role, run_id=self.run_state.id, node_id=node_id
                 )
-                response = agent.execute(request)
+                response = agent.execute(replace(request, agent_run_id=agent_id))
+                normalized_payload, normalization_actions = self._normalize_typed_payload(
+                    phase_value, response.payload, safe_task
+                )
+                if normalization_actions:
+                    response = replace(response, payload=normalized_payload)
+                    self.events.publish(
+                        "ultra.typed_normalized",
+                        "; ".join(normalization_actions),
+                        run_id=self.run_state.id,
+                        node_id=node_id,
+                        role=role.value,
+                        phase=phase_value,
+                        actions=list(normalization_actions),
+                    )
+                # Typed returns are validated before the lifecycle can become
+                # COMPLETED.  This prevents an empty GoalSpec (and equivalent
+                # malformed review/worker payloads) from being accepted and
+                # failing later in the engine.
+                self._validate_typed_response(phase_value, response.payload)
                 self.adaptive.on_success()
                 agent_run = AgentRunV1(
                     id=agent_id,
@@ -1110,6 +1209,45 @@ class UltraOrchestrator:
                     node_id=node_id,
                 )
                 return response
+            except AgentProtocolError as exc:
+                self.state.save_agent_run(
+                    AgentRunV1(
+                        id=agent_id,
+                        run_id=self.run_state.id,
+                        role=role,
+                        phase=phase_value,
+                        status="failed",
+                        provider=str(self.model_snapshot.get("provider", "")),
+                        model=str(self.model_snapshot.get("model", "")),
+                        node_id=node_id,
+                        error=redact_text(f"typed return validation: {exc}")[:4_000],
+                    )
+                )
+                self.events.publish(
+                    "ultra.typed_return_rejected",
+                    f"{role.value} returned invalid {phase_value}: {redact_text(exc, 500)}",
+                    run_id=self.run_state.id,
+                    agent_run_id=agent_id,
+                    role=role.value,
+                    phase=phase_value,
+                    repair_attempt=1 if not typed_repair_used else 2,
+                )
+                if typed_repair_used:
+                    raise AgentProtocolError(
+                        f"ULTRA foundation/phase {phase_value} failed after one targeted typed-return repair: {exc}"
+                    ) from exc
+                typed_repair_used = True
+                repair_task = {
+                    **safe_task,
+                    "typed_return_repair": {
+                        "contract": phase_value,
+                        "errors": [str(exc)],
+                        "previous_payload": redact_data(dict(response.payload)),
+                        "instruction": "Return one complete corrected payload. Repair only the listed contract defects.",
+                    },
+                }
+                request = replace(request, task=repair_task)
+                continue
             except RateLimitError as exc:
                 last_error = exc
                 concurrency = self.adaptive.on_rate_limit()
@@ -1211,6 +1349,185 @@ class UltraOrchestrator:
         assert last_error is not None
         raise last_error
 
+    def _foundation_project_lessons(self, query: str, phase: str) -> tuple[Mapping[str, Any], ...]:
+        if not self.run_state:
+            return ()
+        getter = getattr(self.state, "foundation_project_lessons", None)
+        if not callable(getter):
+            return ()
+        raw = getter(self.run_state.id, query, phase=phase)
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+            return ()
+        return tuple(dict(item) for item in raw if isinstance(item, Mapping))
+
+    @staticmethod
+    def _normalize_typed_payload(
+        phase: str,
+        payload: Mapping[str, Any],
+        task: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], tuple[str, ...]]:
+        normalized = dict(payload)
+        actions: list[str] = []
+        if phase == "goal_spec" and not str(normalized.get("objective", "")).strip():
+            authoritative_prompt = str(task.get("prompt", "")).strip()
+            if authoritative_prompt:
+                normalized["objective"] = authoritative_prompt
+                actions.append("goal_spec.objective restored from authoritative user prompt")
+        if phase == "master_plan":
+            goal_spec = _mapping(task.get("goal_spec"))
+            architecture = _mapping(task.get("architecture"))
+            modules = [dict(item) for item in normalized.get("modules", ()) if isinstance(item, Mapping)]
+            if not modules:
+                components = [
+                    dict(item)
+                    for item in architecture.get("components", ())
+                    if isinstance(item, Mapping)
+                ]
+                for index, component in enumerate(components, start=1):
+                    name = str(component.get("name") or component.get("title") or f"Module {index}").strip()
+                    responsibility = str(
+                        component.get("responsibility")
+                        or component.get("objective")
+                        or f"Implement {name}"
+                    ).strip()
+                    modules.append(
+                        {
+                            "id": f"M{index:03d}",
+                            "title": name,
+                            "objective": responsibility,
+                            "acceptance_criteria": [f"{name} satisfies its architecture responsibility: {responsibility}"],
+                            "verification": [f"Execute or inspect {name} against its architecture contract"],
+                            "depends_on": [] if index == 1 else [f"M{index - 1:03d}"],
+                            "write_paths": ["index.html"],
+                        }
+                    )
+                if modules:
+                    normalized["modules"] = modules
+                    normalized["summary"] = str(
+                        normalized.get("summary") or architecture.get("summary") or goal_spec.get("objective")
+                    ).strip()
+                    normalized["execution_strategy"] = str(
+                        normalized.get("execution_strategy")
+                        or "Implement architecture components sequentially, then run the final quality gate."
+                    ).strip()
+                    actions.append("master_plan.modules restored from accepted architecture components")
+
+            # Requirements may be distributed across objective, constraints,
+            # scope, and success criteria. Inspect the whole accepted GoalSpec
+            # so a terse weak-model objective cannot erase an explicit QA gate.
+            objective_text = json.dumps(goal_spec, ensure_ascii=False, default=str).casefold()
+            requires_browser_qa = any(
+                term in objective_text
+                for term in ("browser", "screenshot", "visual refinement", "visual quality")
+            )
+            dedicated_qa_terms = ("browser qa", "visual qa", "quality gate", "validation gate")
+            has_dedicated_browser_qa = any(
+                any(term in str(item.get("title", "")).casefold() for term in dedicated_qa_terms)
+                for item in modules
+            )
+            # A screenshot mentioned inside an implementation module is not an
+            # independent quality gate: weak planners commonly use it as a
+            # checkbox and omit interaction coverage, error evidence, and the
+            # mandatory refine-and-retest loop.
+            if requires_browser_qa and not has_dedicated_browser_qa:
+                qa_id = f"M{len(modules) + 1:03d}"
+                modules.append(
+                    {
+                        "id": qa_id,
+                        "title": "Browser QA and Visual Refinement Gate",
+                        "objective": "Run the real game in a browser, prove gameplay and runtime stability, score visual quality, and refine any below-target candidate.",
+                        "acceptance_criteria": [
+                            "A real 1280x720 screenshot is captured from the running game, never a placeholder.",
+                            "Console and page errors are zero and unexpected network failures are absent or handled by a visible graceful fallback.",
+                            "Movement, shooting, pause, pickups, wave progression, game-over, and restart are exercised.",
+                            "Visual hierarchy, depth, contrast, density, legibility, and responsiveness meet the approved quality target.",
+                            "Any below-target visual dimension triggers code refinement and fresh browser verification.",
+                        ],
+                        "verification": [
+                            "Preview index.html at 1280x720 and capture the actual browser screenshot.",
+                            "Inspect console, page, and network evidence and exercise the complete gameplay lifecycle.",
+                            "Repeat screenshot and runtime verification after every visual refinement mutation.",
+                        ],
+                        "depends_on": [str(modules[-1].get("id"))] if modules else [],
+                        "write_paths": ["index.html"],
+                    }
+                )
+                normalized["modules"] = modules
+                actions.append("master_plan Browser QA gate added from explicit goal requirements")
+        if phase == InnerPhase.DECOMPOSE.value:
+            parent_contract = _mapping(task.get("contract"))
+            parent_id = str(parent_contract.get("id", "")).strip()
+            parent_title = str(parent_contract.get("title", parent_id or "Parent module")).strip()
+            raw_children = normalized.get("children", ())
+            if isinstance(raw_children, Sequence) and not isinstance(raw_children, (str, bytes)):
+                repaired_children: list[Any] = []
+                for index, child in enumerate(raw_children, start=1):
+                    if not isinstance(child, Mapping):
+                        repaired_children.append(child)
+                        continue
+                    item = dict(child)
+                    child_id = str(item.get("id", f"{parent_id}.{index}" if parent_id else f"child.{index}")).strip()
+                    title = str(item.get("title", item.get("name", ""))).strip()
+                    objective = str(item.get("objective", item.get("description", ""))).strip()
+                    acceptance = list(_strings(item.get("acceptance_criteria")))
+                    verification = list(_strings(item.get("verification")))
+                    hint = str(
+                        item.get("finding")
+                        or item.get("reason")
+                        or item.get("summary")
+                        or item.get("focus")
+                        or ""
+                    ).strip()
+                    if not title:
+                        suffix = hint or child_id
+                        title = f"{parent_title} refinement {index}" if "refinement" in child_id.casefold() else f"{parent_title} subtask {index}"
+                        if hint and hint.casefold() not in title.casefold():
+                            title = f"{title}: {hint[:80]}"
+                        item["title"] = title
+                        actions.append(f"decompose child {child_id} title restored")
+                    if not objective:
+                        objective = hint or (acceptance[0] if acceptance else "") or (verification[0] if verification else "")
+                        if not objective:
+                            objective = f"Advance {parent_title} within the approved contract."
+                        item["objective"] = objective
+                        actions.append(f"decompose child {child_id} objective restored")
+                    if objective and not acceptance:
+                        item["acceptance_criteria"] = [f"Child outcome is implemented: {objective}"]
+                        actions.append(f"decompose child {child_id} acceptance restored")
+                    if objective and not verification:
+                        item["verification"] = [f"Execute or inspect the child outcome against its objective: {objective}"]
+                        actions.append(f"decompose child {child_id} verification restored")
+                    repaired_children.append(item)
+                normalized["children"] = repaired_children
+        return normalized, tuple(actions)
+
+    @staticmethod
+    def _validate_typed_response(phase: str, payload: Mapping[str, Any]) -> None:
+        """Phase-specific semantic validation shared by every agent lifecycle."""
+
+        if phase == "goal_spec":
+            GoalSpecV1.from_mapping(payload)
+            return
+        if phase == "architecture":
+            ArchitectureSpecV1.from_mapping(payload)
+            return
+        if phase == "master_plan":
+            MasterPlanV1.from_mapping(payload)
+            return
+        if phase in {"integrate", "global_integration", "final_evidence"}:
+            if not isinstance(payload.get("success", payload.get("passed")), bool):
+                raise AgentProtocolError(f"{phase}.success (or passed) must be boolean")
+        if phase in {
+            "review",
+            "test",
+            "global_review",
+        }:
+            if not isinstance(payload.get("passed"), bool):
+                raise AgentProtocolError(f"{phase}.passed must be boolean")
+        for key in ("evidence", "findings", "issues"):
+            if key in payload and not isinstance(payload[key], (list, tuple)):
+                raise AgentProtocolError(f"{phase}.{key} must be an array")
+
     @staticmethod
     def _validated_questions(raw: Iterable[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
         questions: list[dict[str, Any]] = []
@@ -1223,8 +1540,48 @@ class UltraOrchestrator:
                 for option in item.get("options", ())
                 if isinstance(option, Mapping)
             )
+            combined = " ".join(
+                (text, str(item.get("header", "")), str(item.get("reason", "")))
+            ).casefold()
+            verification_terms = (
+                "verify", "verification", "read-back", "read back", "metadata",
+                "test method", "check method", "successful write",
+            )
+            consequential_terms = (
+                "platform", "target user", "product behavior", "compatibility",
+                "deployment", "migration", "destructive", "irreversible",
+                "public api", "interface contract", "scope boundary",
+            )
+            implementation_terms = (
+                "enemy behavior", "enemy ai", "threat vector", "combat balance",
+                "asset complexity", "input priorit", "state machine depth",
+                "implementation complexity", "visual effect", "pacing",
+                "particle", "shader", "shaders", "muzzle flash", "explosion",
+                "environmental interactivity", "animated rails", "decorative",
+                "traversable", "collision geometry", "player pathing",
+                "scope creep", "physics integration",
+            )
+            if (
+                any(term in combined for term in (*verification_terms, *implementation_terms))
+                and not any(term in combined for term in consequential_terms)
+            ):
+                # Verification mechanics are harness policy, not product
+                # decisions. Reversible implementation trade-offs are owned by
+                # the architecture pass. Prefer the strongest safe local check
+                # or a concrete bounded implementation without pausing.
+                continue
             if not question_id or question_id in seen or not text:
                 raise AgentProtocolError("ULTRA questions require unique ids and non-empty text")
+            if not options:
+                # Open-ended questions without bounded choices are almost
+                # always weak-model uncertainty, not a real user decision.
+                # The architecture and implementation passes should pick a
+                # safe default and continue autonomously.
+                continue
+            if len(options) == 1:
+                # A single offered option is not a user decision. Treat it as
+                # the model's own bounded default and continue foundation.
+                continue
             if options and not 2 <= len(options) <= 3:
                 raise AgentProtocolError("ULTRA question options must contain two or three choices")
             seen.add(question_id)
@@ -1244,6 +1601,34 @@ class UltraOrchestrator:
             raise AgentProtocolError("ULTRA may ask at most three questions in one foundation round")
         return tuple(questions)
 
+    @staticmethod
+    def _question_reopens_explicit_prompt_constraint(
+        question: Mapping[str, Any], prompt: str
+    ) -> bool:
+        combined = " ".join(
+            (
+                str(question.get("header", "")),
+                str(question.get("question", "")),
+                str(question.get("reason", "")),
+            )
+        ).casefold()
+        objective = str(prompt).casefold()
+        explicit_markers = (
+            "placeholder",
+            "single-file",
+            "single file",
+            "cdn",
+            "visual quality",
+            "visually impressive",
+            "production-quality",
+            "production quality",
+        )
+        if any(marker in combined and marker in objective for marker in explicit_markers):
+            return True
+        if "aspect ratio" in combined and re.search(r"\b\d{3,5}\s*[x×]\s*\d{3,5}\b", objective):
+            return True
+        return False
+
     def _finish_foundation(self, prompt: str) -> MasterPlanV1:
         """Continue Architecture -> Master Plan after goal decisions are complete."""
 
@@ -1253,7 +1638,10 @@ class UltraOrchestrator:
             AgentRole.ARCHITECT,
             "architecture",
             task={"goal_spec": asdict(self.goal_spec)},
-            context={"prompt": prompt},
+            context={
+                "prompt": prompt,
+                "cross_run_project_lessons": self._foundation_project_lessons(prompt, "architecture"),
+            },
         )
         self.architecture = ArchitectureSpecV1.from_mapping(architecture_response.payload)
         self._set_phase(UltraPhase.MASTER_PLAN, "Building master plan")
@@ -1268,9 +1656,27 @@ class UltraOrchestrator:
                     "maximum": self.config.max_top_modules,
                 },
             },
-            context={"prompt": prompt},
+            context={
+                "prompt": prompt,
+                "cross_run_project_lessons": self._foundation_project_lessons(
+                    f"{prompt} {self.architecture.summary}",
+                    "master_plan",
+                ),
+            },
         )
         proposed = MasterPlanV1.from_mapping(plan_response.payload)
+        quality_checklist = (
+            "\n\nULTRA Quality Checklist (approval-bound): clean-code review; security review; "
+            "tests and test-quality review; remediation Change Sets receive fresh reviews; "
+            "integration and global evidence require zero open Critical, High, or Medium findings."
+        )
+        proposed = MasterPlanV1(
+            summary=proposed.summary,
+            modules=proposed.modules,
+            milestones=_with_quality_milestone(proposed.milestones),
+            execution_strategy=proposed.execution_strategy.rstrip() + quality_checklist,
+            revision=proposed.revision,
+        )
         answers = _mapping(self.run_state.metadata.get("question_answers"))
         if answers:
             strategy = proposed.execution_strategy.rstrip()
@@ -1359,11 +1765,25 @@ class UltraOrchestrator:
                     "instruction": (
                         "Inspect the repository first. Derive GoalSpecV1 and ask at most three "
                         "questions only for high-impact decisions that cannot be discovered."
-                    )
+                    ),
+                    "cross_run_project_lessons": self._foundation_project_lessons(prompt, "goal_spec"),
                 },
             )
             self.goal_spec = GoalSpecV1.from_mapping(goal_response.payload)
-            questions = self._validated_questions(self.goal_spec.questions)
+            raw_questions = tuple(self.goal_spec.questions)
+            questions = self._validated_questions(raw_questions)
+            questions = tuple(
+                item
+                for item in questions
+                if not self._question_reopens_explicit_prompt_constraint(item, prompt)
+            )
+            if len(questions) < len(raw_questions):
+                self.events.publish(
+                    "ultra.questions_autoresolved",
+                    f"Resolved {len(raw_questions) - len(questions)} verification-policy question(s) by harness policy",
+                    run_id=self.run_state.id,
+                    removed=len(raw_questions) - len(questions),
+                )
             if questions:
                 self.goal_spec = replace(self.goal_spec, questions=questions)
                 self._save_run(
@@ -1638,12 +2058,90 @@ class UltraOrchestrator:
             return ()
         return tuple(dict(item) for item in raw if isinstance(item, Mapping))
 
-    def _quality(self, node: WorkNode) -> tuple[AgentResponse, AgentResponse]:
-        review = self._invoke(
-            AgentRole.REVIEWER,
+    def _quality_vote_records(
+        self,
+        node: WorkNode,
+        responses: tuple[AgentResponse, ...],
+    ) -> tuple[Mapping[str, Any], ...]:
+        labels = (
+            "clean_code",
+            "security",
+            "runtime_tests",
+            "test_quality",
+            "triage",
+        )
+        records: list[Mapping[str, Any]] = []
+        for label, response in zip(labels, responses):
+            payload = response.payload
+            reasoning_evaluation = _mapping(payload.get("harness_reasoning_evaluation"))
+            raw_verdict = str(payload.get("consensus_vote") or payload.get("verdict") or "").strip().casefold()
+            if raw_verdict not in {"accept", "reject", "abstain"}:
+                raw_verdict = "accept" if self._passed(response) else "reject"
+            if reasoning_evaluation and not bool(reasoning_evaluation.get("passed", True)):
+                raw_verdict = "reject"
+            try:
+                confidence = float(payload.get("confidence", payload.get("quality_confidence", 1.0)))
+            except (TypeError, ValueError):
+                confidence = 1.0
+            if reasoning_evaluation and not bool(reasoning_evaluation.get("passed", True)):
+                confidence = max(confidence, 1.0)
+            records.append(
+                {
+                    "voter_agent_id": f"{node.id}:{label}",
+                    "role": label,
+                    "verdict": raw_verdict,
+                    "confidence": max(0.0, min(1.0, confidence)),
+                    "passed": self._passed(response),
+                    "summary": response.summary,
+                    "rationale": response.reasoning_summary or response.summary,
+                    "evidence": {
+                        "issues": list(_strings(payload.get("issues"))),
+                        "findings": list(_strings(payload.get("findings"))),
+                        "test_results": list(self._records(response, "test_results")),
+                        "harness_reasoning_evaluation": reasoning_evaluation,
+                    },
+                }
+            )
+        return tuple(records)
+
+    def _record_quality_consensus(
+        self,
+        node: WorkNode,
+        responses: tuple[AgentResponse, ...],
+    ) -> Mapping[str, Any]:
+        recorder = getattr(self.state, "record_quality_consensus", None)
+        if not callable(recorder):
+            return {}
+        return dict(
+            recorder(
+                node.id,
+                self._quality_vote_records(node, responses),
+            )
+            or {}
+        )
+
+    @staticmethod
+    def _consensus_accepted(consensus: Mapping[str, Any]) -> bool:
+        if not consensus:
+            return True
+        return str(consensus.get("status", "")).casefold() == "accepted"
+
+    def _quality_gate_passed(self, result: QualityGateResultV1) -> bool:
+        return all(self._passed(item) for item in result.responses) and self._consensus_accepted(result.consensus)
+
+    def _quality(self, node: WorkNode) -> QualityGateResultV1:
+        clean_code = self._invoke(
+            AgentRole.CLEAN_CODE_REVIEWER,
             InnerPhase.REVIEW,
-            task={"contract": asdict(node.contract), "fresh_review": True},
-            context=self._new_context(node, AgentRole.REVIEWER),
+            task={"contract": asdict(node.contract), "fresh_review": True, "category": "clean_code", "read_only": True},
+            context=self._new_context(node, AgentRole.CLEAN_CODE_REVIEWER),
+            node_id=node.id,
+        )
+        security = self._invoke(
+            AgentRole.SECURITY_REVIEWER,
+            InnerPhase.REVIEW,
+            task={"contract": asdict(node.contract), "fresh_review": True, "category": "security", "read_only": True},
+            context=self._new_context(node, AgentRole.SECURITY_REVIEWER),
             node_id=node.id,
         )
         tests = self._invoke(
@@ -1653,7 +2151,38 @@ class UltraOrchestrator:
             context=self._new_context(node, AgentRole.TESTER),
             node_id=node.id,
         )
-        return review, tests
+        test_quality = self._invoke(
+            AgentRole.TEST_QUALITY_REVIEWER,
+            InnerPhase.REVIEW,
+            task={"contract": asdict(node.contract), "fresh_review": True, "category": "test_quality", "read_only": True},
+            context=self._new_context(node, AgentRole.TEST_QUALITY_REVIEWER),
+            node_id=node.id,
+        )
+        triage = self._invoke(
+            AgentRole.QUALITY_TRIAGER,
+            InnerPhase.REVIEW,
+            task={
+                "contract": asdict(node.contract),
+                "read_only": True,
+                "normalize_and_deduplicate": True,
+                "review_summaries": [clean_code.summary, security.summary, tests.summary, test_quality.summary],
+            },
+            context=self._new_context(node, AgentRole.QUALITY_TRIAGER),
+            node_id=node.id,
+        )
+        recorder = getattr(self.state, "record_quality_review", None)
+        if callable(recorder):
+            recorder(node.id, "clean_code", self._passed(clean_code))
+            recorder(node.id, "security", self._passed(security))
+            recorder(node.id, "test_quality", self._passed(test_quality))
+        finding_recorder = getattr(self.state, "record_quality_findings", None)
+        if callable(finding_recorder):
+            finding_recorder(node.id, "clean_code", self._records(clean_code, "findings"))
+            finding_recorder(node.id, "security", self._records(security, "findings"))
+            finding_recorder(node.id, "test_quality", self._records(test_quality, "findings"))
+        responses = (clean_code, security, tests, test_quality, triage)
+        consensus = self._record_quality_consensus(node, responses)
+        return QualityGateResultV1(responses=responses, consensus=consensus)
 
     def _execute_node(self, scheduled_node: WorkNode) -> ResultPackageV1:
         assert self.run_state
@@ -1693,15 +2222,24 @@ class UltraOrchestrator:
             node_id=node.id,
         )
         responses.append(implementation)
-        review, tests = self._quality(node)
-        responses.extend((review, tests))
+        quality_gate = self._quality(node)
+        responses.extend(quality_gate.responses)
         fixes = 0
-        while not (self._passed(review) and self._passed(tests)) and fixes < self.config.max_fix_attempts:
+        while not self._quality_gate_passed(quality_gate) and fixes < self.config.max_fix_attempts:
             fixes += 1
             node = replace(node, phase=InnerPhase.FIX)
             self.nodes[node.id] = node
             self.state.save_work_node(self.run_state.id, node)
-            findings = self._findings(review, tests)
+            findings = self._findings(*quality_gate.responses)
+            if quality_gate.consensus and not self._consensus_accepted(quality_gate.consensus):
+                findings = tuple(
+                    dict.fromkeys(
+                        (
+                            *findings,
+                            f"quality consensus {quality_gate.consensus.get('status')} for {node.id}",
+                        )
+                    )
+                )
             self.events.publish(
                 UltraEventKind.FIX.value,
                 f"Fix loop {fixes}/{self.config.max_fix_attempts}",
@@ -1723,16 +2261,17 @@ class UltraOrchestrator:
                 node_id=node.id,
             )
             responses.append(fix)
-            review, tests = self._quality(node)
-            responses.extend((review, tests))
+            quality_gate = self._quality(node)
+            responses.extend(quality_gate.responses)
 
-        if not (self._passed(review) and self._passed(tests)):
+        if not self._quality_gate_passed(quality_gate):
             replan = self._invoke(
                 AgentRole.PLANNER,
                 InnerPhase.REPLAN,
                 task={
                     "contract": asdict(node.contract),
-                    "findings": self._findings(review, tests),
+                    "findings": self._findings(*quality_gate.responses),
+                    "consensus": dict(quality_gate.consensus),
                     "attempts": fixes,
                 },
                 context=self._new_context(node, AgentRole.PLANNER),
@@ -1744,7 +2283,18 @@ class UltraOrchestrator:
                 success=False,
                 status="revision_required",
                 summary=replan.summary or "Quality gate exhausted; replan required",
-                findings=self._findings(review, tests),
+                findings=tuple(
+                    dict.fromkeys(
+                        (
+                            *self._findings(*quality_gate.responses),
+                            *(
+                                (f"quality consensus {quality_gate.consensus.get('status')} for {node.id}",)
+                                if quality_gate.consensus and not self._consensus_accepted(quality_gate.consensus)
+                                else ()
+                            ),
+                        )
+                    )
+                ),
                 insights=tuple(insight for response in responses for insight in response.insights),
                 fix_attempts=fixes,
             )
@@ -1888,6 +2438,18 @@ class UltraOrchestrator:
             ),
         )
 
+    def _record_global_evaluation_gate(self, global_result: ResultPackageV1) -> Mapping[str, Any]:
+        recorder = getattr(self.state, "record_global_evaluation_gate", None)
+        if not callable(recorder):
+            return {}
+        return dict(
+            recorder(
+                global_result,
+                tuple(self._results[node_id] for node_id in sorted(self._results)),
+            )
+            or {}
+        )
+
     def run(self) -> UltraRunResult:
         """Expand the approved plan, execute waves, and apply global gates."""
 
@@ -1971,6 +2533,35 @@ class UltraOrchestrator:
                     schedule,
                 )
             global_result = self._global_gate()
+            evaluation_gate = self._record_global_evaluation_gate(global_result)
+            if evaluation_gate and not bool(evaluation_gate.get("passed", True)):
+                global_result = replace(
+                    global_result,
+                    success=False,
+                    status="revision_required",
+                    summary=(
+                        str(evaluation_gate.get("blocker") or "").strip()
+                        or global_result.summary
+                        or "Automatic evaluation gate requires revision"
+                    ),
+                    findings=tuple(
+                        dict.fromkeys(
+                            (
+                                *global_result.findings,
+                                str(evaluation_gate.get("blocker") or "automatic evaluation gate failed"),
+                            )
+                        )
+                    ),
+                    evidence=(
+                        *global_result.evidence,
+                        {
+                            "kind": "automatic_evaluation_gate",
+                            "metrics": dict(evaluation_gate.get("metrics", {})),
+                            "scores": dict(evaluation_gate.get("scores", {})),
+                            "benchmark_id": evaluation_gate.get("benchmark_id"),
+                        },
+                    ),
+                )
             self.state.save_result_package(self.run_state.id, global_result)
             if not global_result.success:
                 self._set_phase(UltraPhase.REVISION_REQUIRED, "Final evidence gate requires revision")
@@ -2066,6 +2657,7 @@ __all__ = [
     "PromptTraceV1",
     "ProviderAgentAdapter",
     "ProviderFactoryAdapter",
+    "QualityGateResultV1",
     "ResultPackageV1",
     "ScopeRevisionRequired",
     "TaskContractV1",
