@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+import struct
 import zlib
 from contextlib import contextmanager
 from dataclasses import replace
@@ -87,7 +88,7 @@ from .swarm_protocol import (
 from .workflow import AgentRegistryEntryV1, AgentState
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 DEFAULT_TRACE_MAX_BYTES = 256_000
 MAX_TRACE_MAX_BYTES = 2_000_000
@@ -395,6 +396,9 @@ class StateStore:
                     existing = 6
                 if existing < 7:
                     self._migrate_v7()
+                    existing = 7
+                if existing < 8:
+                    self._migrate_v8()
                 self._connection.execute(
                     "UPDATE managed_resources SET status='stale',updated_at=? WHERE status IN ('running','ready')",
                     (_iso(utc_now()),),
@@ -411,6 +415,7 @@ class StateStore:
                     "WHERE sleep_state<>'off' OR ultra_profile<>'standard'"
                 )
                 self._fts5_available = self._ensure_brain_fts()
+                self._repository_fts5_available = self._ensure_repository_fts()
                 check = self._connection.execute("PRAGMA quick_check").fetchone()[0]
                 if check != "ok":
                     raise StateCorruptionError(f"state database integrity check failed: {check}")
@@ -989,6 +994,181 @@ class StateStore:
         """
         self._connection.executescript(schema)
 
+    def _migrate_v8(self) -> None:
+        """Install the shared intake and recursive component-package journal."""
+
+        existing_swarm_columns = {
+            str(row[1]) for row in self._connection.execute("PRAGMA table_info(swarm_messages)")
+        }
+        swarm_column_definitions = {
+            "fencing_token": "INTEGER NOT NULL DEFAULT 0",
+            "deadline": "TEXT",
+            "evidence_json": "TEXT NOT NULL DEFAULT '[]'",
+            "schema_name": "TEXT NOT NULL DEFAULT 'SwarmMessageV1'",
+        }
+        missing_swarm_alters = "\n".join(
+            f"ALTER TABLE swarm_messages ADD COLUMN {name} {definition};"
+            for name, definition in swarm_column_definitions.items()
+            if name not in existing_swarm_columns
+        )
+        schema = f"""
+        BEGIN IMMEDIATE;
+        {missing_swarm_alters}
+        CREATE TABLE IF NOT EXISTS intake_sessions (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES workflow_sessions(id) ON DELETE CASCADE,
+            original_input TEXT NOT NULL,
+            brief_json TEXT NOT NULL,
+            complexity_json TEXT NOT NULL,
+            requested_mode TEXT NOT NULL,
+            routed_mode TEXT NOT NULL,
+            route_reason TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_intake_session_status
+            ON intake_sessions(session_id,status,updated_at);
+        CREATE TABLE IF NOT EXISTS intake_questions (
+            id TEXT NOT NULL,
+            intake_id TEXT NOT NULL REFERENCES intake_sessions(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL,
+            header TEXT NOT NULL,
+            question TEXT NOT NULL,
+            options_json TEXT NOT NULL,
+            allow_freeform INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            answer TEXT,
+            answer_source TEXT,
+            answered_at TEXT,
+            PRIMARY KEY(intake_id,id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_intake_questions_pending
+            ON intake_questions(intake_id,position,answered_at);
+        CREATE TABLE IF NOT EXISTS specialist_profiles (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            work_node_id TEXT REFERENCES work_nodes(id) ON DELETE CASCADE,
+            parent_profile_id TEXT REFERENCES specialist_profiles(id) ON DELETE SET NULL,
+            mission TEXT NOT NULL,
+            expertise_json TEXT NOT NULL,
+            context_json TEXT NOT NULL,
+            owned_interfaces_json TEXT NOT NULL,
+            deliverable TEXT NOT NULL,
+            quality_rubric_json TEXT NOT NULL,
+            dependencies_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_specialist_profiles_run
+            ON specialist_profiles(ultra_run_id,work_node_id,created_at);
+        CREATE TABLE IF NOT EXISTS component_packages (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            work_node_id TEXT NOT NULL REFERENCES work_nodes(id) ON DELETE CASCADE,
+            parent_package_id TEXT REFERENCES component_packages(id) ON DELETE SET NULL,
+            version INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            implementation_json TEXT NOT NULL,
+            interface_json TEXT NOT NULL,
+            tests_json TEXT NOT NULL,
+            preview_json TEXT NOT NULL,
+            dependencies_json TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            quality_json TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(ultra_run_id,work_node_id,version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_component_packages_node
+            ON component_packages(ultra_run_id,work_node_id,version);
+        CREATE TABLE IF NOT EXISTS node_quality_targets (
+            work_node_id TEXT PRIMARY KEY REFERENCES work_nodes(id) ON DELETE CASCADE,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            target_json TEXT NOT NULL,
+            cycle_scores_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            best_score REAL NOT NULL,
+            plateau_count INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS coordinator_leases (
+            ultra_run_id TEXT PRIMARY KEY REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            leader_agent_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS repository_files (
+            workspace_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            file_hash TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            parser_confidence REAL NOT NULL,
+            provenance_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(workspace_id,path)
+        );
+        CREATE TABLE IF NOT EXISTS repository_symbols (
+            workspace_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            file_hash TEXT NOT NULL,
+            text TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            provenance TEXT NOT NULL,
+            PRIMARY KEY(workspace_id,path,kind,name,start_line)
+        );
+        CREATE INDEX IF NOT EXISTS idx_repository_symbols_name
+            ON repository_symbols(workspace_id,name,kind);
+        CREATE TABLE IF NOT EXISTS repository_edges (
+            workspace_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            source TEXT NOT NULL,
+            target TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            provenance TEXT NOT NULL,
+            PRIMARY KEY(workspace_id,path,kind,source,target,line)
+        );
+        CREATE INDEX IF NOT EXISTS idx_repository_edges_graph
+            ON repository_edges(workspace_id,kind,source,target);
+        CREATE TABLE IF NOT EXISTS repository_owners (
+            workspace_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            source TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            PRIMARY KEY(workspace_id,path,owner,source)
+        );
+        CREATE TABLE IF NOT EXISTS repository_embeddings (
+            workspace_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            dimensions INTEGER NOT NULL,
+            vector_blob BLOB NOT NULL,
+            file_hash TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(workspace_id,path,kind,name,start_line,model)
+        );
+        UPDATE workflow_sessions
+           SET session_mode='normal'
+         WHERE session_mode IN ('chat','plan','goal','manual','default','auto','agent');
+        PRAGMA user_version=8;
+        COMMIT;
+        """
+        self._connection.executescript(schema)
+
     def _ensure_brain_fts(self) -> bool:
         """Enable FTS5 when SQLite provides it; LIKE search remains portable."""
         try:
@@ -1002,6 +1182,16 @@ class StateStore:
                     "INSERT INTO brain_entries_fts(entry_id,title,content,section,role) "
                     "SELECT id,title,content,section,COALESCE(role,'') FROM brain_entries"
                 )
+            return True
+        except sqlite3.OperationalError:
+            return False
+
+    def _ensure_repository_fts(self) -> bool:
+        try:
+            self._connection.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS repository_symbols_fts USING fts5("
+                "workspace_id UNINDEXED,path UNINDEXED,kind,name,text)"
+            )
             return True
         except sqlite3.OperationalError:
             return False
@@ -2439,6 +2629,63 @@ class StateStore:
             updated_at=now,
         )
 
+    def update_work_node_definition(
+        self,
+        node_id: str,
+        *,
+        contract: TaskContractV1,
+        depends_on: Iterable[str],
+        assigned_role: str,
+        checkpoint: str,
+        metadata: Mapping[str, Any],
+    ) -> WorkNode:
+        """Persist the resumable structural snapshot of an existing node.
+
+        Dynamic expansion updates a parent's children and dependency contract
+        after the row is first created.  Those fields are checkpoint state, not
+        merely status, and must survive a process restart.
+        """
+
+        node = self.get_work_node(node_id)
+        dependencies = tuple(dict.fromkeys(str(value) for value in depends_on if str(value)))
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT id,ultra_run_id FROM work_nodes WHERE id IN (%s)"
+                % (",".join("?" for _ in dependencies) or "NULL"),
+                dependencies,
+            ).fetchall()
+        found = {row["id"] for row in rows if row["ultra_run_id"] == node.ultra_run_id}
+        missing = [value for value in dependencies if value not in found]
+        if missing:
+            raise StateStoreError(f"work-node dependency is missing or foreign: {missing!r}")
+        now = utc_now()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE work_nodes SET depends_on_json=?,contract_json=?,assigned_role=?,"
+                "checkpoint=?,metadata_json=?,updated_at=? WHERE id=? AND updated_at=?",
+                (
+                    _json(dependencies),
+                    _json(contract.to_dict()),
+                    str(assigned_role),
+                    str(checkpoint),
+                    _json(dict(metadata)),
+                    _iso(now),
+                    node_id,
+                    _iso(node.updated_at),
+                ),
+            )
+            if not cursor.rowcount:
+                raise StateStoreError("work node changed concurrently")
+        return replace(
+            node,
+            contract=contract,
+            depends_on=dependencies,
+            assigned_role=str(assigned_role),
+            checkpoint=str(checkpoint),
+            metadata=dict(metadata),
+            updated_at=now,
+        )
+
     def sync_master_modules(self, run_id: str) -> tuple[WorkNode, ...]:
         """Materialize approved plan tasks without changing their fingerprint."""
         run = self.get_ultra_run(run_id)
@@ -3310,8 +3557,8 @@ class StateStore:
             connection.execute(
                 "INSERT INTO swarm_messages("
                 "id,ultra_run_id,protocol_version,sender_agent_id,recipient_agent_id,message_type,topic,"
-                "payload_json,confidence,correlation_id,parent_message_id,created_at,consumed_at"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "payload_json,confidence,correlation_id,parent_message_id,fencing_token,deadline,evidence_json,"
+                "schema_name,created_at,consumed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     item.id,
                     item.ultra_run_id,
@@ -3324,6 +3571,10 @@ class StateStore:
                     item.confidence,
                     item.correlation_id,
                     item.parent_message_id,
+                    item.fencing_token,
+                    item.deadline,
+                    _json(item.evidence),
+                    item.schema_name,
                     _iso(item.created_at),
                     None,
                 ),
@@ -3338,6 +3589,7 @@ class StateStore:
         return {
             **dict(row),
             "payload": _loads(row["payload_json"], {}),
+            "evidence": _loads(row["evidence_json"], []),
             "message_type": SwarmMessageType(row["message_type"]).value,
         }
 
@@ -3394,6 +3646,42 @@ class StateStore:
                 return sorted(candidate_set)[0]
             raise NotFoundError(f"no eligible agents for consensus leader in run {ultra_run_id}")
         return sorted(registry, key=lambda item: (item.display_index, item.runtime_id))[0].runtime_id
+
+    def acquire_coordinator_lease(
+        self,
+        ultra_run_id: str,
+        *,
+        candidates: Iterable[str] = (),
+        ttl_seconds: int = 30,
+    ) -> dict[str, Any]:
+        """Acquire or renew one deterministic leader lease with a fencing token."""
+
+        now = utc_now()
+        expires = now + timedelta(seconds=max(5, min(int(ttl_seconds), 3_600)))
+        candidate_ids = tuple(dict.fromkeys(str(item) for item in candidates if str(item).strip()))
+        selected = self.elect_consensus_leader(ultra_run_id, candidates=candidate_ids)
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM coordinator_leases WHERE ultra_run_id=?", (ultra_run_id,)
+            ).fetchone()
+            active = row is not None and (_dt(row["expires_at"]) or now) > now
+            if active and (not candidate_ids or str(row["leader_agent_id"]) in candidate_ids):
+                selected = str(row["leader_agent_id"])
+                fencing = int(row["fencing_token"])
+            else:
+                fencing = int(row["fencing_token"] if row is not None else 0) + 1
+            connection.execute(
+                "INSERT INTO coordinator_leases(ultra_run_id,leader_agent_id,fencing_token,expires_at,updated_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(ultra_run_id) DO UPDATE SET leader_agent_id=excluded.leader_agent_id,"
+                "fencing_token=excluded.fencing_token,expires_at=excluded.expires_at,updated_at=excluded.updated_at",
+                (ultra_run_id, selected, fencing, _iso(expires), _iso(now)),
+            )
+        return {
+            "ultra_run_id": ultra_run_id,
+            "leader_agent_id": selected,
+            "fencing_token": fencing,
+            "expires_at": _iso(expires),
+        }
 
     def open_consensus_round(
         self,
@@ -3537,6 +3825,40 @@ class StateStore:
             "quorum": quorum,
             "votes": len(decisive),
         }
+        now = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE consensus_rounds SET status=?,decision_json=?,updated_at=?,closed_at=? WHERE id=?",
+                (status.value, _json(decision), _iso(now), _iso(now), round_id),
+            )
+        return self.get_consensus_round(round_id)
+
+    def resolve_consensus_tie(
+        self,
+        round_id: str,
+        *,
+        judge_agent_id: str,
+        verdict: str,
+        confidence: float = 1.0,
+        rationale: str = "",
+        evidence: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized = str(verdict).strip().casefold()
+        if normalized not in {"accept", "reject"}:
+            raise ValueError("judge verdict must be accept or reject")
+        current = self.get_consensus_round(round_id)
+        if ConsensusStatus(current["status"]) is not ConsensusStatus.TIED:
+            raise StateStoreError("an independent judge may resolve only a tied consensus round")
+        decision = {
+            **dict(current.get("decision", {})),
+            "verdict": normalized,
+            "resolved_from": "tie",
+            "judge_agent_id": str(judge_agent_id),
+            "judge_confidence": max(0.0, min(1.0, float(confidence))),
+            "judge_rationale": str(rationale),
+            "judge_evidence": dict(evidence or {}),
+        }
+        status = ConsensusStatus.ACCEPTED if normalized == "accept" else ConsensusStatus.REJECTED
         now = utc_now()
         with self.transaction() as connection:
             connection.execute(
@@ -4358,6 +4680,394 @@ class StateStore:
             )
             for row in rows
         )
+
+    def create_intake_session(
+        self,
+        session_id: str,
+        *,
+        original_input: str,
+        brief: Mapping[str, Any],
+        complexity: Mapping[str, Any],
+        requested_mode: str,
+        routed_mode: str,
+        route_reason: str,
+        status: str,
+        questions: Iterable[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
+        intake_id = new_id("intake")
+        now = _iso(utc_now())
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO intake_sessions(id,session_id,original_input,brief_json,complexity_json,"
+                "requested_mode,routed_mode,route_reason,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    intake_id, session_id, original_input, _json(brief), _json(complexity),
+                    requested_mode, routed_mode, route_reason, status, now, now,
+                ),
+            )
+            for position, item in enumerate(questions, 1):
+                connection.execute(
+                    "INSERT INTO intake_questions(id,intake_id,position,header,question,options_json,"
+                    "allow_freeform,reason) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        str(item.get("id") or f"Q{position}"), intake_id, position,
+                        str(item.get("header") or "Decision"), str(item.get("question") or ""),
+                        _json(item.get("options", ())), 1,
+                        str(item.get("reason") or "Required to finalize the execution brief."),
+                    ),
+                )
+        return self.get_intake_session(intake_id)
+
+    def get_intake_session(self, intake_id: str) -> dict[str, Any]:
+        row = self._connection.execute(
+            "SELECT * FROM intake_sessions WHERE id=?", (intake_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"intake session not found: {intake_id}")
+        return {
+            **dict(row),
+            "brief": _loads(row["brief_json"], {}),
+            "complexity": _loads(row["complexity_json"], {}),
+            "questions": self.list_intake_questions(intake_id),
+        }
+
+    def get_pending_intake(self, session_id: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT id FROM intake_sessions WHERE session_id=? AND status='awaiting_answers' "
+            "ORDER BY updated_at DESC,id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        return self.get_intake_session(str(row["id"])) if row is not None else None
+
+    def list_intake_questions(self, intake_id: str) -> tuple[dict[str, Any], ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM intake_questions WHERE intake_id=? ORDER BY position,id", (intake_id,)
+        ).fetchall()
+        return tuple(
+            {
+                **dict(row),
+                "options": _loads(row["options_json"], []),
+                "allow_freeform": bool(row["allow_freeform"]),
+            }
+            for row in rows
+        )
+
+    def answer_intake_question(
+        self,
+        intake_id: str,
+        question_id: str,
+        answer: str,
+        *,
+        source: str,
+    ) -> dict[str, Any]:
+        now = _iso(utc_now())
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE intake_questions SET answer=?,answer_source=?,answered_at=? "
+                "WHERE intake_id=? AND id=?",
+                (answer, source, now, intake_id, question_id),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError(f"intake question not found: {question_id}")
+            remaining = connection.execute(
+                "SELECT COUNT(*) FROM intake_questions WHERE intake_id=? AND answered_at IS NULL",
+                (intake_id,),
+            ).fetchone()[0]
+            status = "ready" if not remaining else "awaiting_answers"
+            connection.execute(
+                "UPDATE intake_sessions SET status=?,updated_at=? WHERE id=?",
+                (status, now, intake_id),
+            )
+        return self.get_intake_session(intake_id)
+
+    def complete_intake_session(
+        self,
+        intake_id: str,
+        *,
+        brief: Mapping[str, Any],
+        routed_mode: str,
+        route_reason: str,
+    ) -> dict[str, Any]:
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE intake_sessions SET brief_json=?,routed_mode=?,route_reason=?,status='routed',updated_at=? "
+                "WHERE id=?",
+                (_json(brief), routed_mode, route_reason, _iso(utc_now()), intake_id),
+            )
+        return self.get_intake_session(intake_id)
+
+    def save_specialist_profile(self, item: Mapping[str, Any]) -> dict[str, Any]:
+        profile_id = str(item.get("id") or new_id("specialist"))
+        now = _iso(utc_now())
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO specialist_profiles(id,ultra_run_id,work_node_id,parent_profile_id,mission,"
+                "expertise_json,context_json,owned_interfaces_json,deliverable,quality_rubric_json,"
+                "dependencies_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET mission=excluded.mission,expertise_json=excluded.expertise_json,"
+                "context_json=excluded.context_json,owned_interfaces_json=excluded.owned_interfaces_json,"
+                "deliverable=excluded.deliverable,quality_rubric_json=excluded.quality_rubric_json,"
+                "dependencies_json=excluded.dependencies_json,updated_at=excluded.updated_at",
+                (
+                    profile_id, str(item["ultra_run_id"]), item.get("work_node_id"),
+                    item.get("parent_profile_id"), str(item.get("mission") or ""),
+                    _json(item.get("expertise", ())), _json(item.get("context", {})),
+                    _json(item.get("owned_interfaces", ())), str(item.get("deliverable") or ""),
+                    _json(item.get("quality_rubric", {})), _json(item.get("dependencies", ())),
+                    now, now,
+                ),
+            )
+        row = self._connection.execute(
+            "SELECT * FROM specialist_profiles WHERE id=?", (profile_id,)
+        ).fetchone()
+        assert row is not None
+        return {
+            **dict(row),
+            "expertise": _loads(row["expertise_json"], []),
+            "context": _loads(row["context_json"], {}),
+            "owned_interfaces": _loads(row["owned_interfaces_json"], []),
+            "quality_rubric": _loads(row["quality_rubric_json"], {}),
+            "dependencies": _loads(row["dependencies_json"], []),
+        }
+
+    def list_specialist_profiles(self, ultra_run_id: str) -> tuple[dict[str, Any], ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM specialist_profiles WHERE ultra_run_id=? ORDER BY created_at,id",
+            (ultra_run_id,),
+        ).fetchall()
+        return tuple(
+            {
+                **dict(row),
+                "expertise": _loads(row["expertise_json"], []),
+                "context": _loads(row["context_json"], {}),
+                "owned_interfaces": _loads(row["owned_interfaces_json"], []),
+                "quality_rubric": _loads(row["quality_rubric_json"], {}),
+                "dependencies": _loads(row["dependencies_json"], []),
+            }
+            for row in rows
+        )
+
+    def put_component_package(self, item: Mapping[str, Any]) -> dict[str, Any]:
+        run_id = str(item["ultra_run_id"])
+        node_id = str(item["work_node_id"])
+        latest = self._connection.execute(
+            "SELECT COALESCE(MAX(version),0) FROM component_packages WHERE ultra_run_id=? AND work_node_id=?",
+            (run_id, node_id),
+        ).fetchone()[0]
+        version = int(item.get("version") or int(latest) + 1)
+        package_id = str(item.get("id") or new_id("component"))
+        payload = {
+            "implementation": dict(item.get("implementation", {})),
+            "interface": dict(item.get("interface", {})),
+            "tests": list(item.get("tests", ())),
+            "preview": dict(item.get("preview", {})),
+            "dependencies": list(item.get("dependencies", ())),
+            "evidence": list(item.get("evidence", ())),
+            "quality": dict(item.get("quality", {})),
+        }
+        content_hash = hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
+        now = _iso(utc_now())
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO component_packages(id,ultra_run_id,work_node_id,parent_package_id,version,status,"
+                "implementation_json,interface_json,tests_json,preview_json,dependencies_json,evidence_json,"
+                "quality_json,content_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    package_id, run_id, node_id, item.get("parent_package_id"), version,
+                    str(item.get("status") or "published"), _json(payload["implementation"]),
+                    _json(payload["interface"]), _json(payload["tests"]), _json(payload["preview"]),
+                    _json(payload["dependencies"]), _json(payload["evidence"]), _json(payload["quality"]),
+                    content_hash, now, now,
+                ),
+            )
+        return self.get_component_package(package_id)
+
+    def get_component_package(self, package_id: str) -> dict[str, Any]:
+        row = self._connection.execute(
+            "SELECT * FROM component_packages WHERE id=?", (package_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"component package not found: {package_id}")
+        return {
+            **dict(row),
+            "implementation": _loads(row["implementation_json"], {}),
+            "interface": _loads(row["interface_json"], {}),
+            "tests": _loads(row["tests_json"], []),
+            "preview": _loads(row["preview_json"], {}),
+            "dependencies": _loads(row["dependencies_json"], []),
+            "evidence": _loads(row["evidence_json"], []),
+            "quality": _loads(row["quality_json"], {}),
+        }
+
+    def list_component_packages(
+        self, ultra_run_id: str, *, work_node_id: str | None = None
+    ) -> tuple[dict[str, Any], ...]:
+        filters, params = ["ultra_run_id=?"], [ultra_run_id]
+        if work_node_id is not None:
+            filters.append("work_node_id=?")
+            params.append(work_node_id)
+        rows = self._connection.execute(
+            "SELECT id FROM component_packages WHERE " + " AND ".join(filters)
+            + " ORDER BY work_node_id,version",
+            tuple(params),
+        ).fetchall()
+        return tuple(self.get_component_package(str(row["id"])) for row in rows)
+
+    def save_node_quality_target(
+        self,
+        ultra_run_id: str,
+        work_node_id: str,
+        target: Mapping[str, Any],
+        *,
+        score: float = 0.0,
+        status: str = "not_evaluated",
+        cycle_scores: Iterable[float] = (),
+    ) -> dict[str, Any]:
+        scores = [max(0.0, min(1.0, float(item))) for item in cycle_scores]
+        best = max([max(0.0, min(1.0, float(score))), *scores])
+        plateau = 0
+        if len(scores) >= 3 and max(scores[-3:]) - min(scores[-3:]) < 0.02:
+            plateau = 3
+            if best < float(target.get("minimum_overall_score", 0.95)):
+                status = "quality_blocked"
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO node_quality_targets(work_node_id,ultra_run_id,target_json,cycle_scores_json,status,"
+                "best_score,plateau_count,updated_at) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(work_node_id) DO UPDATE SET target_json=excluded.target_json,"
+                "cycle_scores_json=excluded.cycle_scores_json,status=excluded.status,best_score=excluded.best_score,"
+                "plateau_count=excluded.plateau_count,updated_at=excluded.updated_at",
+                (work_node_id, ultra_run_id, _json(target), _json(scores), status, best, plateau, _iso(utc_now())),
+            )
+        row = self._connection.execute(
+            "SELECT * FROM node_quality_targets WHERE work_node_id=?", (work_node_id,)
+        ).fetchone()
+        assert row is not None
+        return {
+            **dict(row),
+            "target": _loads(row["target_json"], {}),
+            "cycle_scores": _loads(row["cycle_scores_json"], []),
+        }
+
+    def sync_repository_index(self, workspace: str | Path, index: Any) -> dict[str, int]:
+        """Incrementally mirror parsed symbols, graph edges, owners, and vectors into v8."""
+
+        workspace_id = hashlib.sha256(str(Path(workspace).resolve()).encode("utf-8")).hexdigest()
+        existing = {
+            str(row["path"]): str(row["file_hash"])
+            for row in self._connection.execute(
+                "SELECT path,file_hash FROM repository_files WHERE workspace_id=?", (workspace_id,)
+            ).fetchall()
+        }
+        current = {
+            str(path): str(snapshot.file_hash)
+            for path, snapshot in dict(getattr(index, "_file_snapshots", {})).items()
+        }
+        changed = {path for path, digest in current.items() if existing.get(path) != digest}
+        removed = set(existing) - set(current)
+        now = _iso(utc_now())
+        embedding_model = str(
+            getattr(getattr(index, "embedding_provider", None), "model", None)
+            or type(getattr(index, "embedding_provider", None)).__name__
+        )
+        with self.transaction() as connection:
+            for path in sorted(changed | removed):
+                for table in (
+                    "repository_files", "repository_symbols", "repository_edges",
+                    "repository_owners", "repository_embeddings",
+                ):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE workspace_id=? AND path=?", (workspace_id, path)
+                    )
+                if getattr(self, "_repository_fts5_available", False):
+                    connection.execute(
+                        "DELETE FROM repository_symbols_fts WHERE workspace_id=? AND path=?",
+                        (workspace_id, path),
+                    )
+            for path in sorted(changed):
+                snapshot = index._file_snapshots[path]
+                entries = tuple(index.entries.get(path, ()))
+                provenance = tuple(sorted({str(item.provenance) for item in entries}))
+                connection.execute(
+                    "INSERT INTO repository_files(workspace_id,path,file_hash,size,mtime_ns,parser_confidence,"
+                    "provenance_json,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        workspace_id, path, snapshot.file_hash, snapshot.size, snapshot.mtime_ns,
+                        min((float(item.confidence) for item in entries), default=0.0),
+                        _json(provenance), now,
+                    ),
+                )
+                for entry in entries:
+                    connection.execute(
+                        "INSERT INTO repository_symbols(workspace_id,path,kind,name,start_line,end_line,file_hash,text,"
+                        "confidence,provenance) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            workspace_id, path, entry.kind, entry.name, entry.start, entry.end,
+                            entry.file_hash, entry.text, entry.confidence, entry.provenance,
+                        ),
+                    )
+                    if getattr(self, "_repository_fts5_available", False):
+                        connection.execute(
+                            "INSERT INTO repository_symbols_fts(workspace_id,path,kind,name,text) VALUES(?,?,?,?,?)",
+                            (workspace_id, path, entry.kind, entry.name, entry.text),
+                        )
+                    vector = index._embeddings.get(index._entry_key(entry), ())
+                    if vector:
+                        connection.execute(
+                            "INSERT INTO repository_embeddings(workspace_id,path,kind,name,start_line,model,dimensions,"
+                            "vector_blob,file_hash,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                workspace_id, path, entry.kind, entry.name, entry.start, embedding_model,
+                                len(vector), sqlite3.Binary(struct.pack(f"<{len(vector)}f", *vector)),
+                                entry.file_hash, now,
+                            ),
+                        )
+                for edge in index.relations.get(path, ()):
+                    connection.execute(
+                        "INSERT OR REPLACE INTO repository_edges(workspace_id,path,kind,source,target,line,text,"
+                        "confidence,provenance) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (
+                            workspace_id, path, edge.kind, edge.source, edge.target, edge.line,
+                            edge.text, edge.confidence, edge.provenance,
+                        ),
+                    )
+            connection.execute("DELETE FROM repository_owners WHERE workspace_id=?", (workspace_id,))
+            for path, owners in index.ownership_records().items():
+                for owner, source, confidence in owners:
+                    connection.execute(
+                        "INSERT INTO repository_owners(workspace_id,path,owner,source,confidence) VALUES(?,?,?,?,?)",
+                        (workspace_id, path, owner, source, confidence),
+                    )
+        return {"changed": len(changed), "removed": len(removed), "reused": len(current) - len(changed)}
+
+    def search_repository_symbols(
+        self,
+        workspace: str | Path,
+        query: str,
+        *,
+        limit: int = 50,
+    ) -> tuple[dict[str, Any], ...]:
+        workspace_id = hashlib.sha256(str(Path(workspace).resolve()).encode("utf-8")).hexdigest()
+        if getattr(self, "_repository_fts5_available", False) and str(query).strip():
+            try:
+                rows = self._connection.execute(
+                    "SELECT r.*,bm25(repository_symbols_fts) AS bm25_score FROM repository_symbols_fts f "
+                    "JOIN repository_symbols r ON r.workspace_id=f.workspace_id AND r.path=f.path "
+                    "AND r.kind=f.kind AND r.name=f.name WHERE repository_symbols_fts MATCH ? "
+                    "AND f.workspace_id=? ORDER BY bm25_score LIMIT ?",
+                    (query, workspace_id, max(1, min(int(limit), 1_000))),
+                ).fetchall()
+                return tuple(dict(row) for row in rows)
+            except sqlite3.OperationalError:
+                pass
+        pattern = f"%{str(query).strip()}%"
+        rows = self._connection.execute(
+            "SELECT * FROM repository_symbols WHERE workspace_id=? AND (name LIKE ? OR text LIKE ?) "
+            "ORDER BY confidence DESC,path,start_line LIMIT ?",
+            (workspace_id, pattern, pattern, max(1, min(int(limit), 1_000))),
+        ).fetchall()
+        return tuple(dict(row) for row in rows)
 
     def save_workflow_session(
         self,

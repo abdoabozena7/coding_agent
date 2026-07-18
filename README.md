@@ -44,6 +44,36 @@ have. This design raises its effective reliability by decomposing work, narrowin
 context, preserving facts, demanding evidence, and making unsafe/invalid state
 transitions impossible.
 
+## Readiness architecture
+
+The harness now has executable answers for the large-repository and weak-model
+failure modes that prompts alone cannot solve:
+
+- `RepositoryIndex` uses Python AST plus HTML DOM extraction, overlapping chunks,
+  dependency/resolved-call/ownership graphs, and bounded semantic maps. Retrieval
+  combines lexical, graph, sparse-semantic, and optional Ollama embeddings
+  (`AGENT_EMBEDDING_MODEL=nomic-embed-text:latest`) with an offline hashing fallback.
+- Critical ULTRA phases require auditable decision, counterargument, evidence,
+  rejected-alternative, verification, and reasoning-graph artifacts. The harness
+  scores these external summaries; it never attempts to expose or persist hidden
+  model chain-of-thought.
+- Swarm work uses versioned messages, routing, leases, proposal/vote/quorum
+  consensus, decision publication, and leader metadata. Frames support canonical
+  JSON plus bounded DSL and binary encodings.
+- Project lessons persist across runs with evidence references, reuse counts,
+  confidence history, and asymmetric outcome updates. Failed evaluation writes
+  remediation knowledge for later runs.
+- Retrieval, reasoning, swarm, learning, runtime, and single-file 3D quality have
+  deterministic benchmarks. HTML gates combine browser errors with screenshot
+  composition metrics and store comparable trend records.
+
+Run the structural and behavioral audit, persist its metrics, and compare the next
+run against it:
+
+```powershell
+.venv\Scripts\python -m agent --workspace D:\path\to\project --command "/doctor --record"
+```
+
 ## Quick start
 
 ```powershell
@@ -93,9 +123,10 @@ context → mini-plan → decompose → research → implement
 
 Dynamic child nodes inherit their parent's forbidden changes and write scope.
 New interfaces, dependencies, or out-of-scope paths stop at a new master-plan
-approval. SQLite schema v3 stores the hierarchical task graph, role-isolated
-agent runs, versioned decisions and lessons, artifacts and hashes, redacted
-prompt traces, memory access, and path leases. `/tree`, `/agents`, `/memory`,
+approval. SQLite schema v8 stores intake briefs/questions, AST and graph metadata,
+the hierarchical specialist task graph, typed component packages/messages,
+versioned decisions and lessons, evaluation runs, artifacts and hashes, redacted
+prompt traces, memory access, and fenced path/leader leases. `/tree`, `/agents`, `/memory`,
 `/trace`, `/insights`, and `/metrics` keep the default scrollback uncluttered.
 
 `/permissions full` is fail-closed: it works only after `/setup` builds the
@@ -110,12 +141,13 @@ python agent/main.py --workspace /path/to/project
 
 ## Normal workflow
 
-1. The workspace opens directly in ordinary Chat. Discuss, inspect, or edit code
-   without selecting a structured mode. Action requests are evidence-gated: a
-   prose-only refusal is retried, generated code can be saved from a durable
-   content hash, and HTML can be served, browser-verified, and opened locally.
-2. Enable `/mode plan`, `/mode goal`, or `/mode ultra` when approval-bound or
-   durable autonomous execution is useful. The read-only planner then inspects
+1. Every message enters `Intake/Planning` through Intent Architect. It inspects
+   discoverable repository context, creates a canonical execution brief, and asks
+   only consequential missing product decisions. Each question has exactly three
+   suggestions (the first Recommended) plus a free-form fourth answer.
+2. Normal is the default durable goal workflow. Ultra is selected automatically
+   at complexity `>= 0.65` or for hard triggers such as multi-component systems,
+   high-risk changes, and high-quality visual/interactive work. The read-only planner then inspects
    the repository and submits a
    structured plan containing factual applicability evidence, an execution
    strategy, expected workspace changes, and task-bound verification.
@@ -123,9 +155,10 @@ python agent/main.py --workspace /path/to/project
    for complex or high-risk work.
 4. Review the sparse status and full `/plan`. Use `/edit`, `/add`, or `/remove`,
    then `/approve`.
-5. Choose `/mode chat` for ordinary conversation, `/mode plan` to wait for `/run`, `/mode goal` to continue after
-   approval, or `/mode ultra` for nested Project-Brain execution. Ctrl-C
-   checkpoints automatic work safely.
+5. Use `/mode normal` for the cohesive durable workflow or `/mode ultra` for
+   recursive specialists, architecture debate, component isolation, and consensus.
+   Legacy `chat|plan|goal` values map to Normal for compatibility. Ctrl-C checkpoints
+   automatic work safely.
 6. Add guidance or edit the checklist at any checkpoint. The durable objective is
    always re-injected, even after context compaction or restart.
 7. Completion requires all accepted tasks, direct evidence, no uncertain action,
@@ -160,7 +193,7 @@ opens the redacted, session-only blocks again. Use `/trace`, `/history`, or
 | Command | Effect |
 |---|---|
 | `/` | Open the interactive slash-command palette |
-| `/mode chat`, `/mode plan`, `/mode goal`, `/mode ultra` | Select ordinary chat, approval-bound planning, automatic goals, or Project-Brain execution; mode changes never approve a plan |
+| `/mode normal`, `/mode ultra` | Select the durable Normal workflow or recursive specialist Ultra; legacy `chat|plan|goal` aliases map to Normal |
 | `/settings [NAME [VALUE]]` | Inspect safe session settings or change color/runtime limits; secrets are never displayed |
 | `/model [NAME]` | Reopen the picker or switch models at a safe checkpoint |
 | `/permissions normal\|full`, `/setup` | Select approvals or initialize the fail-closed Docker Full sandbox |
@@ -171,8 +204,8 @@ opens the redacted, session-only blocks again. Use `/trace`, `/history`, or
 | `/memory [SECTION]`, `/trace [latest\|RUN_ID]` | Inspect Project Brain and redacted prompts/context/summaries |
 | `/thinking` | Expand redacted provider thoughts captured during this session |
 | `/insights [NODE]`, `/metrics` | Inspect durable findings and execution metrics |
-| `/questions`, `/answer ID VALUE` | Inspect and answer approval-bound planning decisions |
-| plain text / `/goal TEXT` | Start a goal when idle; otherwise add durable user guidance |
+| `/questions`, `/answer ID VALUE` | Advanced fallback for intake/planning questions; plain text, `1/2/3`, and `4 custom text` work directly |
+| plain text / `/goal TEXT` | Enter the same Intent Architect gate when idle; otherwise add durable user guidance |
 | `/plan`, `/status` | Render the complete plan or a compact scrollback status |
 | `/approve [REV]` | Approve the exact latest plan revision |
 | `/reject FEEDBACK`, `/replan FEEDBACK` | Reject and regenerate with feedback |
@@ -194,7 +227,7 @@ For scripting/non-interactive inspection:
 
 ```bash
 python -m agent --workspace ./project --command "/status"
-python -m agent --workspace ./project --provider ollama --model qwen2.5-coder:7b --mode goal --command "/approve 2"
+python -m agent --workspace ./project --provider ollama --model gemma4:e4b --mode normal --command "/approve 2"
 ```
 
 ## Lifecycle and completion authority

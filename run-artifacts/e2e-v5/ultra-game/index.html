@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Three.js Road-Crossing Arcade</title>
+<link rel="icon" href="data:,">
+<style>
+  :root{color-scheme:dark;font-family:Inter,ui-rounded,"Segoe UI",sans-serif;}
+  html,body{margin:0;height:100%;overflow:hidden;background:#8bd5ff;touch-action:none;}
+  #gameContainer{position:absolute;top:0;left:0;width:100%;height:100%;}
+  #hud{position:absolute;top:18px;left:18px;color:#fff;pointer-events:none;z-index:10;padding:10px 15px;border:1px solid rgba(255,255,255,.28);border-radius:16px;background:rgba(8,24,38,.62);box-shadow:0 12px 35px rgba(0,0,0,.2);backdrop-filter:blur(12px);}
+  #hud span{margin-right:14px;font-size:1rem;font-weight:800;letter-spacing:.02em;}
+  #overlay,.modalOverlay{position:absolute;inset:0;background:linear-gradient(135deg,rgba(5,19,31,.78),rgba(9,43,35,.55));color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;z-index:20;backdrop-filter:blur(7px);}
+  #overlay h1,#overlay h2,.modalOverlay h2{margin:0 20px 8px;font-size:clamp(2rem,6vw,4.6rem);line-height:.95;text-shadow:0 10px 28px rgba(0,0,0,.35)}
+  #overlay p,.modalOverlay p{max-width:540px;margin:12px 24px;color:#d8f5e7;font-size:clamp(.95rem,2vw,1.15rem);line-height:1.6}
+  #overlay button,.modalOverlay button{margin-top:1rem;padding:.8rem 1.7rem;border:0;border-radius:999px;font:800 1rem inherit;color:#08291e;background:#f7d354;box-shadow:0 8px 0 #bd8e20,0 18px 35px rgba(0,0,0,.3);cursor:pointer;transition:transform .15s,box-shadow .15s;}
+  #overlay button:hover,.modalOverlay button:hover{transform:translateY(-2px);box-shadow:0 10px 0 #bd8e20,0 22px 38px rgba(0,0,0,.3)}
+  #dpad{position:absolute;right:22px;bottom:22px;display:grid;grid-template-areas:" . up . " "left down right";gap:7px;z-index:10;}
+  .padBtn{width:46px;height:46px;padding:0;border:1px solid rgba(255,255,255,.35);color:#fff;background:rgba(8,24,38,.62);box-shadow:0 8px 20px rgba(0,0,0,.22);backdrop-filter:blur(8px);border-radius:14px;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:17px;user-select:none;cursor:pointer;}
+  .padBtn:active{background:#f7d354;color:#183329;transform:translateY(2px);}
+  .padBtn[data-key="ArrowUp"]{grid-area:up;}
+  .padBtn[data-key="ArrowLeft"]{grid-area:left;}
+  .padBtn[data-key="ArrowRight"]{grid-area:right;}
+  .padBtn[data-key="ArrowDown"]{grid-area:down;}
+  @media (max-width:700px){#dpad{right:50%;transform:translateX(50%);bottom:16px}.padBtn{width:44px;height:44px}#hud{top:10px;left:10px}}
+  @media (prefers-reduced-motion: reduce) {
+    .reduced-motion * {animation-duration:0s !important; transition:none !important;}
+  }
+</style>
+</head>
+<body>
+<div id="gameContainer"></div>
+<div id="hud"><span id="score">Score: 0</span><span id="high">Best: 0</span></div>
+<div id="overlay" role="dialog" aria-modal="true">
+  <h1>Road-Crossing Arcade</h1>
+  <p>Use WASD / Arrow keys or the D-pad below to move.
+  <br>Cross all lanes without hitting traffic.</p>
+  <button id="startBtn" aria-label="Start Game">Start</button>
+</div>
+<div id="dpad" aria-label="Touch controls">
+  <button class="padBtn" data-key="ArrowUp" aria-label="Move up">▲</button>
+  <button class="padBtn" data-key="ArrowLeft" aria-label="Move left">◀</button>
+  <button class="padBtn" data-key="ArrowDown" aria-label="Move down">▼</button>
+  <button class="padBtn" data-key="ArrowRight" aria-label="Move right">▶</button>
+</div>
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
+
+// ----- Deterministic LCG -----
+class LCG{constructor(s=12345){this.a=1664525;this.c=1013904223;this.m=0x100000000;this.state=s>>>0;}
+next(){this.state=(this.a*this.state+this.c)>>>0;return this.state;}
+nextFloat(){return this.next()/this.m;}}
+const rng=new LCG();
+
+// ----- Core Three.js Setup -----
+const container=document.getElementById('gameContainer');
+const renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
+renderer.setSize(window.innerWidth,window.innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.shadowMap.enabled=true;
+renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+renderer.outputColorSpace=THREE.SRGBColorSpace;
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure=1.15;
+container.appendChild(renderer.domElement);
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x8bd5ff);
+scene.fog=new THREE.Fog(0x88c0d0,30,120);
+
+// Orthographic isometric camera
+let aspect=window.innerWidth/window.innerHeight;
+const frustum=32;
+const camera=new THREE.OrthographicCamera(
+  -frustum*aspect/2, frustum*aspect/2,
+  frustum/2, -frustum/2,
+  0.1,200);
+camera.position.set(20,24,20);
+camera.rotation.order='YXZ';
+camera.rotation.x=Math.PI/4; camera.rotation.y=Math.PI/4;
+camera.updateProjectionMatrix();
+scene.add(camera);
+
+// Lights
+const amb=new THREE.HemisphereLight(0xeaf8ff,0x477a3f,1.25);scene.add(amb);
+const dir=new THREE.DirectionalLight(0xfff4d6,2.1);
+dir.position.set(15,25,15);dir.castShadow=true;scene.add(dir);
+dir.shadow.mapSize.set(2048,2048);
+
+// Ground (grass)
+const groundSize=250;
+const groundGeo=new THREE.PlaneGeometry(groundSize,groundSize);
+const groundMat=new THREE.MeshStandardMaterial({color:0x4fae58,roughness:.9});
+const ground=new THREE.Mesh(groundGeo,groundMat);
+ground.rotation.x=-Math.PI/2;ground.receiveShadow=true;scene.add(ground);
+
+// Lanes (10 traffic lanes + shoulders)
+const laneCount=10; const laneWidth=4; const shoulder=2;
+const laneStartZ=-(laneCount*laneWidth)/2 - shoulder; // start from negative Z
+const laneMeshes=[];
+for(let i=0;i<laneCount;i++){
+  const laneGeo=new THREE.PlaneGeometry(groundSize, laneWidth);
+  const laneMat=new THREE.MeshStandardMaterial({color:0x555555});
+  const lane=new THREE.Mesh(laneGeo,laneMat);
+  lane.rotation.x=-Math.PI/2;
+  lane.position.y=0.02;
+  lane.position.z=laneStartZ + shoulder + i*laneWidth + laneWidth/2;
+  lane.receiveShadow=true;scene.add(lane); laneMeshes.push(lane);
+  // Short repeated lane markings keep traffic direction legible.
+  const dashGeo=new THREE.BoxGeometry(3.2,0.06,0.13);
+  const dashMat=new THREE.MeshStandardMaterial({color:0xf3e6b0,roughness:.7});
+  for(let x=-58;x<=58;x+=8){
+    const dash=new THREE.Mesh(dashGeo,dashMat);
+    dash.position.set(x,0.09,lane.position.z+laneWidth/2-0.22);
+    dash.receiveShadow=true;scene.add(dash);
+  }
+}
+// Shoulder grass strips on both sides
+function addShoulder(zPos){
+  const shGeo=new THREE.PlaneGeometry(groundSize, shoulder);
+  const shMat=new THREE.MeshStandardMaterial({color:0x76c65b});
+  const sh=new THREE.Mesh(shGeo,shMat);
+  sh.rotation.x=-Math.PI/2; sh.position.y=0.01; sh.position.z=zPos;
+  sh.receiveShadow=true; scene.add(sh);
+}
+addShoulder(laneStartZ + shoulder/2);
+addShoulder(laneStartZ + shoulder + laneCount*laneWidth + shoulder/2);
+for(const z of [laneStartZ+shoulder,laneStartZ+shoulder+laneCount*laneWidth]){
+  const curb=new THREE.Mesh(new THREE.BoxGeometry(120,.25,.32),new THREE.MeshStandardMaterial({color:0xf1d8a8}));
+  curb.position.set(0,.13,z);curb.castShadow=true;scene.add(curb);
+}
+
+// Simple trees / rocks for scenery (scatter randomly)
+function addScenery(){
+  const count=30;
+  for(let i=0;i<count;i++){
+    const x=(rng.nextFloat()-0.5)*groundSize*0.9;
+    let z=(rng.nextFloat()-0.5)*groundSize*0.9;
+    const roadMin=laneStartZ-3, roadMax=laneStartZ+shoulder+laneCount*laneWidth+3;
+    if(z>roadMin&&z<roadMax) z=z<((roadMin+roadMax)/2)?roadMin-4:roadMax+4;
+    // choose type randomly
+    if(rng.nextFloat()<0.6){ // tree
+      const trunkGeo=new THREE.CylinderGeometry(0.4,0.6,3,6);
+      const trunkMat=new THREE.MeshStandardMaterial({color:0x8b5a2b});
+      const trunk=new THREE.Mesh(trunkGeo,trunkMat);
+      trunk.position.set(x,1.5,z);
+      trunk.castShadow=true; scene.add(trunk);
+      const foliageGeo=new THREE.ConeGeometry(2,5,6);
+      const foliageMat=new THREE.MeshStandardMaterial({color:0x2e8b57});
+      const foliage=new THREE.Mesh(foliageGeo,foliageMat);
+      foliage.position.set(x,4.5,z);
+      foliage.castShadow=true; scene.add(foliage);
+    }else{ // rock
+      const rockGeo=new THREE.DodecahedronGeometry(1.5,0);
+      const rockMat=new THREE.MeshStandardMaterial({color:0x777777});
+      const rock=new THREE.Mesh(rockGeo,rockMat);
+      rock.position.set(x,1.5,z);
+      rock.castShadow=true; scene.add(rock);
+    }
+  }
+}
+addScenery();
+
+// Chicken player (low‑poly, more details)
+function createChicken(){
+  const group=new THREE.Group();
+  // Body (cone)
+  const bodyGeo=new THREE.ConeGeometry(0.9,2,5);
+  const bodyMat=new THREE.MeshStandardMaterial({color:0xffff99});
+  const body=new THREE.Mesh(bodyGeo,bodyMat); body.castShadow=true; body.position.y=1; group.add(body);
+  // Head (sphere)
+  const headGeo=new THREE.SphereGeometry(0.5,6,6);
+  const headMat=new THREE.MeshStandardMaterial({color:0xffcc66});
+  const head=new THREE.Mesh(headGeo,headMat); head.castShadow=true; head.position.y=2.2; group.add(head);
+  // Beak (tiny cone)
+  const beakGeo=new THREE.ConeGeometry(0.2,0.5,4);
+  const beakMat=new THREE.MeshStandardMaterial({color:0xffa500});
+  const beak=new THREE.Mesh(beakGeo,beakMat); beak.castShadow=true; beak.rotation.x=Math.PI/2; beak.position.set(0,2.2,0.45);
+  group.add(beak);
+  // Comb (small cylinder)
+  const combGeo=new THREE.CylinderGeometry(0.07,0.07,0.2,6);
+  const combMat=new THREE.MeshStandardMaterial({color:0xff0000});
+  const comb=new THREE.Mesh(combGeo,combMat); comb.position.set(0,2.5,0); comb.castShadow=true; group.add(comb);
+  // Wings (boxes)
+  const wingGeo=new THREE.BoxGeometry(0.1,0.6,1.2);
+  const wingMat=new THREE.MeshStandardMaterial({color:0xffff99});
+  const leftWing=new THREE.Mesh(wingGeo,wingMat); leftWing.position.set(-0.8,1.8,0); leftWing.castShadow=true; group.add(leftWing);
+  const rightWing=leftWing.clone(); rightWing.position.x=0.8; group.add(rightWing);
+  // Legs (cylinders)
+  const legGeo=new THREE.CylinderGeometry(0.07,0.07,0.8,6);
+  const legMat=new THREE.MeshStandardMaterial({color:0x804000});
+  const leg1=new THREE.Mesh(legGeo,legMat); leg1.position.set(-0.3,0.4,0); leg1.castShadow=true; group.add(leg1);
+  const leg2=leg1.clone(); leg2.position.x=0.3; group.add(leg2);
+  return group;
+}
+const player=createChicken();
+scene.add(player);
+
+// Player state
+const cellSize=laneWidth; // each movement jumps a lane width
+let playerPos=new THREE.Vector2(0, laneStartZ - laneWidth); // start below first lane
+player.position.set(playerPos.x,0,playerPos.y);
+let moveLock=false;
+let gameRunning=false;
+let score=0; let best=parseInt(localStorage.getItem('best')||'0');
+let highScoreElement=document.getElementById('high');
+let scoreElement=document.getElementById('score');
+function updateHUD(){scoreElement.textContent='Score: '+score; highScoreElement.textContent='Best: '+best;}
+updateHUD();
+
+// Vehicles
+const vehicleColors=[0xff3333,0x33ff33,0x3333ff,0xffff33,0xff33ff];
+class Vehicle{
+  constructor(laneIdx,slot,count){
+    this.laneIdx=laneIdx;
+    const isTruck=rng.nextFloat()<0.3; // 30% trucks
+    const length=isTruck?4.6:3.2;
+    const height=1.2+ (isTruck?0.6:0);
+    const width=1.5;
+    this.mesh=new THREE.Group();
+    const paint=new THREE.MeshStandardMaterial({color:vehicleColors[laneIdx%vehicleColors.length],roughness:.42,metalness:.12});
+    const body=new THREE.Mesh(new THREE.BoxGeometry(length,height*.62,width),paint);
+    body.position.y=.1;body.castShadow=true;this.mesh.add(body);
+    const cabin=new THREE.Mesh(
+      new THREE.BoxGeometry(isTruck?length*.42:length*.52,height*.48,width*.86),
+      new THREE.MeshStandardMaterial({color:0x9dd9ee,roughness:.18,metalness:.18})
+    );
+    cabin.position.set(isTruck?-length*.18:0,height*.52,0);cabin.castShadow=true;this.mesh.add(cabin);
+    const bumperMat=new THREE.MeshStandardMaterial({color:0x17232b,roughness:.6});
+    for(const x of [-length/2,length/2]){
+      const bumper=new THREE.Mesh(new THREE.BoxGeometry(.13,.2,width*1.04),bumperMat);
+      bumper.position.set(x,-height*.12,0);this.mesh.add(bumper);
+    }
+    const lightMat=new THREE.MeshStandardMaterial({color:0xfff2a8,emissive:0xffc64d,emissiveIntensity:1.3});
+    for(const z of [-.47,.47]){
+      const light=new THREE.Mesh(new THREE.BoxGeometry(.12,.18,.22),lightMat);
+      light.position.set(length/2+.07,.08,z);this.mesh.add(light);
+    }
+    // wheels
+    const wheelGeo=new THREE.CylinderGeometry(0.28,0.28,0.22,10);
+    const wheelMat=new THREE.MeshStandardMaterial({color:0x111111});
+    const positions=[[ length/2-.55, -.25, width/2],[-length/2+.55, -.25, width/2],[ length/2-.55, -.25, -width/2],[-length/2+.55, -.25, -width/2]];
+    this.wheels=[];
+    for(const p of positions){
+      const wheel=new THREE.Mesh(wheelGeo,wheelMat);
+      wheel.rotation.x=Math.PI/2;
+      wheel.position.set(p[0],p[1],p[2]);
+      wheel.castShadow=true;
+      this.mesh.add(wheel);
+      this.wheels.push(wheel);
+    }
+    // direction & speed
+    const dir= laneIdx%2===0 ? 1 : -1; // even lanes right, odd left
+    this.baseSpeed=dir*(0.075+rng.nextFloat()*0.045);
+    const zPos=laneStartZ + shoulder + laneIdx*laneWidth + laneWidth/2;
+    this.spawnX=-48+(slot/count)*96+((laneIdx*7)%13);
+    if(this.spawnX>52)this.spawnX-=100;
+    this.mesh.position.set(this.spawnX, height*.42, zPos);
+    if(dir<0)this.mesh.rotation.y=Math.PI;
+    scene.add(this.mesh);
+  }
+  update(speedFactor=1){
+    this.mesh.position.x+=this.baseSpeed*speedFactor;
+    if(this.mesh.position.x>56)this.mesh.position.x=-56;
+    if(this.mesh.position.x<-56)this.mesh.position.x=56;
+  }
+  reset(){
+    this.mesh.position.x=this.spawnX;
+  }
+}
+const vehicles=[];
+for(let i=0;i<laneCount;i++){
+  const count=3;
+  for(let j=0;j<count;j++){
+    const v=new Vehicle(i,j,count);
+    vehicles.push(v);
+  }
+}
+
+// Controls
+function attemptMove(dx,dz){
+  if(moveLock||!gameRunning) return;
+  moveLock=true;
+  const newX=playerPos.x+dx*cellSize;
+  const newZ=playerPos.y+dz*cellSize;
+  // bounds check
+  if(Math.abs(newX)>groundSize/2-2 || Math.abs(newZ)>groundSize/2-2){ moveLock=false; return; }
+  playerPos.set(newX,newZ);
+  player.position.set(newX,0,newZ);
+  // collision check
+  checkCollisions();
+  // crossed all lanes?
+  if(playerPos.y>laneStartZ + shoulder + laneCount*laneWidth){
+    score++;
+    if(score>best){best=score; localStorage.setItem('best',best);}
+    updateHUD();
+    // reset to start line
+    playerPos.set(0, laneStartZ - laneWidth);
+    player.position.set(0,0,playerPos.y);
+  }
+  setTimeout(()=>{moveLock=false;},150);
+}
+function checkCollisions(){
+  const playerBox=new THREE.Box3().setFromObject(player);
+  for(const v of vehicles){
+    const vBox=new THREE.Box3().setFromObject(v.mesh);
+    if(playerBox.intersectsBox(vBox)){
+      endGame();
+      break;
+    }
+  }
+}
+function endGame(){
+  gameRunning=false;
+  // particle burst (simple squares)
+  const particles=[];
+  for(let i=0;i<30;i++){
+    const size=0.2+rng.nextFloat()*0.3;
+    const geo=new THREE.PlaneGeometry(size,size);
+    const mat=new THREE.MeshBasicMaterial({color:0xffdddd,transparent:true,opacity:0.9,side:THREE.DoubleSide});
+    const p=new THREE.Mesh(geo,mat);
+    p.position.copy(player.position);
+    p.rotation.x=-Math.PI/2;
+    scene.add(p);
+    particles.push({mesh:p,vy:0.02+rng.nextFloat()*0.02});
+  }
+  const start=performance.now();
+  const dur=1500;
+  function animatePart(time){
+    const elapsed=time-start;
+    particles.forEach(p=>{p.mesh.position.y+=p.vy; p.mesh.material.opacity=Math.max(0,1-elapsed/dur);});
+    if(elapsed<dur) requestAnimationFrame(animatePart);
+    else particles.forEach(p=>scene.remove(p.mesh));
+  }
+  requestAnimationFrame(animatePart);
+  // show game over overlay
+  const goOverlay=document.createElement('div');
+  goOverlay.className='modalOverlay'; goOverlay.setAttribute('role','dialog'); goOverlay.setAttribute('aria-modal','true');
+  goOverlay.innerHTML=`<h2>Game Over</h2><p>Score: ${score}</p><button id='restartBtn' aria-label='Restart'>Restart (R)</button>`;
+  document.body.appendChild(goOverlay);
+  document.getElementById('restartBtn').addEventListener('click',()=>{goOverlay.remove();resetGame();});
+}
+function resetGame(){
+  score=0; updateHUD();
+  playerPos.set(0, laneStartZ - laneWidth);
+  player.position.set(0,0,playerPos.y);
+  // reset vehicles
+  vehicles.forEach(v=>v.reset());
+  gameRunning=true;
+}
+
+// Keyboard handling
+window.addEventListener('keydown',e=>{
+  if(!gameRunning){
+    if((e.key==='r'||e.key==='R')&&document.querySelector('.modalOverlay')){
+      document.querySelector('.modalOverlay').remove();resetGame();
+    }
+    return;
+  }
+  switch(e.key){
+    case 'ArrowUp': case 'w': case 'W': attemptMove(0,1); break;
+    case 'ArrowDown': case 's': case 'S': attemptMove(0,-1); break;
+    case 'ArrowLeft': case 'a': case 'A': attemptMove(-1,0); break;
+    case 'ArrowRight': case 'd': case 'D': attemptMove(1,0); break;
+  }
+});
+
+// Touch D‑pad handling
+document.querySelectorAll('.padBtn').forEach(btn=>{
+  btn.addEventListener('pointerdown',()=>{
+    const key=btn.dataset.key;
+    switch(key){
+      case 'ArrowUp': attemptMove(0,1); break;
+      case 'ArrowDown': attemptMove(0,-1); break;
+      case 'ArrowLeft': attemptMove(-1,0); break;
+      case 'ArrowRight': attemptMove(1,0); break;
+    }
+  });
+});
+
+// Start button
+document.getElementById('startBtn').addEventListener('click',()=>{
+  document.getElementById('overlay').style.display='none';
+  resetGame();
+});
+
+// Camera follow with a stable isometric offset.
+const cameraOffset=new THREE.Vector3(20,24,20);
+const cameraTarget=new THREE.Vector3();
+function updateCamera(){
+  cameraTarget.copy(player.position).add(cameraOffset);
+  camera.position.lerp(cameraTarget,0.075);
+  camera.lookAt(player.position.x,1.1,player.position.z+3.5);
+}
+
+function animate(){
+  requestAnimationFrame(animate);
+  if(gameRunning){
+    const speedFactor=1+score*0.05;
+    vehicles.forEach(v=>v.update(speedFactor));
+  }
+  updateCamera();
+  renderer.render(scene,camera);
+}
+animate();
+
+// Resize handling
+window.addEventListener('resize',()=>{
+  const w=window.innerWidth,h=window.innerHeight; aspect=w/h;
+  renderer.setSize(w,h);
+  camera.left=-frustum*aspect/2; camera.right=frustum*aspect/2;
+  camera.top=frustum/2; camera.bottom=-frustum/2;
+  camera.updateProjectionMatrix();
+});
+</script>
+</body>
+</html>

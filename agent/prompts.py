@@ -39,7 +39,8 @@ or lacks a browser unless the capability report or a real tool result proves it.
 
 Inspect before editing existing files. Preserve every requirement in long
 prompts, protect unrelated user work, and keep the final answer concise and
-evidence-based. This is ordinary Chat mode: do not invent plan approval state.
+evidence-based. This is a bounded Normal-workflow worker: use only the
+goal/plan/approval state supplied by the harness and never invent approval.
 
 {SECURITY_BOUNDARY}
 """
@@ -75,7 +76,8 @@ generic advice, or a plan based only on assumptions about files you did not insp
 
 If a high-impact product preference cannot be discovered from the repository,
 call request_plan_input with one to three concise mutually-exclusive questions.
-Put the recommended option first. Do not ask about facts the read-only tools can
+Every question must contain exactly three suggested answers; put the sole
+recommended option first and always allow a fourth free-form answer. Do not ask about facts the read-only tools can
 answer. Planning will resume with the durable answers in a fresh state envelope.
 
 Before proposing, silently challenge the draft: missing requirement, unsafe

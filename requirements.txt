@@ -13,3 +13,10 @@ colorama>=0.4.6,<1
 
 # Real local HTML preview verification (uses installed Chrome/Edge first).
 playwright>=1.61,<2
+
+# Deterministic screenshot composition metrics for visual quality gates.
+Pillow>=12.3,<13
+
+# Multi-language AST parsing and approximate semantic retrieval.
+tree-sitter-language-pack>=0.13,<1
+hnswlib>=0.8,<1

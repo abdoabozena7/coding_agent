@@ -246,7 +246,7 @@ class DashboardTests(unittest.TestCase):
         )
         output.encode("ascii")
         self.assertIn("GA3BAD CODING AGENT", output)
-        self.assertIn("MODE PLAN", output)
+        self.assertIn("MODE NORMAL", output)
         self.assertIn("PLAN r3 / r3", output)
         self.assertIn("[x] T001", output)
         self.assertIn("task-specific advers", output)
@@ -649,10 +649,10 @@ class TerminalUITests(unittest.TestCase):
         self.assertEqual({item.text for item in top}, {command for command, _ in ALL_SLASH_COMMANDS})
         self.assertTrue(all(item.start_position == -1 for item in top))
 
-        modes = list(completer.get_completions(Document("/mode g"), None))
-        self.assertEqual([item.text for item in modes], ["goal"])
-        tab_modes = list(completer.get_completions(Document("/mode\t\tg"), None))
-        self.assertEqual([item.text for item in tab_modes], ["goal"])
+        modes = list(completer.get_completions(Document("/mode u"), None))
+        self.assertEqual([item.text for item in modes], ["ultra"])
+        tab_modes = list(completer.get_completions(Document("/mode\t\tu"), None))
+        self.assertEqual([item.text for item in tab_modes], ["ultra"])
         settings = {
             item.text
             for item in completer.get_completions(Document("/settings "), None)
@@ -692,8 +692,8 @@ class TerminalUITests(unittest.TestCase):
         self.assertIn("/ide", rendered)
         self.assertIn("/keymap", rendered)
         self.assertIn("/sandbox-add-read-dir", rendered)
-        self.assertIn("/mode plan", rendered)
-        self.assertIn("/mode goal", rendered)
+        self.assertIn("/mode normal", rendered)
+        self.assertNotIn("/mode goal", rendered)
         self.assertIn("/mode ultra", rendered)
         self.assertIn("/settings", rendered)
         self.assertIn("/trace", rendered)
@@ -741,11 +741,11 @@ class TerminalUITests(unittest.TestCase):
         )
 
         self.assertEqual(console.prompt(), "/status")
-        self.assertEqual(prompts, ["GA3BAD [GOAL]> "])
+        self.assertEqual(prompts, ["GA3BAD [NORMAL]> "])
 
         console.set_mode("plan")
         self.assertEqual(console.prompt(), "/status")
-        self.assertEqual(prompts[-1], "GA3BAD [PLAN]> ")
+        self.assertEqual(prompts[-1], "GA3BAD [NORMAL]> ")
 
     def test_ultra_status_is_sparse_and_active_events_are_gold(self):
         view = DashboardView(

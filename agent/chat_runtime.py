@@ -12,7 +12,7 @@ _WRITE = re.compile(
     r"(?:احفظ|اكتب|أنشئ|انشئ|عد[ّ]?ل|اصلح|أصلح|ضعه|حطه)", re.IGNORECASE,
 )
 _RUN = re.compile(
-    r"\b(run|execute|launch|open|preview|serve|start)\b|"
+    r"\b(run|execute|launch|open|preview|serve|start|verify|test|check)\b|"
     r"(?:شغ[ّ]?ل|نف[ّ]?ذ|افتح|اعرض|ابدأ)", re.IGNORECASE,
 )
 _INSTALL = re.compile(

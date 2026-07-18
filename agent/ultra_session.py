@@ -26,9 +26,16 @@ from .evaluation import (
     learn_from_benchmark_trend,
     record_benchmark_trend,
     record_single_file_3d_html_benchmark,
+    run_single_file_3d_html_benchmark,
 )
 from .model_catalog import ExecutionClass, ModelDescriptor
-from .models import DomainError, GoalStatus, Plan, RoleProfile, TaskStatus, utc_now
+from .local_provider import (
+    extract_first_json_object,
+    normalize_action_proposal,
+    normalize_generated_tool_args,
+)
+from .learning import GlobalLessonStore, LearnedLessonV1
+from .models import DomainError, GoalStatus, Plan, PlanStatus, RoleProfile, TaskStatus, utc_now
 from .providers.base import AssistantTurn, ToolCall
 from .project_brain import ProjectBrain
 from .safety import redact_data, redact_text
@@ -45,6 +52,7 @@ from .ultra import (
     ArchitectureSpecV1 as EngineArchitectureSpec,
     BrainEntryV1,
     BrainSection as EngineBrainSection,
+    ComponentPackageV1,
     GoalSpecV1 as EngineGoalSpec,
     ContextRequest,
     FocusedContextBuilder,
@@ -52,9 +60,11 @@ from .ultra import (
     InnerPhase,
     MasterPlanV1,
     NodeKind,
+    NodeQualityTargetV1,
     NodeStatus,
     PromptTraceV1 as EnginePromptTrace,
     ResultPackageV1 as EngineResult,
+    SpecialistProfileV1,
     UltraConfig,
     UltraOrchestrator,
     UltraPhase as EnginePhase,
@@ -95,6 +105,7 @@ from .quality import (
 )
 from .reasoning import (
     evaluate_reasoning_artifact,
+    repair_reasoning_artifact_graph,
     reasoning_debate_protocol_for,
     reasoning_scaffold_for,
 )
@@ -342,6 +353,21 @@ class WorkspaceUltraAgent:
                 return text
         return None
 
+    @staticmethod
+    def _is_full_html_quality_gate(request: AgentRequest) -> bool:
+        contract = dict(request.task.get("contract", {})) if isinstance(request.task, Mapping) else {}
+        text = " ".join(
+            (
+                str(contract.get("title", "")),
+                str(contract.get("objective", "")),
+                " ".join(str(item) for item in contract.get("acceptance_criteria", ()) or ()),
+            )
+        ).casefold()
+        return any(
+            marker in text
+            for marker in ("browser qa", "visual refinement gate", "screenshot-based visual quality")
+        )
+
     def _harness_html_preview(self, request: AgentRequest) -> dict[str, Any] | None:
         if request.phase != InnerPhase.TEST.value or self.role is not AgentRole.TESTER:
             return None
@@ -376,7 +402,35 @@ class WorkspaceUltraAgent:
                 "page_errors": [],
                 "network_errors": [],
             }
-        return payload if isinstance(payload, Mapping) else {"status": "failed", "error": "preview_html returned non-object payload"}
+        if not isinstance(payload, Mapping):
+            return {"status": "failed", "error": "preview_html returned non-object payload"}
+        evidence = dict(payload)
+        html_result = str(
+            self.executor(
+                ToolCall("harness-html-readback", "read_file", {"path": target}),
+                request,
+            )
+        )
+        if html_result.startswith("Error:"):
+            evidence["verification"] = "failed"
+            evidence["page_errors"] = [
+                *list(evidence.get("page_errors", ()) or ()),
+                html_result,
+            ]
+            return evidence
+        if not self._is_full_html_quality_gate(request):
+            return evidence
+        benchmark = run_single_file_3d_html_benchmark(html_result, preview=evidence)
+        evidence["benchmark_scores"] = dict(benchmark.scores)
+        evidence["benchmark_metrics"] = dict(benchmark.metrics)
+        evidence["benchmark_findings"] = list(benchmark.findings)
+        if benchmark.findings:
+            evidence["verification"] = "failed"
+            evidence["page_errors"] = [
+                *list(evidence.get("page_errors", ()) or ()),
+                *(f"HTML quality benchmark: {item}" for item in benchmark.findings),
+            ]
+        return evidence
 
     def execute(self, request: AgentRequest) -> AgentResponse:
         configured_effort = str(getattr(self.provider, "reasoning_effort", "medium"))
@@ -393,7 +447,7 @@ class WorkspaceUltraAgent:
             effective_effort = "off"
             setattr(self.provider, "reasoning_effort", effective_effort)
         deterministic_budgets = {
-            AgentRole.GOAL_UNDERSTANDING: 2048,
+            AgentRole.GOAL_UNDERSTANDING: 4096,
             AgentRole.ARCHITECT: 3072,
             AgentRole.PLANNER: 4096,
             AgentRole.DECOMPOSER: 4096,
@@ -423,9 +477,80 @@ class WorkspaceUltraAgent:
             request.phase,
             {"payload": {"success": True, "findings": [], "evidence": []}},
         )
+        if self.role is AgentRole.CODER and request.phase in {
+            InnerPhase.IMPLEMENT.value,
+            InnerPhase.FIX.value,
+        }:
+            contract = {
+                "payload": {
+                    **dict(contract.get("payload", {})),
+                    "proposed_write": {
+                        "path": "one exact approved write_path",
+                        "content": "complete replacement content; use only when a native write tool cannot be emitted",
+                    },
+                }
+            }
         inspection_observed = False
+        mutation_observed = False
         harness_inspection: str | None = None
         harness_preview = self._harness_html_preview(request)
+        if (
+            harness_preview
+            and request.phase == InnerPhase.TEST.value
+            and self.role is AgentRole.TESTER
+            and str(
+                harness_preview.get("verification") or harness_preview.get("status") or ""
+            ).casefold()
+            not in {"passed", "ok", "success"}
+        ):
+            browser_details = [
+                *[str(item) for item in harness_preview.get("benchmark_findings", ())],
+                *[str(item) for item in harness_preview.get("console_errors", ())],
+                *[str(item) for item in harness_preview.get("page_errors", ())],
+                *[str(item) for item in harness_preview.get("network_errors", ())],
+            ]
+            findings = list(
+                dict.fromkeys(
+                    ["Harness browser verification failed for HTML output.", *browser_details]
+                )
+            )
+            self.events.publish(
+                "ultra.deterministic_test_gate",
+                "Harness browser/readback benchmark failed; routing evidence to the fix loop",
+                run_id=request.run_id,
+                node_id=request.node_id,
+                findings=findings,
+                scores=dict(harness_preview.get("benchmark_scores", {})),
+            )
+            return AgentResponse.from_mapping(
+                {
+                    "payload": {
+                        "passed": False,
+                        "issues": findings,
+                        "findings": findings,
+                        "test_results": [
+                            {
+                                "name": "harness_html_browser_and_quality_gate",
+                                "passed": False,
+                                "scores": dict(harness_preview.get("benchmark_scores", {})),
+                                "screenshot_path": harness_preview.get("screenshot_path"),
+                            }
+                        ],
+                        "evidence": [
+                            {
+                                "kind": "browser_preview",
+                                "verification": harness_preview.get("verification"),
+                                "screenshot_path": harness_preview.get("screenshot_path"),
+                            }
+                        ],
+                    },
+                    "summary": "Harness browser/readback quality gate failed",
+                    "reasoning_summary": "Observable browser and static benchmark evidence requires remediation.",
+                },
+                node_id=request.node_id,
+                provider=self.provider_name,
+                model=self.model,
+            )
         debate_protocol = reasoning_debate_protocol_for(
             self.role.value,
             request.phase,
@@ -444,11 +569,61 @@ class WorkspaceUltraAgent:
                     + harness_inspection
                 )
             inspection_observed = True
+            listed_paths = {
+                line.strip()
+                for line in harness_inspection.splitlines()
+                if line.strip() and not line.strip().startswith("(")
+            }
+            if "index.html" in listed_paths:
+                current_html = str(
+                    self.executor(
+                        ToolCall(
+                            "harness-goal-index-readback",
+                            "read_file",
+                            {"path": "index.html"},
+                        ),
+                        request,
+                    )
+                )
+                if not current_html.startswith("Error:"):
+                    harness_inspection += (
+                        "\n\nAUTHORITATIVE CURRENT index.html READBACK:\n"
+                        + current_html[:40_000]
+                    )
+        write_target_state: list[dict[str, Any]] = []
+        if self.role is AgentRole.CODER and request.phase in {
+            InnerPhase.IMPLEMENT.value,
+            InnerPhase.FIX.value,
+        }:
+            contract_payload = (
+                dict(request.task.get("contract", {}))
+                if isinstance(request.task, Mapping)
+                else {}
+            )
+            for index, path in enumerate(contract_payload.get("write_paths", ()) or (), start=1):
+                target = str(path).strip()
+                if not target:
+                    continue
+                readback = str(
+                    self.executor(
+                        ToolCall(f"harness-write-target-{index}", "read_file", {"path": target}),
+                        request,
+                    )
+                )
+                write_target_state.append(
+                    {
+                        "path": target,
+                        "exists": not readback.startswith("Error:"),
+                        "content": readback[:40_000] if not readback.startswith("Error:") else "",
+                        "read_error": readback[:500] if readback.startswith("Error:") else "",
+                    }
+                )
         user_payload = {
             "task": request.task,
             "focused_context": request.context,
             "harness_workspace_inspection": harness_inspection,
             "harness_html_preview": harness_preview,
+            "harness_write_target_state": write_target_state,
             "harness_reasoning_scaffold": reasoning_scaffold_for(
                 self.role.value,
                 request.phase,
@@ -505,7 +680,12 @@ class WorkspaceUltraAgent:
         conversation: list[dict[str, Any]] = [
             {"role": "user", "content": _json(user_payload)}
         ]
-        schemas = [] if request.phase == "goal_spec" else _schemas(self._allowed_tools())
+        allowed_tools = self._allowed_tools()
+        if self.role is AgentRole.TESTER and self._html_write_target(request):
+            # HTML verification is platform-neutral through preview_html plus
+            # deterministic readback metrics. Avoid shell quoting/OS drift.
+            allowed_tools = allowed_tools - {"run_bash", "run_command"}
+        schemas = [] if request.phase == "goal_spec" else _schemas(allowed_tools)
         totals = {"input_tokens": 0, "cached_tokens": 0, "output_tokens": 0}
         self.events.publish(
             "ultra.agent_started",
@@ -517,9 +697,44 @@ class WorkspaceUltraAgent:
         )
         last_error: Exception | None = None
         invalid_json_attempts = 0
+        max_invalid_json_attempts = 4 if self.provider_name.casefold() == "ollama" else 2
         for step in range(1, self.max_steps + 1):
             try:
-                turn = self.provider.call(conversation, schemas, request.system_prompt)
+                system_prompt = request.system_prompt
+                contract_for_prompt = (
+                    dict(request.task.get("contract", {}))
+                    if isinstance(request.task, Mapping)
+                    else {}
+                )
+                component_only = bool(
+                    dict(contract_for_prompt.get("metadata", {})).get("component_package_only")
+                )
+                if self.role is AgentRole.CODER and request.phase in {
+                    InnerPhase.IMPLEMENT.value,
+                    InnerPhase.FIX.value,
+                }:
+                    if component_only:
+                        system_prompt += (
+                            "\n\nCOMPONENT PACKAGE PHASE: this specialist must not write the shared final "
+                            "artifact. Return payload.component_package with implementation, interface, "
+                            "tests, preview fixture, dependencies, evidence, and quality fields. The parent "
+                            "FinalAssembler alone owns final_output_paths."
+                        )
+                    else:
+                        system_prompt += (
+                            "\n\nMUTATION PHASE: completion is impossible until at least one successful "
+                            "workspace write/edit occurs inside contract.write_paths. Prefer write_file for "
+                            "a complete HTML replacement. If native tool calling is unavailable, return the "
+                            "complete artifact in payload.proposed_write; the harness will validate its exact "
+                            "path and execute it. Never return success from a read-only state."
+                        )
+                if self.role is AgentRole.INTEGRATOR and bool(request.task.get("final_assembler")):
+                    system_prompt += (
+                        "\n\nFINAL ASSEMBLER PHASE: compose the supplied child_component_packages into "
+                        "the approved final write_paths. You are the only owner of those final paths; perform "
+                        "a real write, then read back and verify the integrated artifact."
+                    )
+                turn = self.provider.call(conversation, schemas, system_prompt)
             except Exception as exc:
                 status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
                 if status == 429 or "rate limit" in str(exc).casefold():
@@ -530,6 +745,29 @@ class WorkspaceUltraAgent:
             if turn.usage:
                 for key in totals:
                     totals[key] += int(getattr(turn.usage, key, 0) or 0)
+            if not turn.tool_calls and schemas and turn.text:
+                candidate = extract_first_json_object(turn.text)
+                proposal = normalize_action_proposal(candidate) if candidate is not None else None
+                if proposal is not None:
+                    name, args = proposal
+                    allowed = {_schema_name(schema) for schema in schemas}
+                    if name in allowed:
+                        turn.tool_calls.append(
+                            ToolCall(
+                                id=f"ultra-harness-{request.node_id or request.phase}-{step}",
+                                name=name,
+                                args=normalize_generated_tool_args(name, args),
+                            )
+                        )
+                        self.events.publish(
+                            "ultra.tool_proposal_normalized",
+                            f"Normalized textual {name} proposal into a governed tool call",
+                            run_id=request.run_id,
+                            node_id=request.node_id,
+                            role=self.role.value,
+                            phase=request.phase,
+                            tool=name,
+                        )
             conversation.append(turn.to_message())
             if turn.tool_calls:
                 if not schemas:
@@ -544,17 +782,72 @@ class WorkspaceUltraAgent:
                     )
                     continue
                 for call in turn.tool_calls:
-                    result = self.executor(call, request)
-                    if call.name in _READ_TOOLS and not str(result).startswith("Error:"):
+                    effective_call = ToolCall(
+                        id=call.id,
+                        name=call.name,
+                        args=normalize_generated_tool_args(call.name, call.args),
+                    )
+                    if call.name == "edit_file":
+                        new_text = str(call.args.get("new_str", ""))
+                        old_text = str(call.args.get("old_str", ""))
+                        complete_html = bool(
+                            re.search(r"(?is)<!doctype\s+html|<html\b", new_text)
+                        )
+                        replacing_document = not old_text.strip() or bool(
+                            re.search(r"(?is)<!doctype\s+html|<html\b", old_text)
+                        )
+                        if complete_html and replacing_document and "write_file" in self._allowed_tools():
+                            effective_call = ToolCall(
+                                id=call.id,
+                                name="write_file",
+                                args={"path": call.args.get("path", ""), "content": new_text},
+                            )
+                            self.events.publish(
+                                "ultra.full_document_write_normalized",
+                                "Normalized full-document edit_file proposal to write_file",
+                                run_id=request.run_id,
+                                node_id=request.node_id,
+                                path=call.args.get("path", ""),
+                            )
+                    result = self.executor(effective_call, request)
+                    if effective_call.name in _READ_TOOLS and not str(result).startswith("Error:"):
                         inspection_observed = True
+                    if effective_call.name in _WRITE_TOOLS and not str(result).startswith("Error:"):
+                        mutation_observed = True
                     conversation.append(
                         {
                             "role": "tool",
-                            "id": call.id,
-                            "name": call.name,
+                            "id": effective_call.id,
+                            "name": effective_call.name,
                             "content": result,
                         }
                     )
+                    if (
+                        effective_call.name == "edit_file"
+                        and str(result).startswith("Error:")
+                        and any(
+                            marker in str(result).casefold()
+                            for marker in ("already exists", "old_str not found")
+                        )
+                    ):
+                        path = str(effective_call.args.get("path", "")).strip()
+                        fresh = str(
+                            self.executor(
+                                ToolCall(f"harness-edit-readback-{step}", "read_file", {"path": path}),
+                                request,
+                            )
+                        )
+                        conversation.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Authoritative readback for {path!r}:\n{fresh[:40_000]}\n\n"
+                                    "For a localized edit, retry edit_file with an old_str copied exactly "
+                                    "from this readback. For a complete artifact replacement, use write_file "
+                                    "with the entire improved content. Do not guess old_str."
+                                ),
+                            }
+                        )
                 continue
             try:
                 data = _extract_json(str(turn.text or ""))
@@ -565,12 +858,18 @@ class WorkspaceUltraAgent:
                     model=self.model,
                     usage=totals,
                 )
+                repaired_reasoning, reasoning_repairs = repair_reasoning_artifact_graph(
+                    response.payload.get("reasoning_artifact")
+                )
                 reasoning_evaluation = evaluate_reasoning_artifact(
-                    response.payload.get("reasoning_artifact"),
+                    repaired_reasoning,
                     debate_protocol,
                 )
                 if debate_protocol.required:
                     payload = dict(response.payload)
+                    payload["reasoning_artifact"] = repaired_reasoning
+                    if reasoning_repairs:
+                        payload["harness_reasoning_repairs"] = list(reasoning_repairs)
                     payload["harness_reasoning_evaluation"] = reasoning_evaluation.to_dict()
                     response = AgentResponse.from_mapping(
                         {
@@ -646,6 +945,68 @@ class WorkspaceUltraAgent:
                             provider=response.provider,
                             model=response.model,
                         )
+                contract_payload = (
+                    dict(request.task.get("contract", {}))
+                    if isinstance(request.task, Mapping)
+                    else {}
+                )
+                requires_mutation = (
+                    (
+                        self.role is AgentRole.CODER
+                        and request.phase in {InnerPhase.IMPLEMENT.value, InnerPhase.FIX.value}
+                    )
+                    or (
+                        self.role is AgentRole.INTEGRATOR
+                        and bool(request.task.get("final_assembler"))
+                    )
+                ) and bool(contract_payload.get("write_paths"))
+                if requires_mutation and not mutation_observed:
+                    proposed_write = response.payload.get("proposed_write")
+                    if isinstance(proposed_write, Mapping):
+                        proposed_path = str(proposed_write.get("path", "")).strip()
+                        proposed_content = str(proposed_write.get("content", ""))
+                        approved_paths = {
+                            str(path).strip()
+                            for path in contract_payload.get("write_paths", ()) or ()
+                            if str(path).strip()
+                        }
+                        if proposed_path in approved_paths and proposed_content.strip():
+                            write_result = str(
+                                self.executor(
+                                    ToolCall(
+                                        f"harness-proposed-write-{step}",
+                                        "write_file",
+                                        {"path": proposed_path, "content": proposed_content},
+                                    ),
+                                    request,
+                                )
+                            )
+                            if not write_result.startswith("Error:"):
+                                mutation_observed = True
+                                self.events.publish(
+                                    "ultra.proposed_write_executed",
+                                    "Validated and executed typed proposed_write fallback",
+                                    run_id=request.run_id,
+                                    node_id=request.node_id,
+                                    path=proposed_path,
+                                    characters=len(proposed_content),
+                                )
+                if requires_mutation and not mutation_observed:
+                    conversation.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "No successful workspace mutation was observed. This phase owns "
+                                f"write_paths={list(contract_payload.get('write_paths', ()))!r}. "
+                                "Use an allowed write/edit tool now, then inspect the changed artifact "
+                                "Use write_file for a complete artifact replacement; use edit_file only "
+                                "with an exact old_str from harness_write_target_state. "
+                                "and only afterward return the required JSON result. A prose or JSON-only "
+                                "claim cannot complete an implementation/fix phase."
+                            ),
+                        }
+                    )
+                    continue
                 return response
             except Exception as exc:
                 content_preview = redact_text(str(turn.text or ""), 800)
@@ -653,9 +1014,10 @@ class WorkspaceUltraAgent:
                     f"{exc}; content_preview={content_preview!r}"
                 )
                 invalid_json_attempts += 1
-                if invalid_json_attempts >= 2:
+                if invalid_json_attempts >= max_invalid_json_attempts:
                     raise RuntimeError(
-                        f"{self.role.value} returned invalid structured JSON twice: {last_error}"
+                        f"{self.role.value} returned invalid structured JSON "
+                        f"{invalid_json_attempts} times: {last_error}"
                     ) from exc
                 conversation.append(
                     {
@@ -858,6 +1220,10 @@ class StateStoreUltraAdapter(InMemoryUltraState):
         self._lease_scopes: dict[str, tuple[str, ...]] = {}
         self._lease_hashes: dict[str, dict[str, str | None]] = {}
         self._used_project_lessons: dict[str, dict[str, Any]] = {}
+        model_name = str(descriptor.model).casefold()
+        self._global_memory_enabled = not model_name.startswith(("offline", "fake", "test"))
+        self.global_lessons = GlobalLessonStore()
+        self._used_global_lesson_ids: set[str] = set()
         self._adapter_lock = threading.RLock()
 
     def _run_config(self, run: UltraRunV1) -> dict[str, Any]:
@@ -911,6 +1277,56 @@ class StateStoreUltraAdapter(InMemoryUltraState):
                 config=self._run_config(run),
                 error=("ULTRA execution failed" if run.phase is EnginePhase.FAILED else None),
             )
+
+    def save_specialist_profile(self, run_id: str, profile: SpecialistProfileV1) -> None:
+        super().save_specialist_profile(run_id, profile)
+        self.store.save_specialist_profile(
+            {
+                **asdict(profile),
+                "ultra_run_id": run_id,
+                "work_node_id": profile.node_id,
+            }
+        )
+
+    def save_component_package(self, run_id: str, package: ComponentPackageV1) -> None:
+        super().save_component_package(run_id, package)
+        stored = self.store.put_component_package(
+            {
+                **asdict(package),
+                "ultra_run_id": run_id,
+                "work_node_id": package.node_id,
+            }
+        )
+        node = self.store.get_work_node(package.node_id)
+        self.store.post_swarm_message(
+            SwarmMessageV1(
+                ultra_run_id=run_id,
+                sender_agent_id=f"specialist:{package.node_id}",
+                recipient_agent_id=(
+                    f"specialist:{node.parent_id}" if node.parent_id else "final-assembler"
+                ),
+                message_type=SwarmMessageType.PACKAGE_PUBLISHED,
+                topic=f"component-package:{package.node_id}",
+                payload={
+                    "package_id": stored["id"],
+                    "node_id": package.node_id,
+                    "status": package.status,
+                    "content_hash": stored["content_hash"],
+                    "quality": dict(package.quality),
+                },
+                evidence=package.evidence,
+                correlation_id=package.node_id,
+            )
+        )
+
+    def save_node_quality_target(self, run_id: str, target: NodeQualityTargetV1) -> None:
+        super().save_node_quality_target(run_id, target)
+        self.store.save_node_quality_target(
+            run_id,
+            target.node_id,
+            asdict(target),
+            status="not_evaluated",
+        )
 
     def foundation_project_lessons(
         self,
@@ -977,7 +1393,72 @@ class StateStoreUltraAdapter(InMemoryUltraState):
                     "evidence_refs": memory["evidence_refs"],
                 }
             )
+        if self._global_memory_enabled and len(result) < max(1, int(limit)):
+            for lesson in self.global_lessons.search(
+                query,
+                limit=max(1, int(limit)) - len(result),
+            ):
+                self._used_global_lesson_ids.add(lesson.id)
+                result.append(
+                    {
+                        "id": lesson.id,
+                        "section": BrainSection.LESSON.value,
+                        "phase": phase,
+                        "title": lesson.title,
+                        "content": lesson.content,
+                        "confidence": lesson.confidence,
+                        "effective_confidence": lesson.confidence,
+                        "reuse_count": lesson.successes + lesson.failures,
+                        "evidence_refs": lesson.evidence_refs,
+                        "scope": "global",
+                    }
+                )
         return tuple(result)
+
+    def _record_global_lesson_evaluation_outcomes(
+        self,
+        *,
+        passed: bool,
+        benchmark_id: str,
+        blocker: str,
+        html_benchmark: Mapping[str, Any] | None,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not self._global_memory_enabled:
+            return ()
+        outcomes: list[Mapping[str, Any]] = []
+        for lesson_id in tuple(self._used_global_lesson_ids):
+            updated = self.global_lessons.record_outcome(lesson_id, succeeded=passed)
+            if updated is not None:
+                outcomes.append(
+                    {"id": updated.id, "confidence": updated.confidence, "succeeded": passed}
+                )
+        visual = html_benchmark is not None
+        content = (
+            "Use recursive component isolation, FinalAssembler ownership, independent review, "
+            "and evidence-backed consensus before accepting an Ultra result."
+        )
+        if visual:
+            content += " Interactive HTML requires clean browser runtime, screenshots, and critical visual scores."
+        if blocker:
+            content += f" Last blocker pattern: {redact_text(blocker, 500)}"
+        learned = self.global_lessons.put(
+            LearnedLessonV1(
+                title="Ultra recursive quality gate",
+                content=content,
+                applicability_tags=(
+                    "ultra",
+                    "recursive-specialists",
+                    "visual" if visual else "integration",
+                ),
+                evidence_refs=(f"benchmark:{benchmark_id}",),
+                successes=1 if passed else 0,
+                failures=0 if passed else 1,
+            )
+        )
+        outcomes.append(
+            {"id": learned.id, "confidence": learned.confidence, "succeeded": passed, "recorded": True}
+        )
+        return tuple(outcomes)
 
     def _record_project_lesson_evaluation_outcomes(
         self,
@@ -1481,15 +1962,42 @@ class StateStoreUltraAdapter(InMemoryUltraState):
             if node.id not in self._persisted_nodes:
                 self._flush_nodes()
                 return
-            current = self.store.get_work_node(node.id)
+            stored = self._stored_node(node)
+            current = self.store.update_work_node_definition(
+                node.id,
+                contract=stored.contract,
+                depends_on=stored.depends_on,
+                assigned_role=stored.assigned_role,
+                checkpoint=stored.checkpoint,
+                metadata=stored.metadata,
+            )
             target = _store_node_status(node.status)
             result = self._result_cache.get(node.id)
             if current.status != target or result is not None:
+                clear_error_states = {
+                    WorkNodeStatus.PENDING,
+                    WorkNodeStatus.READY,
+                    WorkNodeStatus.IN_PROGRESS,
+                    WorkNodeStatus.COMPLETED,
+                }
                 self.store.transition_work_node(
                     node.id,
                     target,
                     result=self._result(result) if result else current.result,
-                    error=(result.summary if result and not result.success else current.error),
+                    error=(
+                        result.summary
+                        if result
+                        and not result.success
+                        and target
+                        in {
+                            WorkNodeStatus.FAILED,
+                            WorkNodeStatus.REVISION_REQUIRED,
+                            WorkNodeStatus.BLOCKED,
+                        }
+                        else None
+                        if target in clear_error_states
+                        else current.error
+                    ),
                     checkpoint=node.phase.value if node.phase else current.checkpoint,
                 )
             self._pending_nodes.pop(node.id, None)
@@ -1532,6 +2040,7 @@ class StateStoreUltraAdapter(InMemoryUltraState):
                 "status": value.status,
                 "fix_attempts": value.fix_attempts,
                 "evidence": list(value.evidence),
+                "component_package": dict(value.component_package),
             },
         )
 
@@ -2028,6 +2537,28 @@ class StateStoreUltraAdapter(InMemoryUltraState):
         )
         if self._trend_quality_regression(html_trend):
             blocker = blocker or "HTML benchmark quality regressed against the previous baseline"
+        weighted_dimensions = [
+            scores["consensus_accept_ratio"],
+            scores["final_evidence_score"],
+            scores["global_success"],
+        ]
+        # A final-only evaluation has no component population to average. Keep
+        # the metric at zero for trend visibility, but do not punish the score
+        # for an inapplicable dimension.
+        if nodes:
+            weighted_dimensions.insert(0, scores["node_success_ratio"])
+        if html_benchmark:
+            html_scores = dict(html_benchmark.get("scores", {}))
+            weighted_dimensions.append(float(html_scores.get("overall", 0.0)))
+            visual_score = float(
+                html_scores.get("visual_composition", html_scores.get("visual_richness", 0.0))
+            )
+            scores["visual_critical"] = visual_score
+            if visual_score < 0.85:
+                blocker = blocker or "critical visual quality score is below 0.85"
+        scores["overall"] = sum(weighted_dimensions) / max(1, len(weighted_dimensions))
+        if scores["overall"] < 0.95:
+            blocker = blocker or "overall quality score is below 0.95"
         passed = not blocker
         artifact_refs: list[str] = []
         for artifact in global_result.artifacts:
@@ -2064,6 +2595,12 @@ class StateStoreUltraAdapter(InMemoryUltraState):
             html_benchmark_id=str(html_benchmark.get("id")) if html_benchmark else None,
             blocker=blocker,
         )
+        global_lesson_outcomes = self._record_global_lesson_evaluation_outcomes(
+            passed=passed,
+            benchmark_id=str(recorded["id"]),
+            blocker=blocker,
+            html_benchmark=html_benchmark,
+        )
         remediation_knowledge = self._record_global_remediation_knowledge(
             passed=passed,
             benchmark_id=str(recorded["id"]),
@@ -2086,6 +2623,7 @@ class StateStoreUltraAdapter(InMemoryUltraState):
             "html_benchmark_trend_learning": html_trend.get("learning") if html_trend else None,
             "blocker": blocker,
             "project_lesson_outcomes": lesson_outcomes,
+            "global_lesson_outcomes": global_lesson_outcomes,
             "remediation_knowledge": remediation_knowledge,
         }
 
@@ -2150,6 +2688,34 @@ class StateStoreUltraAdapter(InMemoryUltraState):
                 blocker=f"HTML benchmark could not read index.html: {type(exc).__name__}",
             )
             return recorded
+        preview: Mapping[str, Any] = {}
+        preview_id = ""
+        try:
+            preview_raw = tools.run_tool(
+                "preview_html",
+                {
+                    "path": "index.html",
+                    "open_browser": False,
+                    "verify": True,
+                    "settle_ms": 2500,
+                },
+            )
+            parsed_preview = json.loads(preview_raw)
+            if isinstance(parsed_preview, Mapping):
+                preview = dict(parsed_preview)
+                preview_id = str(preview.get("preview_id") or "")
+        except (DomainError, OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            preview = {
+                "status": "failed",
+                "verification": "failed",
+                "page_errors": [f"benchmark preview failed: {type(exc).__name__}: {exc}"],
+            }
+        finally:
+            if preview_id:
+                try:
+                    tools.run_tool("stop_preview", {"preview_id": preview_id})
+                except (DomainError, OSError, RuntimeError, ValueError):
+                    pass
         return record_single_file_3d_html_benchmark(
             self.store,
             html,
@@ -2157,6 +2723,7 @@ class StateStoreUltraAdapter(InMemoryUltraState):
             model=self.descriptor.model,
             ultra_run_id=self.run_id,
             artifact_ref="workspace:index.html",
+            preview=preview,
         )
 
     def save_prompt_trace(self, trace: EnginePromptTrace) -> None:
@@ -2814,10 +3381,11 @@ class UltraSession:
             evidence=tuple(value.metadata.get("evidence", ())),
             test_results=value.tests,
             findings=value.issues,
+            component_package=dict(value.metadata.get("component_package", {})),
             fix_attempts=int(value.metadata.get("fix_attempts", 0) or 0),
         )
 
-    def restore(self, run_id: str) -> Future[UltraRunResult]:
+    def restore(self, run_id: str) -> Future[UltraRunResult] | Plan:
         """Rebuild the scheduler from durable evidence without replaying uncertainty."""
 
         run = self.store.get_ultra_run(run_id)
@@ -2836,9 +3404,15 @@ class UltraSession:
             raise RuntimeError(
                 "reconcile uncertain ULTRA work before resume: " + ", ".join(values[:12])
             )
-        if not run.master_approved or run.plan_revision is None:
-            raise RuntimeError("the interrupted ULTRA run has no approved master plan")
-        plan = self.store.get_plan(run.goal_id, run.plan_revision)
+        awaiting_approval = not run.master_approved or run.plan_revision is None
+        if awaiting_approval:
+            if run.status is not UltraRunStatus.AWAITING_APPROVAL:
+                raise RuntimeError("the interrupted ULTRA run has no approved master plan")
+            plan = self.store.get_latest_plan(run.goal_id)
+            if plan is None or plan.status is not PlanStatus.PENDING_APPROVAL:
+                raise RuntimeError("the interrupted ULTRA run has no pending master plan")
+        else:
+            plan = self.store.get_plan(run.goal_id, run.plan_revision)
         if run.goal_spec is None or run.architecture_spec is None:
             raise RuntimeError("the interrupted ULTRA foundation is incomplete; use /replan")
 
@@ -2853,7 +3427,7 @@ class UltraSession:
         )
         self.adapter.run_id = run.id
         self.adapter.plan = plan
-        self.adapter.approved = True
+        self.adapter.approved = not awaiting_approval
         self.adapter.task_ids = {
             str(task.metadata.get("ultra_node_id", task.id)): task.id for task in plan.tasks
         }
@@ -2904,6 +3478,11 @@ class UltraSession:
             invariants=run.architecture_spec.constraints,
         )
         stored_by_id = {item.id: item for item in nodes}
+        top_level_ids = {
+            item.id
+            for item in nodes
+            if item.parent_id is None and item.kind is WorkNodeKind.MODULE
+        }
         engine_nodes: dict[str, EngineWorkNode] = {}
         module_contracts = []
         for item in nodes:
@@ -2916,6 +3495,16 @@ class UltraSession:
                 verification = legacy.verification if legacy else ("Inspect the durable evidence.",)
             contract = self._engine_contract(item, verification)
             children = tuple(str(value) for value in item.metadata.get("children", ()))
+            if not children:
+                # Backward-compatible recovery for checkpoints written before
+                # parent structure updates were persisted. Parent links are
+                # independently durable, so reconstruct the exact child set
+                # without invoking the planner or creating duplicate ids.
+                children = tuple(
+                    candidate.id
+                    for candidate in nodes
+                    if candidate.parent_id == item.id
+                )
             dependencies = tuple(dict.fromkeys((*item.depends_on, *children)))
             try:
                 phase = InnerPhase(item.checkpoint) if item.checkpoint else None
@@ -2957,11 +3546,71 @@ class UltraSession:
                 )
             engine_nodes[engine.id] = engine
             if item.parent_id is None and item.kind is WorkNodeKind.MODULE:
-                module_contracts.append(contract)
+                # Dynamic children are scheduler dependencies of the parent,
+                # not peers in the approval-bound top-level master plan.
+                # Persisted graph checkpoints may include them in the engine
+                # contract, so project only approved top-level dependencies
+                # when rebuilding MasterPlanV1.
+                module_contracts.append(
+                    type(contract)(
+                        id=contract.id,
+                        title=contract.title,
+                        objective=contract.objective,
+                        acceptance_criteria=contract.acceptance_criteria,
+                        verification=contract.verification,
+                        depends_on=tuple(
+                            dependency
+                            for dependency in contract.depends_on
+                            if dependency in top_level_ids
+                        ),
+                        write_paths=contract.write_paths,
+                        forbidden_changes=contract.forbidden_changes,
+                        owned_interfaces=contract.owned_interfaces,
+                        metadata=contract.metadata,
+                    )
+                )
             if item.result:
                 converted = self._engine_result(item.id, item.result)
                 self.adapter._result_cache[item.id] = converted
                 self.adapter.results[run_id][item.id] = converted
+
+        # A foundation can be checkpointed between persisting the approval-bound
+        # legacy Plan and materializing durable WorkNodes.  Rebuild only the
+        # top-level module contracts from that immutable pending plan; execution
+        # still cannot begin until the user approves its fingerprint.
+        if not module_contracts and awaiting_approval:
+            from .ultra import TaskContractV1 as EngineTaskContract
+
+            paths_by_task: dict[str, list[str]] = {}
+            for change in plan.expected_changes:
+                path = str(change.get("path", "")).strip()
+                for task_id in change.get("supports_tasks", ()):
+                    if path:
+                        paths_by_task.setdefault(str(task_id), []).append(path)
+            task_to_node = {
+                task.id: str(task.metadata.get("ultra_node_id", task.id))
+                for task in plan.tasks
+            }
+            for position, task in enumerate(plan.tasks, start=1):
+                node_id = task_to_node[task.id]
+                contract = EngineTaskContract(
+                    id=node_id,
+                    title=task.title,
+                    objective=task.description or task.title,
+                    acceptance_criteria=task.acceptance_criteria,
+                    verification=task.verification,
+                    depends_on=tuple(
+                        task_to_node.get(dependency, dependency)
+                        for dependency in task.depends_on
+                    ),
+                    write_paths=tuple(dict.fromkeys(paths_by_task.get(task.id, ()))),
+                    forbidden_changes=(),
+                    owned_interfaces=(),
+                    metadata={**dict(task.metadata), "restored_from_pending_plan": True},
+                )
+                node = EngineWorkNode(contract=contract, order=position)
+                module_contracts.append(contract)
+                engine_nodes[node.id] = node
 
         if not module_contracts:
             raise RuntimeError("the approved ULTRA run has no durable master modules")
@@ -2981,7 +3630,7 @@ class UltraSession:
             phase=EnginePhase.AWAITING_APPROVAL,
             concurrency=run.concurrency,
             master_fingerprint=master.fingerprint,
-            approved=True,
+            approved=not awaiting_approval,
             model_snapshot=self.descriptor.to_dict(),
             config_snapshot=dict(run.config),
             metadata={"restored": True},
@@ -2997,6 +3646,14 @@ class UltraSession:
         self.orchestrator._order = max((item.order for item in engine_nodes.values()), default=0)
         self.adapter.runs[run_id] = engine_run
         self.adapter.nodes[run_id] = dict(engine_nodes)
+        if awaiting_approval:
+            self.events.publish(
+                "ultra.awaiting_approval",
+                f"Restored ULTRA plan revision {plan.revision}; approval is still required",
+                run_id=run_id,
+                revision=plan.revision,
+            )
+            return plan
         self.store.update_ultra_run(
             run_id,
             phase=UltraPhase.MODULE_WAVES,

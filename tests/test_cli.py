@@ -67,9 +67,9 @@ class CLITests(unittest.TestCase):
         mode_query = parse_command("/mode")
         self.assertEqual(mode_query.kind, CommandKind.MODE)
         self.assertIsNone(mode_query.args["mode"])
-        self.assertEqual(parse_command("/mode GOAL").args["mode"], "goal")
-        self.assertEqual(parse_command("/mode\tgoal").args["mode"], "goal")
-        self.assertEqual(parse_command(":mode plan").args["mode"], "plan")
+        self.assertEqual(parse_command("/mode GOAL").args["mode"], "normal")
+        self.assertEqual(parse_command("/mode\tgoal").args["mode"], "normal")
+        self.assertEqual(parse_command(":mode plan").args["mode"], "normal")
 
         settings_query = parse_command("/settings")
         self.assertEqual(settings_query.kind, CommandKind.SETTINGS)
@@ -104,9 +104,9 @@ class CLITests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             rendered = output.getvalue()
-            self.assertIn("GOAL mode active", rendered)
+            self.assertIn("NORMAL mode active", rendered)
             self.assertIn("Session settings", rendered)
-            self.assertIn("mode       = goal", rendered)
+            self.assertIn("mode       = normal", rendered)
             self.assertNotIn("API_KEY", rendered)
 
     def test_doctor_record_command_persists_benchmark_history(self):

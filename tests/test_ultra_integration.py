@@ -204,6 +204,21 @@ class HtmlGameProvider(PhaseProvider):
 
     def call(self, conversation, tools, system, on_text=None, on_thought=None):
         phase = self._phase(system)
+        # Recursive single-artifact runs reserve the final path for the parent
+        # FinalAssembler. The fixture must therefore perform its write during
+        # the final assembler's integrate phase, not only in a leaf coder.
+        if phase == "integrate" and "FINAL ASSEMBLER PHASE" in system and self.calls == 0:
+            self.calls += 1
+            return AssistantTurn(
+                tool_calls=[
+                    ToolCall(
+                        "assemble-html",
+                        "write_file",
+                        {"path": "index.html", "content": self.html},
+                    )
+                ],
+                usage=Usage(1, 0, 1),
+            )
         if phase == "master_plan":
             self.calls += 1
             payload = {
@@ -652,7 +667,7 @@ class UltraIntegrationTests(unittest.TestCase):
             )
         )
         self.assertEqual(provider.reasoning_effort, "off")
-        self.assertEqual(provider.max_output_tokens, 2048)
+        self.assertEqual(provider.max_output_tokens, 4096)
         self.assertTrue(provider.force_json)
 
     def test_ultra_goal_spec_runs_harness_workspace_inspection_before_provider(self):
@@ -759,9 +774,17 @@ class UltraIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(calls[0].name, "preview_html")
         self.assertFalse(response.payload["passed"])
-        self.assertIn("Harness browser verification failed", response.payload["issues"][-1])
+        self.assertTrue(
+            any(
+                "Harness browser verification failed" in issue
+                for issue in response.payload["issues"]
+            )
+        )
         self.assertIn("THREE is not defined", response.payload["findings"])
-        self.assertEqual(response.payload["test_results"][-1]["name"], "harness_html_preview")
+        self.assertEqual(
+            response.payload["test_results"][-1]["name"],
+            "harness_html_browser_and_quality_gate",
+        )
 
     def test_ultra_drops_verification_mechanics_questions_but_keeps_product_decisions(self):
         questions = UltraOrchestrator._validated_questions(
@@ -860,6 +883,37 @@ class UltraIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["modules"][-1]["title"], "Browser QA and Visual Refinement Gate")
         self.assertIn("Browser QA gate added", " ".join(actions))
 
+    def test_ultra_single_file_goal_rewrites_split_module_paths_to_index(self):
+        payload, actions = UltraOrchestrator._normalize_typed_payload(
+            "master_plan",
+            {
+                "summary": "Build split game",
+                "modules": [
+                    {
+                        "id": "M001",
+                        "title": "Game",
+                        "objective": "Implement game logic",
+                        "acceptance_criteria": ["Game runs"],
+                        "verification": ["Open browser"],
+                        "depends_on": [],
+                        "write_paths": ["index.html", "js/game.js"],
+                    }
+                ],
+            },
+            {
+                "goal_spec": {
+                    "objective": "Build one self-contained single-file index.html Three.js game using the jsDelivr CDN",
+                    "constraints": ["No separate JavaScript or CSS files"],
+                },
+                "architecture": {},
+            },
+        )
+
+        self.assertEqual(payload["modules"][0]["write_paths"], ["index.html"])
+        self.assertTrue(any("All implementation remains inside index.html" in item for item in payload["modules"][0]["acceptance_criteria"]))
+        self.assertTrue(any("only external runtime dependency" in item for item in payload["modules"][0]["acceptance_criteria"]))
+        self.assertIn("single index.html", " ".join(actions))
+
     def test_ultra_finds_browser_qa_requirement_outside_terse_objective(self):
         payload, _ = UltraOrchestrator._normalize_typed_payload(
             "master_plan",
@@ -883,7 +937,8 @@ class UltraIntegrationTests(unittest.TestCase):
             {"contract": {"id": "M001", "title": "Environment Generation & Visual Effects"}},
         )
         child = payload["children"][0]
-        self.assertEqual(child["id"], "M001_Refinement")
+        self.assertEqual(child["id"], "M001.1")
+        self.assertTrue(any("namespaced" in action for action in actions))
         self.assertIn("Environment Generation & Visual Effects", child["title"])
         self.assertIn("Improve canyon depth", child["objective"])
         self.assertTrue(child["acceptance_criteria"])
@@ -943,6 +998,27 @@ class UltraIntegrationTests(unittest.TestCase):
                     "reason": "Clarify implementation detail.",
                     "options": [],
                 }
+            ]
+        )
+        self.assertEqual(questions, ())
+
+    def test_ultra_autoresolves_reversible_optional_preferences(self):
+        questions = UltraOrchestrator._validated_questions(
+            [
+                {
+                    "id": "touch",
+                    "header": "Touch Input Method",
+                    "question": "Should mobile controls use buttons, swipes, or both?",
+                    "reason": "This changes UI layout and implementation complexity.",
+                    "options": [{"label": "Both"}, {"label": "Buttons"}],
+                },
+                {
+                    "id": "audio",
+                    "header": "Optional Audio",
+                    "question": "Should the game include procedural sound effects?",
+                    "reason": "Audio is optional polish and can use a safe default.",
+                    "options": [{"label": "Include"}, {"label": "Omit"}],
+                },
             ]
         )
         self.assertEqual(questions, ())
@@ -1095,7 +1171,7 @@ class UltraIntegrationTests(unittest.TestCase):
                     runtime.close()
                 store.close()
 
-    def test_ultra_accepts_rich_single_file_3d_html_benchmark(self):
+    def test_ultra_rejects_code_rich_but_nonfunctional_3d_html_benchmark(self):
         rich_html = """
 <!doctype html><html><head><title>Neon Rift Arena</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{margin:0;background:radial-gradient(circle,#102,#001);overflow:hidden}.hud{position:fixed;color:white;filter:drop-shadow(0 0 8px cyan)}</style></head>
@@ -1145,17 +1221,21 @@ animate();
                     runtime = self._runtime(workspace, store)
                     runtime.start_ultra("Build a production-quality single-file 3D HTML game")
                     runtime.approve_ultra()
-                    result = runtime.ultra_session.future.result(timeout=10)
+                    # Real browser startup can exceed ten seconds on a busy Windows host.
+                    # This test asserts fail-closed quality behavior, not browser cold-start
+                    # latency, so use the same bounded allowance as the weak-HTML case.
+                    result = runtime.ultra_session.future.result(timeout=45)
 
                 run = runtime.active_ultra_run()
-                self.assertTrue(result.successful)
-                self.assertEqual(store.get_ultra_run(run.id).status, UltraRunStatus.COMPLETED)
+                self.assertFalse(result.successful)
+                self.assertEqual(store.get_ultra_run(run.id).status, UltraRunStatus.REVISION_REQUIRED)
                 html_benchmarks = store.list_benchmark_results(
                     suite_name="weak-model-html",
                     scenario_name="threejs-single-file",
                 )
-                self.assertEqual(html_benchmarks[0]["result"], "passed")
-                self.assertGreaterEqual(html_benchmarks[0]["scores"]["overall"], 0.8)
+                self.assertEqual(html_benchmarks[0]["result"], "failed")
+                self.assertLess(html_benchmarks[0]["scores"]["overall"], 0.8)
+                self.assertIn("Browser/runtime preview evidence failed", html_benchmarks[0]["blocker"])
             finally:
                 if runtime:
                     runtime.close()
@@ -1471,6 +1551,53 @@ animate();
                         accepted.goal_id,
                         GoalStatus.PAUSED,
                         reason="simulated restart",
+                    )
+                    first.close()
+                    first = None
+
+                    second = self._runtime(workspace, store)
+                    second.resume()
+                    result = second.ultra_session.future.result(timeout=10)
+
+                self.assertTrue(result.successful)
+                self.assertEqual(store.get_goal(accepted.goal_id).status, GoalStatus.COMPLETED)
+                self.assertEqual((workspace / "game.txt").read_text(), "ready\n")
+            finally:
+                if first:
+                    first.close()
+                if second:
+                    second.close()
+                store.close()
+
+    def test_recoverable_blocked_ultra_resumes_from_sqlite_checkpoint(self):
+        """A fixed harness/provider failure must not force foundation replay."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            first = second = None
+            try:
+                with mock.patch.object(
+                    ModelDescriptor,
+                    "create_provider",
+                    lambda _self: PhaseProvider(),
+                ):
+                    first = self._runtime(workspace, store)
+                    first.start_ultra("Build the demo")
+                    orchestrator = first.ultra_session.orchestrator
+                    adapter = first.ultra_session.adapter
+                    orchestrator.approve(orchestrator.master_plan.fingerprint)
+                    accepted = adapter.approve_master(orchestrator.master_plan)
+                    run_id = adapter.run_id
+                    store.update_ultra_run(
+                        run_id,
+                        status=UltraRunStatus.RECOVERING,
+                        phase=UltraPhase.MODULE_WAVES,
+                    )
+                    store.transition_goal(
+                        accepted.goal_id,
+                        GoalStatus.BLOCKED,
+                        reason="simulated recoverable provider/parser failure",
                     )
                     first.close()
                     first = None

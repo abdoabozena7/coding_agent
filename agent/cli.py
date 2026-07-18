@@ -452,7 +452,7 @@ def choose_interaction_mode(
     input_func: Callable[[str], str] = input,
     output: TextIO = sys.stdout,
     rich: bool | None = None,
-    initial: str | InteractionMode = InteractionMode.CHAT,
+    initial: str | InteractionMode = InteractionMode.NORMAL,
     step_label: str = "Setup 4 of 4",
     no_color: bool = False,
     reduced_motion: bool = False,
@@ -467,31 +467,14 @@ def choose_interaction_mode(
         selected = select_choice(
             (
                 ChoiceItem(
-                    key=InteractionMode.CHAT.value,
-                    label="Chat",
-                    description="Ordinary coding-agent chat. Enable a structured workflow only when useful.",
-                    meta="Current" if selected_mode is InteractionMode.CHAT else "Default",
-                    value=InteractionMode.CHAT,
-                ),
-                ChoiceItem(
-                    key=InteractionMode.PLAN.value,
-                    label="Plan",
+                    key=InteractionMode.NORMAL.value,
+                    label="Normal",
                     description=(
-                        "Review and approve the plan, then run each work slice yourself. "
-                        "Best for sensitive work."
+                        "Intent intake, one durable goal, planning, review, and automatic execution. "
+                        "Complex requests are promoted to Ultra automatically."
                     ),
-                    meta="Current" if selected_mode is InteractionMode.PLAN else "Manual",
-                    value=InteractionMode.PLAN,
-                ),
-                ChoiceItem(
-                    key=InteractionMode.GOAL.value,
-                    label="Goal",
-                    description=(
-                        "Approve the plan once, then continue automatically to clear checkpoints. "
-                        "Recommended for most work."
-                    ),
-                    meta="Current" if selected_mode is InteractionMode.GOAL else "Recommended",
-                    value=InteractionMode.GOAL,
+                    meta="Current" if selected_mode is InteractionMode.NORMAL else "Recommended",
+                    value=InteractionMode.NORMAL,
                 ),
                 ChoiceItem(
                     key=InteractionMode.ULTRA.value,
@@ -519,17 +502,15 @@ def choose_interaction_mode(
             raise PickerBack()
         return selected.value
     print("Mode", file=output)
-    print("  1. chat   ordinary coding-agent conversation (default)", file=output)
-    print("  2. plan   approve, then run manually", file=output)
-    print("  3. goal   approve, then continue automatically", file=output)
-    print("  4. ultra  Project Brain, nested nodes, review/test/fix/integration", file=output)
+    print("  1. normal  intent intake, durable goal, plan, review, and automatic execution", file=output)
+    print("  2. ultra   recursive specialists, component packages, and deeper quality gates", file=output)
     while True:
         choice = input_func("mode> ").strip().lower()
-        aliases = {"1": "chat", "2": "plan", "3": "goal", "4": "ultra"}
+        aliases = {"1": "normal", "2": "ultra"}
         choice = aliases.get(choice, choice)
-        if choice in {"chat", "plan", "goal", "ultra"}:
+        if choice in {"normal", "ultra", "chat", "plan", "goal"}:
             return InteractionMode.parse(choice)
-        print("Choose chat, plan, goal, or ultra.", file=output)
+        print("Choose normal or ultra.", file=output)
 
 
 def _descriptor_for_explicit_model(
@@ -582,8 +563,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", help="Override the selected provider's model for this run.")
     parser.add_argument(
         "--mode",
-        choices=(InteractionMode.CHAT.value, InteractionMode.PLAN.value, InteractionMode.GOAL.value, InteractionMode.ULTRA.value),
-        help="Interaction mode: chat (default), plan, goal, or full Project-Brain ULTRA execution.",
+        type=lambda value: InteractionMode.parse(value).value,
+        choices=(InteractionMode.NORMAL.value, InteractionMode.ULTRA.value),
+        help="Run mode: normal (default) or recursive-specialist ultra. Legacy chat/plan/goal map to normal.",
     )
     parser.add_argument(
         "--permissions",
@@ -742,14 +724,6 @@ def _set_interaction_mode(
     if not detailed:
         console.write(f"Mode switched to {selected.value.upper()}.")
         return
-    if selected == InteractionMode.PLAN:
-        console.write(
-            "PLAN mode active: create/review the plan, approve it, then use /run or /auto explicitly."
-        )
-        return
-    if selected == InteractionMode.CHAT:
-        console.write("CHAT mode active: discuss, inspect, and edit normally; structured modes are optional.")
-        return
     if selected == InteractionMode.ULTRA:
         console.write(
             "ULTRA mode active: GoalSpec → architecture → one master approval → "
@@ -763,8 +737,8 @@ def _set_interaction_mode(
         else ""
     )
     console.write(
-        "GOAL mode active: plan approval remains mandatory; after your next /approve, "
-        f"the agent continues automatically.{suffix}"
+        "NORMAL mode active: every request passes through Intent Architect, then uses a durable "
+        f"goal, plan, review, and automatic execution. Complex work auto-promotes to ULTRA.{suffix}"
     )
 
 
@@ -996,9 +970,12 @@ def _current_ultra_run(runtime: AgentRuntime) -> object | None:
 
 
 def _show_questions(runtime: AgentRuntime, console: ConsoleUI) -> None:
+    intake_questions = runtime.intake_questions()
     goal = runtime.active_goal()
     questions = (
-        runtime.ultra_questions()
+        intake_questions
+        if intake_questions
+        else runtime.ultra_questions()
         if goal is not None and goal.metadata.get("ultra_run_id")
         else runtime.plan_questions()
     )
@@ -1013,16 +990,17 @@ def _show_questions(runtime: AgentRuntime, console: ConsoleUI) -> None:
         mark = "[x]" if answer else "[ ]"
         lines.append(f"  {mark} {question_id} · {item.get('header', '')}")
         lines.append(f"      {item.get('question', '')}")
-        for option in item.get("options", ()):
+        for index, option in enumerate(item.get("options", ()), 1):
             if not isinstance(option, dict):
                 continue
             recommended = " (recommended)" if option.get("recommended") else ""
             lines.append(
-                f"      - {option.get('label', '')}{recommended}: {option.get('description', '')}"
+                f"      {index}. {option.get('label', '')}{recommended}: {option.get('description', '')}"
             )
+        lines.append("      4. Write your own answer")
         if answer:
             lines.append(f"      answer: {answer}")
-    lines.append("  Use /answer QUESTION_ID VALUE")
+    lines.append("  Reply normally to answer the first pending question, or use /answer QUESTION_ID 1|2|3|YOUR_TEXT")
     console.write("\n".join(lines))
 
 
@@ -1579,7 +1557,7 @@ def execute_command(
                 )
             else:
                 console.write(
-                    f"mode = {preferences.mode.value}; choose /mode chat, /mode plan, /mode goal, or /mode ultra"
+                    f"mode = {preferences.mode.value}; choose /mode normal or /mode ultra"
                 )
         else:
             _set_interaction_mode(runtime, console, preferences, selected)
@@ -1722,23 +1700,20 @@ def execute_command(
         _run_auto(runtime, console)
         return True
 
-    if preferences.mode == InteractionMode.CHAT and command.kind == CommandKind.TEXT:
-        text = command.args.get("text", "").strip()
-        result = runtime.chat(text) if text else None
-    elif preferences.mode == InteractionMode.ULTRA and command.kind in {
+    if command.kind in {
         CommandKind.GOAL,
         CommandKind.TEXT,
     }:
         text = command.args.get("objective", command.args.get("text", "")).strip()
         if not text:
             return True
-        if runtime.active_goal() is None:
-            result = runtime.start_ultra(text)
-        else:
+        active = runtime.active_goal()
+        active_metadata = getattr(active, "metadata", {}) if active is not None else {}
+        if active is not None and active_metadata.get("ultra_run_id"):
             pending = [
                 item
                 for item in runtime.ultra_questions()
-                if not runtime.active_goal().metadata.get("plan_answers", {}).get(
+                if not active_metadata.get("plan_answers", {}).get(
                     str(item.get("id"))
                 )
             ]
@@ -1747,6 +1722,8 @@ def execute_command(
                 if len(pending) == 1
                 else runtime.add_ultra_guidance(text)
             )
+        else:
+            result = runtime.apply_command(command)
     elif preferences.mode == InteractionMode.ULTRA and command.kind == CommandKind.RUN:
         console.write("ULTRA module waves run in the background; use /agents, /tree, or /pause.")
         result = None
@@ -1762,13 +1739,25 @@ def execute_command(
         # Persisted plans are presentation-ready immediately.  A UI preference
         # change is deliberately not part of this approval transition.
         console.write(render_plan(runtime.dashboard()))
+    try:
+        actual_mode = InteractionMode.parse(
+            runtime.store.get_workflow_session(runtime.session_id)["session_mode"]
+        )
+        if actual_mode is not preferences.mode:
+            preferences.mode = actual_mode
+            console.set_mode(actual_mode)
+    except (StateStoreError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+    pending_intake = runtime.intake_questions()
+    if isinstance(pending_intake, (tuple, list)) and pending_intake:
+        _show_questions(runtime, console)
     _show_runtime_state(runtime, console)
     goal_mode_triggers = {CommandKind.APPROVE, CommandKind.RESUME, CommandKind.TEXT}
     nonempty_guidance = command.kind != CommandKind.TEXT or bool(command.args.get("text", "").strip())
     if (
         command.kind in goal_mode_triggers
         and nonempty_guidance
-        and preferences.mode == InteractionMode.GOAL
+        and preferences.mode == InteractionMode.NORMAL
     ):
         goal = runtime.active_goal()
         if goal is not None and goal.status == GoalStatus.RUNNING:
@@ -1777,7 +1766,7 @@ def execute_command(
                 CommandKind.RESUME: "goal resumed",
                 CommandKind.TEXT: "guidance received",
             }[command.kind]
-            console.write(f"GOAL mode: {reason}; continuing automatically.")
+            console.write(f"NORMAL mode: {reason}; continuing automatically.")
             _run_auto(runtime, console)
     return True
 
@@ -1899,7 +1888,7 @@ def _interactive_setup(
     workspace: Path | None = None
     descriptor: ModelDescriptor | None = None
     requested_access: AccessLevel | None = None
-    selected_mode: InteractionMode | None = InteractionMode.CHAT
+    selected_mode: InteractionMode | None = InteractionMode.NORMAL
 
     if args.workspace:
         workspace = _resolve_workspace(

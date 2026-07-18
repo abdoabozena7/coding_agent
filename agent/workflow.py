@@ -22,10 +22,26 @@ from .models import InvalidTransitionError
 
 
 class SessionMode(str, Enum):
-    CHAT = "chat"
-    PLAN = "plan"
-    GOAL = "goal"
+    NORMAL = "normal"
     ULTRA = "ultra"
+    CHAT = "normal"
+    PLAN = "normal"
+    GOAL = "normal"
+
+    @classmethod
+    def parse(cls, value: str | "SessionMode") -> "SessionMode":
+        if isinstance(value, cls):
+            return value
+        normalized = str(getattr(value, "value", value)).strip().casefold()
+        normalized = {
+            "chat": "normal", "plan": "normal", "goal": "normal",
+            "manual": "normal", "default": "normal", "auto": "normal",
+            "agent": "normal", "deep": "ultra", "max": "ultra",
+        }.get(normalized, normalized)
+        try:
+            return cls(normalized)
+        except ValueError as exc:
+            raise ValueError("session mode must be normal or ultra") from exc
 
 
 class PlanState(str, Enum):

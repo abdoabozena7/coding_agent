@@ -13,6 +13,45 @@ from typing import Any, Mapping
 
 
 @dataclass(frozen=True, slots=True)
+class HypothesisV1:
+    claim: str
+    evidence: tuple[str, ...]
+    falsification_checks: tuple[str, ...]
+    confidence: float = 0.5
+    version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class ArchitectureCandidateV1:
+    index: int
+    summary: str
+    architecture: Mapping[str, Any]
+    strengths: tuple[str, ...] = ()
+    risks: tuple[str, ...] = ()
+    version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionRecordV1:
+    decision: str
+    selected_candidate: int
+    evidence: tuple[str, ...]
+    rejected_alternatives: tuple[str, ...]
+    confidence: float
+    version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class CriticVerdictV1:
+    candidate_index: int
+    verdict: str
+    issues: tuple[str, ...]
+    evidence: tuple[str, ...]
+    score: float
+    version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
 class ReasoningScaffoldV1:
     role: str
     phase: str
@@ -268,6 +307,89 @@ def _reasoning_graph_findings(
             notes.append("reasoning graph edge uses an unsupported relation")
             break
     return not weak, tuple(dict.fromkeys(weak)), tuple(dict.fromkeys(notes))
+
+
+def repair_reasoning_artifact_graph(artifact: Any) -> tuple[Any, tuple[str, ...]]:
+    """Repair graph syntax from small models without fabricating evidence.
+
+    Claims, evidence, objections, and alternatives remain model-authored. The
+    harness only assigns stable node ids/statuses and replaces invalid edge
+    references with one relationship derived from those existing statements.
+    """
+
+    if not isinstance(artifact, Mapping):
+        return artifact, ()
+    result = dict(artifact)
+    graph = result.get("reasoning_graph")
+    graph = dict(graph) if isinstance(graph, Mapping) else {}
+    raw_nodes = tuple(item for item in _items(graph.get("nodes")) if isinstance(item, Mapping))
+    actions: list[str] = []
+    nodes: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_nodes, 1):
+        node = dict(item)
+        node["id"] = f"n{index}"
+        node.setdefault("type", "decision" if index == 1 else "option")
+        node.setdefault("summary", str(result.get("claim") or f"external option {index}"))
+        node.setdefault("evidence_refs", [])
+        nodes.append(node)
+    if not nodes:
+        nodes.append(
+            {
+                "id": "n1",
+                "type": "decision",
+                "summary": str(result.get("claim") or "external claim"),
+                "status": "chosen",
+                "evidence_refs": list(_items(result.get("supporting_evidence"))),
+            }
+        )
+        actions.append("reasoning graph chosen node derived from existing claim")
+    if len(nodes) == 1:
+        alternatives = _items(result.get("rejected_alternatives")) or _items(
+            result.get("counterarguments")
+        )
+        if alternatives:
+            nodes.append(
+                {
+                    "id": "n2",
+                    "type": "option",
+                    "summary": str(alternatives[0]),
+                    "status": "rejected",
+                    "evidence_refs": [],
+                }
+            )
+            actions.append("reasoning graph alternative node derived from existing alternative")
+    statuses = {str(node.get("status") or "").casefold() for node in nodes}
+    if "chosen" not in statuses and "verified" not in statuses:
+        nodes[0]["status"] = "chosen"
+        actions.append("reasoning graph primary node status normalized to chosen")
+    if len(nodes) >= 2 and "rejected" not in statuses:
+        nodes[1]["status"] = "rejected"
+        actions.append("reasoning graph alternative node status normalized to rejected")
+    valid_ids = {node["id"] for node in nodes}
+    raw_edges = tuple(item for item in _items(graph.get("edges")) if isinstance(item, Mapping))
+    edges = [
+        dict(item)
+        for item in raw_edges
+        if str(item.get("from") or "") in valid_ids
+        and str(item.get("to") or "") in valid_ids
+        and str(item.get("relation") or "").casefold()
+        in {"supports", "depends_on", "contradicts", "verifies", "rejects"}
+    ]
+    if len(nodes) >= 2 and not edges:
+        chosen = next(
+            (node for node in nodes if str(node.get("status") or "").casefold() in {"chosen", "verified"}),
+            nodes[0],
+        )
+        rejected = next(
+            (node for node in nodes if str(node.get("status") or "").casefold() == "rejected"),
+            nodes[1],
+        )
+        edges = [{"from": chosen["id"], "to": rejected["id"], "relation": "rejects"}]
+        actions.append("invalid reasoning graph edge references replaced with stable ids")
+    graph["nodes"] = nodes
+    graph["edges"] = edges
+    result["reasoning_graph"] = graph
+    return result, tuple(actions)
 
 
 def evaluate_reasoning_artifact(

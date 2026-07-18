@@ -61,7 +61,7 @@ CODEX_SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
 )
 
 SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
-    ("/mode", "switch CHAT / PLAN / GOAL / ULTRA mode"),
+    ("/mode", "switch NORMAL / ULTRA mode"),
     ("/model", "choose a model and reasoning effort"),
     ("/permissions", "switch NORMAL / FULL access"),
     ("/tree", "show the hierarchical project tree"),
@@ -70,8 +70,8 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/trace", "inspect redacted prompts and run trace"),
     ("/thinking", "expand redacted thoughts captured in this session"),
     ("/insights", "show durable findings and decisions"),
-    ("/questions", "show pending plan questions"),
-    ("/answer", "answer a durable plan question"),
+    ("/questions", "show pending intake or plan questions"),
+    ("/answer", "answer with 1/2/3 or free-form text"),
     ("/metrics", "show quality, usage, and timing metrics"),
     ("/doctor", "audit weak-model agent readiness; add --live/--record for probes/history"),
     ("/settings", "inspect or change session settings"),
@@ -259,9 +259,8 @@ if Completer is not None:
                 yield from self._values(
                     current,
                     (
-                        ("plan", "approve, then run work manually"),
-                        ("goal", "approve once, then continue automatically"),
-                        ("ultra", "nested agents with review/test/fix loops"),
+                        ("normal", "shared intake, durable goal, planning, review, and automatic execution"),
+                        ("ultra", "recursive specialists with component and quality gates"),
                     ),
                 )
             elif tokens[0] in {"/permissions", "/permission", "/access"} and len(tokens) <= 2:
@@ -273,7 +272,7 @@ if Completer is not None:
                     ),
                 )
             elif tokens[0] == "/settings" and len(tokens) >= 2 and tokens[1] == "mode" and len(tokens) <= 3:
-                yield from self._values(current, ("plan", "goal", "ultra"))
+                yield from self._values(current, ("normal", "ultra"))
             elif tokens[0] == "/settings" and len(tokens) >= 2 and tokens[1] == "color" and len(tokens) <= 3:
                 yield from self._values(current, ("auto", "on", "off"))
             elif tokens[0] == "/settings" and (
@@ -336,7 +335,7 @@ class DashboardView:
     model: str = "-"
     # Standalone view construction retains the legacy PLAN rendering default;
     # live sessions explicitly inject the chat-first preference.
-    interaction_mode: str = InteractionMode.PLAN.value
+    interaction_mode: str = InteractionMode.NORMAL.value
     workspace: str = "."
     waiting_question: str = ""
     activity: list[str] = field(default_factory=list)
@@ -415,9 +414,8 @@ def render_slash_menu() -> str:
         (
             "",
             "More GA3BAD commands remain available directly, including:",
-            "  /mode plan   plan, review, and approve before manual execution",
-            "  /mode goal   plan and approve first, then continue automatically",
-            "  /mode ultra  deep project brain, hierarchical nodes, review/test/fix loops",
+            "  /mode normal shared intake, durable goal, planning, review, and automatic execution",
+            "  /mode ultra  recursive specialists, component packages, and deeper quality gates",
             "  /settings    inspect or change session settings",
             "  /trace       inspect redacted prompts and run trace",
             "",
@@ -762,9 +760,8 @@ HELP_TEXT = """\
 Slash palette and modes
   /                           open the slash-command palette
   /mode                      show the current interaction mode
-  /mode plan                 plan/approve, then wait for manual /run
-  /mode goal                 plan/approve, then continue automatically
-  /mode ultra                Project Brain + hierarchical agents + full quality gates
+  /mode normal               intent intake + durable goal + planning/review/automatic execution
+  /mode ultra                recursive specialists + Project Brain + full quality gates
   /settings                  show safe session settings (never secrets)
   /settings NAME VALUE       change mode, color, or a runtime limit this session
   /model                     reopen the tool-capable model picker at a safe checkpoint
@@ -780,8 +777,8 @@ Goal and plan
   /reject FEEDBACK           reject and regenerate the draft
   /replan FEEDBACK           ask for a revised plan
   /plan                      show the dashboard/checklist
-  /questions                 show non-discoverable decisions awaiting input
-  /answer ID VALUE           save a durable answer bound into the plan fingerprint
+  /questions                 show non-discoverable intake/planning decisions
+  /answer ID 1|2|3|TEXT      select a suggestion or save a free-form answer
 
 Editable checklist
   /add TEXT :: CRITERIA      add a user-approved task
@@ -1027,7 +1024,7 @@ class ConsoleUI:
         stream: TextIO | None = None,
         color: bool | None = None,
         input_func: Any = input,
-        interaction_mode: str | InteractionMode = InteractionMode.CHAT,
+        interaction_mode: str | InteractionMode = InteractionMode.NORMAL,
         plain: bool = False,
         reduced_motion: bool = False,
     ) -> None:

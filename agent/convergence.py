@@ -70,6 +70,8 @@ class QualityDimensionV1:
     description: str
     weight: float = 1.0
     hard_gate: bool = False
+    # Individual rubrics may opt into the stricter Ultra critical threshold.
+    # Keeping the primitive neutral preserves explicitly-authored lower targets.
     minimum_score: float = 0.8
     required_evidence: tuple[str, ...] = ()
     evaluation_method: str = "evidence_review"
@@ -103,9 +105,13 @@ class QualityTargetV1:
     artifact_ids: tuple[str, ...]
     rubric: QualityRubricV1
     hard_gates: tuple[str, ...] = ()
-    minimum_overall_score: float = 0.8
+    # Product modes set 0.95 explicitly; the reusable contract remains
+    # backwards-compatible for callers that author their own target.
+    minimum_overall_score: float = 0.9
     independent_evaluations: int = 1
     stable_successful_evaluations: int = 1
+    plateau_window: int = 3
+    plateau_delta: float = 0.02
     allowed_automatic_refinements: tuple[str, ...] = ()
     user_preferences: Mapping[str, Any] = field(default_factory=dict)
     explicit_feedback: tuple[str, ...] = ()
@@ -120,6 +126,8 @@ class QualityTargetV1:
             raise DomainError("overall threshold must be between 0 and 1")
         if self.independent_evaluations < 1 or self.stable_successful_evaluations < 1:
             raise DomainError("evaluation counts must be positive")
+        if self.plateau_window < 2 or not 0 <= self.plateau_delta <= 1:
+            raise DomainError("plateau window/delta is invalid")
         object.__setattr__(self, "user_preferences", dict(self.user_preferences))
         object.__setattr__(self, "verification_environment", dict(self.verification_environment))
 
@@ -242,7 +250,18 @@ class QualityConvergenceEngine:
             raise DomainError("evaluation does not cover every target artifact")
         self.evaluations.append(evaluation)
         if not evaluation_passes(self.target, evaluation):
-            self.state = QualityConvergenceState.BELOW_TARGET
+            recent = self.evaluations[-self.target.plateau_window :]
+            plateau = (
+                len(recent) >= self.target.plateau_window
+                and max(item.overall_score for item in recent)
+                - min(item.overall_score for item in recent)
+                < self.target.plateau_delta
+            )
+            self.state = (
+                QualityConvergenceState.BLOCKED
+                if plateau
+                else QualityConvergenceState.BELOW_TARGET
+            )
             return self.state
         fresh = [item for item in reversed(self.evaluations) if item.mutation_sequence == self.latest_mutation_sequence]
         required = max(self.target.independent_evaluations, self.target.stable_successful_evaluations)

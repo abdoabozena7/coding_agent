@@ -70,6 +70,40 @@ class ChatExecutionTests(unittest.TestCase):
                 self.assertIn("verification passed", result.message)
                 self.assertNotIn("Open it yourself", result.message)
 
+    def test_advertised_native_tool_json_text_is_normalized_and_executed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.runtime(directory, [
+                '{"name":"write_file","arguments":{"path":"hello.txt","content":"hello"}}',
+                "Done.",
+            ]) as (runtime, store, provider):
+                provider.capability_profile = type("Capabilities", (), {"tool_call_support": True})()
+                result = runtime.chat("create hello.txt")
+
+                self.assertEqual(Path(directory, "hello.txt").read_text(encoding="utf-8"), "hello")
+                self.assertIn("write_file", result.message)
+                self.assertEqual(len(provider.calls), 2)
+                self.assertEqual(store.list_session_actions(runtime.session_id)[0]["status"], "completed")
+
+    def test_native_write_repairs_double_escaped_document_layout(self):
+        escaped_html = (
+            '<!DOCTYPE html>\\n<html>\\n<body>\\n<script>'
+            'const label = "line\\nvalue";'
+            '</script>\\n</body>\\n</html>'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.runtime(directory, [
+                {"tool_calls": [{"id": "write", "name": "write_file", "args": {
+                    "path": "index.html", "content": escaped_html,
+                }}]},
+                "Done.",
+            ]) as (runtime, _store, _provider):
+                runtime.chat("create index.html")
+
+                written = Path(directory, "index.html").read_text(encoding="utf-8")
+                self.assertIn("<!DOCTYPE html>\n<html>\n<body>", written)
+                self.assertIn('"line\\nvalue"', written)
+                self.assertNotIn(r"<!DOCTYPE html>\n<html>", written)
+
     def test_failed_write_is_not_mutation_or_artifact_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.runtime(directory, [

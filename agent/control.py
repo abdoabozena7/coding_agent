@@ -124,7 +124,7 @@ REQUEST_PLAN_INPUT = _fn(
                         "question": {"type": "string", "minLength": 3, "maxLength": 1_000},
                         "options": {
                             "type": "array",
-                            "minItems": 2,
+                            "minItems": 3,
                             "maxItems": 3,
                             "items": {
                                 "type": "object",

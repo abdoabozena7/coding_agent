@@ -142,7 +142,7 @@ class UltraStoreTests(unittest.TestCase):
         self.assertIs(AccessLevel, SandboxAccessLevel)
         connection = sqlite3.connect(self.store.path)
         try:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
             tables = {
                 row[0]
                 for row in connection.execute(
@@ -1176,6 +1176,52 @@ class UltraStoreTests(unittest.TestCase):
             topic=f"consensus-decision:{workflow.consensus_round_id}",
         )
         self.assertEqual(decision_inbox[0]["message_type"], SwarmMessageType.DECISION.value)
+
+    def test_swarm_tie_is_sent_to_independent_judge_and_resolved(self) -> None:
+        bus = SwarmBus(self.store)
+        judge_requests: list[dict[str, object]] = []
+        bus.subscribe(self.run.id, judge_requests.append, recipient_agent_id="independent-judge")
+        coordinator = SwarmCoordinator(self.store, bus)
+        workflow = coordinator.propose(
+            ultra_run_id=self.run.id,
+            proposer_agent_id="planner-1",
+            topic="Release candidate",
+            proposal={"artifact": "index.html"},
+            voters=("reviewer-1", "reviewer-2"),
+            quorum=2,
+            leader_agent_id="planner-1",
+        )
+        coordinator.submit_vote(
+            round_id=workflow.consensus_round_id,
+            voter_agent_id="reviewer-1",
+            verdict="accept",
+            confidence=0.9,
+        )
+        tied = coordinator.submit_vote(
+            round_id=workflow.consensus_round_id,
+            voter_agent_id="reviewer-2",
+            verdict="reject",
+            confidence=0.9,
+        )
+
+        self.assertEqual(tied["status"], ConsensusStatus.TIED.value)
+        self.assertEqual(judge_requests[0]["payload"]["round_id"], workflow.consensus_round_id)
+        resolved = coordinator.submit_judge_verdict(
+            round_id=workflow.consensus_round_id,
+            judge_agent_id="independent-judge",
+            verdict="reject",
+            confidence=0.95,
+            rationale="Critical visual evidence is missing.",
+            evidence={"visual": "failed"},
+        )
+        self.assertEqual(resolved["status"], ConsensusStatus.REJECTED.value)
+        self.assertEqual(resolved["decision"]["resolved_from"], "tie")
+        results = self.store.list_swarm_messages(
+            self.run.id,
+            recipient_agent_id="swarm",
+            topic=f"consensus-result:{workflow.consensus_round_id}",
+        )
+        self.assertEqual(results[0]["message_type"], SwarmMessageType.CONSENSUS_RESULT.value)
 
     def test_artifacts_preserve_pre_and_post_write_hashes(self) -> None:
         module = self.store.sync_master_modules(self.run.id)[0]

@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from agent.convergence import (
 )
 from agent.evaluation import (
     RetrievalBenchmarkCase,
+    _screenshot_quality_metrics,
     record_repository_retrieval_benchmark,
     record_single_file_3d_html_benchmark,
     run_repository_retrieval_benchmark,
@@ -22,7 +24,7 @@ from agent.local_provider import (ModelCapabilityProfile, OllamaRequestCompiler,
     ProviderRequestError, extract_first_json_object, normalize_action_proposal)
 from agent.providers.ollama_provider import OllamaProvider
 from agent.reasoning import evaluate_reasoning_artifact, reasoning_debate_protocol_for
-from agent.repository_index import HashingEmbeddingProvider, RepositoryIndex
+from agent.repository_index import HashingEmbeddingProvider, OllamaEmbeddingProvider, RepositoryIndex
 from agent.run_context import RunContextV1
 from agent.store import StateStore
 from agent.workflow import SessionMode
@@ -369,6 +371,42 @@ def enqueue_retry(job):
             hits = index.embedding_search("retry queue worker", kinds=("py_function",))
             self.assertEqual(hits[0].name, "enqueue_retry")
 
+    def test_repository_index_chunks_and_bounds_large_source_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            content = "\n".join(f"value_{index} = {index}" for index in range(600))
+            Path(root, "large.py").write_text(content, encoding="utf-8")
+            index = RepositoryIndex(root, embedding_provider=HashingEmbeddingProvider(dimensions=32))
+            entries = index.update("large.py")
+
+            file_entry = next(item for item in entries if item.kind == "file")
+            chunks = [item for item in entries if item.kind == "code_chunk"]
+            self.assertLessEqual(len(file_entry.text), index._MAX_ENTRY_CHARS + 64)
+            self.assertGreaterEqual(len(chunks), 4)
+            self.assertEqual(chunks[0].start, 1)
+            self.assertGreater(chunks[1].start, chunks[0].start)
+            self.assertEqual(index.hybrid_search("value_570", kinds=("code_chunk",))[0].path, "large.py")
+
+    def test_ollama_embedding_provider_batches_real_semantic_vectors(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"embeddings":[[1,0,0],[0,1,0]]}'
+
+        provider = OllamaEmbeddingProvider("nomic-embed-text:latest")
+        with patch("agent.repository_index.urlopen", return_value=Response()) as opened:
+            vectors = provider.embed_many(("authentication", "rendering"))
+
+        self.assertEqual(vectors, ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)))
+        request = opened.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["input"], ["authentication", "rendering"])
+        self.assertEqual(provider.last_error, "")
+
     def test_repository_retrieval_benchmark_reports_accuracy_and_rank(self):
         code = '''
 import json
@@ -505,6 +543,18 @@ def enqueue_retry(job):
         self.assertLess(result.scores["overall"], 0.5)
         self.assertIn("3D/WebGL renderer", "; ".join(result.findings))
         self.assertIn("Gameplay", "; ".join(result.findings))
+
+    def test_screenshot_metrics_reject_blank_visual_evidence(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as root:
+            screenshot = Path(root, "blank.png")
+            Image.new("RGB", (1280, 720), (8, 8, 12)).save(screenshot)
+            metrics = _screenshot_quality_metrics({"screenshot_path": str(screenshot)})
+
+        self.assertEqual(metrics["screenshot_available"], 1.0)
+        self.assertLess(metrics["screenshot_composition_score"], 0.2)
+        self.assertGreater(metrics["screenshot_dominant_color_fraction"], 0.99)
 
     def test_single_file_3d_html_benchmark_scores_rich_game_candidate(self):
         rich = """

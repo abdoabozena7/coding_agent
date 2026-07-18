@@ -519,7 +519,9 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         self.assertEqual(session["state"]["run_id"], run_id)
         self.assertEqual(session["session_mode"], "ultra")
         transitions = [event for event in self.store.list_recent_events(after.id, limit=100) if event.event_type == "mode.transition"]
-        self.assertGreaterEqual(len(transitions), 5)
+        # Legacy chat/plan/goal aliases all normalize to one durable Normal
+        # mode, so only the final Normal -> Ultra transition is material.
+        self.assertGreaterEqual(len(transitions), 1)
 
     def test_short_visual_feedback_creates_delta_refinement_on_same_run_and_index(self):
         html_plan = plan_call()
@@ -797,6 +799,23 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         retried = runtime.reject_plan("Use one concise, directly verifiable task.")
         self.assertIsNotNone(retried)
         self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
+        provider.assert_exhausted()
+
+    def test_short_single_artifact_goal_recovers_from_prose_only_weak_planner(self):
+        runtime, provider = self.runtime(
+            [inspect_call(), "I will create the file after planning."]
+        )
+
+        plan = runtime.start_goal(
+            "Create counter.html with a visible counter and verify it in a browser."
+        )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.assertEqual(plan.expected_changes[0]["path"], "counter.html")
+        self.assertEqual(plan.proposed_by, "harness-weak-model-fallback")
+        events = self.store.list_recent_events(runtime.active_goal().id, limit=100)
+        self.assertTrue(any(event.event_type == "planning.harness_fallback" for event in events))
         provider.assert_exhausted()
 
     def test_planning_provider_exhaustion_pauses_instead_of_stranding_phase(self):

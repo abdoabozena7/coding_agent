@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Numeric Rock Coding-Agent Intro
+GA3BAD Birth Intro
 ================================
 
 A dependency-free, cross-platform terminal animation inspired by a small,
@@ -26,6 +26,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,75 @@ MOUTH_INNER = (60, 29, 22)
 TITLE_COLOR = (190, 151, 101)
 PROMPT_COLOR = (126, 101, 76)
 FLOOR_COLOR = (65, 47, 35)
+
+# Birth intro timing:
+# 1) a large brown "GA3BAD" word appears,
+# 2) the digits collapse and gather,
+# 3) they form the rock character,
+# 4) then the original loop keeps repeating forever.
+BIRTH_HOLD_FRAMES = 96
+BIRTH_MORPH_FRAMES = 46
+BIRTH_TOTAL_FRAMES = BIRTH_HOLD_FRAMES + BIRTH_MORPH_FRAMES
+
+TITLE_FONT_5X7 = {
+    # Bold 7x9 terminal font. The doubled strokes make GA3BAD much clearer
+    # than the earlier thin 5x7 version.
+    "G": (
+        "0111110",
+        "1100011",
+        "1100000",
+        "1100000",
+        "1101111",
+        "1100011",
+        "1100011",
+        "1100011",
+        "0111110",
+    ),
+    "A": (
+        "0011100",
+        "0110110",
+        "1100011",
+        "1100011",
+        "1111111",
+        "1100011",
+        "1100011",
+        "1100011",
+        "1100011",
+    ),
+    "3": (
+        "1111110",
+        "0000011",
+        "0000011",
+        "0000110",
+        "0011100",
+        "0000110",
+        "0000011",
+        "1100011",
+        "0111110",
+    ),
+    "B": (
+        "1111100",
+        "1100110",
+        "1100011",
+        "1100110",
+        "1111100",
+        "1100110",
+        "1100011",
+        "1100110",
+        "1111100",
+    ),
+    "D": (
+        "1111100",
+        "1100110",
+        "1100011",
+        "1100011",
+        "1100011",
+        "1100011",
+        "1100011",
+        "1100110",
+        "1111100",
+    ),
+}
 
 RESET = "\x1b[0m"
 HOME = "\x1b[H"
@@ -293,7 +363,7 @@ SEQUENCE_FRAMES = 192
 
 
 def pose_for_frame(frame: int) -> Pose:
-    f = frame % SEQUENCE_FRAMES
+    f = max(0, frame - BIRTH_TOTAL_FRAMES) % SEQUENCE_FRAMES
     pose = Pose()
 
     # Always-alive micro motion.
@@ -644,6 +714,206 @@ def sample_debris(
     return None
 
 
+
+# ---------------------------------------------------------------------------
+# BIRTH INTRO HELPERS
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def title_source_points() -> Tuple[Tuple[float, float], ...]:
+    """
+    Build a wide, bold GA3BAD word from numeric particles.
+
+    The font uses a 7x9 matrix with thick strokes. Each active matrix cell
+    creates several nearby particles, so the letters look solid and readable
+    while still being made entirely from changing digits.
+    """
+    scale_x = 1.28
+    scale_y = 1.45
+    gap = 1.90
+
+    text_value = TITLE
+    widths = []
+    for char in text_value:
+        pattern = TITLE_FONT_5X7.get(char, TITLE_FONT_5X7["A"])
+        widths.append(len(pattern[0]))
+
+    total_units = sum(widths) + gap * (len(text_value) - 1)
+    start_x = -(total_units - 1.0) * scale_x / 2.0
+    start_y = -5.8
+
+    points = []
+    cursor = start_x
+
+    for char_index, char in enumerate(text_value):
+        pattern = TITLE_FONT_5X7.get(char, TITLE_FONT_5X7["A"])
+
+        for row_index, row in enumerate(pattern):
+            for col_index, cell in enumerate(row):
+                if cell != "1":
+                    continue
+
+                px = cursor + col_index * scale_x
+                py = start_y + row_index * scale_y
+
+                # Main point.
+                points.append((px, py))
+
+                # Horizontal thickness. This is deliberately wider than the
+                # old font so each stroke occupies a clearly visible band.
+                points.append((px + 0.52, py))
+
+                # Slight lower fill removes holes caused by terminal-cell
+                # aspect ratios and gives the word a heavier logo-like feel.
+                if (row_index + col_index + char_index) % 2 == 0:
+                    points.append((px, py + 0.42))
+                    points.append((px + 0.52, py + 0.42))
+
+        cursor += (len(pattern[0]) + gap) * scale_x
+
+    return tuple(points)
+
+
+@lru_cache(maxsize=1)
+def target_character_points() -> Tuple[Tuple[float, float, Tuple[int, int, int]], ...]:
+    """
+    Collect a cloud of points from the neutral rock character silhouette.
+    Those points are the destinations for the word particles.
+    """
+    neutral_pose = Pose()
+    points = []
+
+    y = -13.5
+    while y <= 13.5:
+        x = -28.0
+        while x <= 28.0:
+            sampled = sample_character(x, y, neutral_pose, 0)
+            if sampled is not None:
+                _, color = sampled
+                points.append((x, y, color))
+            x += 1.05
+        y += 0.90
+
+    return tuple(points)
+
+
+def world_to_cell(
+    x: float,
+    y: float,
+    art_width: int,
+    art_height: int,
+    scale_x: float,
+    scale_y: float,
+) -> Optional[Tuple[int, int]]:
+    col = int(round(x * scale_x + (art_width - 1) / 2.0))
+    row = int(round(y * scale_y + (art_height - 1) / 2.0))
+    if 0 <= col < art_width and 0 <= row < art_height:
+        return row, col
+    return None
+
+
+def render_birth_art(frame: int, art_width: int, art_height: int) -> list[str]:
+    scale_x = art_width / 72.0
+    scale_y = art_height / 28.0
+
+    # Buffer stores (priority, char, color)
+    buffer: dict[Tuple[int, int], Tuple[int, str, Tuple[int, int, int]]] = {}
+
+    def plot(
+        x: float,
+        y: float,
+        char: str,
+        color: Tuple[int, int, int],
+        priority: int = 0,
+    ) -> None:
+        cell = world_to_cell(x, y, art_width, art_height, scale_x, scale_y)
+        if cell is None:
+            return
+        old = buffer.get(cell)
+        if old is None or priority >= old[0]:
+            buffer[cell] = (priority, char, color)
+
+    sources = title_source_points()
+    targets = target_character_points()
+
+    if frame < BIRTH_HOLD_FRAMES:
+        # Phase 1: large brown GA3BAD word.
+        pulse = 0.92 + 0.08 * math.sin(frame * 0.24)
+        title_color = tuple(int(channel * pulse) for channel in TITLE_COLOR)
+        for i, (sx, sy) in enumerate(sources):
+            char = str((i + frame * 3) % 10)
+            plot(sx, sy, char, title_color, priority=1)
+
+    else:
+        # Phase 2: the word collapses and becomes the character.
+        raw_t = (frame - BIRTH_HOLD_FRAMES) / max(1, BIRTH_MORPH_FRAMES)
+        morph_t = smoothstep(raw_t)
+        particle_count = max(len(sources), len(targets))
+
+        for i in range(particle_count):
+            sx, sy = sources[i % len(sources)]
+            tx, ty, target_color = targets[i % len(targets)]
+
+            # A small stagger makes the gathering feel more cinematic.
+            delay = (i % 17) * 0.012
+            local_t = clamp((morph_t - delay) / (1.0 - delay + 1e-9))
+            local_t = smoothstep(local_t)
+
+            spiral = (1.0 - local_t) * (1.6 + (i % 5) * 0.22)
+            angle = frame * 0.18 + i * 0.61
+            px = lerp(sx, tx, local_t) + math.cos(angle) * spiral
+            py = lerp(sy, ty, local_t) + math.sin(angle * 1.17) * spiral * 0.55
+
+            color = TITLE_COLOR if local_t < 0.72 else target_color
+            char = str((i * 7 + frame * 5) % 10)
+            plot(px, py, char, color, priority=1)
+
+        # During the final reveal, fade in the actual character behind
+        # the particles so the facial details become crisp.
+        if morph_t > 0.55:
+            reveal = clamp((morph_t - 0.55) / 0.45)
+            reveal_threshold = 1.0 - reveal
+
+            neutral_pose = Pose()
+            for row in range(art_height):
+                y = (row - (art_height - 1) / 2.0) / max(0.01, scale_y)
+                for col in range(art_width):
+                    x = (col - (art_width - 1) / 2.0) / max(0.01, scale_x)
+                    sampled = sample_character(x, y, neutral_pose, frame)
+                    if sampled is None:
+                        continue
+                    if stable_noise(x, y, frame // 3 + 77) < reveal_threshold:
+                        continue
+                    char, color = sampled
+                    plot(x, y, char, color, priority=2)
+
+    # Convert the buffer to terminal lines.
+    lines = []
+    for row in range(art_height):
+        pieces = []
+        current_color: Optional[Tuple[int, int, int]] = None
+        for col in range(art_width):
+            info = buffer.get((row, col))
+            if info is None:
+                if current_color is not None:
+                    pieces.append(RESET)
+                    current_color = None
+                pieces.append(" ")
+                continue
+
+            _, char, color = info
+            if color != current_color:
+                pieces.append(rgb(color))
+                current_color = color
+            pieces.append(char)
+
+        if current_color is not None:
+            pieces.append(RESET)
+        lines.append("".join(pieces))
+
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # FRAME RENDERING
 # ---------------------------------------------------------------------------
@@ -674,48 +944,60 @@ def render_frame(frame: int, pose: Pose) -> str:
 
     lines = [""] * top_padding
 
-    title_text = rgb(TITLE_COLOR) + TITLE + RESET
-    lines.append(center_visible(title_text, len(TITLE), cols))
-    lines.append("")
+    # For the one-time birth animation, the big brown GA3BAD word is already
+    # on-screen, so we hide the small header until the character is born.
+    show_small_title = frame >= BIRTH_TOTAL_FRAMES
+    if show_small_title:
+        title_text = rgb(TITLE_COLOR) + TITLE + RESET
+        lines.append(center_visible(title_text, len(TITLE), cols))
+        lines.append("")
+    else:
+        lines.append("")
+        lines.append("")
 
     left_padding = max(0, (cols - art_width) // 2)
 
-    for row in range(art_height):
-        y = (row - (art_height - 1) / 2.0) / max(0.01, scale_y)
-        pieces = [" " * left_padding]
-        current_color: Optional[Tuple[int, int, int]] = None
+    if frame < BIRTH_TOTAL_FRAMES:
+        birth_lines = render_birth_art(frame, art_width, art_height)
+        for line in birth_lines:
+            lines.append(" " * left_padding + line)
+    else:
+        for row in range(art_height):
+            y = (row - (art_height - 1) / 2.0) / max(0.01, scale_y)
+            pieces = [" " * left_padding]
+            current_color: Optional[Tuple[int, int, int]] = None
 
-        for col in range(art_width):
-            x = (col - (art_width - 1) / 2.0) / max(0.01, scale_x)
+            for col in range(art_width):
+                x = (col - (art_width - 1) / 2.0) / max(0.01, scale_x)
 
-            sampled = sample_character(x, y, pose, frame)
-            if sampled is None:
-                sampled = sample_debris(x, y, pose, frame)
+                sampled = sample_character(x, y, pose, frame)
+                if sampled is None:
+                    sampled = sample_debris(x, y, pose, frame)
 
-            # Sparse ground digits appear during the slam.
-            if sampled is None and pose.impact > 0.08 and abs(y - 12.45) < 0.33:
-                if stable_noise(x, frame * 0.1, 212) > 0.58:
-                    sampled = (
-                        digit_for(x, y, frame, 213),
-                        FLOOR_COLOR,
-                    )
+                # Sparse ground digits appear during the slam.
+                if sampled is None and pose.impact > 0.08 and abs(y - 12.45) < 0.33:
+                    if stable_noise(x, frame * 0.1, 212) > 0.58:
+                        sampled = (
+                            digit_for(x, y, frame, 213),
+                            FLOOR_COLOR,
+                        )
 
-            if sampled is None:
-                if current_color is not None:
-                    pieces.append(RESET)
-                    current_color = None
-                pieces.append(" ")
-                continue
+                if sampled is None:
+                    if current_color is not None:
+                        pieces.append(RESET)
+                        current_color = None
+                    pieces.append(" ")
+                    continue
 
-            char, color = sampled
-            if color != current_color:
-                pieces.append(rgb(color))
-                current_color = color
-            pieces.append(char)
+                char, color = sampled
+                if color != current_color:
+                    pieces.append(rgb(color))
+                    current_color = color
+                pieces.append(char)
 
-        if current_color is not None:
-            pieces.append(RESET)
-        lines.append("".join(pieces))
+            if current_color is not None:
+                pieces.append(RESET)
+            lines.append("".join(pieces))
 
     lines.append("")
     pulse = 0.72 + 0.28 * (0.5 + 0.5 * math.sin(frame * 0.16))
@@ -773,7 +1055,7 @@ def play_intro(*, loop: bool = LOOP_ANIMATION, fps: int = FPS) -> None:
                     break
 
                 frame += 1
-                if not loop and frame >= SEQUENCE_FRAMES:
+                if not loop and frame >= BIRTH_TOTAL_FRAMES + SEQUENCE_FRAMES:
                     break
     except KeyboardInterrupt:
         pass

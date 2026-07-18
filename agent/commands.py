@@ -128,16 +128,19 @@ def parse_command(line: str) -> UserCommand:
             return UserCommand(CommandKind.MODE, {"mode": None}, raw)
         mode = rest.lower()
         mode_aliases = {
-            "manual": "chat",
-            "default": "chat",
-            "auto": "goal",
-            "agent": "goal",
+            "manual": "normal",
+            "default": "normal",
+            "auto": "normal",
+            "agent": "normal",
+            "chat": "normal",
+            "plan": "normal",
+            "goal": "normal",
             "deep": "ultra",
             "max": "ultra",
         }
         mode = mode_aliases.get(mode, mode)
-        if mode not in {"chat", "plan", "goal", "ultra"}:
-            raise CommandParseError(f"Usage: {usage('mode', 'chat|plan|goal|ultra')}")
+        if mode not in {"normal", "ultra"}:
+            raise CommandParseError(f"Usage: {usage('mode', 'normal|ultra')}")
         return UserCommand(CommandKind.MODE, {"mode": mode}, raw)
     if name == "settings":
         if not rest:

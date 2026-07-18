@@ -7,33 +7,27 @@ from dataclasses import dataclass, fields, replace
 from enum import Enum
 from typing import Any
 
+from .intake import RunMode
+
 
 class InteractionMode(str, Enum):
-    """Session input policy; separate from durable goal/task lifecycle state."""
+    """Public run policy; intake/planning are internal lifecycle phases."""
 
-    CHAT = "chat"
-    PLAN = "plan"
-    GOAL = "goal"
+    NORMAL = "normal"
     ULTRA = "ultra"
+    CHAT = "normal"
+    PLAN = "normal"
+    GOAL = "normal"
 
     @classmethod
     def parse(cls, value: str | "InteractionMode") -> "InteractionMode":
         if isinstance(value, cls):
             return value
-        normalized = str(value).strip().lower()
-        aliases = {
-            "manual": cls.CHAT.value,
-            "default": cls.CHAT.value,
-            "auto": cls.GOAL.value,
-            "agent": cls.GOAL.value,
-            "deep": cls.ULTRA.value,
-            "max": cls.ULTRA.value,
-        }
-        normalized = aliases.get(normalized, normalized)
+        normalized = RunMode.parse(str(getattr(value, "value", value))).value
         try:
             return cls(normalized)
         except ValueError as exc:
-            raise ValueError("mode must be 'chat', 'plan', 'goal', or 'ultra'") from exc
+            raise ValueError("mode must be 'normal' or 'ultra'") from exc
 
 
 class ReasoningEffort(str, Enum):
@@ -59,11 +53,11 @@ class ReasoningEffort(str, Enum):
 class SessionPreferences:
     """Mutable UI preferences that intentionally last only for this process."""
 
-    mode: InteractionMode = InteractionMode.CHAT
+    mode: InteractionMode = InteractionMode.NORMAL
 
     @classmethod
     def from_env(cls, mode: str | None = None) -> "SessionPreferences":
-        return cls(mode=InteractionMode.parse(mode or os.getenv("AGENT_MODE", "chat")))
+        return cls(mode=InteractionMode.parse(mode or os.getenv("AGENT_MODE", "normal")))
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -110,8 +104,8 @@ class RuntimeConfig:
     goal_retry_base_ms: int = 1_000
     goal_retry_max_ms: int = 30_000
     ultra_cloud_concurrency: int = 4
-    ultra_max_depth: int = 5
-    ultra_max_nodes: int = 500
+    ultra_max_depth: int = 8
+    ultra_max_nodes: int = 1_000
     ultra_top_modules_min: int = 4
     ultra_top_modules_max: int = 12
     ultra_fix_attempts: int = 3
@@ -138,8 +132,8 @@ class RuntimeConfig:
             goal_retry_base_ms=_env_int("AGENT_GOAL_RETRY_BASE_MS", 1_000, 0, 60_000),
             goal_retry_max_ms=_env_int("AGENT_GOAL_RETRY_MAX_MS", 30_000, 0, 60_000),
             ultra_cloud_concurrency=_env_int("AGENT_ULTRA_CLOUD_CONCURRENCY", 4, 1, 8),
-            ultra_max_depth=_env_int("AGENT_ULTRA_MAX_DEPTH", 5, 1, 12),
-            ultra_max_nodes=_env_int("AGENT_ULTRA_MAX_NODES", 500, 10, 5_000),
+            ultra_max_depth=_env_int("AGENT_ULTRA_MAX_DEPTH", 8, 1, 12),
+            ultra_max_nodes=_env_int("AGENT_ULTRA_MAX_NODES", 1_000, 10, 5_000),
             ultra_top_modules_min=_env_int("AGENT_ULTRA_MODULES_MIN", 4, 1, 32),
             ultra_top_modules_max=_env_int("AGENT_ULTRA_MODULES_MAX", 12, 1, 80),
             ultra_fix_attempts=_env_int("AGENT_ULTRA_FIX_ATTEMPTS", 3, 1, 20),

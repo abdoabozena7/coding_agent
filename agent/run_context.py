@@ -1,4 +1,4 @@
-"""Shared durable run memory used across Chat, Plan, Goal, and Ultra."""
+"""Shared durable run memory used across Normal intake/execution and Ultra."""
 
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ class RunContextV1:
     workspace_fingerprint: str
     original_objective: str
     current_objective: str
-    mode: SessionMode = SessionMode.CHAT
+    mode: SessionMode = SessionMode.NORMAL
     run_id: str = field(default_factory=lambda: new_id("run"))
     version: int = 1
     weak_model_policy: WeakModelPolicy = field(default_factory=WeakModelPolicy)

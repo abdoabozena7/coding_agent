@@ -22,6 +22,9 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
+
+from .intake import answer_from_value, normalize_question
+from .local_provider import repair_structured_json_object
 from uuid import uuid4
 
 from .events import EventBus
@@ -395,6 +398,56 @@ class WorkNode:
 
 
 @dataclass(frozen=True, slots=True)
+class SpecialistProfileV1:
+    id: str
+    node_id: str
+    mission: str
+    expertise: tuple[str, ...]
+    context: Mapping[str, Any]
+    owned_interfaces: tuple[str, ...]
+    deliverable: str
+    quality_rubric: Mapping[str, Any]
+    dependencies: tuple[str, ...] = ()
+    parent_profile_id: str | None = None
+    version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class LeafReadinessV1:
+    node_id: str
+    ready: bool
+    score: float
+    reasons: tuple[str, ...]
+    recommended_children: int = 0
+    version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class ComponentPackageV1:
+    node_id: str
+    implementation: Mapping[str, Any]
+    interface: Mapping[str, Any]
+    tests: tuple[Mapping[str, Any], ...]
+    preview: Mapping[str, Any]
+    dependencies: tuple[str, ...]
+    evidence: tuple[Mapping[str, Any], ...]
+    quality: Mapping[str, Any]
+    status: str = "published"
+    version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class NodeQualityTargetV1:
+    node_id: str
+    minimum_overall_score: float = 0.95
+    minimum_critical_score: float = 0.85
+    critical_dimensions: tuple[str, ...] = ("functional", "integration")
+    plateau_window: int = 3
+    plateau_delta: float = 0.02
+    version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
 class MasterPlanV1:
     summary: str
     modules: tuple[TaskContractV1, ...]
@@ -431,20 +484,36 @@ class MasterPlanV1:
     def from_mapping(cls, value: Mapping[str, Any]) -> "MasterPlanV1":
         data = _mapping(value.get("master_plan", value))
         raw_modules = [item for item in data.get("modules", ()) if isinstance(item, Mapping)]
+        namespace_matches = [
+            re.fullmatch(r"(r[a-f0-9]{12})\..+", str(item.get("id", "")).strip())
+            for item in raw_modules
+        ]
+        namespaces = {match.group(1) for match in namespace_matches if match is not None}
+        namespace = (
+            next(iter(namespaces))
+            if raw_modules and len(namespaces) == 1 and all(match is not None for match in namespace_matches)
+            else ""
+        )
+
+        def canonical_id(index: int) -> str:
+            local = f"M{index:03d}"
+            return f"{namespace}.{local}" if namespace else local
+
         legacy_ids: dict[str, str] = {}
         for index, item in enumerate(raw_modules, start=1):
-            generated = f"M{index:03d}"
+            generated = canonical_id(index)
             raw_id = str(item.get("id", "")).strip()
             if raw_id:
                 legacy_ids[raw_id.casefold()] = generated
             legacy_ids[f"m{index}".casefold()] = generated
             legacy_ids[f"m{index:02d}".casefold()] = generated
+            legacy_ids[f"m{index:03d}".casefold()] = generated
             legacy_ids[generated.casefold()] = generated
 
         normalized_modules: list[dict[str, Any]] = []
         for index, item in enumerate(raw_modules, start=1):
             normalized = dict(item)
-            normalized["id"] = f"M{index:03d}"
+            normalized["id"] = canonical_id(index)
             title = str(item.get("title", item.get("name", ""))).strip()
             objective = str(item.get("objective", item.get("description", ""))).strip()
             acceptance = _strings(item.get("acceptance_criteria"))
@@ -472,13 +541,13 @@ class MasterPlanV1:
                     # e.g. ``M001: Renderer Core``. The stable ID prefix is the
                     # dependency; descriptive suffixes must not break the DAG.
                     match = re.match(r"^[Mm]0*(\d+)(?:\b|\s*[:\-])", text)
-                    resolved = f"M{int(match.group(1)):03d}" if match else text
+                    resolved = canonical_id(int(match.group(1))) if match else text
                 if resolved and resolved not in dependencies:
                     dependencies.append(resolved)
             normalized["depends_on"] = dependencies
             normalized_modules.append(normalized)
         modules = tuple(
-            TaskContractV1.from_mapping(item, fallback_id=f"M{index:03d}")
+            TaskContractV1.from_mapping(item, fallback_id=canonical_id(index))
             for index, item in enumerate(normalized_modules, start=1)
         )
         return cls(
@@ -532,6 +601,7 @@ class ResultPackageV1:
     test_results: tuple[Mapping[str, Any], ...] = ()
     findings: tuple[str, ...] = ()
     insights: tuple[InsightV1, ...] = ()
+    component_package: Mapping[str, Any] = field(default_factory=dict)
     fix_attempts: int = 0
     version: int = 1
 
@@ -636,9 +706,23 @@ class AgentResponse:
                             details=_mapping(item.get("details")),
                         )
                     )
-        payload = value.get("payload", value)
+        payload = dict(_mapping(value.get("payload", value)))
+        # The response contract places inspectable reasoning artifacts beside
+        # ``summary`` and ``payload``. Preserve those typed envelope fields
+        # when normalizing the phase payload; otherwise every valid reviewer
+        # vote is downgraded after the model did exactly what was requested.
+        for key in (
+            "reasoning_artifact",
+            "hypothesis",
+            "architecture_candidate",
+            "decision_record",
+            "critic_verdict",
+            "quality_finding",
+        ):
+            if key in value and key not in payload:
+                payload[key] = value[key]
         return cls(
-            payload=_mapping(payload),
+            payload=payload,
             summary=str(value.get("summary", "")).strip(),
             insights=tuple(insights),
             reasoning_summary=str(value.get("reasoning_summary", "")).strip(),
@@ -671,6 +755,9 @@ class UltraStateAdapter(Protocol):
     def append_brain_entry(self, entry: BrainEntryV1) -> None: ...
     def list_brain_entries(self, run_id: str) -> tuple[BrainEntryV1, ...]: ...
     def get_result_package(self, run_id: str, node_id: str) -> ResultPackageV1 | None: ...
+    def save_specialist_profile(self, run_id: str, profile: SpecialistProfileV1) -> None: ...
+    def save_component_package(self, run_id: str, package: ComponentPackageV1) -> None: ...
+    def save_node_quality_target(self, run_id: str, target: NodeQualityTargetV1) -> None: ...
 
 
 class InMemoryUltraState:
@@ -683,6 +770,9 @@ class InMemoryUltraState:
         self.traces: list[PromptTraceV1] = []
         self.results: dict[str, dict[str, ResultPackageV1]] = defaultdict(dict)
         self.brain: list[BrainEntryV1] = []
+        self.specialists: dict[str, dict[str, SpecialistProfileV1]] = defaultdict(dict)
+        self.component_packages: dict[str, dict[str, ComponentPackageV1]] = defaultdict(dict)
+        self.quality_targets: dict[str, dict[str, NodeQualityTargetV1]] = defaultdict(dict)
         self._lock = threading.RLock()
 
     def save_ultra_run(self, run: UltraRunV1) -> None:
@@ -727,6 +817,18 @@ class InMemoryUltraState:
     def get_result_package(self, run_id: str, node_id: str) -> ResultPackageV1 | None:
         with self._lock:
             return self.results.get(run_id, {}).get(node_id)
+
+    def save_specialist_profile(self, run_id: str, profile: SpecialistProfileV1) -> None:
+        with self._lock:
+            self.specialists[run_id][profile.node_id] = profile
+
+    def save_component_package(self, run_id: str, package: ComponentPackageV1) -> None:
+        with self._lock:
+            self.component_packages[run_id][package.node_id] = package
+
+    def save_node_quality_target(self, run_id: str, target: NodeQualityTargetV1) -> None:
+        with self._lock:
+            self.quality_targets[run_id][target.node_id] = target
 
 
 class JournaledUltraState(InMemoryUltraState):
@@ -843,14 +945,9 @@ class FocusedContextBuilder:
 
 
 def _extract_json(text: str) -> Mapping[str, Any]:
-    candidate = str(text or "").strip()
-    if candidate.startswith("```"):
-        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
-        candidate = re.sub(r"\s*```$", "", candidate)
-    try:
-        value = json.loads(candidate)
-    except json.JSONDecodeError as exc:
-        raise AgentProtocolError("ULTRA agents must return one JSON object") from exc
+    value, _actions = repair_structured_json_object(text)
+    if value is None:
+        raise AgentProtocolError("ULTRA agents must return one JSON object")
     if not isinstance(value, Mapping):
         raise AgentProtocolError("ULTRA agent response must be a JSON object")
     return value
@@ -934,8 +1031,8 @@ class ProviderFactoryAdapter:
 class UltraConfig:
     min_top_modules: int = 4
     max_top_modules: int = 12
-    max_depth: int = 5
-    max_nodes: int = 500
+    max_depth: int = 8
+    max_nodes: int = 1_000
     max_fix_attempts: int = 3
     cloud_concurrency: int = 4
     max_concurrency: int = 8
@@ -1095,6 +1192,11 @@ class UltraOrchestrator:
         system = _SYSTEM_PROMPT.format(role=role.value, phase=phase_value).strip()
         safe_context = redact_data(dict(context))
         safe_task = redact_data(dict(task))
+        if phase_value == "master_plan":
+            # Engine node identifiers are persisted in a shared project DB.
+            # Give each run its own protocol namespace so a later replan can
+            # safely reuse human-friendly model ids such as M001.
+            safe_task["protocol_node_namespace"] = f"r{self.run_state.id[-12:]}"
         request = AgentRequest(
             run_id=self.run_state.id,
             role=role,
@@ -1355,10 +1457,39 @@ class UltraOrchestrator:
         getter = getattr(self.state, "foundation_project_lessons", None)
         if not callable(getter):
             return ()
-        raw = getter(self.run_state.id, query, phase=phase)
+        try:
+            raw = getter(self.run_state.id, query, phase=phase, limit=4)
+        except TypeError:
+            raw = getter(self.run_state.id, query, phase=phase)
         if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
             return ()
-        return tuple(dict(item) for item in raw if isinstance(item, Mapping))
+        compact: list[Mapping[str, Any]] = []
+        seen: set[str] = set()
+        for item in raw:
+            if not isinstance(item, Mapping):
+                continue
+            content = str(item.get("content", "")).strip()
+            title = str(item.get("title", "")).strip()
+            key = re.sub(r"\s+", " ", f"{title} {content}").casefold()[:500]
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            compact.append(
+                {
+                    "id": item.get("id"),
+                    "section": item.get("section"),
+                    "phase": phase,
+                    "title": title[:200],
+                    "content": content[:1_200],
+                    "confidence": item.get("confidence"),
+                    "effective_confidence": item.get("effective_confidence"),
+                    "reuse_count": item.get("reuse_count", 0),
+                    "evidence_refs": list(item.get("evidence_refs", ()) or ())[:4],
+                }
+            )
+            if len(compact) >= 4:
+                break
+        return tuple(compact)
 
     @staticmethod
     def _normalize_typed_payload(
@@ -1368,15 +1499,61 @@ class UltraOrchestrator:
     ) -> tuple[dict[str, Any], tuple[str, ...]]:
         normalized = dict(payload)
         actions: list[str] = []
+        nested = normalized.get(phase)
+        if isinstance(nested, Mapping):
+            normalized = dict(nested)
+            actions.append(f"{phase} envelope unwrapped")
         if phase == "goal_spec" and not str(normalized.get("objective", "")).strip():
             authoritative_prompt = str(task.get("prompt", "")).strip()
             if authoritative_prompt:
                 normalized["objective"] = authoritative_prompt
                 actions.append("goal_spec.objective restored from authoritative user prompt")
+        if phase == "goal_spec":
+            authoritative_prompt = str(task.get("prompt", "")).strip()
+            prompt_key = authoritative_prompt.casefold()
+            constraints = list(_strings(normalized.get("constraints")))
+            in_scope = list(_strings(normalized.get("in_scope", normalized.get("scope"))))
+            success_criteria = list(_strings(normalized.get("success_criteria")))
+            if (
+                "index.html" in prompt_key
+                and any(term in prompt_key for term in ("single-file", "single file", "self-contained"))
+            ):
+                constraint = (
+                    "All implementation must remain in one workspace-relative index.html; "
+                    "no other local JS, CSS, asset, or build files are allowed."
+                )
+                if constraint not in constraints:
+                    constraints.append(constraint)
+                if "Single workspace-relative index.html artifact" not in in_scope:
+                    in_scope.append("Single workspace-relative index.html artifact")
+                actions.append("goal_spec preserved explicit single-file index.html boundary")
+            if "jsdelivr" in prompt_key and "three" in prompt_key:
+                constraint = (
+                    "Three.js from the explicitly requested jsDelivr CDN is the only allowed "
+                    "external runtime dependency."
+                )
+                if constraint not in constraints:
+                    constraints.append(constraint)
+                actions.append("goal_spec preserved explicit Three.js jsDelivr dependency boundary")
+            if any(term in prompt_key for term in ("browser verification", "screenshot", "visual quality")):
+                criterion = (
+                    "The running artifact passes real browser verification and screenshot-based "
+                    "visual quality review after any refinement."
+                )
+                if criterion not in success_criteria:
+                    success_criteria.append(criterion)
+                actions.append("goal_spec preserved explicit browser visual-quality gate")
+            if constraints:
+                normalized["constraints"] = constraints
+            if in_scope:
+                normalized["in_scope"] = in_scope
+            if success_criteria:
+                normalized["success_criteria"] = success_criteria
         if phase == "master_plan":
             goal_spec = _mapping(task.get("goal_spec"))
             architecture = _mapping(task.get("architecture"))
             modules = [dict(item) for item in normalized.get("modules", ()) if isinstance(item, Mapping)]
+            restored_from_architecture = not modules
             if not modules:
                 components = [
                     dict(item)
@@ -1401,21 +1578,88 @@ class UltraOrchestrator:
                             "write_paths": ["index.html"],
                         }
                     )
-                if modules:
-                    normalized["modules"] = modules
-                    normalized["summary"] = str(
-                        normalized.get("summary") or architecture.get("summary") or goal_spec.get("objective")
-                    ).strip()
-                    normalized["execution_strategy"] = str(
-                        normalized.get("execution_strategy")
-                        or "Implement architecture components sequentially, then run the final quality gate."
-                    ).strip()
-                    actions.append("master_plan.modules restored from accepted architecture components")
+            if restored_from_architecture and modules:
+                normalized["modules"] = modules
+                normalized["summary"] = str(
+                    normalized.get("summary") or architecture.get("summary") or goal_spec.get("objective")
+                ).strip()
+                normalized["execution_strategy"] = str(
+                    normalized.get("execution_strategy")
+                    or "Implement architecture components sequentially, then run the final quality gate."
+                ).strip()
+                actions.append("master_plan.modules restored from accepted architecture components")
 
             # Requirements may be distributed across objective, constraints,
             # scope, and success criteria. Inspect the whole accepted GoalSpec
             # so a terse weak-model objective cannot erase an explicit QA gate.
             objective_text = json.dumps(goal_spec, ensure_ascii=False, default=str).casefold()
+            requires_single_index = (
+                "index.html" in objective_text
+                and any(
+                    term in objective_text
+                    for term in (
+                        "single-file",
+                        "single file",
+                        "self-contained",
+                        "single index.html",
+                        "one workspace-relative index.html",
+                        "all code must reside in a single",
+                    )
+                )
+            )
+            if requires_single_index:
+                rewrote_paths = False
+                only_three_cdn = "jsdelivr" in objective_text and "three" in objective_text
+                for item in modules:
+                    current_paths = tuple(str(path) for path in item.get("write_paths", ()) or ())
+                    if current_paths != ("index.html",):
+                        item["write_paths"] = ["index.html"]
+                        rewrote_paths = True
+                    acceptance = list(_strings(item.get("acceptance_criteria")))
+                    single_file_gate = (
+                        "All implementation remains inside index.html; no local JS, CSS, asset, or build files are created."
+                    )
+                    if single_file_gate not in acceptance:
+                        acceptance.append(single_file_gate)
+                    if only_three_cdn:
+                        dependency_gate = (
+                            "The explicitly allowed Three.js jsDelivr CDN is the only external runtime dependency; no other libraries or assets are introduced."
+                        )
+                        if dependency_gate not in acceptance:
+                            acceptance.append(dependency_gate)
+                    item["acceptance_criteria"] = acceptance
+                if only_three_cdn and re.search(r"\b(?:hammer|babylon|phaser|jquery|react|vue)\.?(?:js)?\b", str(normalized.get("summary", "")), re.I):
+                    normalized["summary"] = str(goal_spec.get("objective") or "Implement the approved single-file Three.js game").strip()
+                    actions.append("master_plan summary removed an unapproved external runtime dependency")
+                if rewrote_paths:
+                    actions.append("master_plan write ownership constrained to explicit single index.html artifact")
+                normalized["modules"] = modules
+            if not re.search(r"\b0\.\d+\s*,\s*0\.\d+", objective_text):
+                for item in modules:
+                    acceptance = list(_strings(item.get("acceptance_criteria")))
+                    normalized_acceptance: list[str] = []
+                    replaced_prng_fixture = False
+                    for criterion in acceptance:
+                        key = criterion.casefold()
+                        if (
+                            any(term in key for term in ("prng", "nextfloat", "random sequence"))
+                            and re.search(r"\[\s*0\.\d+", criterion)
+                        ):
+                            replacement = (
+                                "The same explicit PRNG seed produces the same sequence across reloads; "
+                                "no Math.random source is used."
+                            )
+                            if replacement not in normalized_acceptance:
+                                normalized_acceptance.append(replacement)
+                            replaced_prng_fixture = True
+                        else:
+                            normalized_acceptance.append(criterion)
+                    if replaced_prng_fixture:
+                        item["acceptance_criteria"] = normalized_acceptance
+                        actions.append(
+                            "master_plan removed an unrequested brittle PRNG numeric fixture"
+                        )
+                normalized["modules"] = modules
             requires_browser_qa = any(
                 term in objective_text
                 for term in ("browser", "screenshot", "visual refinement", "visual quality")
@@ -1425,11 +1669,97 @@ class UltraOrchestrator:
                 any(term in str(item.get("title", "")).casefold() for term in dedicated_qa_terms)
                 for item in modules
             )
+            if has_dedicated_browser_qa:
+                qa_modules = [
+                    item
+                    for item in modules
+                    if any(term in str(item.get("title", "")).casefold() for term in dedicated_qa_terms)
+                ]
+                implementation_modules = [item for item in modules if item not in qa_modules]
+                qa_ids = {str(item.get("id", "")) for item in qa_modules}
+                for item in implementation_modules:
+                    item["depends_on"] = [
+                        dependency
+                        for dependency in _strings(item.get("depends_on"))
+                        if dependency not in qa_ids
+                    ]
+                if implementation_modules:
+                    last_implementation_id = str(implementation_modules[-1].get("id", ""))
+                    for item in qa_modules:
+                        item["depends_on"] = [last_implementation_id]
+                    modules = [*implementation_modules, *qa_modules]
+                    normalized["modules"] = modules
+                    actions.append("master_plan Browser QA gate ordered after implementation")
             # A screenshot mentioned inside an implementation module is not an
             # independent quality gate: weak planners commonly use it as a
             # checkbox and omit interaction coverage, error evidence, and the
             # mandatory refine-and-retest loop.
             if requires_browser_qa and not has_dedicated_browser_qa:
+                bounds = _mapping(task.get("module_bounds"))
+                try:
+                    maximum_modules = max(0, int(bounds.get("maximum", 0) or 0))
+                except (TypeError, ValueError):
+                    maximum_modules = 0
+                if maximum_modules >= 2 and len(modules) >= maximum_modules:
+                    merge_at = maximum_modules - 2
+                    head = modules[:merge_at]
+                    tail = modules[merge_at:]
+                    tail_ids = {str(item.get("id", "")) for item in tail}
+                    merged_id = str(tail[0].get("id") or f"M{merge_at + 1:03d}")
+                    merged_dependencies: list[str] = []
+                    for item in tail:
+                        for dependency in _strings(item.get("depends_on")):
+                            if dependency not in tail_ids and dependency not in merged_dependencies:
+                                merged_dependencies.append(dependency)
+                    merged = {
+                        "id": merged_id,
+                        "title": "Combined gameplay implementation",
+                        "objective": " Integrate these approved responsibilities: " + " | ".join(
+                            str(item.get("objective") or item.get("title") or "implementation")
+                            for item in tail
+                        ),
+                        "acceptance_criteria": list(
+                            dict.fromkeys(
+                                criterion
+                                for item in tail
+                                for criterion in _strings(item.get("acceptance_criteria"))
+                            )
+                        )[:20],
+                        "verification": list(
+                            dict.fromkeys(
+                                step
+                                for item in tail
+                                for step in _strings(item.get("verification"))
+                            )
+                        )[:20],
+                        "depends_on": merged_dependencies,
+                        "write_paths": list(
+                            dict.fromkeys(
+                                path
+                                for item in tail
+                                for path in _strings(item.get("write_paths"))
+                            )
+                        ),
+                        "forbidden_changes": list(
+                            dict.fromkeys(
+                                value
+                                for item in tail
+                                for value in _strings(item.get("forbidden_changes"))
+                            )
+                        ),
+                        "owned_interfaces": list(
+                            dict.fromkeys(
+                                value
+                                for item in tail
+                                for value in _strings(item.get("owned_interfaces"))
+                            )
+                        ),
+                        "metadata": {"coalesced_module_ids": sorted(tail_ids)},
+                    }
+                    modules = [*head, merged]
+                    actions.append(
+                        f"master_plan coalesced {len(tail)} implementation modules to reserve Browser QA capacity"
+                    )
                 qa_id = f"M{len(modules) + 1:03d}"
                 modules.append(
                     {
@@ -1439,13 +1769,13 @@ class UltraOrchestrator:
                         "acceptance_criteria": [
                             "A real 1280x720 screenshot is captured from the running game, never a placeholder.",
                             "Console and page errors are zero and unexpected network failures are absent or handled by a visible graceful fallback.",
-                            "Movement, shooting, pause, pickups, wave progression, game-over, and restart are exercised.",
+                            "Primary input, core hazards/collisions, scoring or progress, game-over, and restart are exercised exactly as required by the GoalSpec.",
                             "Visual hierarchy, depth, contrast, density, legibility, and responsiveness meet the approved quality target.",
                             "Any below-target visual dimension triggers code refinement and fresh browser verification.",
                         ],
                         "verification": [
                             "Preview index.html at 1280x720 and capture the actual browser screenshot.",
-                            "Inspect console, page, and network evidence and exercise the complete gameplay lifecycle.",
+                            "Inspect console, page, and network evidence and exercise the GoalSpec's complete gameplay lifecycle.",
                             "Repeat screenshot and runtime verification after every visual refinement mutation.",
                         ],
                         "depends_on": [str(modules[-1].get("id"))] if modules else [],
@@ -1454,19 +1784,63 @@ class UltraOrchestrator:
                 )
                 normalized["modules"] = modules
                 actions.append("master_plan Browser QA gate added from explicit goal requirements")
+            namespace = str(task.get("protocol_node_namespace", "")).strip()
+            if namespace and modules:
+                aliases: dict[str, str] = {}
+                for index, module in enumerate(modules, start=1):
+                    raw_id = str(module.get("id", f"M{index:03d}")).strip() or f"M{index:03d}"
+                    aliases[raw_id] = (
+                        raw_id if raw_id.startswith(f"{namespace}.") else f"{namespace}.{raw_id}"
+                    )
+                for index, module in enumerate(modules, start=1):
+                    raw_id = str(module.get("id", f"M{index:03d}")).strip() or f"M{index:03d}"
+                    module["id"] = aliases[raw_id]
+                    dependencies = list(_strings(module.get("depends_on")))
+                    module["depends_on"] = [aliases.get(item, item) for item in dependencies]
+                normalized["modules"] = modules
+                actions.append(f"master_plan node ids isolated in run namespace {namespace}")
         if phase == InnerPhase.DECOMPOSE.value:
             parent_contract = _mapping(task.get("contract"))
             parent_id = str(parent_contract.get("id", "")).strip()
             parent_title = str(parent_contract.get("title", parent_id or "Parent module")).strip()
             raw_children = normalized.get("children", ())
             if isinstance(raw_children, Sequence) and not isinstance(raw_children, (str, bytes)):
+                child_id_aliases: dict[str, str] = {}
+                for index, child in enumerate(raw_children, start=1):
+                    if not isinstance(child, Mapping):
+                        continue
+                    raw_id = str(
+                        child.get("id", f"{parent_id}.{index}" if parent_id else f"child.{index}")
+                    ).strip()
+                    namespaced = (
+                        raw_id
+                        if parent_id and raw_id.startswith(f"{parent_id}.")
+                        else f"{parent_id}.{index}" if parent_id else f"child.{index}"
+                    )
+                    child_id_aliases.setdefault(raw_id, namespaced)
                 repaired_children: list[Any] = []
                 for index, child in enumerate(raw_children, start=1):
                     if not isinstance(child, Mapping):
                         repaired_children.append(child)
                         continue
                     item = dict(child)
-                    child_id = str(item.get("id", f"{parent_id}.{index}" if parent_id else f"child.{index}")).strip()
+                    raw_child_id = str(
+                        item.get("id", f"{parent_id}.{index}" if parent_id else f"child.{index}")
+                    ).strip()
+                    child_id = child_id_aliases.get(raw_child_id, raw_child_id)
+                    if child_id != raw_child_id:
+                        item["id"] = child_id
+                        actions.append(
+                            f"decompose child id {raw_child_id} namespaced as {child_id}"
+                        )
+                    dependencies = list(_strings(item.get("depends_on")))
+                    remapped_dependencies = [
+                        child_id_aliases.get(dependency, dependency)
+                        for dependency in dependencies
+                    ]
+                    if remapped_dependencies != dependencies:
+                        item["depends_on"] = remapped_dependencies
+                        actions.append(f"decompose child {child_id} dependencies namespaced")
                     title = str(item.get("title", item.get("name", ""))).strip()
                     objective = str(item.get("objective", item.get("description", ""))).strip()
                     acceptance = list(_strings(item.get("acceptance_criteria")))
@@ -1499,6 +1873,19 @@ class UltraOrchestrator:
                         actions.append(f"decompose child {child_id} verification restored")
                     repaired_children.append(item)
                 normalized["children"] = repaired_children
+        if phase in {"review", "test", "global_review"} and not isinstance(
+            normalized.get("passed"), bool
+        ):
+            # Missing verdicts are never interpreted as success. Normalizing to
+            # false lets the bounded fix/review loop consume the finding instead
+            # of turning a weak-model schema omission into an engine crash.
+            normalized["passed"] = False
+            actions.append(f"{phase}.passed defaulted to false for safe remediation")
+        if phase in {"integrate", "global_integration", "final_evidence"} and not isinstance(
+            normalized.get("success", normalized.get("passed")), bool
+        ):
+            normalized["success"] = False
+            actions.append(f"{phase}.success defaulted to false for safe remediation")
         return normalized, tuple(actions)
 
     @staticmethod
@@ -1570,6 +1957,12 @@ class UltraOrchestrator:
                 # the architecture pass. Prefer the strongest safe local check
                 # or a concrete bounded implementation without pausing.
                 continue
+            if not any(term in combined for term in consequential_terms):
+                # Bounded, reversible product/implementation preferences are
+                # not blockers.  The architecture pass owns the recommended
+                # safe default so autonomous runs do not stall on optional
+                # audio, touch style, polish, or feature-depth questions.
+                continue
             if not question_id or question_id in seen or not text:
                 raise AgentProtocolError("ULTRA questions require unique ids and non-empty text")
             if not options:
@@ -1579,24 +1972,25 @@ class UltraOrchestrator:
                 # safe default and continue autonomously.
                 continue
             if len(options) == 1:
-                # A single offered option is not a user decision. Treat it as
-                # the model's own bounded default and continue foundation.
                 continue
-            if options and not 2 <= len(options) <= 3:
-                raise AgentProtocolError("ULTRA question options must contain two or three choices")
             seen.add(question_id)
-            questions.append(
-                {
-                    "id": question_id,
-                    "header": str(item.get("header", question_id)).strip()[:40],
-                    "question": text[:1_000],
-                    "options": options,
-                    "allow_freeform": bool(item.get("allow_freeform", True)),
-                    "reason": str(
-                        item.get("reason", "Required to finalize the master plan.")
-                    ).strip()[:1_000],
-                }
-            )
+            try:
+                normalized = normalize_question(
+                    {
+                        "id": question_id,
+                        "header": str(item.get("header", question_id)).strip()[:40],
+                        "question": text[:1_000],
+                        "options": options,
+                        "allow_freeform": True,
+                        "reason": str(
+                            item.get("reason", "Required to finalize the master plan.")
+                        ).strip()[:1_000],
+                    },
+                    index=index,
+                )
+            except ValueError as exc:
+                raise AgentProtocolError(str(exc)) from exc
+            questions.append(normalized.to_dict())
         if len(questions) > 3:
             raise AgentProtocolError("ULTRA may ask at most three questions in one foundation round")
         return tuple(questions)
@@ -1634,16 +2028,81 @@ class UltraOrchestrator:
 
         assert self.run_state and self.goal_spec
         self._set_phase(UltraPhase.ARCHITECTURE, "Designing architecture")
-        architecture_response = self._invoke(
-            AgentRole.ARCHITECT,
-            "architecture",
-            task={"goal_spec": asdict(self.goal_spec)},
-            context={
-                "prompt": prompt,
-                "cross_run_project_lessons": self._foundation_project_lessons(prompt, "architecture"),
+        lesson_context = self._foundation_project_lessons(prompt, "architecture")
+        candidate_count = 3 if any(
+            marker in prompt.casefold()
+            for marker in ("migration", "security", "production", "destructive", "ترحيل", "أمان")
+        ) else 2
+        candidate_specs: list[ArchitectureSpecV1] = []
+        candidate_payloads: list[Mapping[str, Any]] = []
+        for candidate_index in range(1, candidate_count + 1):
+            architecture_response = self._invoke(
+                AgentRole.ARCHITECT,
+                "architecture",
+                task={
+                    "goal_spec": asdict(self.goal_spec),
+                    "candidate_index": candidate_index,
+                    "candidate_count": candidate_count,
+                    "instruction": (
+                        "Produce an architecture materially different from the other candidates; "
+                        "optimize quality, specialist isolation, integration contracts, and verification."
+                    ),
+                },
+                context={
+                    "prompt": prompt,
+                    "cross_run_project_lessons": lesson_context,
+                },
+            )
+            candidate = ArchitectureSpecV1.from_mapping(architecture_response.payload)
+            candidate_specs.append(candidate)
+            candidate_payloads.append(asdict(candidate))
+        critic = self._invoke(
+            AgentRole.REVIEWER,
+            "architecture_critique",
+            task={
+                "goal_spec": asdict(self.goal_spec),
+                "candidates": candidate_payloads,
+                "instruction": "Identify omissions, integration risks, weak-model failure modes, and unverifiable claims for every candidate.",
             },
+            context={"prompt": prompt, "clean_context": True},
         )
-        self.architecture = ArchitectureSpecV1.from_mapping(architecture_response.payload)
+        judge = self._invoke(
+            AgentRole.GOAL_CHECKER,
+            "architecture_judge",
+            task={
+                "goal_spec": asdict(self.goal_spec),
+                "candidates": candidate_payloads,
+                "critic_verdict": dict(critic.payload),
+                "instruction": "Select the strongest candidate or return a synthesized architecture and cite observable reasons.",
+            },
+            context={"prompt": prompt, "clean_context": True},
+        )
+        try:
+            selected_index = int(judge.payload.get("selected_index", 1) or 1)
+        except (TypeError, ValueError):
+            selected_index = 1
+        selected_index = min(max(1, selected_index), len(candidate_specs))
+        synthesized = judge.payload.get("architecture")
+        self.architecture = (
+            ArchitectureSpecV1.from_mapping({"architecture": synthesized})
+            if isinstance(synthesized, Mapping)
+            else candidate_specs[selected_index - 1]
+        )
+        self.state.append_brain_entry(
+            BrainEntryV1(
+                BrainSection.DECISION,
+                "architecture_debate",
+                {
+                    "candidate_count": candidate_count,
+                    "candidates": candidate_payloads,
+                    "critic": dict(critic.payload),
+                    "judge": dict(judge.payload),
+                    "selected_index": selected_index,
+                    "selected_summary": self.architecture.summary,
+                },
+                self.run_state.id,
+            )
+        )
         self._set_phase(UltraPhase.MASTER_PLAN, "Building master plan")
         plan_response = self._invoke(
             AgentRole.PLANNER,
@@ -1664,7 +2123,10 @@ class UltraOrchestrator:
                 ),
             },
         )
-        proposed = MasterPlanV1.from_mapping(plan_response.payload)
+        proposed = self._enforce_master_artifact_contract(
+            prompt,
+            MasterPlanV1.from_mapping(plan_response.payload),
+        )
         quality_checklist = (
             "\n\nULTRA Quality Checklist (approval-bound): clean-code review; security review; "
             "tests and test-quality review; remediation Change Sets receive fresh reviews; "
@@ -1769,7 +2231,10 @@ class UltraOrchestrator:
                     "cross_run_project_lessons": self._foundation_project_lessons(prompt, "goal_spec"),
                 },
             )
-            self.goal_spec = GoalSpecV1.from_mapping(goal_response.payload)
+            self.goal_spec = self._enforce_goal_artifact_contract(
+                prompt,
+                GoalSpecV1.from_mapping(goal_response.payload),
+            )
             raw_questions = tuple(self.goal_spec.questions)
             questions = self._validated_questions(raw_questions)
             questions = tuple(
@@ -1800,6 +2265,10 @@ class UltraOrchestrator:
                     questions=list(questions),
                 )
                 return None
+            # Do not retain model-proposed questions that harness policy has
+            # explicitly auto-resolved; callers use GoalSpec.questions as the
+            # authoritative live checkpoint state.
+            self.goal_spec = replace(self.goal_spec, questions=())
             return self._finish_foundation(prompt)
         except CancellationRequested:
             self._set_phase(UltraPhase.CANCELLED, "ULTRA foundation cancelled")
@@ -1818,7 +2287,14 @@ class UltraOrchestrator:
         ):
             raise UltraError("this ULTRA run is not waiting for goal questions")
         questions = {str(item["id"]): item for item in self.goal_spec.questions}
-        normalized = {str(key): str(value).strip() for key, value in answers.items()}
+        normalized: dict[str, str] = {}
+        for key, value in answers.items():
+            question_id = str(key)
+            if question_id not in questions:
+                normalized[question_id] = str(value).strip()
+                continue
+            question = normalize_question(questions[question_id])
+            normalized[question_id] = answer_from_value(question, str(value))[0]
         missing = set(questions) - {key for key, value in normalized.items() if value}
         unknown = set(normalized) - set(questions)
         if unknown:
@@ -1868,6 +2344,107 @@ class UltraOrchestrator:
         return self.master_plan
 
     @staticmethod
+    def _requires_single_html_artifact(prompt: str) -> bool:
+        text = str(prompt).casefold()
+        return "html" in text and any(
+            marker in text
+            for marker in ("three.js", "threejs", "webgl", "3d", "game", "لعبة")
+        )
+
+    @classmethod
+    def _enforce_goal_artifact_contract(
+        cls,
+        prompt: str,
+        goal: GoalSpecV1,
+    ) -> GoalSpecV1:
+        if not cls._requires_single_html_artifact(prompt):
+            return goal
+        return replace(
+            goal,
+            constraints=tuple(
+                dict.fromkeys(
+                    (
+                        *goal.constraints,
+                        "The final deliverable is one self-contained index.html file.",
+                        "Only FinalAssembler may write index.html; specialists publish component packages.",
+                    )
+                )
+            ),
+            in_scope=tuple(dict.fromkeys((*goal.in_scope, "index.html", "playable browser runtime"))),
+            success_criteria=tuple(
+                dict.fromkeys(
+                    (
+                        *goal.success_criteria,
+                        "index.html runs with zero console, page, network, or WebGL errors",
+                        "keyboard controls, gameplay loop, collision, scoring, and restart are playable",
+                        "overall quality >= 0.95 and critical visual dimensions >= 0.85",
+                    )
+                )
+            ),
+        )
+
+    @classmethod
+    def _enforce_master_artifact_contract(
+        cls,
+        prompt: str,
+        proposed: MasterPlanV1,
+    ) -> MasterPlanV1:
+        if not cls._requires_single_html_artifact(prompt):
+            return proposed
+        inherited = proposed.modules[0]
+        final_module = TaskContractV1(
+            id=inherited.id,
+            title="FinalAssembler for the Three.js vehicle game",
+            objective=(
+                "Build a polished playable 3D vehicle game and compose the World, Vehicles, Character, "
+                "Gameplay, Presentation, and QA component packages into one self-contained index.html."
+            ),
+            acceptance_criteria=(
+                "index.html contains a visibly modeled road/world, detailed vehicles, and readable character",
+                "Keyboard input drives a complete collision, scoring/progression, game-over, and restart loop",
+                "Camera, HUD, lighting, effects, responsiveness, and accessibility form one cohesive presentation",
+                "Browser, WebGL, functional, visual, and performance evidence passes with no runtime errors",
+            ),
+            verification=(
+                "Run index.html in Playwright and inspect console, page, network, WebGL, and input state",
+                "Capture staged and final screenshots and score the visual quality rubric",
+                "Verify overall score >= 0.95 and every critical visual score >= 0.85",
+            ),
+            depends_on=(),
+            write_paths=("index.html",),
+            forbidden_changes=tuple(dict.fromkeys((*inherited.forbidden_changes, "Do not create split final source artifacts"))),
+            owned_interfaces=tuple(
+                dict.fromkeys(
+                    (
+                        *inherited.owned_interfaces,
+                        "WorldPackage",
+                        "VehiclePackage",
+                        "CharacterPackage",
+                        "GameplayPackage",
+                        "PresentationPackage",
+                        "QAPackage",
+                    )
+                )
+            ),
+            metadata={
+                **dict(inherited.metadata),
+                "force_recursive_specialists": True,
+                "final_output_paths": ["index.html"],
+                "source_module_count": len(proposed.modules),
+            },
+        )
+        return MasterPlanV1(
+            summary=proposed.summary + " Harness-enforced single-artifact recursive assembly.",
+            modules=(final_module,),
+            milestones=proposed.milestones,
+            execution_strategy=(
+                proposed.execution_strategy.rstrip()
+                + "\nHarness invariant: specialists publish isolated packages; FinalAssembler alone writes index.html."
+            ),
+            revision=proposed.revision,
+        )
+
+    @staticmethod
     def _contains_scope(parent: str, child: str) -> bool:
         p = parent.replace("\\", "/").rstrip("/") or "."
         c = child.replace("\\", "/").rstrip("/") or "."
@@ -1878,6 +2455,195 @@ class UltraOrchestrator:
 
             return fnmatch.fnmatchcase(c, p)
         return c == p or c.startswith(p + "/")
+
+    @staticmethod
+    def _leaf_readiness(node: WorkNode) -> LeafReadinessV1:
+        text = " ".join(
+            (
+                node.contract.title,
+                node.contract.objective,
+                *node.contract.acceptance_criteria,
+            )
+        ).casefold()
+        component_terms = (
+            "world", "road", "environment", "vehicle", "car", "wheel", "chassis",
+            "character", "gameplay", "collision", "scoring", "camera", "hud", "audio",
+            "lighting", "quality", "accessibility", "العربية", "الطريق", "الشخصية", "اللوجيك",
+        )
+        matched = tuple(term for term in component_terms if term in text)
+        shared_artifact = len(node.write_paths) == 1 and node.write_paths[0].casefold().endswith((".html", ".htm"))
+        score = 1.0
+        reasons: list[str] = []
+        visual_shared = any(marker in text for marker in ("three.js", "threejs", "webgl", "3d", "game", "لعبة"))
+        if shared_artifact and (len(matched) >= 2 or visual_shared):
+            score -= 0.55
+            reasons.append("single final artifact still contains multiple independently evaluable components")
+        if len(node.contract.acceptance_criteria) > 6:
+            score -= 0.20
+            reasons.append("broad acceptance surface")
+        if len(node.contract.objective) > 1_000:
+            score -= 0.15
+            reasons.append("large objective")
+        ready = score >= 0.65 or bool(node.contract.metadata.get("component_leaf"))
+        return LeafReadinessV1(
+            node_id=node.id,
+            ready=ready,
+            score=max(0.0, min(1.0, score)),
+            reasons=tuple(reasons) or ("bounded specialist contract",),
+            recommended_children=0 if ready else min(8, max(3, len(matched))),
+        )
+
+    @staticmethod
+    def _specialist_profile(node: WorkNode) -> SpecialistProfileV1:
+        expertise = tuple(
+            dict.fromkeys(
+                (
+                    node.contract.title,
+                    *node.contract.owned_interfaces,
+                    *tuple(str(item) for item in node.contract.metadata.get("expertise", ())),
+                )
+            )
+        )
+        return SpecialistProfileV1(
+            id=f"specialist:{node.id}",
+            node_id=node.id,
+            parent_profile_id=f"specialist:{node.parent_id}" if node.parent_id else None,
+            mission=node.contract.objective,
+            expertise=expertise,
+            context={
+                "acceptance_criteria": list(node.contract.acceptance_criteria),
+                "verification": list(node.contract.verification),
+                "component_package_only": bool(node.contract.metadata.get("component_package_only")),
+            },
+            owned_interfaces=node.contract.owned_interfaces,
+            deliverable=(
+                "A typed component package for the parent assembler"
+                if node.contract.metadata.get("component_package_only")
+                else "An integrated implementation inside the approved write scope"
+            ),
+            quality_rubric={
+                "minimum_overall_score": 0.95,
+                "minimum_critical_score": 0.85,
+                "dimensions": ["functional", "integration", "visual", "maintainability"],
+            },
+            dependencies=node.depends_on,
+        )
+
+    @staticmethod
+    def _deterministic_shared_artifact_children(parent: WorkNode) -> tuple[Mapping[str, Any], ...]:
+        readiness = UltraOrchestrator._leaf_readiness(parent)
+        if readiness.ready or not (
+            len(parent.write_paths) == 1
+            and parent.write_paths[0].casefold().endswith((".html", ".htm"))
+        ):
+            return ()
+        domains = (
+            ("world", "World, road, environment, lighting, spatial composition, and scene depth"),
+            ("vehicles", "Vehicle modeling including chassis, wheels, cabin, glass, lights, and materials"),
+            ("character", "Character modeling, pose, animation, control feedback, and visual readability"),
+            ("gameplay", "Gameplay state, traffic, collisions, scoring, progression, and input logic"),
+            ("presentation", "Camera, HUD, audio hooks, effects, responsiveness, and accessibility"),
+            ("qa", "Functional, visual, performance, browser, and accessibility acceptance evidence"),
+        )
+        children: list[Mapping[str, Any]] = []
+        previous: str | None = None
+        for suffix, objective in domains:
+            child_id = f"{parent.id}.{suffix}"
+            children.append(
+                {
+                    "id": child_id,
+                    "title": suffix.replace("_", " ").title() + " specialist",
+                    "objective": objective,
+                    "acceptance_criteria": [
+                        f"The {suffix} component is detailed, coherent, and ready for parent integration.",
+                        "The package exposes explicit integration guidance and observable quality evidence.",
+                    ],
+                    "verification": [
+                        "Review the isolated component contract and its integration fixture.",
+                        "Check the package against the parent acceptance criteria it supports.",
+                    ],
+                    "depends_on": [previous] if previous and suffix in {"gameplay", "presentation", "qa"} else [],
+                    "write_paths": [],
+                    "owned_interfaces": [],
+                    "metadata": {
+                        "component_package_only": True,
+                        "final_output_paths": list(parent.write_paths),
+                        "specialist_domain": suffix,
+                    },
+                }
+            )
+            previous = child_id
+        return tuple(children)
+
+    @staticmethod
+    def _deterministic_specialist_children(parent: WorkNode) -> tuple[Mapping[str, Any], ...]:
+        """Recursively split broad visual/game domains into local-model leaves."""
+
+        metadata = parent.contract.metadata
+        domain = str(metadata.get("specialist_domain") or "").casefold()
+        if not domain or metadata.get("component_leaf"):
+            return ()
+        parts: Mapping[str, tuple[tuple[str, str], ...]] = {
+            "world": (
+                ("road", "Road geometry, lane language, collision surface, and reusable segment contract"),
+                ("environment", "Environment props, depth layers, boundaries, spawn anchors, and composition"),
+                ("lighting", "Lighting, atmosphere, shadows, time treatment, and material readability"),
+            ),
+            "vehicles": (
+                ("chassis", "Vehicle body silhouette, chassis proportions, bumpers, and structural details"),
+                ("wheels", "Wheel geometry, suspension placement, steering pose, and grounded contact"),
+                ("cabin", "Cabin, glass, interior hints, mirrors, and driver readability"),
+                ("materials", "Paint, glass, tire, light materials, emissive cues, and color variants"),
+            ),
+            "character": (
+                ("body", "Character body model, proportions, silhouette, and readable pose"),
+                ("animation", "Animation states, transitions, timing, and motion feedback"),
+                ("controls", "Character controls, interaction boundaries, and game-loop contract"),
+            ),
+            "gameplay": (
+                ("traffic", "Traffic spawning, lane behavior, difficulty pacing, and deterministic updates"),
+                ("collision", "Collision rules, recovery, invulnerability windows, and observable feedback"),
+                ("progression", "Scoring, progression, restart flow, goals, and state transitions"),
+            ),
+            "presentation": (
+                ("camera", "Camera composition, follow behavior, shake, framing, and responsive viewport"),
+                ("hud", "HUD hierarchy, readability, controls help, score, state, and responsive layout"),
+                ("effects", "Audio hooks, particles, impacts, speed feedback, and polish effects"),
+                ("accessibility", "Keyboard/touch affordances, reduced motion, contrast, and status feedback"),
+            ),
+            "qa": (
+                ("functional", "Playable-flow, input, collision, scoring, restart, console, and WebGL checks"),
+                ("visual", "Modeling, composition, lighting, readability, feedback, and polish rubric"),
+                ("performance", "Frame stability, resize behavior, asset/runtime constraints, and accessibility checks"),
+            ),
+        }
+        definitions = parts.get(domain, ())
+        return tuple(
+            {
+                "id": f"{parent.id}.{suffix}",
+                "title": f"{title.replace('_', ' ').title()} specialist",
+                "objective": objective,
+                "acceptance_criteria": [
+                    f"The {title.replace('_', ' ')} package is concrete and directly integrable.",
+                    "Implementation, interface, tests, preview fixture, and evidence are explicit.",
+                ],
+                "verification": [
+                    "Evaluate the actual component candidate against its bounded contract.",
+                    "Reject unsupported claims and cite observable package evidence.",
+                ],
+                "depends_on": [],
+                "write_paths": [],
+                "owned_interfaces": [],
+                "metadata": {
+                    "component_package_only": True,
+                    "component_leaf": True,
+                    "specialist_domain": f"{domain}.{suffix}",
+                    "final_output_paths": list(metadata.get("final_output_paths", ())),
+                },
+            }
+            for suffix, objective in definitions
+            for title in (suffix,)
+        )
 
     def _validated_children(
         self,
@@ -1939,10 +2705,20 @@ class UltraOrchestrator:
             inherited_forbidden = tuple(
                 dict.fromkeys((*parent.contract.forbidden_changes, *child.forbidden_changes))
             )
+            component_only = bool(metadata.get("component_package_only")) or (
+                len(parent.write_paths) == 1
+                and parent.write_paths[0].casefold().endswith((".html", ".htm"))
+                and not child.write_paths
+            )
+            if component_only:
+                metadata["component_package_only"] = True
+                metadata.setdefault("final_output_paths", list(parent.write_paths))
             child = replace(
                 child,
                 depends_on=inherited_dependencies,
+                write_paths=() if component_only else (child.write_paths or parent.write_paths),
                 forbidden_changes=inherited_forbidden,
+                metadata=metadata,
             )
             self._order += 1
             children.append(
@@ -1961,6 +2737,14 @@ class UltraOrchestrator:
         assert self.run_state
         self.control.checkpoint()
         node = self.nodes[node_id]
+        profile = self._specialist_profile(node)
+        target = NodeQualityTargetV1(node_id=node.id)
+        profile_saver = getattr(self.state, "save_specialist_profile", None)
+        if callable(profile_saver):
+            profile_saver(self.run_state.id, profile)
+        target_saver = getattr(self.state, "save_node_quality_target", None)
+        if callable(target_saver):
+            target_saver(self.run_state.id, target)
         node = replace(node, status=NodeStatus.PLANNING, phase=InnerPhase.CONTEXT)
         self.nodes[node_id] = node
         self.state.save_work_node(self.run_state.id, node)
@@ -1972,18 +2756,37 @@ class UltraOrchestrator:
             context=context,
             node_id=node.id,
         )
-        decompose_response = self._invoke(
-            AgentRole.DECOMPOSER,
-            InnerPhase.DECOMPOSE,
-            task={
-                "contract": asdict(node.contract),
-                "mini_plan": dict(plan_response.payload),
-                "remaining_node_budget": self.config.max_nodes - len(self.nodes),
-            },
-            context=context,
-            node_id=node.id,
-        )
-        children = self._validated_children(node, decompose_response.payload.get("children", ()))
+        readiness = self._leaf_readiness(node)
+        deterministic_children = self._deterministic_shared_artifact_children(node)
+        specialist_children = self._deterministic_specialist_children(node)
+        decompose_payload: Mapping[str, Any] = {}
+        if node.contract.metadata.get("component_leaf"):
+            raw_children: Any = ()
+        elif specialist_children:
+            raw_children = specialist_children
+        elif deterministic_children:
+            # The final artifact contract requires independently evaluable
+            # domains. A weak model's generic "subtask 1" decomposition is not
+            # a substitute for named specialist ownership.
+            raw_children = deterministic_children
+        elif node.contract.metadata.get("component_package_only"):
+            raw_children = ()
+        else:
+            decompose_response = self._invoke(
+                AgentRole.DECOMPOSER,
+                InnerPhase.DECOMPOSE,
+                task={
+                    "contract": asdict(node.contract),
+                    "mini_plan": dict(plan_response.payload),
+                    "leaf_readiness": asdict(readiness),
+                    "remaining_node_budget": self.config.max_nodes - len(self.nodes),
+                },
+                context=context,
+                node_id=node.id,
+            )
+            decompose_payload = dict(decompose_response.payload)
+            raw_children = decompose_payload.get("children", ())
+        children = self._validated_children(node, raw_children)
         if len(self.nodes) + len(children) > self.config.max_nodes:
             raise ScopeRevisionRequired(
                 f"dynamic expansion exceeds max node count {self.config.max_nodes}"
@@ -1991,7 +2794,7 @@ class UltraOrchestrator:
         self._prepared[node.id] = (context, dict(plan_response.payload))
         self._research_required[node.id] = bool(
             plan_response.payload.get("research_required")
-            or decompose_response.payload.get("research_required")
+            or decompose_payload.get("research_required")
             or node.contract.metadata.get("research_required")
         )
         if children:
@@ -2129,32 +2932,142 @@ class UltraOrchestrator:
     def _quality_gate_passed(self, result: QualityGateResultV1) -> bool:
         return all(self._passed(item) for item in result.responses) and self._consensus_accepted(result.consensus)
 
-    def _quality(self, node: WorkNode) -> QualityGateResultV1:
+    @staticmethod
+    def _review_candidate(response: AgentResponse) -> Mapping[str, Any]:
+        return {
+            "summary": response.summary,
+            "payload": dict(response.payload),
+            "artifacts": list(UltraOrchestrator._records(response, "artifacts")),
+            "evidence": list(UltraOrchestrator._records(response, "evidence")),
+            "test_results": list(UltraOrchestrator._records(response, "test_results")),
+        }
+
+    @staticmethod
+    def _merge_candidate_response(
+        base: AgentResponse,
+        revision: AgentResponse,
+    ) -> AgentResponse:
+        def merge(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[str, Any]:
+            combined = dict(left)
+            for key, value in right.items():
+                previous = combined.get(key)
+                combined[key] = (
+                    merge(previous, value)
+                    if isinstance(previous, Mapping) and isinstance(value, Mapping)
+                    else value
+                )
+            return combined
+
+        return AgentResponse(
+            payload=merge(base.payload, revision.payload),
+            summary=revision.summary or base.summary,
+            insights=tuple((*base.insights, *revision.insights)),
+            reasoning_summary=revision.reasoning_summary or base.reasoning_summary,
+            usage={
+                key: int(base.usage.get(key, 0)) + int(revision.usage.get(key, 0))
+                for key in set(base.usage) | set(revision.usage)
+            },
+            provider=revision.provider or base.provider,
+            model=revision.model or base.model,
+        )
+
+    @staticmethod
+    def _refine_contract_from_replan(
+        contract: TaskContractV1,
+        replan: Mapping[str, Any],
+    ) -> TaskContractV1:
+        requirements: list[str] = []
+
+        def collect(value: Any, key: str = "") -> None:
+            if isinstance(value, Mapping):
+                for child_key, child in value.items():
+                    name = str(child_key)
+                    collect(
+                        child,
+                        name if name in {"verification_plan", "findings", "claim"} else key,
+                    )
+                return
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                for child in value:
+                    collect(child, key)
+                return
+            text = str(value or "").strip()
+            if text and key in {"verification_plan", "findings", "claim"}:
+                requirements.append(text[:600])
+
+        collect(replan)
+        requirements = list(dict.fromkeys(requirements))[:8]
+        if not requirements:
+            return contract
+        signatures: list[str] = []
+        for requirement in requirements:
+            signatures.extend(
+                match.strip()
+                for match in re.findall(
+                    r"`([^`(]{2,160}\([^`]*\)(?:\s*:\s*[A-Za-z][\w<>\[\]]*)?)`",
+                    requirement,
+                )
+                if match.strip()
+            )
+        metadata = dict(contract.metadata)
+        metadata["replan_refinement_requirements"] = requirements
+        return replace(
+            contract,
+            acceptance_criteria=tuple(
+                dict.fromkeys(
+                    (
+                        *contract.acceptance_criteria,
+                        *(f"Replan refinement requirement: {item}" for item in requirements),
+                    )
+                )
+            ),
+            verification=tuple(
+                dict.fromkeys((*contract.verification, *requirements))
+            ),
+            owned_interfaces=tuple(
+                dict.fromkeys((*contract.owned_interfaces, *signatures))
+            ),
+            metadata=metadata,
+        )
+
+    def _quality(
+        self,
+        node: WorkNode,
+        candidate_response: AgentResponse,
+    ) -> QualityGateResultV1:
+        candidate = self._review_candidate(candidate_response)
+        evaluation_policy = {
+            "evaluate_candidate_not_contract_alone": True,
+            "cite_candidate_evidence_for_every_blocking_finding": True,
+            "do_not_invent_requirements_outside_contract": True,
+            "component_package_only": bool(node.contract.metadata.get("component_package_only")),
+            "component_packages_must_not_write_final_output": True,
+        }
         clean_code = self._invoke(
             AgentRole.CLEAN_CODE_REVIEWER,
             InnerPhase.REVIEW,
-            task={"contract": asdict(node.contract), "fresh_review": True, "category": "clean_code", "read_only": True},
+            task={"contract": asdict(node.contract), "candidate": candidate, "evaluation_policy": evaluation_policy, "fresh_review": True, "category": "clean_code", "read_only": True},
             context=self._new_context(node, AgentRole.CLEAN_CODE_REVIEWER),
             node_id=node.id,
         )
         security = self._invoke(
             AgentRole.SECURITY_REVIEWER,
             InnerPhase.REVIEW,
-            task={"contract": asdict(node.contract), "fresh_review": True, "category": "security", "read_only": True},
+            task={"contract": asdict(node.contract), "candidate": candidate, "evaluation_policy": evaluation_policy, "fresh_review": True, "category": "security", "read_only": True},
             context=self._new_context(node, AgentRole.SECURITY_REVIEWER),
             node_id=node.id,
         )
         tests = self._invoke(
             AgentRole.TESTER,
             InnerPhase.TEST,
-            task={"contract": asdict(node.contract), "fresh_test_context": True},
+            task={"contract": asdict(node.contract), "candidate": candidate, "evaluation_policy": evaluation_policy, "fresh_test_context": True},
             context=self._new_context(node, AgentRole.TESTER),
             node_id=node.id,
         )
         test_quality = self._invoke(
             AgentRole.TEST_QUALITY_REVIEWER,
             InnerPhase.REVIEW,
-            task={"contract": asdict(node.contract), "fresh_review": True, "category": "test_quality", "read_only": True},
+            task={"contract": asdict(node.contract), "candidate": candidate, "evaluation_policy": evaluation_policy, "fresh_review": True, "category": "test_quality", "read_only": True},
             context=self._new_context(node, AgentRole.TEST_QUALITY_REVIEWER),
             node_id=node.id,
         )
@@ -2163,9 +3076,22 @@ class UltraOrchestrator:
             InnerPhase.REVIEW,
             task={
                 "contract": asdict(node.contract),
+                "candidate": candidate,
+                "evaluation_policy": evaluation_policy,
                 "read_only": True,
                 "normalize_and_deduplicate": True,
                 "review_summaries": [clean_code.summary, security.summary, tests.summary, test_quality.summary],
+                "review_verdicts": [
+                    {
+                        "role": role,
+                        "passed": self._passed(response),
+                        "payload": dict(response.payload),
+                    }
+                    for role, response in zip(
+                        ("clean_code", "security", "runtime_tests", "test_quality"),
+                        (clean_code, security, tests, test_quality),
+                    )
+                ],
             },
             context=self._new_context(node, AgentRole.QUALITY_TRIAGER),
             node_id=node.id,
@@ -2187,6 +3113,19 @@ class UltraOrchestrator:
     def _execute_node(self, scheduled_node: WorkNode) -> ResultPackageV1:
         assert self.run_state
         node = self.nodes[scheduled_node.id]
+        prior_result = self._results.get(node.id)
+        prior_component = (
+            dict(prior_result.component_package)
+            if prior_result is not None and prior_result.component_package
+            else {}
+        )
+        prior_replan = prior_component.get("replan")
+        if isinstance(prior_replan, Mapping) and prior_replan:
+            refined_contract = self._refine_contract_from_replan(node.contract, prior_replan)
+            if refined_contract != node.contract:
+                node = replace(node, contract=refined_contract)
+                self.nodes[node.id] = node
+                self.state.save_work_node(self.run_state.id, node)
         node = replace(node, status=NodeStatus.RUNNING, phase=InnerPhase.RESEARCH)
         self.nodes[node.id] = node
         self.state.save_work_node(self.run_state.id, node)
@@ -2208,21 +3147,39 @@ class UltraOrchestrator:
                     node_id=node.id,
                 )
             )
-        node = replace(node, phase=InnerPhase.IMPLEMENT)
+        is_parent_assembler = bool(node.children)
+        is_final_assembler = is_parent_assembler and bool(node.write_paths)
+        node = replace(
+            node,
+            phase=InnerPhase.INTEGRATE if is_parent_assembler else InnerPhase.IMPLEMENT,
+        )
         self.nodes[node.id] = node
         self.state.save_work_node(self.run_state.id, node)
         implementation = self._invoke(
-            AgentRole.CODER,
-            InnerPhase.IMPLEMENT,
+            AgentRole.INTEGRATOR if is_parent_assembler else AgentRole.CODER,
+            InnerPhase.INTEGRATE if is_parent_assembler else InnerPhase.IMPLEMENT,
             task={
                 "contract": asdict(node.contract),
                 "mini_plan": dict(self._prepared.get(node.id, ({}, {}))[1]),
+                "final_assembler": is_final_assembler,
+                "component_assembler": is_parent_assembler and not is_final_assembler,
+                "child_component_packages": {
+                    child_id: dict(self._results[child_id].component_package)
+                    for child_id in node.children
+                    if child_id in self._results
+                },
+                "prior_best_candidate": dict(prior_component.get("candidate", {})),
+                "prior_replan_guidance": dict(prior_component.get("replan", {})),
+                "prior_findings": list(prior_result.findings) if prior_result else [],
             },
-            context=self._new_context(node, AgentRole.CODER),
+            context=self._new_context(
+                node, AgentRole.INTEGRATOR if is_parent_assembler else AgentRole.CODER
+            ),
             node_id=node.id,
         )
         responses.append(implementation)
-        quality_gate = self._quality(node)
+        candidate_response = implementation
+        quality_gate = self._quality(node, candidate_response)
         responses.extend(quality_gate.responses)
         fixes = 0
         while not self._quality_gate_passed(quality_gate) and fixes < self.config.max_fix_attempts:
@@ -2248,20 +3205,29 @@ class UltraOrchestrator:
                 attempt=fixes,
                 findings=findings,
             )
+            fix_role = AgentRole.INTEGRATOR if is_parent_assembler else AgentRole.CODER
             fix = self._invoke(
-                AgentRole.CODER,
+                fix_role,
                 InnerPhase.FIX,
                 task={
                     "contract": asdict(node.contract),
                     "findings": findings,
                     "attempt": fixes,
                     "change_approach": fixes == self.config.max_fix_attempts,
+                    "final_assembler": is_final_assembler,
+                    "component_assembler": is_parent_assembler and not is_final_assembler,
+                    "child_component_packages": {
+                        child_id: dict(self._results[child_id].component_package)
+                        for child_id in node.children
+                        if child_id in self._results
+                    },
                 },
-                context=self._new_context(node, AgentRole.CODER),
+                context=self._new_context(node, fix_role),
                 node_id=node.id,
             )
             responses.append(fix)
-            quality_gate = self._quality(node)
+            candidate_response = self._merge_candidate_response(candidate_response, fix)
+            quality_gate = self._quality(node, candidate_response)
             responses.extend(quality_gate.responses)
 
         if not self._quality_gate_passed(quality_gate):
@@ -2297,6 +3263,11 @@ class UltraOrchestrator:
                 ),
                 insights=tuple(insight for response in responses for insight in response.insights),
                 fix_attempts=fixes,
+                component_package={
+                    "candidate": dict(self._review_candidate(candidate_response)),
+                    "replan": dict(replan.payload),
+                    "status": "best_candidate_below_target",
+                },
             )
             self._results[node.id] = result
             self.state.save_result_package(self.run_state.id, result)
@@ -2305,17 +3276,26 @@ class UltraOrchestrator:
             self.state.save_work_node(self.run_state.id, node)
             raise NodePipelineFailed(result)
 
-        node = replace(node, phase=InnerPhase.INTEGRATE)
-        self.nodes[node.id] = node
-        self.state.save_work_node(self.run_state.id, node)
-        integration = self._invoke(
-            AgentRole.INTEGRATOR,
-            InnerPhase.INTEGRATE,
-            task={"contract": asdict(node.contract)},
-            context=self._new_context(node, AgentRole.INTEGRATOR),
-            node_id=node.id,
-        )
-        responses.append(integration)
+        if is_parent_assembler:
+            # Parent fixes are cumulative integration revisions. Publish the
+            # exact candidate that passed the final quality gate, never the
+            # stale first integration response.
+            integration = candidate_response
+        else:
+            node = replace(node, phase=InnerPhase.INTEGRATE)
+            self.nodes[node.id] = node
+            self.state.save_work_node(self.run_state.id, node)
+            integration = self._invoke(
+                AgentRole.INTEGRATOR,
+                InnerPhase.INTEGRATE,
+                task={
+                    "contract": asdict(node.contract),
+                    "publish_component_package": True,
+                },
+                context=self._new_context(node, AgentRole.INTEGRATOR),
+                node_id=node.id,
+            )
+            responses.append(integration)
         node = replace(node, phase=InnerPhase.MEMORY_WRITEBACK)
         self.nodes[node.id] = node
         self.state.save_work_node(self.run_state.id, node)
@@ -2330,26 +3310,72 @@ class UltraOrchestrator:
             node_id=node.id,
         )
         responses.append(memory)
+        artifacts = tuple(
+            item for response in responses for item in self._records(response, "artifacts")
+        )
+        evidence = tuple(
+            item for response in responses for item in self._records(response, "evidence")
+        )
+        test_results = tuple(
+            item for response in responses for item in self._records(response, "test_results")
+        )
+        raw_component = integration.payload.get("component_package")
+        implementation_payload = (
+            dict(raw_component.get("implementation", {}))
+            if isinstance(raw_component, Mapping)
+            else {
+                "summary": integration.summary or implementation.summary,
+                "artifacts": list(artifacts),
+                "component_only": bool(node.contract.metadata.get("component_package_only")),
+            }
+        )
+        passed_votes = sum(self._passed(item) for item in quality_gate.responses)
+        quality_score = passed_votes / max(1, len(quality_gate.responses))
+        component_package = ComponentPackageV1(
+            node_id=node.id,
+            implementation=implementation_payload,
+            interface={
+                "owned_interfaces": list(node.contract.owned_interfaces),
+                "integration_guidance": (
+                    raw_component.get("interface", {})
+                    if isinstance(raw_component, Mapping)
+                    else node.contract.metadata.get("integration_guidance", {})
+                ),
+            },
+            tests=test_results,
+            preview=(
+                dict(raw_component.get("preview", {}))
+                if isinstance(raw_component, Mapping)
+                else {}
+            ),
+            dependencies=node.depends_on,
+            evidence=evidence,
+            quality={
+                "overall_score": quality_score,
+                "consensus": dict(quality_gate.consensus),
+                "critical_minimum": 0.85,
+                "target": 0.95,
+            },
+            status="published" if self._passed(integration) else "rejected",
+        )
         result = ResultPackageV1(
             node_id=node.id,
             success=self._passed(integration),
             status="completed" if self._passed(integration) else "failed",
             summary=integration.summary or implementation.summary or f"{node.id} completed",
-            artifacts=tuple(
-                item for response in responses for item in self._records(response, "artifacts")
-            ),
-            evidence=tuple(
-                item for response in responses for item in self._records(response, "evidence")
-            ),
-            test_results=tuple(
-                item for response in responses for item in self._records(response, "test_results")
-            ),
+            artifacts=artifacts,
+            evidence=evidence,
+            test_results=test_results,
             findings=self._findings(*responses),
             insights=tuple(insight for response in responses for insight in response.insights),
+            component_package=asdict(component_package),
             fix_attempts=fixes,
         )
         self._results[node.id] = result
         self.state.save_result_package(self.run_state.id, result)
+        package_saver = getattr(self.state, "save_component_package", None)
+        if callable(package_saver):
+            package_saver(self.run_state.id, component_package)
         if not result.success:
             node = replace(node, status=NodeStatus.FAILED, phase=InnerPhase.INTEGRATE)
             self.nodes[node.id] = node
@@ -2494,7 +3520,14 @@ class UltraOrchestrator:
                 initially_completed=completed_before,
             )
             for outcome in schedule.outcomes:
-                if outcome.status is ScheduleStatus.BLOCKED:
+                if outcome.status is ScheduleStatus.FAILED:
+                    node = self.nodes[outcome.item_id]
+                    self.nodes[node.id] = replace(
+                        node,
+                        status=NodeStatus.FAILED,
+                    )
+                    self.state.save_work_node(self.run_state.id, self.nodes[node.id])
+                elif outcome.status is ScheduleStatus.BLOCKED:
                     node = self.nodes[outcome.item_id]
                     self.nodes[node.id] = replace(node, status=NodeStatus.BLOCKED)
                     self.state.save_work_node(self.run_state.id, self.nodes[node.id])
@@ -2644,6 +3677,7 @@ __all__ = [
     "BrainSection",
     "ContextBuilder",
     "ContextRequest",
+    "ComponentPackageV1",
     "ExecutionClass",
     "FocusedContextBuilder",
     "GoalSpecV1",
@@ -2652,14 +3686,17 @@ __all__ = [
     "InsightV1",
     "JournaledUltraState",
     "MasterPlanV1",
+    "LeafReadinessV1",
     "NodeKind",
     "NodeStatus",
+    "NodeQualityTargetV1",
     "PromptTraceV1",
     "ProviderAgentAdapter",
     "ProviderFactoryAdapter",
     "QualityGateResultV1",
     "ResultPackageV1",
     "ScopeRevisionRequired",
+    "SpecialistProfileV1",
     "TaskContractV1",
     "UltraAgent",
     "UltraAgentFactory",

@@ -29,13 +29,16 @@ process-global `chdir` exists in
 the runtime core. The provider, store, approval callback, event bus, sleep policy,
 and runtime limits are injected, which makes the full lifecycle testable offline.
 
-The CLI owns a separate, session-scoped `InteractionMode`. `PLAN` waits for an
-explicit `/run` or `/auto` after the user approves a revision. `GOAL` invokes the
-same unbounded loop automatically only after an explicit successful `/approve`.
-This UI preference is not a `GoalStatus`, never auto-approves a plan, and never
-bypasses shell/tool approval or crash-recovery boundaries. `prompt-toolkit` adds
-the live `/` completion palette; the plain-input fallback still accepts every
-slash command and opens the palette when `/` is submitted.
+The CLI exposes only `Normal` and `Ultra`. Both enter the same durable
+`Intake/Planning` gate and both require one explicit approval of the exact plan
+fingerprint before the first mutation. Normal then runs the persistent
+plan/execute/review/repair loop; Ultra adds recursive specialists, architecture
+debate, component packages, and consensus. Legacy `chat|plan|goal` values are
+migration aliases for Normal, not separate quality levels. This session policy
+never auto-approves a plan and never bypasses shell/tool approval or
+crash-recovery boundaries. `prompt-toolkit` adds the live `/` completion palette;
+the plain-input fallback still accepts every slash command and opens the palette
+when `/` is submitted.
 
 ## Durable domain
 

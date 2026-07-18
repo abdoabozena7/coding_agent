@@ -15,12 +15,14 @@ from agent.scheduler import (
     ResourceLeaseManager,
     ScheduleStatus,
 )
+from agent.reasoning import evaluate_reasoning_artifact, repair_reasoning_artifact_graph, reasoning_debate_protocol_for
 from agent.ultra import (
     AgentRequest,
     AgentResponse,
     AgentRole,
     InMemoryUltraState,
     InnerPhase,
+    TaskContractV1,
     UltraConfig,
     UltraOrchestrator,
     UltraPhase,
@@ -253,6 +255,132 @@ class SchedulerTests(unittest.TestCase):
 
 
 class UltraEngineTests(unittest.TestCase):
+    def test_agent_response_preserves_typed_envelope_reasoning_artifact(self):
+        artifact = {
+            "claim": "candidate passes",
+            "supporting_evidence": ["review:candidate"],
+            "counterarguments": ["runtime still pending"],
+            "rejected_alternatives": ["contract-only review"],
+            "verification_plan": ["run the candidate"],
+        }
+        response = AgentResponse.from_mapping(
+            {
+                "summary": "reviewed",
+                "payload": {"passed": True},
+                "reasoning_artifact": artifact,
+            }
+        )
+
+        self.assertTrue(response.payload["passed"])
+        self.assertEqual(response.payload["reasoning_artifact"], artifact)
+
+    def test_small_model_reasoning_graph_ids_are_repaired_without_inventing_evidence(self):
+        artifact = {
+            "claim": "candidate passes",
+            "supporting_evidence": ["candidate:api"],
+            "counterarguments": ["browser pending"],
+            "rejected_alternatives": ["contract-only review"],
+            "verification_plan": ["run candidate"],
+            "reasoning_graph": {
+                "nodes": [
+                    {"id": "choice", "summary": "candidate passes"},
+                    {"id": "alt", "summary": "contract-only review"},
+                ],
+                "edges": [{"from": "missing", "to": "alt", "relation": "supports"}],
+            },
+        }
+        repaired, actions = repair_reasoning_artifact_graph(artifact)
+        protocol = reasoning_debate_protocol_for("reviewer", "review", {})
+
+        self.assertTrue(actions)
+        self.assertEqual(repaired["supporting_evidence"], artifact["supporting_evidence"])
+        self.assertTrue(evaluate_reasoning_artifact(repaired, protocol).passed)
+
+    def test_fix_candidate_is_composed_with_prior_implementation(self):
+        base = AgentResponse(
+            payload={
+                "implementation": {"code": "class Environment {}", "api": {"setup": True}},
+                "evidence": [{"id": "initial"}],
+            },
+            summary="initial",
+        )
+        fix = AgentResponse(
+            payload={
+                "implementation": {"api": {"update": True}},
+                "evidence": [{"id": "fix"}],
+            },
+            summary="fixed",
+        )
+
+        combined = UltraOrchestrator._merge_candidate_response(base, fix)
+
+        self.assertEqual(combined.payload["implementation"]["code"], "class Environment {}")
+        self.assertEqual(
+            combined.payload["implementation"]["api"],
+            {"setup": True, "update": True},
+        )
+        self.assertEqual(combined.payload["evidence"], [{"id": "fix"}])
+
+    def test_single_html_artifact_uses_recursive_specialists_and_parent_packages(self):
+        state = InMemoryUltraState()
+        html_module = module("GAME", "index.html")
+        html_module.update(
+            {
+                "title": "Three.js vehicle game",
+                "objective": "Build a polished 3D vehicle, road, character, gameplay, and presentation",
+            }
+        )
+        engine, factory, _plan = prepared_engine(
+            state=state,
+            modules=[html_module],
+        )
+
+        result = engine.run()
+
+        self.assertTrue(result.successful)
+        root = next(node for node in engine.nodes.values() if node.parent_id is None)
+        children = [node for node in engine.nodes.values() if node.parent_id]
+        direct_children = [node for node in children if node.parent_id == root.id]
+        recursive_leaves = [node for node in children if node.parent_id != root.id]
+        self.assertGreaterEqual(len(children), 6)
+        self.assertEqual(len(direct_children), 6)
+        self.assertGreaterEqual(len(recursive_leaves), 18)
+        self.assertTrue(all(node.contract.metadata.get("component_leaf") for node in recursive_leaves))
+        self.assertTrue(all(not node.contract.write_paths for node in children))
+        self.assertTrue(
+            all(node.contract.metadata.get("component_package_only") for node in children)
+        )
+        run_id = engine.run_state.id
+        self.assertGreaterEqual(len(state.specialists[run_id]), len(children) + 1)
+        self.assertTrue(all(child.id in state.component_packages[run_id] for child in children))
+        assembler_requests = [
+            request
+            for request in factory.requests
+            if request.phase == InnerPhase.INTEGRATE.value
+            and request.task.get("final_assembler")
+        ]
+        self.assertEqual(len(assembler_requests), 1)
+        self.assertEqual(
+            set(assembler_requests[0].task["child_component_packages"]),
+            {child.id for child in direct_children},
+        )
+        component_assemblers = [
+            request
+            for request in factory.requests
+            if request.phase == InnerPhase.INTEGRATE.value
+            and request.task.get("component_assembler")
+        ]
+        self.assertGreaterEqual(len(component_assemblers), len(direct_children))
+        self.assertTrue(all(not request.task.get("final_assembler") for request in component_assemblers))
+        review_requests = [
+            request
+            for request in factory.requests
+            if request.phase in {InnerPhase.REVIEW.value, InnerPhase.TEST.value}
+            and request.task.get("fresh_review", request.task.get("fresh_test_context", False))
+        ]
+        self.assertTrue(review_requests)
+        self.assertTrue(all("candidate" in request.task for request in review_requests))
+
     def test_foundation_is_sequential_fingerprint_bound_and_traced_without_cot(self):
         state = InMemoryUltraState()
         engine, factory, plan = prepared_engine(state=state)
@@ -260,10 +388,17 @@ class UltraEngineTests(unittest.TestCase):
         self.assertEqual(engine.phase, UltraPhase.AWAITING_APPROVAL)
         self.assertTrue(engine.run_state.approved)
         self.assertEqual(
-            [request.phase for request in factory.requests[:3]],
-            ["goal_spec", "architecture", "master_plan"],
+            [request.phase for request in factory.requests[:6]],
+            [
+                "goal_spec",
+                "architecture",
+                "architecture",
+                "architecture_critique",
+                "architecture_judge",
+                "master_plan",
+            ],
         )
-        self.assertEqual(len(factory.created), 3)
+        self.assertEqual(len(factory.created), 6)
         self.assertEqual(plan.fingerprint, engine.run_state.master_fingerprint)
         self.assertTrue(all("chain-of-thought" not in trace.reasoning_summary for trace in state.traces))
         self.assertTrue(all(not hasattr(trace, "chain_of_thought") for trace in state.traces))
@@ -283,6 +418,10 @@ class UltraEngineTests(unittest.TestCase):
         cloud_pipeline = Counter(request.phase for request in cloud_factory.requests)
         self.assertEqual(local_pipeline, cloud_pipeline)
         self.assertEqual(
+            [result.node_id.split(".", 1)[-1] for result in local_result.node_results],
+            [result.node_id.split(".", 1)[-1] for result in cloud_result.node_results],
+        )
+        self.assertNotEqual(
             [result.node_id for result in local_result.node_results],
             [result.node_id for result in cloud_result.node_results],
         )
@@ -292,7 +431,7 @@ class UltraEngineTests(unittest.TestCase):
 
         def contained(request: AgentRequest) -> AgentResponse:
             response = standard_handler(request, modules=parent_module)
-            if request.phase == InnerPhase.DECOMPOSE.value and request.node_id == "M001":
+            if request.phase == InnerPhase.DECOMPOSE.value and request.node_id.endswith(".M001"):
                 return AgentResponse(
                     payload={
                         "children": [
@@ -306,14 +445,16 @@ class UltraEngineTests(unittest.TestCase):
         engine, _, _ = prepared_engine(handler=contained, modules=parent_module)
         result = engine.run()
         self.assertTrue(result.successful)
-        child = engine.nodes["M1.child"]
-        self.assertEqual(child.parent_id, "M001")
+        parent_id = next(node_id for node_id in engine.nodes if node_id.endswith(".M001"))
+        child_id = engine.nodes[parent_id].children[0]
+        child = engine.nodes[child_id]
+        self.assertEqual(child.parent_id, parent_id)
         self.assertIn("do not change public scope", child.contract.forbidden_changes)
-        self.assertIn("M1.child", engine.nodes["M001"].depends_on)
+        self.assertIn(child_id, engine.nodes[parent_id].depends_on)
 
         def escaped(request: AgentRequest) -> AgentResponse:
             response = standard_handler(request, modules=parent_module)
-            if request.phase == InnerPhase.DECOMPOSE.value and request.node_id == "M001":
+            if request.phase == InnerPhase.DECOMPOSE.value and request.node_id.endswith(".M001"):
                 return AgentResponse(
                     payload={"children": [module("M1.escape", "outside/file.py")]},
                     summary="bad child",
@@ -349,6 +490,44 @@ class UltraEngineTests(unittest.TestCase):
         self.assertEqual(phases[InnerPhase.FIX.value], 3)
         self.assertEqual(phases[InnerPhase.REPLAN.value], 1)
         self.assertEqual(result.node_results[0].fix_attempts, 3)
+        self.assertEqual(
+            result.node_results[0].component_package["status"],
+            "best_candidate_below_target",
+        )
+        self.assertEqual(
+            result.node_results[0].component_package["replan"]["revision"],
+            "change approach",
+        )
+
+    def test_replan_refines_contract_without_expanding_scope(self):
+        original = TaskContractV1.from_mapping(module("M1", "src/one"))
+        refined = UltraOrchestrator._refine_contract_from_replan(
+            original,
+            {
+                "reasoning_artifact": {
+                    "claim": "The integration contract must expose `masterUpdate(deltaTime): void`.",
+                    "findings": [
+                        "The current package has no stable parent-callable update entrypoint."
+                    ],
+                    "verification_plan": [
+                        "Call `masterUpdate(deltaTime): void` twice and verify deterministic state."
+                    ],
+                }
+            },
+        )
+
+        self.assertIn("masterUpdate(deltaTime): void", refined.owned_interfaces)
+        self.assertIn(
+            "Call `masterUpdate(deltaTime): void` twice and verify deterministic state.",
+            refined.verification,
+        )
+        self.assertTrue(
+            any("integration contract" in item for item in refined.acceptance_criteria)
+        )
+        self.assertEqual(refined.write_paths, original.write_paths)
+        self.assertEqual(refined.depends_on, original.depends_on)
+        self.assertEqual(refined.forbidden_changes, original.forbidden_changes)
+        self.assertTrue(refined.metadata["replan_refinement_requirements"])
 
     def test_background_cancel_stops_at_safe_checkpoint(self):
         modules = [module("M1", "src/one")]

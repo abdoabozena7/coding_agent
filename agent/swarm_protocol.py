@@ -25,6 +25,13 @@ class SwarmMessageType(str, Enum):
     VOTE = "vote"
     DECISION = "decision"
     BLOCKER = "blocker"
+    CONTRACT_QUERY = "contract_query"
+    CONTRACT_RESPONSE = "contract_response"
+    PACKAGE_PUBLISHED = "package_published"
+    QUALITY_FINDING = "quality_finding"
+    REVISION_REQUEST = "revision_request"
+    INTEGRATION_READY = "integration_ready"
+    CONSENSUS_RESULT = "consensus_result"
 
 
 class ConsensusStatus(str, Enum):
@@ -68,6 +75,10 @@ class SwarmMessageV1:
     confidence: float = 1.0
     correlation_id: str = ""
     parent_message_id: str | None = None
+    fencing_token: int = 0
+    deadline: str | None = None
+    evidence: tuple[Mapping[str, Any], ...] = ()
+    schema_name: str = "SwarmMessageV1"
     id: str = field(default_factory=lambda: new_id("swarm_msg"))
     protocol_version: int = 1
     created_at: Any = field(default_factory=utc_now)
@@ -81,6 +92,10 @@ class SwarmMessageV1:
             raise ValueError("swarm message requires a topic")
         object.__setattr__(self, "payload", dict(self.payload))
         object.__setattr__(self, "confidence", max(0.0, min(1.0, float(self.confidence))))
+        object.__setattr__(self, "fencing_token", max(0, int(self.fencing_token)))
+        object.__setattr__(self, "evidence", tuple(dict(item) for item in self.evidence))
+        if not str(self.schema_name).strip():
+            raise ValueError("swarm message requires a schema name")
 
     def to_dict(self) -> dict[str, Any]:
         created = self.created_at.isoformat() if hasattr(self.created_at, "isoformat") else str(self.created_at)
@@ -96,6 +111,10 @@ class SwarmMessageV1:
             "confidence": self.confidence,
             "correlation_id": self.correlation_id,
             "parent_message_id": self.parent_message_id,
+            "fencing_token": self.fencing_token,
+            "deadline": self.deadline,
+            "evidence": [dict(item) for item in self.evidence],
+            "schema_name": self.schema_name,
             "created_at": created,
         }
 
@@ -119,6 +138,12 @@ class SwarmMessageV1:
             confidence=float(value.get("confidence", 1.0) or 0.0),
             correlation_id=str(value.get("correlation_id") or ""),
             parent_message_id=str(value["parent_message_id"]) if value.get("parent_message_id") else None,
+            fencing_token=int(value.get("fencing_token", 0) or 0),
+            deadline=str(value["deadline"]) if value.get("deadline") else None,
+            evidence=tuple(
+                dict(item) for item in value.get("evidence", ()) if isinstance(item, Mapping)
+            ),
+            schema_name=str(value.get("schema_name") or "SwarmMessageV1"),
             created_at=created or utc_now(),
         )
 
@@ -156,6 +181,10 @@ class SwarmMessageV1:
             "confidence": f"{self.confidence:.6f}",
             "correlation": _b64_encode(self.correlation_id),
             "parent": _b64_encode(self.parent_message_id or ""),
+            "fencing": str(self.fencing_token),
+            "deadline": _b64_encode(self.deadline or ""),
+            "evidence": _b64_encode(json.dumps(list(self.evidence), ensure_ascii=False, sort_keys=True, separators=(",", ":"))),
+            "schema": _b64_encode(self.schema_name),
             "created": _b64_encode(self.to_dict()["created_at"]),
             "payload": _b64_encode(payload),
         }
@@ -187,6 +216,14 @@ class SwarmMessageV1:
             parent_message_id=(
                 _b64_decode(values.get("parent", "")).decode("utf-8") or None
             ),
+            fencing_token=int(values.get("fencing", "0") or 0),
+            deadline=_b64_decode(values.get("deadline", "")).decode("utf-8") or None,
+            evidence=tuple(
+                dict(item)
+                for item in json.loads(_b64_decode(values.get("evidence", "W10")).decode("utf-8") or "[]")
+                if isinstance(item, Mapping)
+            ),
+            schema_name=_b64_decode(values.get("schema", _b64_encode("SwarmMessageV1"))).decode("utf-8") or "SwarmMessageV1",
             created_at=(
                 datetime.fromisoformat(_b64_decode(values["created"]).decode("utf-8"))
                 if values.get("created")

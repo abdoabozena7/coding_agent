@@ -40,6 +40,16 @@ from .control import (
 )
 from .events import EventBus
 from .hardware import probe_local_gpu
+from .intake import (
+    ClarificationQuestionV1,
+    IntakeStatus,
+    IntentArchitect,
+    RunMode,
+    answer_from_value,
+    normalize_question,
+    normalize_questions,
+)
+from .learning import GlobalLessonStore, LearnedLessonV1
 from .models import (
     Delegation,
     DelegationStatus,
@@ -83,9 +93,13 @@ from .sleep_profile import SleepController
 from .quality import ChangeSetStatus
 from .run_context import GoalContractV1, is_goal_escalation_approval
 from .weak_model import WeakModelPolicy
-from .repository_index import RepositoryIndex
+from .repository_index import OllamaEmbeddingProvider, RepositoryIndex
 from .diagnostics import ErrorSignature, FailureDomain, normalize_error_message
-from .local_provider import extract_first_json_object, normalize_action_proposal
+from .local_provider import (
+    extract_first_json_object,
+    normalize_action_proposal,
+    normalize_generated_tool_args,
+)
 
 try:
     from .model_catalog import ExecutionClass, ModelDescriptor
@@ -206,8 +220,14 @@ class AgentRuntime:
         self.session_id = "workspace-session"
         self.sleep_controller = SleepController()
         self.weak_model_policy = WeakModelPolicy()
+        self.intent_architect = IntentArchitect()
+        model_name = str(getattr(provider, "model", "")).casefold()
+        self._global_memory_enabled = not model_name.startswith(("offline", "fake", "test"))
+        self.global_lessons = GlobalLessonStore()
+        self._used_global_lesson_ids: set[str] = set()
         self.repository_index = RepositoryIndex(
             self.workspace,
+            embedding_provider=OllamaEmbeddingProvider.from_environment(),
             cache_path=self.workspace / ".coding-agent" / "repository-index-v1.json",
         )
         self.repository_index_warmup_error = ""
@@ -216,6 +236,7 @@ class AgentRuntime:
                 self.repository_index.update_all(
                     max_files=self.config.repository_index_warmup_files,
                 )
+                self.store.sync_repository_index(self.workspace, self.repository_index)
             except (OSError, UnicodeError, ValueError) as exc:
                 self.repository_index_warmup_error = f"{type(exc).__name__}: {exc}"
         try:
@@ -224,7 +245,7 @@ class AgentRuntime:
             self.store.save_workflow_session(
                 self.session_id,
                 goal_id=None,
-                session_mode=SessionMode.CHAT.value,
+                session_mode=SessionMode.NORMAL.value,
                 plan_state=PlanState.NONE.value,
                 run_state=RunState.IDLE.value,
             )
@@ -319,6 +340,24 @@ class AgentRuntime:
                         )
                 except (NotFoundError, StateStoreError, DomainError):
                     continue
+
+        auto_reconciled = self._auto_reconcile_read_only_ultra_uncertainty()
+        if auto_reconciled:
+            recovered_goal = self.store.load_active_goal()
+            if recovered_goal is not None:
+                self.store.update_goal_metadata(
+                    recovered_goal.id,
+                    waiting_question=(
+                        "Interrupted read-only/component-package work was safely reset to its "
+                        "durable checkpoint; use /resume to continue."
+                    ),
+                    resume_status=GoalStatus.RUNNING.value,
+                )
+            self.events.publish(
+                "recovery",
+                "Read-only ULTRA uncertainty was reconciled automatically; no workspace write was replayed.",
+                entities=list(auto_reconciled),
+            )
 
         # Planning/review phases are model-call transients. A process can stop
         # there without an action row, so normalize them to an explicit paused
@@ -556,6 +595,216 @@ class AgentRuntime:
         self.ultra_session = self._make_ultra_session()
         return self.ultra_session.start(redact_text(objective, 20_000))
 
+    def intake_questions(self) -> tuple[Mapping[str, Any], ...]:
+        pending = self.store.get_pending_intake(self.session_id)
+        if pending is None:
+            return ()
+        return tuple(
+            dict(item)
+            for item in pending.get("questions", ())
+            if not str(item.get("answer") or "").strip()
+        )
+
+    def _intake_repository_facts(self, query: str) -> tuple[str, ...]:
+        """Return a small provenance-bearing slice before asking the user."""
+
+        facts: list[str] = []
+        if self._global_memory_enabled:
+            for lesson in self.global_lessons.search(query, limit=4):
+                self._used_global_lesson_ids.add(lesson.id)
+                facts.append(
+                    "Cross-run learned lesson: "
+                    f"{lesson.title} — {lesson.content} (confidence={lesson.confidence:.2f})"
+                )
+        try:
+            context_slice = self.repository_index.context_slice(
+                query,
+                max_entries=8,
+                budget_chars=6_000,
+            )
+        except (OSError, UnicodeError, ValueError, TypeError):
+            return tuple(facts)
+        for entry in context_slice.entries:
+            facts.append(
+                "Discovered repository context: "
+                f"{entry.path} -> {entry.kind} {entry.name} "
+                f"(confidence={entry.confidence:.2f}, provenance={entry.provenance}, "
+                f"hash={entry.file_hash[:12]})"
+            )
+        if context_slice.omitted_entries:
+            facts.append(
+                f"Repository retrieval omitted {context_slice.omitted_entries} lower-ranked entries."
+            )
+        return tuple(facts)
+
+    def _record_global_learning(
+        self,
+        goal: Goal,
+        *,
+        succeeded: bool,
+        evidence_ref: str,
+        blocker: str = "",
+    ) -> None:
+        if not self._global_memory_enabled:
+            return
+        for lesson_id in tuple(self._used_global_lesson_ids):
+            self.global_lessons.record_outcome(lesson_id, succeeded=succeeded)
+        visual = any(
+            str(path).casefold().endswith((".html", ".htm"))
+            for path in dict(goal.metadata.get("quality_target", {})).get("artifact_ids", ())
+        )
+        tags = ("normal", "visual", "browser") if visual else ("normal", "implementation", "verification")
+        content = (
+            "Require deterministic evidence and independent review before completion; "
+            + (
+                "interactive HTML also requires browser/runtime and visual evidence."
+                if visual
+                else "preserve the durable goal, plan, and checklist across retries."
+            )
+        )
+        if blocker:
+            content += f" Last blocker pattern: {redact_text(blocker, 500)}"
+        self.global_lessons.put(
+            LearnedLessonV1(
+                title="Normal evidence-gated execution",
+                content=content,
+                applicability_tags=tags,
+                evidence_refs=(evidence_ref,),
+                successes=1 if succeeded else 0,
+                failures=0 if succeeded else 1,
+            )
+        )
+
+    def _route_intake(self, intake: Mapping[str, Any], brief: Any) -> Any:
+        routed = RunMode.parse(brief.routed_mode)
+        self.store.complete_intake_session(
+            str(intake["id"]),
+            brief=brief.to_dict(),
+            routed_mode=routed.value,
+            route_reason=brief.route_reason,
+        )
+        self.transition_mode(routed.value)
+        self.events.publish(
+            "intake.routed",
+            f"Intent Architect routed the task to {routed.value.upper()}: {brief.route_reason}",
+            intake_id=intake["id"],
+            mode=routed.value,
+            complexity=dict(intake.get("complexity", {})),
+            execution_brief=brief.to_dict(),
+        )
+        canonical = brief.canonical_prompt()
+        return self.start_ultra(canonical) if routed is RunMode.ULTRA else self.start_goal(canonical)
+
+    def submit_intent(
+        self,
+        text: str,
+        *,
+        requested_mode: str | RunMode = RunMode.NORMAL,
+    ) -> Any:
+        """Run every new objective through the shared, durable intake gate."""
+
+        value = redact_text(text, 20_000).strip()
+        if not value:
+            return None
+        pending = self.store.get_pending_intake(self.session_id)
+        if pending is not None:
+            unanswered = [
+                item for item in pending.get("questions", ())
+                if not str(item.get("answer") or "").strip()
+            ]
+            if not unanswered:
+                raise RuntimeStateError("intake is ready but has not been routed")
+            return self.answer_intake_question(str(unanswered[0]["id"]), value)
+        if self.active_goal() is not None:
+            return self.add_guidance(value)
+        decision = self.intent_architect.analyze(
+            value,
+            requested_mode=requested_mode,
+            repository_facts=self._intake_repository_facts(value),
+        )
+        intake = self.store.create_intake_session(
+            self.session_id,
+            original_input=value,
+            brief=decision.brief.to_dict(),
+            complexity=decision.complexity.to_dict(),
+            requested_mode=decision.brief.requested_mode.value,
+            routed_mode=decision.brief.routed_mode.value,
+            route_reason=decision.brief.route_reason,
+            status=decision.status.value,
+            questions=(item.to_dict() for item in decision.questions),
+        )
+        self.events.publish(
+            "intake.analyzed",
+            (
+                f"Intent Architect needs {len(decision.questions)} decision(s)."
+                if decision.questions
+                else f"Intent Architect prepared a {decision.brief.routed_mode.value.upper()} execution brief."
+            ),
+            intake_id=intake["id"],
+            mode=decision.brief.routed_mode.value,
+            complexity=decision.complexity.to_dict(),
+            questions=[item.to_dict() for item in decision.questions],
+        )
+        if decision.questions:
+            self.store.save_workflow_session(
+                self.session_id,
+                goal_id=None,
+                session_mode=decision.brief.routed_mode.value,
+                plan_state=PlanState.INSPECTING.value,
+                run_state=RunState.PLANNING.value,
+                state={
+                    "intake_id": intake["id"],
+                    "intake_status": IntakeStatus.AWAITING_ANSWERS.value,
+                },
+            )
+            return SliceResult(
+                "awaiting_answers",
+                f"Intent Architect needs {len(decision.questions)} decision(s) before planning.",
+                needs_user=True,
+            )
+        return self._route_intake(intake, decision.brief)
+
+    def answer_intake_question(self, question_id: str, value: str) -> Any:
+        pending = self.store.get_pending_intake(self.session_id)
+        if pending is None:
+            raise RuntimeStateError("there is no active intake question")
+        raw_questions = {str(item["id"]): item for item in pending.get("questions", ())}
+        if question_id not in raw_questions:
+            raise RuntimeStateError(f"unknown intake question id: {question_id}")
+        question: ClarificationQuestionV1 = normalize_question(raw_questions[question_id])
+        answer, source = answer_from_value(question, redact_text(value, 2_000))
+        updated = self.store.answer_intake_question(
+            str(pending["id"]), question_id, answer, source=source
+        )
+        unanswered = [
+            item for item in updated.get("questions", ())
+            if not str(item.get("answer") or "").strip()
+        ]
+        self.events.publish(
+            "intake.question_answered",
+            f"Saved {question_id}; {len(unanswered)} decision(s) remain.",
+            intake_id=pending["id"],
+            question_id=question_id,
+            answer_source=source,
+        )
+        if unanswered:
+            return SliceResult(
+                "awaiting_answers",
+                f"Saved {question_id}; {len(unanswered)} decision(s) remain.",
+                needs_user=True,
+            )
+        answers = {
+            str(item["id"]): str(item.get("answer") or "")
+            for item in updated.get("questions", ())
+        }
+        decision = self.intent_architect.analyze(
+            str(updated["original_input"]),
+            requested_mode=str(updated["requested_mode"]),
+            answers=answers,
+            repository_facts=self._intake_repository_facts(str(updated["original_input"])),
+        )
+        return self._route_intake(updated, decision.brief)
+
     def active_ultra_run(self) -> Any | None:
         goal = self.active_goal() or self.store.get_latest_goal()
         run_id = str(goal.metadata.get("ultra_run_id", "")) if goal else ""
@@ -641,11 +890,15 @@ class AgentRuntime:
                     GoalStatus.REVISING,
                     reason="ULTRA master-plan revision requested",
                 )
-            elif current.status == GoalStatus.RUNNING:
+            elif current.status in {GoalStatus.RUNNING, GoalStatus.BLOCKED}:
                 self.store.transition_goal(
                     goal.id,
                     GoalStatus.REVISING,
-                    reason="ULTRA master-plan revision requested",
+                    reason=(
+                        "ULTRA master-plan revision requested after a blocked quality gate"
+                        if current.status is GoalStatus.BLOCKED
+                        else "ULTRA master-plan revision requested"
+                    ),
                 )
             elif current.status != GoalStatus.REVISING:
                 raise RuntimeStateError(
@@ -690,9 +943,9 @@ class AgentRuntime:
 
     def transition_mode(self, mode: str) -> str:
         """Persist a policy change without replacing the active run or its memory."""
-        target = SessionMode(str(getattr(mode, "value", mode)).casefold())
+        target = SessionMode.parse(mode)
         session = self.store.get_workflow_session(self.session_id)
-        previous = SessionMode(str(session["session_mode"]))
+        previous = SessionMode.parse(str(session["session_mode"]))
         state = dict(session.get("state", {}))
         goal = self.active_goal()
         if goal is not None:
@@ -819,11 +1072,20 @@ class AgentRuntime:
                 for call in turn.tool_calls:
                     if not isinstance(call.args, dict):
                         call.args = {}
-                if not turn.tool_calls and not native_tools and turn.text:
+                    else:
+                        call.args = normalize_generated_tool_args(call.name, call.args)
+                if not turn.tool_calls and schemas and turn.text:
+                    # Some weak models advertise native tool calling but emit
+                    # the requested call as a JSON object in assistant text.
+                    # Treat this as a recoverable transport-shape mismatch and
+                    # normalize exactly one allow-listed proposal.  The normal
+                    # schema, permission, and action journal gates still own
+                    # execution.
                     candidate = extract_first_json_object(turn.text)
                     proposal = normalize_action_proposal(candidate) if candidate is not None else None
                     if proposal is not None:
                         name, args = proposal
+                        args = normalize_generated_tool_args(name, args)
                         allowed = {_tool_name(schema) for schema in schemas}
                         if name in allowed:
                             generated_id = f"harness-{actor.replace(':', '-')}-{step}-{attempt}"
@@ -831,7 +1093,12 @@ class AgentRuntime:
                             if current_goal is not None:
                                 self.store.append_event(
                                     "tool_action.proposal_normalized", goal_id=current_goal.id,
-                                    payload={"actor": actor, "tool": name, "generated_id": generated_id},
+                                    payload={
+                                        "actor": actor,
+                                        "tool": name,
+                                        "generated_id": generated_id,
+                                        "advertised_native_tools": native_tools,
+                                    },
                                 )
                 self._emit_usage(turn)
                 return turn
@@ -1097,6 +1364,122 @@ class AgentRuntime:
         bound["applicability_evidence"] = evidence
         return bound
 
+    def _harness_fallback_plan(
+        self,
+        goal: Goal,
+        inspection_records: Mapping[str, Mapping[str, Any]],
+    ) -> Plan | None:
+        """Create a narrow approval-bound plan when a weak planner stalls.
+
+        This fallback is deliberately limited to short objectives naming one
+        concrete artifact. It never executes or approves the plan.
+        """
+
+        objective = str(goal.objective).strip()
+        if not inspection_records or len(objective) > 1_200:
+            return None
+        paths = re.findall(
+            r"(?<![\w./-])([A-Za-z0-9_.-]+\.(?:html?|py|js|ts|tsx|jsx|css|json|md|txt|ya?ml|toml))\b",
+            objective,
+            flags=re.IGNORECASE,
+        )
+        unique_paths = tuple(dict.fromkeys(path.replace("\\", "/") for path in paths))
+        if len(unique_paths) != 1:
+            return None
+        target = unique_paths[0]
+        is_html = target.casefold().endswith((".html", ".htm"))
+        reference, record = next(iter(inspection_records.items()))
+        raw = {
+            "summary": f"Implement and verify {target} from the user's explicit objective.",
+            "applicability_evidence": [
+                {
+                    "fact": (
+                        "The workspace was inspected and the named artifact can be implemented in place. "
+                        + str(record.get("result") or "")[:400]
+                    ),
+                    "source": f"inspection:{reference}",
+                    "supports_tasks": ["T001"],
+                }
+            ],
+            "execution_strategy": (
+                f"Create or update {target}, read it back, then "
+                + ("run browser preview verification and inspect runtime errors." if is_html else "run the narrowest applicable verification.")
+            ),
+            "expected_changes": [
+                {"path": target, "intent": objective, "supports_tasks": ["T001"]}
+            ],
+            "tasks": [
+                {
+                    "title": f"Implement and verify {target}",
+                    "description": objective,
+                    "acceptance_criteria": [
+                        f"{target} exists and implements every behavior explicitly requested in the objective.",
+                        "The saved artifact is re-read and contains no placeholder-only implementation.",
+                    ],
+                    "verification": [
+                        f"Read {target} after writing and compare it with the objective.",
+                        (
+                            f"Open {target} with the browser preview and confirm HTTP success with no console, page, or network errors."
+                            if is_html
+                            else "Run the narrowest executable or static check applicable to the artifact."
+                        ),
+                    ],
+                    "depends_on": [],
+                    "risk": "low",
+                }
+            ],
+        }
+        proposed, actions = normalize_plan_draft(raw)
+        validate_normalized_plan(proposed)
+        for task in proposed["tasks"]:
+            task.pop("_unresolved_dependencies", None)
+        plan = self.store.create_plan(
+            goal.id,
+            proposed["summary"],
+            proposed["tasks"],
+            applicability_evidence=proposed["applicability_evidence"],
+            execution_strategy=proposed["execution_strategy"],
+            expected_changes=proposed["expected_changes"],
+            proposed_by="harness-weak-model-fallback",
+            submit=True,
+        )
+        current_goal = self.store.get_goal(goal.id)
+        if current_goal.status != GoalStatus.AWAITING_PLAN_APPROVAL:
+            self.store.transition_goal(
+                goal.id,
+                GoalStatus.AWAITING_PLAN_APPROVAL,
+                reason="narrow harness fallback plan awaits user approval",
+            )
+        self.store.append_event(
+            "planning.harness_fallback",
+            goal_id=goal.id,
+            entity_type="plan",
+            entity_id=plan.id,
+            payload={"target": target, "normalization_actions": list(actions)},
+        )
+        self.events.publish(
+            "plan",
+            f"Plan r{plan.revision} was recovered from the explicit single-artifact objective. Review it, then use /approve {plan.revision}.",
+        )
+        self.store.update_goal_metadata(
+            goal.id,
+            consecutive_retries=0,
+            retry_reason="",
+            retry_after_ms=0,
+            auto_retryable=False,
+            plan_questions=[],
+            waiting_question="",
+        )
+        self.store.save_workflow_session(
+            self.session_id,
+            goal_id=goal.id,
+            session_mode=SessionMode.PLAN.value,
+            plan_state=PlanState.AWAITING_APPROVAL.value,
+            run_state=RunState.PLANNING.value,
+            state={"plan_revision": plan.revision, "plan_fingerprint": plan.fingerprint, "fallback": True},
+        )
+        return plan
+
     def _pause_planning(self, goal: Goal, question: str, reason: str) -> None:
         """Checkpoint a bounded/failed planning pass as an explicit user-visible pause."""
         current = self.store.get_goal(goal.id)
@@ -1127,7 +1510,10 @@ class AgentRuntime:
         current = self.store.get_goal(goal.id)
         if current.status not in {GoalStatus.DISCOVERING, GoalStatus.REVISING}:
             raise RuntimeStateError("planning questions can only pause an active planning phase")
-        values = [redact_data(dict(item)) for item in questions]
+        values = [
+            redact_data(normalize_question(item, index=index).to_dict())
+            for index, item in enumerate(questions, 1)
+        ]
         first = str(values[0].get("question", ""))
         self.store.update_goal_metadata(
             goal.id,
@@ -1182,6 +1568,8 @@ class AgentRuntime:
         if not answer:
             raise ValueError("question answers must not be empty")
         item = questions[question_id]
+        normalized_question = normalize_question(item)
+        answer, _answer_source = answer_from_value(normalized_question, answer)
         labels = {
             str(option.get("label", "")).strip()
             for option in item.get("options", ())
@@ -1336,6 +1724,7 @@ class AgentRuntime:
         ]
         revisions = 0
         invalid_plan_calls = 0
+        unproductive_turns_after_inspection = 0
         last_plan_format_error = ""
         plan_format_exhausted = False
         successful_inspection_ids: set[str] = set()
@@ -1407,7 +1796,20 @@ class AgentRuntime:
                             plan_format_exhausted = True
                 elif call.name == "request_plan_input":
                     try:
-                        request = validate_control_call(call.name, call.args)
+                        # Weak/local models often omit the third choice or mark
+                        # several recommendations. Canonicalize first, then
+                        # validate the strict persisted/UI contract.
+                        normalized = normalize_questions(
+                            tuple(
+                                item
+                                for item in call.args.get("questions", ())
+                                if isinstance(item, Mapping)
+                            )
+                        )
+                        request = validate_control_call(
+                            call.name,
+                            {"questions": [item.to_dict() for item in normalized]},
+                        )
                         if not inspections_before_turn:
                             raise ControlValidationError(
                                 "inspect the workspace successfully before asking the user"
@@ -1485,6 +1887,13 @@ class AgentRuntime:
             if requested_questions is not None and proposed is None:
                 self._pause_for_plan_questions(goal, requested_questions)
                 return None
+
+            if proposed is None and requested_questions is None and inspection_records:
+                unproductive_turns_after_inspection += 1
+                if unproductive_turns_after_inspection >= 2:
+                    fallback_plan = self._harness_fallback_plan(goal, inspection_records)
+                    if fallback_plan is not None:
+                        return fallback_plan
 
             if proposed is not None:
                 # Inspection provenance and persistence-only cross references
@@ -1657,6 +2066,10 @@ class AgentRuntime:
                     }
                 )
 
+        fallback_plan = self._harness_fallback_plan(goal, inspection_records)
+        if fallback_plan is not None:
+            return fallback_plan
+
         checkpoint_reason = (
             (
                 "planner repeatedly returned an invalid structured plan; exact field validation is recorded"
@@ -1738,28 +2151,28 @@ class AgentRuntime:
                 ("runtime-stability", "No relevant runtime, provider, browser, or console error remains", True, 1.0),
                 ("integration-correctness", "The change is integrated without breaking existing contracts", True, 1.0),
                 ("regression-safety", "Impacted focused checks and appropriate broader regression checks pass", True, 1.0),
-                ("maintainability", "The implementation is coherent, bounded, and avoids unnecessary complexity", False, 0.8),
+                ("maintainability", "The implementation is coherent, bounded, and avoids unnecessary complexity", False, 0.85),
             ]
             objective_lower = contract.interpreted_objective.casefold()
             castle_dimensions = []
             artifact_dimensions = []
             if any(path.casefold().endswith((".html", ".htm")) for path in artifact_paths):
                 artifact_dimensions = [
-                    ("visual-quality", "Visual composition, hierarchy, detail, and polish meet the requested quality", False, 0.8),
-                    ("interaction-quality", "Interactive and animated behavior is understandable, stable, and appropriately varied", False, 0.8),
+                    ("visual-quality", "Visual composition, hierarchy, detail, and polish meet the requested quality", False, 0.85),
+                    ("interaction-quality", "Interactive and animated behavior is understandable, stable, and appropriately varied", False, 0.85),
                 ]
             if "castle" in objective_lower and "siege" in objective_lower:
                 castle_dimensions = [
-                    ("castle-recognizable", "Castle is visually recognizable and more detailed than placeholder rectangles", False, 0.8),
+                    ("castle-recognizable", "Castle is visually recognizable and more detailed than placeholder rectangles", False, 0.85),
                     ("main-gate-visible", "Main gate is visible and not hidden by overlap", True, 1.0),
-                    ("ram-soldiers", "Soldiers visibly attempt to breach the gate with a battering ram", False, 0.8),
-                    ("ram-motion", "Battering ram has repeated understandable motion", False, 0.8),
-                    ("siege-tower", "Siege tower is clearly represented and participates in the scene", False, 0.8),
-                    ("moving-arrows", "Archers visibly release moving arrows", False, 0.8),
-                    ("catapult-projectiles", "Catapults visibly launch moving projectiles", False, 0.8),
-                    ("projectile-distinction", "Projectiles are distinguishable from static decoration", False, 0.8),
-                    ("animation-variety", "Actors do not all use identical synchronized animation", False, 0.8),
-                    ("scene-depth", "Scene has meaningful layering, depth, and a non-empty composition", False, 0.8),
+                    ("ram-soldiers", "Soldiers visibly attempt to breach the gate with a battering ram", False, 0.85),
+                    ("ram-motion", "Battering ram has repeated understandable motion", False, 0.85),
+                    ("siege-tower", "Siege tower is clearly represented and participates in the scene", False, 0.85),
+                    ("moving-arrows", "Archers visibly release moving arrows", False, 0.85),
+                    ("catapult-projectiles", "Catapults visibly launch moving projectiles", False, 0.85),
+                    ("projectile-distinction", "Projectiles are distinguishable from static decoration", False, 0.85),
+                    ("animation-variety", "Actors do not all use identical synchronized animation", False, 0.85),
+                    ("scene-depth", "Scene has meaningful layering, depth, and a non-empty composition", False, 0.85),
                     ("self-contained", "The requested single HTML artifact is self-contained with no unexpected network requests", True, 1.0),
                     ("extended-stability", "Animation remains stable during an extended run without JavaScript errors", True, 1.0),
                     ("responsive-usability", "Wide and narrow viewports remain usable without harmful overflow", True, 1.0),
@@ -1796,7 +2209,7 @@ class AgentRuntime:
                 "id": f"quality-{goal.id}",
                 "objective": updated_contract.interpreted_objective,
                 "artifact_ids": artifact_paths or ("workspace",),
-                "minimum_overall_score": 0.8,
+                "minimum_overall_score": 0.95,
                 "hard_gates": list(verification),
                 "dimensions": [
                     {
@@ -2180,6 +2593,11 @@ class AgentRuntime:
             )
             self.store.transition_goal(goal.id, GoalStatus.REVIEWING, reason="user accepted only the unresolved subjective visual dimension")
             self.store.transition_goal(goal.id, GoalStatus.COMPLETED, reason="correctness gates and independent review passed; user accepted subjective visual quality")
+            self._record_global_learning(
+                self.store.get_goal(goal.id),
+                succeeded=True,
+                evidence_ref=f"goal:{goal.id}:user-visual-acceptance:{item.id}",
+            )
             self.store.append_event(
                 "quality_convergence.decided", goal_id=goal.id,
                 payload={"state": "converged", "source": "explicit_user_visual_acceptance", "evidence_id": item.id},
@@ -2313,6 +2731,72 @@ class AgentRuntime:
             dict.fromkeys([*action_ids, *delegation_ids, *task_ids, *ultra_ids])
         )
 
+    def _auto_reconcile_read_only_ultra_uncertainty(self) -> tuple[str, ...]:
+        """Reset provably side-effect-free crash windows without user ceremony."""
+
+        from .ultra_models import AgentRunStatus, WorkNodeStatus
+
+        goal = self.store.load_active_goal()
+        if goal is None:
+            return ()
+        run_id = str(goal.metadata.get("ultra_run_id", ""))
+        if not run_id:
+            return ()
+        reconciled: list[str] = []
+        uncertain_agents = [
+            item
+            for item in self.store.list_agent_runs(run_id)
+            if item.status is AgentRunStatus.UNCERTAIN
+        ]
+        mutating_action_nodes: set[str] = set()
+        for action in self.store.list_actions(goal.id):
+            if not bool(action.get("mutating")):
+                continue
+            arguments = action.get("args")
+            if not isinstance(arguments, Mapping):
+                arguments = action.get("arguments")
+            if not isinstance(arguments, Mapping):
+                try:
+                    decoded = json.loads(str(action.get("args_json") or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    decoded = {}
+                arguments = decoded if isinstance(decoded, Mapping) else {}
+            if not isinstance(arguments, Mapping):
+                continue
+            node_id = str(arguments.get("node_id") or "")
+            if node_id:
+                mutating_action_nodes.add(node_id)
+        unsafe_nodes = {
+            str(item.work_node_id)
+            for item in uncertain_agents
+            if item.side_effects
+            and item.work_node_id
+            and str(item.work_node_id) in mutating_action_nodes
+        }
+        for agent in uncertain_agents:
+            if agent.side_effects and str(agent.work_node_id or "") in mutating_action_nodes:
+                continue
+            self.store.update_agent_run(
+                agent.id,
+                AgentRunStatus.CANCELLED,
+                error="interrupted read-only model call; safe to recompute from durable input",
+            )
+            reconciled.append(agent.id)
+        for node in self.store.list_work_nodes(run_id):
+            if node.status is not WorkNodeStatus.UNCERTAIN:
+                continue
+            component_only = bool(node.contract.metadata.get("component_package_only"))
+            if not component_only or node.contract.write_paths or node.id in unsafe_nodes:
+                continue
+            self.store.transition_work_node(
+                node.id,
+                WorkNodeStatus.PENDING,
+                error=None,
+                checkpoint="auto_reconciled_read_only",
+            )
+            reconciled.append(node.id)
+        return tuple(reconciled)
+
     def pause(self, reason: str = "paused by user") -> Goal:
         goal = self.active_goal()
         if goal is None:
@@ -2328,7 +2812,17 @@ class AgentRuntime:
 
     def resume(self) -> Goal:
         goal = self.active_goal()
-        if goal is None or goal.status != GoalStatus.PAUSED:
+        ultra_run = self.active_ultra_run() if goal is not None else None
+        resumable_failed_ultra = bool(
+            goal is not None
+            and goal.status == GoalStatus.BLOCKED
+            and goal.metadata.get("ultra_run_id")
+            and ultra_run is not None
+            and ultra_run.status.value in {"running", "recovering"}
+        )
+        if goal is None or (
+            goal.status != GoalStatus.PAUSED and not resumable_failed_ultra
+        ):
             raise RuntimeStateError("goal is not paused")
         unresolved = self._unresolved_recovery_entities(goal.id)
         if unresolved:
@@ -2338,7 +2832,11 @@ class AgentRuntime:
                 "cannot resume while crash-window work is uncertain; inspect it and use "
                 f"/resolve first ({preview}{suffix})"
             )
-        desired = GoalStatus(goal.metadata.get("resume_status", GoalStatus.RUNNING.value))
+        desired = (
+            GoalStatus.RUNNING
+            if resumable_failed_ultra
+            else GoalStatus(goal.metadata.get("resume_status", GoalStatus.RUNNING.value))
+        )
         if desired in {
             GoalStatus.NEW,
             GoalStatus.PAUSED,
@@ -2351,7 +2849,15 @@ class AgentRuntime:
         self.store.update_goal_metadata(goal.id, waiting_question="")
         self.store.update_goal_metadata(goal.id, no_progress_slices=0)
         self.store.update_goal_metadata(goal.id, retry_after_ms=0, auto_retryable=False)
-        result = self.store.transition_goal(goal.id, desired, reason="resumed by user")
+        result = self.store.transition_goal(
+            goal.id,
+            desired,
+            reason=(
+                "resumed after a recoverable ULTRA engine failure"
+                if resumable_failed_ultra
+                else "resumed by user"
+            ),
+        )
         self.events.publish("phase", f"Goal resumed in {desired.value}.")
         ultra_run_id = str(goal.metadata.get("ultra_run_id", ""))
         if ultra_run_id and self.ultra_session is None:
@@ -3060,6 +3566,83 @@ class AgentRuntime:
             return f"Error: checklist update rejected: {redact_text(exc, 1_000)}"
         return f"Checklist {task.id} -> {task.status.value}. Durable state updated."
 
+    def _maybe_complete_harness_fallback_task(self, goal: Goal, plan: Plan) -> bool:
+        """Close a narrow fallback task from authoritative artifact evidence.
+
+        Weak models often keep re-reading a proven file instead of emitting the
+        checklist control call.  For the single-artifact fallback only, the
+        harness can evaluate the exact deterministic gates it authored.
+        """
+
+        if plan.proposed_by != "harness-weak-model-fallback" or len(plan.tasks) != 1:
+            return False
+        task = plan.tasks[0]
+        if task.status not in {TaskStatus.READY, TaskStatus.IN_PROGRESS, TaskStatus.VERIFYING}:
+            return False
+        if not plan.expected_changes:
+            return False
+        relative = str(plan.expected_changes[0].get("path") or "").strip()
+        candidate = (self.workspace / relative).resolve(strict=False)
+        if not relative or not candidate.is_file() or not candidate.is_relative_to(self.workspace):
+            return False
+        evidence = [
+            item
+            for item in self.store.list_evidence(goal.id, task_id=task.id)
+            if item.plan_revision == plan.revision and item.verified
+        ]
+        tools_seen = {str(item.data.get("tool") or "") for item in evidence}
+        if "read_file" not in tools_seen:
+            return False
+        objective = goal.objective.casefold()
+        if relative.casefold().endswith((".html", ".htm")):
+            if not tools_seen.intersection({"preview_html", "inspect_preview"}):
+                return False
+            preview_results = [
+                str(item.data.get("result") or "")
+                for item in evidence
+                if str(item.data.get("tool") or "") in {"preview_html", "inspect_preview"}
+            ]
+            if not any(
+                ('"verification": "passed"' in result or '"status": "passed"' in result)
+                and '"console_errors": []' in result
+                and '"page_errors": []' in result
+                and '"network_errors": []' in result
+                for result in preview_results
+            ):
+                return False
+            html = candidate.read_text(encoding="utf-8", errors="replace")
+            lowered = html.casefold()
+            if "<!doctype html" not in lowered or "<html" not in lowered:
+                return False
+            if "accessible" in objective and not (re.search(r"<html\b[^>]*\blang=", lowered) and "<button" in lowered):
+                return False
+            if "visible" in objective and "counter" in objective:
+                if not (
+                    re.search(r"id=[\"']counter[\"'][^>]*>\s*\d+", lowered)
+                    and "<button" in lowered
+                    and re.search(r"(?:addEventListener|onclick|increment)", html, re.IGNORECASE)
+                ):
+                    return False
+        self.store.transition_task(
+            goal.id,
+            plan.revision,
+            task.id,
+            TaskStatus.COMPLETED,
+            note="harness-authored fallback verification gates passed",
+            evidence=(
+                f"Harness verified {relative}: saved artifact read-back and required runtime/static gates passed.",
+            ),
+            actor="harness-fallback-verifier",
+        )
+        self.store.append_event(
+            "task.fallback_verified",
+            goal_id=goal.id,
+            entity_type="task",
+            entity_id=task.id,
+            payload={"path": relative, "tools": sorted(tools_seen)},
+        )
+        return True
+
     def _record_memory(self, goal: Goal, plan: Plan, args: dict[str, Any]) -> str:
         item = self.store.add_evidence(
             goal_id=goal.id,
@@ -3602,6 +4185,11 @@ class AgentRuntime:
                 reason="all checklist evidence passed independent final review",
                 metadata={"completion_summary": redact_text(args["summary"], 4_000)},
             )
+            self._record_global_learning(
+                self.store.get_goal(goal.id),
+                succeeded=True,
+                evidence_ref=f"goal:{goal.id}:evaluation:{evaluation_record.get('evaluated_at_unix')}",
+            )
             self.store.save_workflow_session(
                 self.session_id,
                 goal_id=goal.id,
@@ -3613,6 +4201,12 @@ class AgentRuntime:
             self.events.publish("phase", "Goal completed after evidence gate and independent review.")
             return "Goal completed. The harness accepted the independent review."
 
+        self._record_global_learning(
+            self.store.get_goal(goal.id),
+            succeeded=False,
+            evidence_ref=f"goal:{goal.id}:review-failed",
+            blocker=str(verdict.get("summary") or "independent review failed"),
+        )
         repair_tasks = []
         existing = list(plan.tasks)
         for issue in verdict["issues"]:
@@ -3815,6 +4409,21 @@ class AgentRuntime:
                     if not result.startswith("Error:") and not result.startswith("Permission denied"):
                         made_progress = True
 
+                refreshed_goal = self.store.get_goal(goal.id)
+                refreshed_plan = self.store.get_latest_plan(goal.id)
+                if self._maybe_complete_harness_fallback_task(refreshed_goal, refreshed_plan):
+                    made_progress = True
+                    self._work_conversation.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "HARNESS FALLBACK VERIFICATION PASSED: the selected checklist task is now completed "
+                                "from authoritative read-back and runtime evidence. Request finish_goal with a concise "
+                                "evidence summary; do not repeat file reads."
+                            ),
+                        }
+                    )
+
                 durable_checkpoint = state_envelope(self._state_payload(
                     self.store.get_goal(goal.id),
                     self.store.get_latest_plan(goal.id),
@@ -3938,12 +4547,15 @@ class AgentRuntime:
     def apply_command(self, command: UserCommand) -> Any:
         kind, args = command.kind, command.args
         if kind == CommandKind.ANSWER:
+            if self.store.get_pending_intake(self.session_id) is not None:
+                return self.answer_intake_question(args["question_id"], args["value"])
             goal = self.active_goal()
             if goal and goal.metadata.get("ultra_run_id"):
                 return self.answer_ultra_question(args["question_id"], args["value"])
             return self.answer_plan_question(args["question_id"], args["value"])
         if kind == CommandKind.GOAL:
-            return self.start_goal(args["objective"])
+            mode = self.store.get_workflow_session(self.session_id)["session_mode"]
+            return self.submit_intent(args["objective"], requested_mode=mode)
         if kind == CommandKind.APPROVE:
             return self.approve_plan(args["revision"])
         if kind in {CommandKind.REJECT, CommandKind.REPLAN}:
@@ -3976,6 +4588,11 @@ class AgentRuntime:
             text = args["text"]
             if not text:
                 return None
+            if self.store.get_pending_intake(self.session_id) is not None:
+                pending = self.intake_questions()
+                if not pending:
+                    raise RuntimeStateError("intake is ready but has not been routed")
+                return self.answer_intake_question(str(pending[0]["id"]), text)
             goal, plan = self.active_goal(), self.latest_plan()
             if (
                 goal is not None
@@ -3992,7 +4609,10 @@ class AgentRuntime:
                     payload={"utterance": redact_text(text, 200)},
                 )
                 return self.approve_plan(plan.revision)
-            return self.start_goal(text) if self.active_goal() is None else self.add_guidance(text)
+            if self.active_goal() is None:
+                mode = self.store.get_workflow_session(self.session_id)["session_mode"]
+                return self.submit_intent(text, requested_mode=mode)
+            return self.add_guidance(text)
         return None
 
     @staticmethod

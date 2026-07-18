@@ -1,8 +1,12 @@
-# GA3BAD workflow architecture (schema v5)
+# GA3BAD workflow architecture (schema v8)
 
-GA3BAD opens in **Chat**. Chat is an ordinary coding-agent session and does not create an approval workflow unless the user selects Plan, Goal, or Ultra. Selecting a mode is a preference change; it is never evidence of approval or completion.
+GA3BAD opens in **Normal**. Every message first enters the shared Intent
+Architect, which discovers repository facts, creates a canonical execution brief,
+asks only consequential missing decisions, and routes to Normal or Ultra.
+Planning is an internal stage, not a third public mode. Selecting or automatically
+routing a mode is never evidence of approval or completion.
 
-Chat action requests use a deterministic postcondition gate. Create/edit/install/run
+Normal action requests use a deterministic postcondition gate. Create/edit/install/run
 intent authorizes only the matching semantic tool, while arbitrary shell work keeps
 the existing Normal/Full policy. Tool-less refusals are corrected up to the configured
 no-action limit. Large generated code blocks are stored by content hash and replaced
@@ -12,7 +16,14 @@ verification, and a managed visible browser rather than a timed foreground shell
 
 ## State machines
 
-The harness owns `SessionMode` (`chat`, `plan`, `goal`, `ultra`), `PlanState`, `RunState`, `AgentState`, `UltraProfile`, and `SleepState`. Invalid Plan transitions are rejected by `ensure_plan_state_transition`. Durable workflow checkpoints live in `workflow_sessions`; schema v5 also persists Chat messages, artifacts, session actions, and managed-resource metadata. Sleep authorization is deliberately reset to off on process startup.
+The harness owns public `SessionMode` values (`normal`, `ultra`), `PlanState`,
+`RunState`, `AgentState`, `UltraProfile`, and `SleepState`. Legacy session modes
+migrate to Normal. Invalid Plan transitions are rejected by
+`ensure_plan_state_transition`. Durable workflow checkpoints live in
+`workflow_sessions`; schema v8 also persists intake sessions, questions/answers,
+repository intelligence, specialist profiles/messages/packages, evaluation runs,
+lessons, artifacts, session actions, and managed-resource metadata. Sleep
+authorization is deliberately reset to off on process startup.
 
 Legacy `GoalStatus`, `PlanStatus`, and task rows remain the persistence authority for existing projects. The v4 states make orchestration stages explicit without destructively rewriting those records.
 
@@ -22,7 +33,10 @@ Plan runs are `inspect -> draft -> normalize -> validate -> risk-based critic ->
 
 Inspection is cached by normalized tool call. An empty result is a valid inventory meaning that the project will be created from scratch. The model proposes content, earlier-task numbers, criteria, and verification; `normalize_plan_draft` creates `T001` IDs and cross references. Scalar verification, numeric dependencies, whitespace, duplicates, and empty optional values are repaired mechanically. Semantic defects produce JSON-pointer errors and one targeted repair. Only complex or high-risk plans use an independent critic.
 
-Approval is stored on the Plan and remains separate from the selected mode. A single pending plan recognizes narrow approval utterances such as “do it” and “go ahead”. The presentation layer renders the persisted plan immediately. Plan and Ultra reject mutations before approval.
+Approval is stored on the Plan and remains separate from the selected mode. A
+single pending plan recognizes narrow approval utterances such as “do it” and
+“go ahead”. The presentation layer renders the persisted plan immediately.
+Normal and Ultra reject mutations before approval.
 
 ## Goal pipeline
 

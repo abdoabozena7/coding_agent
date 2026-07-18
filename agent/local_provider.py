@@ -30,12 +30,114 @@ def extract_first_json_object(text: str) -> Mapping[str, Any] | None:
     return None
 
 
+def repair_structured_json_object(text: str) -> tuple[Mapping[str, Any] | None, tuple[str, ...]]:
+    """Apply bounded transport repairs to a weak-model JSON envelope.
+
+    Semantic fields are never invented here; typed validation remains the
+    caller's job. The repairs cover only malformed envelope keys, trailing
+    commas, and illegal control characters observed from local providers.
+    """
+
+    source = str(text or "").strip()
+    if source.startswith("```"):
+        source = re.sub(r"^```(?:json)?\s*", "", source, flags=re.IGNORECASE)
+        source = re.sub(r"\s*```$", "", source)
+    direct = extract_first_json_object(source)
+    if direct is not None:
+        return direct, ()
+    actions: list[str] = []
+    repaired = source
+    key_pattern = re.compile(
+        r'"(payload|summary|reasoning_summary|insights|tool_calls|artifacts|evidence|findings|issues|test_results)\\+"\s*:'
+    )
+    normalized = key_pattern.sub(lambda match: f'"{match.group(1)}":', repaired)
+    if normalized != repaired:
+        repaired = normalized
+        actions.append("removed stray backslash from a known response-envelope key")
+    normalized = re.sub(r",\s*([}\]])", r"\1", repaired)
+    if normalized != repaired:
+        repaired = normalized
+        actions.append("removed trailing JSON comma")
+    normalized = "".join(char for char in repaired if char in "\r\n\t" or ord(char) >= 32)
+    if normalized != repaired:
+        repaired = normalized
+        actions.append("removed invalid JSON control characters")
+    return extract_first_json_object(repaired), tuple(actions)
+
+
 def normalize_action_proposal(value: Mapping[str, Any]) -> tuple[str, dict[str, Any]] | None:
     name = str(value.get("name") or value.get("tool") or value.get("action") or "").strip()
     args = value.get("args", value.get("arguments", {}))
     if not name or not isinstance(args, Mapping):
         return None
     return name, dict(args)
+
+
+def normalize_generated_tool_args(name: str, args: Mapping[str, Any]) -> dict[str, Any]:
+    """Repair layout escapes from weak-model tool transports without touching code strings.
+
+    A few models emit a native ``write_file`` argument whose document separators
+    are the two literal characters ``\\n``.  The JSON layer has already been
+    decoded at that point, so writing the value verbatim produces a one-line,
+    invalid artifact.  Only source-like full documents with almost no real line
+    breaks are eligible.  Escapes inside quoted source strings remain escapes.
+    """
+
+    normalized = dict(args)
+    field = "content" if str(name) == "write_file" else "new_str" if str(name) == "edit_file" else ""
+    if not field or not isinstance(normalized.get(field), str):
+        return normalized
+    source = str(normalized[field])
+    lowered = source.lstrip().casefold()
+    source_like = lowered.startswith(("<!doctype", "<html", "<?xml")) or any(
+        token in source for token in ("\\nimport ", "\\ndef ", "\\nclass ", "\\nfunction ")
+    )
+    if not source_like or source.count("\n") >= 2 or source.count(r"\n") < 4:
+        return normalized
+
+    output: list[str] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if quote is not None:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            output.append(char)
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(source):
+            marker = source[index + 1]
+            if marker == "n":
+                output.append("\n")
+                index += 2
+                continue
+            if marker == "r":
+                if index + 3 < len(source) and source[index + 2 : index + 4] == r"\n":
+                    output.append("\n")
+                    index += 4
+                else:
+                    output.append("\r")
+                    index += 2
+                continue
+            if marker == "t":
+                output.append("\t")
+                index += 2
+                continue
+        output.append(char)
+        index += 1
+    normalized[field] = "".join(output)
+    return normalized
 
 
 class ProviderFailureKind(str, Enum):

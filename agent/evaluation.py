@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import math
+from pathlib import Path
 import re
 from typing import Any, Mapping, Protocol
 
@@ -512,6 +514,91 @@ def _score(value: float, maximum: float) -> float:
     return max(0.0, min(1.0, float(value) / maximum))
 
 
+def _screenshot_quality_metrics(preview: Mapping[str, Any]) -> dict[str, float]:
+    """Measure rendered composition instead of trusting feature-name counts.
+
+    These intentionally model only observable visual signals, not taste.  They
+    detect blank/flat/under-rendered candidates using colorfulness, luminance
+    contrast, palette diversity, edge detail, scene occupancy, and exposure.
+    """
+
+    screenshot_path = str(preview.get("screenshot_path") or "").strip()
+    if not screenshot_path or not Path(screenshot_path).is_file():
+        return {"screenshot_available": 0.0}
+    try:
+        from PIL import Image
+
+        with Image.open(screenshot_path) as source:
+            image = source.convert("RGB")
+            image.thumbnail((160, 90))
+            width, height = image.size
+            get_pixels = getattr(image, "get_flattened_data", image.getdata)
+            pixels = list(get_pixels())
+    except (ImportError, OSError, ValueError):
+        return {"screenshot_available": 0.0}
+    if width < 2 or height < 2 or not pixels:
+        return {"screenshot_available": 0.0}
+
+    luminance = [0.2126 * red + 0.7152 * green + 0.0722 * blue for red, green, blue in pixels]
+    mean_luma = sum(luminance) / len(luminance)
+    contrast = math.sqrt(sum((value - mean_luma) ** 2 for value in luminance) / len(luminance))
+    rg = [float(red) - float(green) for red, green, _blue in pixels]
+    yb = [0.5 * (float(red) + float(green)) - float(blue) for red, green, blue in pixels]
+    mean_rg = sum(rg) / len(rg)
+    mean_yb = sum(yb) / len(yb)
+    std_rg = math.sqrt(sum((value - mean_rg) ** 2 for value in rg) / len(rg))
+    std_yb = math.sqrt(sum((value - mean_yb) ** 2 for value in yb) / len(yb))
+    colorfulness = math.sqrt(std_rg ** 2 + std_yb ** 2) + 0.3 * math.sqrt(mean_rg ** 2 + mean_yb ** 2)
+
+    quantized = [((red // 32), (green // 32), (blue // 32)) for red, green, blue in pixels]
+    counts: dict[tuple[int, int, int], int] = {}
+    for color in quantized:
+        counts[color] = counts.get(color, 0) + 1
+    dominant_fraction = max(counts.values()) / len(quantized)
+    unique_colors = len(counts)
+
+    edge_count = 0
+    comparisons = 0
+    for y in range(height):
+        for x in range(width):
+            index = y * width + x
+            if x + 1 < width:
+                comparisons += 1
+                edge_count += abs(luminance[index] - luminance[index + 1]) >= 18.0
+            if y + 1 < height:
+                comparisons += 1
+                edge_count += abs(luminance[index] - luminance[index + width]) >= 18.0
+    edge_density = edge_count / max(1, comparisons)
+    clipped_fraction = sum(value <= 5.0 or value >= 250.0 for value in luminance) / len(luminance)
+
+    colorfulness_score = _score(colorfulness, 80.0)
+    contrast_score = _score(contrast, 64.0)
+    diversity_score = _score(unique_colors, 96.0)
+    detail_score = _score(edge_density, 0.18)
+    occupancy_score = _score(1.0 - dominant_fraction, 0.75)
+    exposure_score = 1.0 - _score(clipped_fraction, 0.7)
+    composition_score = (
+        0.25 * colorfulness_score
+        + 0.20 * contrast_score
+        + 0.20 * diversity_score
+        + 0.20 * detail_score
+        + 0.10 * occupancy_score
+        + 0.05 * exposure_score
+    )
+    return {
+        "screenshot_available": 1.0,
+        "screenshot_width": float(width),
+        "screenshot_height": float(height),
+        "screenshot_colorfulness": round(colorfulness, 4),
+        "screenshot_luminance_contrast": round(contrast, 4),
+        "screenshot_unique_colors": float(unique_colors),
+        "screenshot_edge_density": round(edge_density, 6),
+        "screenshot_dominant_color_fraction": round(dominant_fraction, 6),
+        "screenshot_clipped_fraction": round(clipped_fraction, 6),
+        "screenshot_composition_score": round(composition_score, 4),
+    }
+
+
 def run_single_file_3d_html_benchmark(
     html: str,
     *,
@@ -613,6 +700,7 @@ def run_single_file_3d_html_benchmark(
         for item in (preview.get(key) or ())
     )
     runtime_pass = not preview or (preview_status in {"passed", "ok", "success"} and not preview_errors)
+    screenshot_metrics = _screenshot_quality_metrics(preview) if preview else {"screenshot_available": 0.0}
 
     metrics = {
         "bytes": float(len(text.encode("utf-8", errors="replace"))),
@@ -628,6 +716,7 @@ def run_single_file_3d_html_benchmark(
         "accessibility": 1.0 if accessibility else 0.0,
         "runtime_pass": 1.0 if runtime_pass else 0.0,
         "runtime_errors": float(len(preview_errors)),
+        **screenshot_metrics,
     }
     scores = {
         "self_contained": metrics["single_file"],
@@ -638,14 +727,20 @@ def run_single_file_3d_html_benchmark(
         "responsive_accessible": (metrics["responsive"] + metrics["accessibility"]) / 2,
         "runtime": metrics["runtime_pass"],
     }
+    scores["visual_composition"] = (
+        metrics.get("screenshot_composition_score", 0.0)
+        if metrics.get("screenshot_available")
+        else scores["visual_richness"]
+    )
     scores["overall"] = round(
-        0.15 * scores["self_contained"]
-        + 0.2 * scores["rendering_3d"]
-        + 0.12 * scores["animation"]
-        + 0.18 * scores["gameplay"]
-        + 0.2 * scores["visual_richness"]
+        0.12 * scores["self_contained"]
+        + 0.17 * scores["rendering_3d"]
+        + 0.10 * scores["animation"]
+        + 0.16 * scores["gameplay"]
+        + 0.14 * scores["visual_richness"]
+        + 0.16 * scores["visual_composition"]
         + 0.05 * scores["responsive_accessible"]
-        + 0.1 * scores["runtime"],
+        + 0.10 * scores["runtime"],
         4,
     )
     if not single_file:
@@ -660,6 +755,15 @@ def run_single_file_3d_html_benchmark(
         findings.append("Visual richness signals are too weak for a showcase benchmark")
     if not runtime_pass:
         findings.append("Browser/runtime preview evidence failed")
+    if preview.get("screenshot_path") and not metrics.get("screenshot_available"):
+        findings.append("Rendered screenshot evidence is unavailable")
+    elif metrics.get("screenshot_available") and scores["visual_composition"] < 0.42:
+        findings.append("Rendered scene is visually flat, sparse, or under-composed")
+    if findings:
+        # Keep the numeric headline consistent with the hard-gate verdict.
+        # A candidate with a runtime or observable visual blocker must never
+        # present a misleading green-looking >=0.8 aggregate score.
+        scores["overall"] = min(scores["overall"], 0.79)
     return Html3DBenchmarkResult(
         suite_name=suite_name,
         scenario_name=scenario_name,

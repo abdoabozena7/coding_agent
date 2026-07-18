@@ -1,0 +1,29 @@
+{
+  "artifact": "index.html",
+  "artifact_sha256": "da5946a65d57050da8d7b8bb7b74c9db27b64f54c8b4dfe12a48a7ee1b22dfef",
+  "evaluated_at": "2026-07-19",
+  "model": "gemma4:e4b",
+  "provider": "ollama",
+  "browser": {
+    "console_errors": 0,
+    "console_warnings": 0,
+    "input_observed": true,
+    "collision_observed": true,
+    "game_over_observed": true,
+    "restart_observed": true,
+    "webgl_context": true
+  },
+  "scores": {
+    "animation": 1.0,
+    "gameplay": 1.0,
+    "overall": 0.9549,
+    "rendering_3d": 1.0,
+    "responsive_accessible": 1.0,
+    "runtime": 1.0,
+    "self_contained": 1.0,
+    "visual_composition": 0.7184,
+    "visual_richness": 1.0
+  },
+  "screenshot": "../../../output/playwright/gemma-ultra-game-gameplay.png",
+  "status": "passed"
+}
