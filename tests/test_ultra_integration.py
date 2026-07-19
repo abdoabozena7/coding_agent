@@ -1158,14 +1158,22 @@ class UltraIntegrationTests(unittest.TestCase):
 
                 run = runtime.active_ultra_run()
                 self.assertFalse(result.successful)
-                self.assertEqual(store.get_ultra_run(run.id).status, UltraRunStatus.REVISION_REQUIRED)
+                self.assertEqual(store.get_ultra_run(run.id).status, UltraRunStatus.BLOCKED)
                 html_benchmarks = store.list_benchmark_results(
                     suite_name="weak-model-html",
                     scenario_name="threejs-single-file",
                 )
-                self.assertEqual(html_benchmarks[0]["result"], "failed")
-                self.assertLess(html_benchmarks[0]["scores"]["overall"], 0.8)
-                self.assertIn("3D/WebGL", html_benchmarks[0]["blocker"])
+                # v9 rejects the provider before final assembly because it did
+                # not publish runnable materialized specialist packages. The
+                # old heuristic HTML benchmark is therefore not an acceptance
+                # authority and must not manufacture a result for this run.
+                self.assertEqual(html_benchmarks, ())
+                self.assertFalse(
+                    any(
+                        package.get("schema_name") == "MaterializedComponentPackageV2"
+                        for package in store.list_component_packages(run.id)
+                    )
+                )
             finally:
                 if runtime:
                     runtime.close()
@@ -1228,14 +1236,18 @@ animate();
 
                 run = runtime.active_ultra_run()
                 self.assertFalse(result.successful)
-                self.assertEqual(store.get_ultra_run(run.id).status, UltraRunStatus.REVISION_REQUIRED)
+                self.assertEqual(store.get_ultra_run(run.id).status, UltraRunStatus.BLOCKED)
                 html_benchmarks = store.list_benchmark_results(
                     suite_name="weak-model-html",
                     scenario_name="threejs-single-file",
                 )
-                self.assertEqual(html_benchmarks[0]["result"], "failed")
-                self.assertLess(html_benchmarks[0]["scores"]["overall"], 0.8)
-                self.assertIn("Browser/runtime preview evidence failed", html_benchmarks[0]["blocker"])
+                self.assertEqual(html_benchmarks, ())
+                self.assertFalse(
+                    any(
+                        package.get("schema_name") == "MaterializedComponentPackageV2"
+                        for package in store.list_component_packages(run.id)
+                    )
+                )
             finally:
                 if runtime:
                     runtime.close()

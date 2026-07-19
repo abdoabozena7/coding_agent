@@ -21,6 +21,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import tools
+from .component_artifacts import (
+    ComponentArtifactError,
+    ComponentArtifactStore,
+    MaterializedComponentPackageV2,
+)
 from .events import EventBus
 from .evaluation import (
     learn_from_benchmark_trend,
@@ -92,6 +97,12 @@ from .ultra_models import (
     WorkNodeKind,
     WorkNodeStatus,
 )
+from .visual_judge import (
+    VisualJudgeUnavailable,
+    create_visual_judge,
+    require_two_clean_acceptances,
+    screenshot_anomalies,
+)
 from .workflow import AgentRegistryEntryV1, AgentState
 from .quality import (
     ChangeSetStatus,
@@ -114,6 +125,62 @@ from .reasoning import (
 _READ_TOOLS = tools.names(categories={"read"})
 _WRITE_TOOLS = tools.names(categories={"write", "command", "install"})
 _TOOL_RISK = tools.risk_map()
+_STAGE_COMPONENT_FILE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "stage_component_file",
+        "description": (
+            "Stage exactly one real component file in harness-owned isolation. "
+            "Call once per implementation, test, preview, or asset file before publishing."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+                "role": {
+                    "type": "string",
+                    "enum": ["implementation", "preview", "test", "asset"],
+                },
+            },
+            "required": ["path", "content", "role"],
+        },
+    },
+}
+_PUBLISH_COMPONENT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "publish_component",
+        "description": (
+            "Finalize previously staged component files with an interface and preview manifest. "
+            "This is the only valid completion path for component specialists."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "interface": {
+                    "type": "object",
+                    "properties": {
+                        "exports": {"type": "array", "items": {"type": "string"}},
+                        "imports": {"type": "array", "items": {"type": "string"}},
+                        "invariants": {"type": "array", "items": {"type": "string"}},
+                        "integration_points": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["exports"],
+                },
+                "preview": {
+                    "type": "object",
+                    "properties": {"entrypoint": {"type": "string"}},
+                    "required": ["entrypoint"],
+                },
+                "dependencies": {"type": "array", "items": {"type": "string"}},
+                "evidence": {"type": "array", "items": {"type": "object"}},
+                "quality": {"type": "object"},
+            },
+            "required": ["interface", "preview"],
+        },
+    },
+}
 
 
 def _schema_name(schema: Mapping[str, Any]) -> str:
@@ -339,7 +406,10 @@ class WorkspaceUltraAgent:
 
     def _allowed_tools(self) -> frozenset[str]:
         if self.role in {AgentRole.CODER, AgentRole.INTEGRATOR}:
-            return _READ_TOOLS | _WRITE_TOOLS
+            return _READ_TOOLS | _WRITE_TOOLS | {
+                "stage_component_file",
+                "publish_component",
+            }
         if self.role in {AgentRole.TESTER, AgentRole.RESEARCHER}:
             return _READ_TOOLS | {"run_bash", "preview_html"}
         return _READ_TOOLS
@@ -492,6 +562,7 @@ class WorkspaceUltraAgent:
             }
         inspection_observed = False
         mutation_observed = False
+        component_publication_passed = False
         harness_inspection: str | None = None
         harness_preview = self._harness_html_preview(request)
         if (
@@ -618,74 +689,187 @@ class WorkspaceUltraAgent:
                         "read_error": readback[:500] if readback.startswith("Error:") else "",
                     }
                 )
-        user_payload = {
-            "task": request.task,
-            "focused_context": request.context,
-            "harness_workspace_inspection": harness_inspection,
-            "harness_html_preview": harness_preview,
-            "harness_write_target_state": write_target_state,
-            "harness_reasoning_scaffold": reasoning_scaffold_for(
-                self.role.value,
-                request.phase,
-                request.task,
-            ).to_dict(),
-            "harness_debate_protocol": debate_protocol.to_dict(),
-            "response_contract": {
-                **contract,
-                "summary": "brief factual result summary",
-                "reasoning_summary": (
-                    "brief conclusion, decisions, and evidence only; never hidden chain-of-thought"
-                ),
-                "reasoning_artifact": {
-                    "claim": "short external claim being made",
-                    "supporting_evidence": ["observable/tool/hash/browser/test evidence"],
-                    "counterarguments": ["short objection or likely failure mode"],
-                    "rejected_alternatives": ["alternative considered and why rejected"],
-                    "verification_plan": ["concrete verification still required or already run"],
-                    "reasoning_graph": {
-                        "nodes": [
-                            {
-                                "id": "chosen",
-                                "type": "decision",
-                                "summary": "chosen external decision",
-                                "status": "chosen",
-                                "evidence_refs": ["tool/test/hash/browser evidence"],
-                            },
-                            {
-                                "id": "rejected",
-                                "type": "option",
-                                "summary": "rejected alternative",
-                                "status": "rejected",
-                                "evidence_refs": [],
-                            },
-                        ],
-                        "edges": [
-                            {
-                                "from": "chosen",
-                                "to": "rejected",
-                                "relation": "rejects",
-                            }
-                        ],
-                    },
+        request_contract = (
+            dict(request.task.get("contract", {}))
+            if isinstance(request.task, Mapping)
+            else {}
+        )
+        request_component_only = bool(
+            dict(request_contract.get("metadata", {})).get("component_package_only")
+        )
+        component_publication_phase = bool(
+            request_component_only
+            and self.role in {AgentRole.CODER, AgentRole.INTEGRATOR}
+            and request.phase
+            in {InnerPhase.IMPLEMENT.value, InnerPhase.FIX.value, InnerPhase.INTEGRATE.value}
+        )
+        if component_publication_phase:
+            context_mapping = (
+                dict(request.context) if isinstance(request.context, Mapping) else {}
+            )
+            north_star = (
+                dict(context_mapping.get("north_star", {}))
+                if isinstance(context_mapping.get("north_star"), Mapping)
+                else {}
+            )
+            contract_metadata = (
+                dict(request_contract.get("metadata", {}))
+                if isinstance(request_contract.get("metadata"), Mapping)
+                else {}
+            )
+            compact_contract = {
+                key: request_contract.get(key)
+                for key in (
+                    "id",
+                    "title",
+                    "objective",
+                    "acceptance_criteria",
+                    "verification",
+                    "owned_interfaces",
+                )
+                if request_contract.get(key) not in (None, "", (), [], {})
+            }
+            compact_contract["metadata"] = {
+                key: contract_metadata.get(key)
+                for key in (
+                    "specialist_domain",
+                    "owned_interfaces",
+                    "component_leaf",
+                    "component_assembler",
+                )
+                if contract_metadata.get(key) not in (None, "", (), [], {})
+            }
+            compact_context = {
+                "north_star": {
+                    key: north_star.get(key)
+                    for key in ("objective", "success_criteria", "constraints")
+                    if north_star.get(key)
                 },
-                "insights": [
-                    {
-                        "summary": "durable insight",
-                        "severity": "info|warning|error",
-                        "details": {},
-                    }
-                ],
-            },
-        }
+            }
+            compact_task = {
+                key: request.task.get(key)
+                for key in (
+                    "findings",
+                    "attempt",
+                    "change_approach",
+                    "component_assembler",
+                    "child_component_packages",
+                    "prior_replan_guidance",
+                    "prior_findings",
+                )
+                if request.task.get(key) not in (None, "", (), [], {})
+            }
+            compact_task["contract"] = compact_contract
+            user_payload = {
+                "component_task": compact_task,
+                "integration_context": compact_context,
+                "required_action": (
+                    "Call publish_component with complete real files. If it rejects the "
+                    "candidate, revise this component and call it again."
+                ),
+                "response_after_accepted_publication": {
+                    "payload": {"success": True, "findings": [], "evidence": []},
+                    "summary": "brief publication result",
+                    "reasoning_summary": "brief evidence-based conclusion",
+                },
+            }
+        else:
+            user_payload = {
+                "task": request.task,
+                "focused_context": request.context,
+                "harness_workspace_inspection": harness_inspection,
+                "harness_html_preview": harness_preview,
+                "harness_write_target_state": write_target_state,
+                "harness_reasoning_scaffold": reasoning_scaffold_for(
+                    self.role.value,
+                    request.phase,
+                    request.task,
+                ).to_dict(),
+                "harness_debate_protocol": debate_protocol.to_dict(),
+                "response_contract": {
+                    **contract,
+                    "summary": "brief factual result summary",
+                    "reasoning_summary": (
+                        "brief conclusion, decisions, and evidence only; never hidden chain-of-thought"
+                    ),
+                    "reasoning_artifact": {
+                        "claim": "short external claim being made",
+                        "supporting_evidence": ["observable/tool/hash/browser/test evidence"],
+                        "counterarguments": ["short objection or likely failure mode"],
+                        "rejected_alternatives": ["alternative considered and why rejected"],
+                        "verification_plan": ["concrete verification still required or already run"],
+                        "reasoning_graph": {
+                            "nodes": [
+                                {
+                                    "id": "chosen",
+                                    "type": "decision",
+                                    "summary": "chosen external decision",
+                                    "status": "chosen",
+                                    "evidence_refs": ["tool/test/hash/browser evidence"],
+                                },
+                                {
+                                    "id": "rejected",
+                                    "type": "option",
+                                    "summary": "rejected alternative",
+                                    "status": "rejected",
+                                    "evidence_refs": [],
+                                },
+                            ],
+                            "edges": [
+                                {
+                                    "from": "chosen",
+                                    "to": "rejected",
+                                    "relation": "rejects",
+                                }
+                            ],
+                        },
+                    },
+                    "insights": [
+                        {
+                            "summary": "durable insight",
+                            "severity": "info|warning|error",
+                            "details": {},
+                        }
+                    ],
+                },
+            }
         conversation: list[dict[str, Any]] = [
             {"role": "user", "content": _json(user_payload)}
         ]
         allowed_tools = self._allowed_tools()
+        if component_publication_phase:
+            if self.provider_name == "ollama":
+                # Leaf quality comes from isolated previews, independent
+                # judging, and revision loops. Keep the initial tool emission
+                # bounded so a small thinking model cannot spend the whole
+                # transport timeout before publishing the first candidate.
+                setattr(self.provider, "reasoning_effort", "off")
+                setattr(self.provider, "max_output_tokens", 2_048)
+                self.events.publish(
+                    "ultra.component_generation_routed",
+                    (
+                        f"[{request.node_id}] component emission think=off, output<=2048, "
+                        f"prompt={len(conversation[0]['content'])} chars"
+                    ),
+                    run_id=request.run_id,
+                    node_id=request.node_id,
+                    role=self.role.value,
+                    phase=request.phase,
+                    prompt_chars=len(conversation[0]["content"]),
+                )
+            # A component specialist has no final workspace write ownership.
+            # Exposing generic mutation tools encourages small local models to
+            # bypass the typed package contract or merely describe a write.
+            allowed_tools = allowed_tools & _READ_TOOLS
         if self.role is AgentRole.TESTER and self._html_write_target(request):
             # HTML verification is platform-neutral through preview_html plus
             # deterministic readback metrics. Avoid shell quoting/OS drift.
             allowed_tools = allowed_tools - {"run_bash", "run_command"}
         schemas = [] if request.phase == "goal_spec" else _schemas(allowed_tools)
+        if component_publication_phase:
+            schemas.extend(
+                (dict(_STAGE_COMPONENT_FILE_TOOL), dict(_PUBLISH_COMPONENT_TOOL))
+            )
         totals = {"input_tokens": 0, "cached_tokens": 0, "output_tokens": 0}
         self.events.publish(
             "ultra.agent_started",
@@ -716,9 +900,16 @@ class WorkspaceUltraAgent:
                     if component_only:
                         system_prompt += (
                             "\n\nCOMPONENT PACKAGE PHASE: this specialist must not write the shared final "
-                            "artifact. Return payload.component_package with implementation, interface, "
-                            "tests, preview fixture, dependencies, evidence, and quality fields. The parent "
-                            "FinalAssembler alone owns final_output_paths."
+                            "artifact. Stage exactly one complete file per stage_component_file call, "
+                            "including implementation, test, and preview HTML files. Then call "
+                            "publish_component with the interface and preview entrypoint. "
+                            "A prose claim or payload.component_package without the tool call is invalid. "
+                            "The interface must declare concrete exports/imports. "
+                            "Every component preview must visibly demonstrate only this component in a "
+                            "neutral, reviewable scene. Descriptions or summaries without full file content "
+                            "are invalid. If the tool returns findings, revise only this component and call "
+                            "publish_component again. Return the response_contract only after the tool says "
+                            "passed=true. The parent FinalAssembler alone owns final_output_paths."
                         )
                     else:
                         system_prompt += (
@@ -728,11 +919,28 @@ class WorkspaceUltraAgent:
                             "complete artifact in payload.proposed_write; the harness will validate its exact "
                             "path and execute it. Never return success from a read-only state."
                         )
+                if (
+                    self.role is AgentRole.INTEGRATOR
+                    and component_only
+                    and not bool(request.task.get("final_assembler"))
+                    and request.phase in {InnerPhase.INTEGRATE.value, InnerPhase.FIX.value}
+                ):
+                    system_prompt += (
+                        "\n\nMATERIALIZED PARENT PACKAGE PHASE: integrate the exact child package "
+                        "file_contents and exports. Stage each integrated file separately, then call "
+                        "publish_component with a concrete interface and runnable preview entrypoint. "
+                        "Do not summarize or "
+                        "independently recreate child work. "
+                        "Do not return final success until publish_component returns passed=true."
+                    )
                 if self.role is AgentRole.INTEGRATOR and bool(request.task.get("final_assembler")):
                     system_prompt += (
                         "\n\nFINAL ASSEMBLER PHASE: compose the supplied child_component_packages into "
                         "the approved final write_paths. You are the only owner of those final paths; perform "
-                        "a real write, then read back and verify the integrated artifact."
+                        "a real write, then read back and verify the integrated artifact. Consume the exact "
+                        "materialized file_contents/exports and preserve their hashes where files remain "
+                        "separate; do not recreate a child's implementation from its summary. The harness "
+                        "will reject assembly when approved child bytes are neither copied nor inlined."
                     )
                 turn = self.provider.call(conversation, schemas, system_prompt)
             except Exception as exc:
@@ -810,6 +1018,40 @@ class WorkspaceUltraAgent:
                                 path=call.args.get("path", ""),
                             )
                     result = self.executor(effective_call, request)
+                    if effective_call.name == "publish_component":
+                        try:
+                            publication_result = json.loads(str(result))
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            publication_result = {}
+                        component_publication_passed = bool(
+                            isinstance(publication_result, Mapping)
+                            and publication_result.get("passed")
+                        )
+                        if not component_publication_passed:
+                            # The rejected source can be many thousands of
+                            # tokens and is not evidence. Keep the typed
+                            # finding/tool receipt, but compact the replayed
+                            # assistant call so the next revision has room to
+                            # generate a fresh candidate.
+                            assistant_message = conversation[-1]
+                            if isinstance(assistant_message, dict):
+                                for historical_call in assistant_message.get(
+                                    "tool_calls", ()
+                                ):
+                                    if (
+                                        isinstance(historical_call, dict)
+                                        and historical_call.get("id") == effective_call.id
+                                    ):
+                                        historical_call["args"] = {
+                                            "rejected_candidate_omitted": True
+                                        }
+                            self.events.publish(
+                                "ultra.component_revision_context_compacted",
+                                f"[{request.node_id}] omitted rejected source from revision context",
+                                run_id=request.run_id,
+                                node_id=request.node_id,
+                                phase=request.phase,
+                            )
                     if effective_call.name in _READ_TOOLS and not str(result).startswith("Error:"):
                         inspection_observed = True
                     if effective_call.name in _WRITE_TOOLS and not str(result).startswith("Error:"):
@@ -1003,6 +1245,20 @@ class WorkspaceUltraAgent:
                                 "with an exact old_str from harness_write_target_state. "
                                 "and only afterward return the required JSON result. A prose or JSON-only "
                                 "claim cannot complete an implementation/fix phase."
+                            ),
+                        }
+                    )
+                    continue
+                if request_component_only and not component_publication_passed:
+                    conversation.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your final response is rejected because the harness has no successful "
+                                "publish_component receipt. Stage each complete implementation/test/preview "
+                                "file, then call publish_component. If a previous call returned findings, "
+                                "revise the staged files and call it again. Do not return another prose "
+                                "claim or JSON-only package."
                             ),
                         }
                     )
@@ -1224,6 +1480,19 @@ class StateStoreUltraAdapter(InMemoryUltraState):
         self._global_memory_enabled = not model_name.startswith(("offline", "fake", "test"))
         self.global_lessons = GlobalLessonStore()
         self._used_global_lesson_ids: set[str] = set()
+        self.component_artifacts = (
+            ComponentArtifactStore(workspace)
+            if workspace is not None
+            else None
+        )
+        self._materialized_packages: dict[str, MaterializedComponentPackageV2] = {}
+        self._component_previews: dict[str, str] = {}
+        self._published_component_results: dict[str, Mapping[str, Any]] = {}
+        self.visual_judge = create_visual_judge(
+            builder_provider=descriptor.provider,
+            builder_model=descriptor.model,
+            ollama_host=descriptor.host or "http://127.0.0.1:11434",
+        )
         self._adapter_lock = threading.RLock()
 
     def _run_config(self, run: UltraRunV1) -> dict[str, Any]:
@@ -1287,6 +1556,387 @@ class StateStoreUltraAdapter(InMemoryUltraState):
                 "work_node_id": profile.node_id,
             }
         )
+
+    def save_interface_contract(
+        self,
+        run_id: str,
+        node_id: str,
+        contract: Mapping[str, Any],
+    ) -> None:
+        self.store.save_interface_contract(run_id, node_id, contract)
+
+    @staticmethod
+    def _visual_rubric(node: EngineWorkNode) -> Mapping[str, Any]:
+        domain = str(node.contract.metadata.get("specialist_domain") or "").casefold()
+        dimensions: Mapping[str, tuple[str, ...]] = {
+            "vehicles": (
+                "silhouette", "proportions", "wheels_contact", "cabin_glass",
+                "lights", "materials", "detail",
+            ),
+            "character": (
+                "silhouette", "anatomy_stylization", "pose", "animation", "readability",
+            ),
+            "world": (
+                "road_language", "depth", "environment_density", "lighting", "composition",
+            ),
+            "gameplay": (
+                "responsiveness", "collisions", "pacing", "feedback", "progression",
+            ),
+            "presentation": (
+                "camera", "hud_readability", "feedback", "polish", "accessibility",
+            ),
+            "qa": (
+                "evidence_readability", "coverage", "runtime_health", "performance",
+            ),
+        }
+        root = domain.split(".", 1)[0]
+        selected = dimensions.get(
+            root,
+            ("task_fit", "composition", "readability", "polish", "integration_readiness"),
+        )
+        return {
+            "domain": domain or node.contract.title,
+            "dimensions": list(selected),
+            "critical_minimum": 0.85,
+            "zero_critical_findings": True,
+        }
+
+    def materialize_component_candidate(
+        self,
+        run_id: str,
+        node: EngineWorkNode,
+        candidate: AgentResponse,
+        *,
+        revision: int,
+        child_packages: Mapping[str, Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        if self.component_artifacts is None:
+            raise ComponentArtifactError("component artifact store requires a workspace")
+        published = self._published_component_results.pop(node.id, None)
+        if published is not None:
+            return dict(published)
+        raw = candidate.payload.get("component_package")
+        if not isinstance(raw, Mapping):
+            raise ComponentArtifactError(
+                "specialist response omitted payload.component_package"
+            )
+        component = dict(raw)
+        designed = UltraOrchestrator._interface_contract(node)
+        supplied_interface = component.get("interface")
+        if isinstance(supplied_interface, Mapping):
+            interface = {
+                **dict(designed),
+                **dict(supplied_interface),
+            }
+            if not interface.get("exports"):
+                interface["exports"] = list(designed["exports"])
+        else:
+            interface = dict(designed)
+        component["interface"] = interface
+        package = self.component_artifacts.materialize(
+            run_id=run_id,
+            node_id=node.id,
+            component=component,
+            revision=revision,
+            dependencies=node.depends_on,
+            evidence=tuple(
+                dict(item)
+                for item in candidate.payload.get("evidence", ())
+                if isinstance(item, Mapping)
+            ),
+            quality={"status": "pending_independent_evaluation"},
+            parent_package_ids=tuple(
+                str(value.get("id"))
+                for value in child_packages.values()
+                if value.get("id")
+            ),
+        )
+        stored = self.store.put_materialized_component_package(package.to_dict())
+        self._materialized_packages[package.id] = package
+        preview = self.component_artifacts.verify_preview(package)
+        screenshot = str(preview.get("screenshot_path") or "")
+        findings: list[str] = []
+        runtime_passed = str(preview.get("status")) == "passed" and bool(screenshot)
+        if not runtime_passed:
+            findings.append(
+                "component preview failed runtime verification: "
+                + str(preview.get("reason") or preview.get("status") or "unknown")
+            )
+        anomaly_findings = screenshot_anomalies(screenshot) if screenshot else ()
+        findings.extend(f"visual anomaly gate: {item}" for item in anomaly_findings)
+        verdict_values: list[Mapping[str, Any]] = []
+        pairwise_value: Mapping[str, Any] | None = None
+        status = "evaluated"
+        if runtime_passed:
+            try:
+                verdicts = require_two_clean_acceptances(
+                    self.visual_judge,
+                    brief=node.contract.objective,
+                    rubric=self._visual_rubric(node),
+                    screenshot=screenshot,
+                    runtime_evidence=preview,
+                    nonce_prefix=f"{run_id}:{node.id}:r{revision}",
+                )
+                for verdict in verdicts:
+                    value = verdict.to_dict()
+                    verdict_values.append(value)
+                    self.store.save_visual_evaluation(
+                        run_id,
+                        value,
+                        work_node_id=node.id,
+                        package_id=stored["id"],
+                    )
+                    findings.extend(item.message for item in verdict.findings)
+                previous = self._component_previews.get(node.id)
+                if previous and Path(previous).is_file():
+                    comparison = self.visual_judge.compare(
+                        brief=node.contract.objective,
+                        rubric=self._visual_rubric(node),
+                        candidate=screenshot,
+                        baseline=previous,
+                        clean_context_nonce=f"{run_id}:{node.id}:pairwise:r{revision}",
+                    )
+                    pairwise_value = comparison.to_dict()
+                    self.store.save_pairwise_visual_comparison(
+                        run_id,
+                        pairwise_value,
+                        work_node_id=node.id,
+                    )
+                    if not comparison.candidate_preferred:
+                        findings.append(
+                            "blind pairwise judge did not prefer this revision over its baseline"
+                        )
+                self._component_previews[node.id] = screenshot
+            except VisualJudgeUnavailable as exc:
+                status = "USER_REVIEW_REQUIRED"
+                findings.append(str(exc))
+                failure_value = {
+                    "evaluator": str(
+                        getattr(self.visual_judge, "evaluator", "unavailable_vision")
+                    ),
+                    "model": str(getattr(self.visual_judge, "model", "")),
+                    "accepted": False,
+                    "scores": {},
+                    "findings": [
+                        {
+                            "severity": "critical",
+                            "category": "evaluator_error",
+                            "message": str(exc),
+                            "evidence": screenshot,
+                        }
+                    ],
+                    "summary": "Independent visual evaluation could not produce a valid verdict.",
+                    "confidence": 0.0,
+                    "screenshot_hash": hashlib.sha256(
+                        Path(screenshot).read_bytes()
+                    ).hexdigest(),
+                    "context_fingerprint": hashlib.sha256(
+                        f"{run_id}:{node.id}:visual-error:{revision}".encode("utf-8")
+                    ).hexdigest(),
+                    "status": "USER_REVIEW_REQUIRED",
+                    "version": 1,
+                }
+                verdict_values.append(failure_value)
+                self.store.save_visual_evaluation(
+                    run_id,
+                    failure_value,
+                    work_node_id=node.id,
+                    package_id=stored["id"],
+                )
+        accepted_twice = (
+            len(verdict_values) == 2
+            and all(bool(value.get("accepted")) for value in verdict_values)
+        )
+        pairwise_passed = (
+            pairwise_value is None
+            or bool(pairwise_value.get("candidate_preferred"))
+        )
+        passed = (
+            runtime_passed
+            and not anomaly_findings
+            and accepted_twice
+            and pairwise_passed
+        )
+        if status == "USER_REVIEW_REQUIRED":
+            passed = False
+        return {
+            "passed": passed,
+            "status": "accepted" if passed else status if status != "evaluated" else "rejected",
+            "package": package.to_dict(include_content=True),
+            "stored_package_id": stored["id"],
+            "preview": preview,
+            "visual_evaluations": verdict_values,
+            "pairwise_comparison": pairwise_value,
+            "findings": list(dict.fromkeys(findings)),
+        }
+
+    def publish_component_tool(
+        self,
+        run_id: str,
+        node: EngineWorkNode,
+        component: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        existing = self.store.list_component_packages(
+            run_id,
+            work_node_id=node.id,
+        )
+        revision = max(
+            (int(item.get("version") or 0) for item in existing),
+            default=0,
+        ) + 1
+        normalized_component = dict(component)
+        staged_files = list(
+            self.component_artifacts.draft_files(
+                run_id=run_id,
+                node_id=node.id,
+            )
+        ) if self.component_artifacts is not None else []
+        preview = (
+            dict(normalized_component.get("preview", {}))
+            if isinstance(normalized_component.get("preview"), Mapping)
+            else {}
+        )
+        preview_content = str(preview.pop("content", ""))
+        preview_entrypoint = str(preview.get("entrypoint", "")).strip()
+        implementation = (
+            dict(normalized_component.get("implementation", {}))
+            if isinstance(normalized_component.get("implementation"), Mapping)
+            else {}
+        )
+        implementation_files = [
+            dict(item)
+            for item in implementation.get("files", ())
+            if isinstance(item, Mapping)
+        ]
+        implementation_by_path = {
+            str(item.get("path", "")): item
+            for item in (
+                *implementation_files,
+                *(item for item in staged_files if str(item.get("role")) != "test"),
+            )
+            if str(item.get("path", ""))
+        }
+        implementation_files = list(implementation_by_path.values())
+        staged_tests = [
+            item for item in staged_files if str(item.get("role")) == "test"
+        ]
+        known_paths = {str(item.get("path", "")) for item in implementation_files}
+        implementation["files"] = [
+            *implementation_files,
+            *(
+                [
+                    {
+                        "path": preview_entrypoint,
+                        "content": preview_content,
+                        "role": "preview",
+                    }
+                ]
+                if preview_entrypoint
+                and preview_content.strip()
+                and preview_entrypoint not in known_paths
+                else []
+            ),
+        ]
+        normalized_component["implementation"] = implementation
+        normalized_component["preview"] = preview
+        normalized_component["tests"] = [
+            *(
+                dict(item)
+                for item in normalized_component.get("tests", ())
+                if isinstance(item, Mapping)
+            ),
+            *staged_tests,
+        ]
+        response = AgentResponse(
+            payload={"component_package": normalized_component},
+            summary=f"Typed component publication for {node.id}",
+            reasoning_summary="Files were submitted through publish_component.",
+            provider="harness_tool",
+            model="publish-component-v2",
+        )
+        self._published_component_results.pop(node.id, None)
+        result = dict(
+            self.materialize_component_candidate(
+                run_id,
+                node,
+                response,
+                revision=revision,
+                child_packages={},
+            )
+        )
+        self._published_component_results[node.id] = result
+        return result
+
+    def stage_component_file_tool(
+        self,
+        run_id: str,
+        node: EngineWorkNode,
+        *,
+        path: str,
+        content: str,
+        role: str,
+    ) -> Mapping[str, Any]:
+        if self.component_artifacts is None:
+            raise ComponentArtifactError("component artifact store requires a workspace")
+        return self.component_artifacts.stage_draft_file(
+            run_id=run_id,
+            node_id=node.id,
+            path=path,
+            content=content,
+            role=role,
+        )
+
+    def verify_package_consumption(
+        self,
+        run_id: str,
+        node: EngineWorkNode,
+        packages: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        if self.component_artifacts is None or self.workspace is None:
+            return {
+                "passed": False,
+                "findings": ["package consumption verification requires a workspace"],
+            }
+        materialized = tuple(
+            self._materialized_packages[str(item.get("id"))]
+            for item in packages
+            if str(item.get("id")) in self._materialized_packages
+        )
+        missing = [
+            str(item.get("id") or item.get("node_id") or "unknown")
+            for item in packages
+            if str(item.get("id")) not in self._materialized_packages
+        ]
+        target_paths = tuple(self.workspace / path for path in node.write_paths)
+        evidence = self.component_artifacts.verify_consumption(
+            assembler_node_id=node.id,
+            packages=materialized,
+            target_paths=target_paths,
+        )
+        for item in evidence:
+            self.store.save_package_consumption_evidence(
+                run_id,
+                node.id,
+                item.package_id,
+                item.to_dict(),
+            )
+        findings = [
+            finding
+            for item in evidence
+            for finding in item.findings
+        ]
+        findings.extend(
+            f"child package {identifier} was not materialized in this run"
+            for identifier in missing
+        )
+        passed = bool(packages) and not missing and bool(evidence) and all(
+            item.passed for item in evidence
+        )
+        return {
+            "passed": passed,
+            "evidence": [item.to_dict() for item in evidence],
+            "findings": findings,
+        }
 
     def save_component_package(self, run_id: str, package: ComponentPackageV1) -> None:
         super().save_component_package(run_id, package)
@@ -2537,6 +3187,55 @@ class StateStoreUltraAdapter(InMemoryUltraState):
         )
         if self._trend_quality_regression(html_trend):
             blocker = blocker or "HTML benchmark quality regressed against the previous baseline"
+        visual_evaluations = self.store.list_visual_evaluations(self.run_id)
+        materialized_packages = tuple(
+            item
+            for item in self.store.list_component_packages(self.run_id)
+            if str(item.get("schema_name")) == "MaterializedComponentPackageV2"
+        )
+        latest_materialized: dict[str, Mapping[str, Any]] = {}
+        for item in materialized_packages:
+            node_id = str(item.get("work_node_id"))
+            if (
+                node_id not in latest_materialized
+                or int(item.get("version") or 0)
+                > int(latest_materialized[node_id].get("version") or 0)
+            ):
+                latest_materialized[node_id] = item
+        accepted_visual_contexts = 0
+        visual_score_values: list[float] = []
+        visual_critical_findings = 0
+        for package in latest_materialized.values():
+            package_evaluations = [
+                dict(item.get("verdict") or {})
+                for item in visual_evaluations
+                if str(item.get("package_id")) == str(package.get("id"))
+            ]
+            accepted_visual_contexts += sum(
+                1 for value in package_evaluations if bool(value.get("accepted"))
+            )
+            for value in package_evaluations:
+                visual_critical_findings += int(value.get("critical_findings") or 0)
+                visual_score_values.extend(
+                    float(score)
+                    for score in dict(value.get("scores") or {}).values()
+                )
+            if len(package_evaluations) < 2 or not all(
+                bool(value.get("accepted"))
+                for value in package_evaluations[-2:]
+            ):
+                blocker = blocker or (
+                    f"component {package.get('work_node_id')} lacks two clean-context "
+                    "visual acceptances"
+                )
+        if html_benchmark and not latest_materialized:
+            blocker = blocker or "USER_REVIEW_REQUIRED: no materialized visual packages were evaluated"
+        if visual_critical_findings:
+            blocker = blocker or "independent visual judge reported critical findings"
+        metrics["independent_visual_evaluations"] = float(len(visual_evaluations))
+        metrics["accepted_visual_contexts"] = float(accepted_visual_contexts)
+        metrics["visual_critical_findings"] = float(visual_critical_findings)
+        metrics["heuristic_visual_metrics_are_anomaly_only"] = 1.0
         weighted_dimensions = [
             scores["consensus_accept_ratio"],
             scores["final_evidence_score"],
@@ -2549,13 +3248,19 @@ class StateStoreUltraAdapter(InMemoryUltraState):
             weighted_dimensions.insert(0, scores["node_success_ratio"])
         if html_benchmark:
             html_scores = dict(html_benchmark.get("scores", {}))
-            weighted_dimensions.append(float(html_scores.get("overall", 0.0)))
-            visual_score = float(
-                html_scores.get("visual_composition", html_scores.get("visual_richness", 0.0))
+            # Legacy HTML metrics remain useful as blank/runtime anomaly checks,
+            # but cannot award visual acceptance.
+            scores["legacy_heuristic_html_overall"] = float(
+                html_scores.get("overall", 0.0)
+            )
+            visual_score = (
+                min(visual_score_values)
+                if visual_score_values
+                else 0.0
             )
             scores["visual_critical"] = visual_score
             if visual_score < 0.85:
-                blocker = blocker or "critical visual quality score is below 0.85"
+                blocker = blocker or "independent critical visual quality score is below 0.85"
         scores["overall"] = sum(weighted_dimensions) / max(1, len(weighted_dimensions))
         if scores["overall"] < 0.95:
             blocker = blocker or "overall quality score is below 0.95"
@@ -2575,6 +3280,8 @@ class StateStoreUltraAdapter(InMemoryUltraState):
             inputs={
                 "global_result_status": global_result.status,
                 "node_ids": [item.node_id for item in nodes],
+                "evaluation_authority": "materialized_v9",
+                "legacy_html_authority": "legacy_heuristic_anomaly_only",
             },
             metrics=metrics,
             scores=scores,
@@ -3032,6 +3739,75 @@ class UltraSession:
             return f"Error: role {request.role.value} cannot use {call.name}"
         args = call.args if isinstance(call.args, dict) else {}
         node = self._node(request.node_id)
+        if call.name == "stage_component_file":
+            if (
+                node is None
+                or not node.contract.metadata.get("component_package_only")
+                or self.adapter is None
+                or self.run_id is None
+            ):
+                return "Error: stage_component_file requires an active component specialist node"
+            try:
+                result = self.adapter.stage_component_file_tool(
+                    self.run_id,
+                    node,
+                    path=str(args.get("path", "")),
+                    content=str(args.get("content", "")),
+                    role=str(args.get("role", "")),
+                )
+            except Exception as exc:
+                rendered = f"Error: stage_component_file rejected the file: {exc}"
+            else:
+                rendered = _json({"status": "staged", **dict(result)})
+            self.events.publish(
+                "tool_result",
+                rendered,
+                tool=call.name,
+                actor=request.role.value,
+                node_id=request.node_id,
+            )
+            return rendered
+        if call.name == "publish_component":
+            if (
+                node is None
+                or not node.contract.metadata.get("component_package_only")
+                or self.adapter is None
+                or self.run_id is None
+            ):
+                return "Error: publish_component requires an active component specialist node"
+            self.events.publish(
+                "tool_call",
+                call.name,
+                args={"file_count": len(dict(args.get("implementation") or {}).get("files", ()))},
+                actor=request.role.value,
+                node_id=request.node_id,
+            )
+            try:
+                result = self.adapter.publish_component_tool(
+                    self.run_id,
+                    node,
+                    args,
+                )
+            except Exception as exc:
+                rendered = f"Error: publish_component rejected the package: {exc}"
+            else:
+                rendered = _json(
+                    {
+                        "status": result.get("status"),
+                        "passed": result.get("passed"),
+                        "package_id": dict(result.get("package") or {}).get("id"),
+                        "preview": result.get("preview"),
+                        "findings": result.get("findings", ()),
+                    }
+                )
+            self.events.publish(
+                "tool_result",
+                rendered,
+                tool=call.name,
+                actor=request.role.value,
+                node_id=request.node_id,
+            )
+            return rendered
         if call.name == "apply_patch":
             patch_paths = [
                 match.group(1).strip()

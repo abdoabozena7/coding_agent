@@ -733,6 +733,10 @@ class AgentRuntime:
             status=decision.status.value,
             questions=(item.to_dict() for item in decision.questions),
         )
+        self.store.save_prompt_completeness(
+            str(intake["id"]),
+            decision.completeness.to_dict(),
+        )
         self.events.publish(
             "intake.analyzed",
             (
@@ -802,6 +806,10 @@ class AgentRuntime:
             requested_mode=str(updated["requested_mode"]),
             answers=answers,
             repository_facts=self._intake_repository_facts(str(updated["original_input"])),
+        )
+        self.store.save_prompt_completeness(
+            str(updated["id"]),
+            decision.completeness.to_dict(),
         )
         return self._route_intake(updated, decision.brief)
 

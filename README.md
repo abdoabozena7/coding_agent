@@ -63,9 +63,10 @@ failure modes that prompts alone cannot solve:
 - Project lessons persist across runs with evidence references, reuse counts,
   confidence history, and asymmetric outcome updates. Failed evaluation writes
   remediation knowledge for later runs.
-- Retrieval, reasoning, swarm, learning, runtime, and single-file 3D quality have
-  deterministic benchmarks. HTML gates combine browser errors with screenshot
-  composition metrics and store comparable trend records.
+- Retrieval, reasoning, swarm, learning, runtime, and interactive output have
+  deterministic benchmarks. Screenshot statistics are anomaly checks only;
+  visual acceptance requires an independent vision model, two clean verdicts,
+  and a blind pairwise preference. The builder cannot judge its own output.
 
 Run the structural and behavioral audit, persist its metrics, and compare the next
 run against it:
@@ -123,10 +124,14 @@ context → mini-plan → decompose → research → implement
 
 Dynamic child nodes inherit their parent's forbidden changes and write scope.
 New interfaces, dependencies, or out-of-scope paths stop at a new master-plan
-approval. SQLite schema v8 stores intake briefs/questions, AST and graph metadata,
-the hierarchical specialist task graph, typed component packages/messages,
-versioned decisions and lessons, evaluation runs, artifacts and hashes, redacted
-prompt traces, memory access, and fenced path/leader leases. `/tree`, `/agents`, `/memory`,
+approval. SQLite schema v9 stores prompt completeness, intake briefs/questions,
+AST and graph metadata, the hierarchical specialist task graph, staged component
+files, materialized package revisions, interface contracts, package-consumption
+evidence, independent visual verdicts/pairwise comparisons, typed messages,
+versioned decisions and lessons, evaluation runs, redacted prompt traces, memory
+access, and fenced path/leader leases. Component specialists stage one real file
+at a time and publish a manifest; only FinalAssembler owns final output paths.
+`/tree`, `/agents`, `/memory`,
 `/trace`, `/insights`, and `/metrics` keep the default scrollback uncluttered.
 
 `/permissions full` is fail-closed: it works only after `/setup` builds the

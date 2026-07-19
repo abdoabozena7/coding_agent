@@ -88,7 +88,7 @@ from .swarm_protocol import (
 from .workflow import AgentRegistryEntryV1, AgentState
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 DEFAULT_TRACE_MAX_BYTES = 256_000
 MAX_TRACE_MAX_BYTES = 2_000_000
@@ -399,6 +399,9 @@ class StateStore:
                     existing = 7
                 if existing < 8:
                     self._migrate_v8()
+                    existing = 8
+                if existing < 9:
+                    self._migrate_v9()
                 self._connection.execute(
                     "UPDATE managed_resources SET status='stale',updated_at=? WHERE status IN ('running','ready')",
                     (_iso(utc_now()),),
@@ -1165,6 +1168,107 @@ class StateStore:
            SET session_mode='normal'
          WHERE session_mode IN ('chat','plan','goal','manual','default','auto','agent');
         PRAGMA user_version=8;
+        COMMIT;
+        """
+        self._connection.executescript(schema)
+
+    def _migrate_v9(self) -> None:
+        """Install materialized packages and truthful visual-evaluation evidence."""
+
+        component_columns = {
+            str(row[1])
+            for row in self._connection.execute("PRAGMA table_info(component_packages)")
+        }
+        alters = []
+        if "schema_name" not in component_columns:
+            alters.append(
+                "ALTER TABLE component_packages ADD COLUMN schema_name TEXT "
+                "NOT NULL DEFAULT 'ComponentPackageV1';"
+            )
+        if "revision_lineage_json" not in component_columns:
+            alters.append(
+                "ALTER TABLE component_packages ADD COLUMN revision_lineage_json TEXT "
+                "NOT NULL DEFAULT '[]';"
+            )
+        benchmark_columns = {
+            str(row[1])
+            for row in self._connection.execute("PRAGMA table_info(benchmark_runs)")
+        }
+        if "evaluation_authority" not in benchmark_columns:
+            alters.append(
+                "ALTER TABLE benchmark_runs ADD COLUMN evaluation_authority TEXT "
+                "NOT NULL DEFAULT 'legacy_heuristic';"
+            )
+        schema = f"""
+        BEGIN IMMEDIATE;
+        {' '.join(alters)}
+        CREATE TABLE IF NOT EXISTS prompt_completeness (
+            intake_id TEXT PRIMARY KEY REFERENCES intake_sessions(id) ON DELETE CASCADE,
+            completeness_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS component_files (
+            package_id TEXT NOT NULL REFERENCES component_packages(id) ON DELETE CASCADE,
+            path TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            media_type TEXT NOT NULL,
+            role TEXT NOT NULL,
+            staging_root TEXT NOT NULL,
+            PRIMARY KEY(package_id,path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_component_files_hash
+            ON component_files(content_hash,package_id);
+        CREATE TABLE IF NOT EXISTS interface_contracts (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            work_node_id TEXT NOT NULL REFERENCES work_nodes(id) ON DELETE CASCADE,
+            version INTEGER NOT NULL,
+            contract_json TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(ultra_run_id,work_node_id,version)
+        );
+        CREATE TABLE IF NOT EXISTS visual_evaluations (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            work_node_id TEXT REFERENCES work_nodes(id) ON DELETE CASCADE,
+            package_id TEXT REFERENCES component_packages(id) ON DELETE CASCADE,
+            evaluator TEXT NOT NULL,
+            model TEXT NOT NULL,
+            status TEXT NOT NULL,
+            verdict_json TEXT NOT NULL,
+            screenshot_hash TEXT NOT NULL,
+            context_fingerprint TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_visual_evaluations_target
+            ON visual_evaluations(ultra_run_id,work_node_id,package_id,created_at);
+        CREATE TABLE IF NOT EXISTS pairwise_visual_comparisons (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            work_node_id TEXT REFERENCES work_nodes(id) ON DELETE CASCADE,
+            evaluator TEXT NOT NULL,
+            model TEXT NOT NULL,
+            candidate_hash TEXT NOT NULL,
+            baseline_hash TEXT NOT NULL,
+            preferred TEXT NOT NULL,
+            comparison_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS package_consumption_evidence (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            assembler_node_id TEXT NOT NULL REFERENCES work_nodes(id) ON DELETE CASCADE,
+            package_id TEXT NOT NULL REFERENCES component_packages(id) ON DELETE CASCADE,
+            passed INTEGER NOT NULL,
+            evidence_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_package_consumption_assembler
+            ON package_consumption_evidence(ultra_run_id,assembler_node_id,passed);
+        PRAGMA user_version=9;
         COMMIT;
         """
         self._connection.executescript(schema)
@@ -3488,14 +3592,22 @@ class StateStore:
         started = started_at or utc_now()
         ended = ended_at or utc_now()
         created = utc_now()
+        evaluation_authority = str(
+            (inputs or {}).get("evaluation_authority")
+            or (
+                "legacy_heuristic"
+                if suite_name == "weak-model-html"
+                else "deterministic_harness"
+            )
+        )
         with self.transaction() as connection:
             if ultra_run_id and connection.execute("SELECT 1 FROM ultra_runs WHERE id=?", (ultra_run_id,)).fetchone() is None:
                 raise NotFoundError(f"ULTRA run not found: {ultra_run_id}")
             connection.execute(
                 "INSERT INTO benchmark_runs("
                 "id,suite_name,scenario_name,provider,model,ultra_run_id,inputs_json,metrics_json,"
-                "scores_json,result,artifact_refs_json,blocker,started_at,ended_at,created_at"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "scores_json,result,artifact_refs_json,blocker,started_at,ended_at,created_at,"
+                "evaluation_authority) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     benchmark_id,
                     suite_name,
@@ -3512,6 +3624,7 @@ class StateStore:
                     _iso(started),
                     _iso(ended),
                     _iso(created),
+                    evaluation_authority,
                 ),
             )
         return self.list_benchmark_results(limit=1)[0]
@@ -4872,13 +4985,16 @@ class StateStore:
             connection.execute(
                 "INSERT INTO component_packages(id,ultra_run_id,work_node_id,parent_package_id,version,status,"
                 "implementation_json,interface_json,tests_json,preview_json,dependencies_json,evidence_json,"
-                "quality_json,content_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "quality_json,content_hash,created_at,updated_at,schema_name,revision_lineage_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     package_id, run_id, node_id, item.get("parent_package_id"), version,
                     str(item.get("status") or "published"), _json(payload["implementation"]),
                     _json(payload["interface"]), _json(payload["tests"]), _json(payload["preview"]),
                     _json(payload["dependencies"]), _json(payload["evidence"]), _json(payload["quality"]),
                     content_hash, now, now,
+                    str(item.get("schema_name") or "ComponentPackageV1"),
+                    _json(list(item.get("revision_lineage", ()))),
                 ),
             )
         return self.get_component_package(package_id)
@@ -4898,6 +5014,7 @@ class StateStore:
             "dependencies": _loads(row["dependencies_json"], []),
             "evidence": _loads(row["evidence_json"], []),
             "quality": _loads(row["quality_json"], {}),
+            "revision_lineage": _loads(row["revision_lineage_json"], []),
         }
 
     def list_component_packages(
@@ -4913,6 +5030,257 @@ class StateStore:
             tuple(params),
         ).fetchall()
         return tuple(self.get_component_package(str(row["id"])) for row in rows)
+
+    def save_prompt_completeness(
+        self,
+        intake_id: str,
+        completeness: Mapping[str, Any],
+    ) -> None:
+        now = _iso(utc_now())
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO prompt_completeness(intake_id,completeness_json,created_at,updated_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(intake_id) DO UPDATE SET "
+                "completeness_json=excluded.completeness_json,updated_at=excluded.updated_at",
+                (intake_id, _json(dict(completeness)), now, now),
+            )
+
+    def get_prompt_completeness(self, intake_id: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT completeness_json FROM prompt_completeness WHERE intake_id=?",
+            (intake_id,),
+        ).fetchone()
+        return (
+            dict(_loads(row["completeness_json"], {}))
+            if row is not None
+            else None
+        )
+
+    def put_materialized_component_package(
+        self,
+        item: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        files = tuple(
+            dict(value)
+            for value in item.get("files", ())
+            if isinstance(value, Mapping)
+        )
+        package = self.put_component_package(
+            {
+                "id": item.get("id"),
+                "ultra_run_id": item["run_id"],
+                "work_node_id": item["node_id"],
+                "version": item.get("revision", 1),
+                "status": item.get("status", "published"),
+                "implementation": {
+                    "root": item.get("root"),
+                    "files": files,
+                    "content_hash": item.get("content_hash"),
+                },
+                "interface": item.get("interface", {}),
+                "tests": [
+                    value for value in files if str(value.get("role")) == "test"
+                ],
+                "preview": {
+                    "entrypoint": item.get("preview_entrypoint"),
+                    "files": [
+                        value
+                        for value in files
+                        if str(value.get("role")) == "preview"
+                    ],
+                },
+                "dependencies": item.get("dependencies", ()),
+                "evidence": item.get("evidence", ()),
+                "quality": item.get("quality", {}),
+                "parent_package_id": None,
+                "schema_name": "MaterializedComponentPackageV2",
+                "revision_lineage": item.get("parent_package_ids", ()),
+            }
+        )
+        with self.transaction() as connection:
+            connection.executemany(
+                "INSERT INTO component_files(package_id,path,content_hash,size,media_type,role,staging_root) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    (
+                        package["id"],
+                        str(value["path"]),
+                        str(value["content_hash"]),
+                        int(value["size"]),
+                        str(value.get("media_type") or "application/octet-stream"),
+                        str(value.get("role") or "implementation"),
+                        str(item.get("root") or ""),
+                    )
+                    for value in files
+                ),
+            )
+        self.save_interface_contract(
+            str(item["run_id"]),
+            str(item["node_id"]),
+            dict(item.get("interface") or {}),
+            version=int(item.get("revision", 1)),
+        )
+        return self.get_component_package(str(package["id"]))
+
+    def save_interface_contract(
+        self,
+        ultra_run_id: str,
+        work_node_id: str,
+        contract: Mapping[str, Any],
+        *,
+        version: int = 1,
+    ) -> dict[str, Any]:
+        payload = dict(contract)
+        content_hash = hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
+        identifier = new_id("interface")
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO interface_contracts(id,ultra_run_id,work_node_id,version,"
+                "contract_json,content_hash,created_at) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(ultra_run_id,work_node_id,version) DO UPDATE SET "
+                "contract_json=excluded.contract_json,content_hash=excluded.content_hash",
+                (
+                    identifier,
+                    ultra_run_id,
+                    work_node_id,
+                    max(1, int(version)),
+                    _json(payload),
+                    content_hash,
+                    _iso(utc_now()),
+                ),
+            )
+        return {
+            "id": identifier,
+            "ultra_run_id": ultra_run_id,
+            "work_node_id": work_node_id,
+            "version": max(1, int(version)),
+            "contract": payload,
+            "content_hash": content_hash,
+        }
+
+    def save_visual_evaluation(
+        self,
+        ultra_run_id: str,
+        verdict: Mapping[str, Any],
+        *,
+        work_node_id: str | None = None,
+        package_id: str | None = None,
+    ) -> str:
+        identifier = new_id("visual")
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO visual_evaluations(id,ultra_run_id,work_node_id,package_id,"
+                "evaluator,model,status,verdict_json,screenshot_hash,context_fingerprint,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    identifier,
+                    ultra_run_id,
+                    work_node_id,
+                    package_id,
+                    str(verdict.get("evaluator") or "unknown"),
+                    str(verdict.get("model") or ""),
+                    str(verdict.get("status") or "evaluated"),
+                    _json(dict(verdict)),
+                    str(verdict.get("screenshot_hash") or ""),
+                    str(verdict.get("context_fingerprint") or ""),
+                    _iso(utc_now()),
+                ),
+            )
+        return identifier
+
+    def list_visual_evaluations(
+        self,
+        ultra_run_id: str,
+        *,
+        work_node_id: str | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        filters = ["ultra_run_id=?"]
+        params: list[Any] = [ultra_run_id]
+        if work_node_id is not None:
+            filters.append("work_node_id=?")
+            params.append(work_node_id)
+        rows = self._connection.execute(
+            "SELECT * FROM visual_evaluations WHERE "
+            + " AND ".join(filters)
+            + " ORDER BY created_at,id",
+            tuple(params),
+        ).fetchall()
+        return tuple(
+            {
+                **dict(row),
+                "verdict": _loads(row["verdict_json"], {}),
+            }
+            for row in rows
+        )
+
+    def save_pairwise_visual_comparison(
+        self,
+        ultra_run_id: str,
+        comparison: Mapping[str, Any],
+        *,
+        work_node_id: str | None = None,
+    ) -> str:
+        identifier = new_id("pairwise")
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO pairwise_visual_comparisons(id,ultra_run_id,work_node_id,"
+                "evaluator,model,candidate_hash,baseline_hash,preferred,comparison_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    identifier,
+                    ultra_run_id,
+                    work_node_id,
+                    str(comparison.get("evaluator") or "unknown"),
+                    str(comparison.get("model") or ""),
+                    str(comparison.get("candidate_hash") or ""),
+                    str(comparison.get("baseline_hash") or ""),
+                    str(comparison.get("preferred") or "tie"),
+                    _json(dict(comparison)),
+                    _iso(utc_now()),
+                ),
+            )
+        return identifier
+
+    def list_pairwise_visual_comparisons(
+        self,
+        ultra_run_id: str,
+    ) -> tuple[dict[str, Any], ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM pairwise_visual_comparisons WHERE ultra_run_id=? "
+            "ORDER BY created_at,id",
+            (ultra_run_id,),
+        ).fetchall()
+        return tuple(
+            {
+                **dict(row),
+                "comparison": _loads(row["comparison_json"], {}),
+            }
+            for row in rows
+        )
+
+    def save_package_consumption_evidence(
+        self,
+        ultra_run_id: str,
+        assembler_node_id: str,
+        package_id: str,
+        evidence: Mapping[str, Any],
+    ) -> str:
+        identifier = new_id("consumption")
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO package_consumption_evidence(id,ultra_run_id,assembler_node_id,"
+                "package_id,passed,evidence_json,created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    identifier,
+                    ultra_run_id,
+                    assembler_node_id,
+                    package_id,
+                    1 if evidence.get("passed") else 0,
+                    _json(dict(evidence)),
+                    _iso(utc_now()),
+                ),
+            )
+        return identifier
 
     def save_node_quality_target(
         self,

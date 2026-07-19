@@ -192,10 +192,15 @@ class OllamaProvider:
 
     def call(self, conversation, tools, system, on_text=None, on_thought=None) -> AssistantTurn:
         self._ensure_capabilities()
+        tool_specs = tuple(tools or ())
         payload = self.request_compiler.compile(
             self.capability_profile,
-            messages=self._to_messages(conversation, system), tools=tools or (),
-            stream=True,
+            messages=self._to_messages(conversation, system),
+            tools=tool_specs,
+            # Ollama emits native tool arguments as one completed assistant
+            # message. Several thinking models lose that final call when the
+            # endpoint is asked for NDJSON token streaming.
+            stream=not bool(tool_specs),
             options=(
                 {
                     "think": (

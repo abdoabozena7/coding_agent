@@ -287,6 +287,29 @@ class OllamaProviderTests(unittest.TestCase):
 
         self.assertIs(provider._post_json.call_args.args[1]["think"], False)
 
+    def test_tool_requests_are_atomic_instead_of_token_streamed(self):
+        provider = OllamaProvider(model="offline")
+        provider.capability_profile = __import__(
+            "agent.local_provider", fromlist=["ModelCapabilityProfile"]
+        ).ModelCapabilityProfile(
+            "offline", tool_call_support=True, health_status="reachable"
+        )
+        provider._post_json = Mock(
+            return_value=io.BytesIO(
+                b'{"message":{"tool_calls":[{"function":{"name":"x","arguments":{}}}]},"done":true}\n'
+            )
+        )
+
+        turn = provider.call(
+            [],
+            [{"type": "function", "function": {"name": "x"}}],
+            "system",
+        )
+
+        payload = provider._post_json.call_args.args[1]
+        self.assertIs(payload["stream"], False)
+        self.assertEqual(turn.tool_calls[0].name, "x")
+
     def test_unsupported_tools_rejection_is_adapted_once_without_faking_connectivity_failure(self):
         provider = OllamaProvider(model="offline")
         provider.capability_profile = __import__("agent.local_provider", fromlist=["ModelCapabilityProfile"]).ModelCapabilityProfile(

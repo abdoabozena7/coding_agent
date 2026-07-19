@@ -1004,6 +1004,65 @@ def _show_questions(runtime: AgentRuntime, console: ConsoleUI) -> None:
     console.write("\n".join(lines))
 
 
+def _answer_pending_intake_with_picker(
+    runtime: AgentRuntime,
+    console: ConsoleUI,
+) -> bool:
+    """Answer one intake question with arrows/Enter; plain CLI remains fallback."""
+
+    questions = runtime.intake_questions()
+    if not questions:
+        return False
+    question = questions[0]
+    options = [
+        ChoiceItem(
+            key=str(index),
+            label=str(option.get("label") or f"Option {index}"),
+            description=str(option.get("description") or ""),
+            meta="Recommended" if index == 1 else "",
+            value=str(option.get("label") or ""),
+        )
+        for index, option in enumerate(question.get("options", ()), 1)
+        if isinstance(option, Mapping)
+    ]
+    options.append(
+        ChoiceItem(
+            key="4",
+            label="Write your answer",
+            description="Enter a custom decision in your own words.",
+            value=None,
+        )
+    )
+    selected = select_choice(
+        options,
+        title=str(question.get("question") or "Choose an answer"),
+        subtitle=str(question.get("reason") or ""),
+        step_label=f"Intake · {question.get('header', 'Decision')}",
+        action_label="Answer",
+        initial_key="1",
+        filterable=False,
+        page_size=4,
+        input_func=console.input_func,
+        output=console.stream,
+        no_color=not console.color,
+    )
+    if selected is None:
+        return False
+    if selected.key == "4":
+        try:
+            answer = console.input_func("Write your answer: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        if not answer:
+            return False
+    else:
+        answer = str(selected.resolved_value)
+    result = runtime.answer_intake_question(str(question.get("id")), answer)
+    if isinstance(result, SliceResult):
+        console.write(result.message)
+    return True
+
+
 def _show_tree(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -> None:
     run = _current_ultra_run(runtime)
     if run is None:
@@ -1780,6 +1839,7 @@ def interactive_loop(
     active_work: Thread | None = None
     work_done = Event()
     work_errors: list[BaseException] = []
+    deferred_picker_question: str | None = None
 
     def work(command: UserCommand) -> None:
         try:
@@ -1809,6 +1869,21 @@ def interactive_loop(
                     runtime.checkpoint_interrupt()
                 else:
                     console.write(f"error: {exc}")
+        if active_work is None:
+            pending = runtime.intake_questions()
+            pending_id = (
+                str(pending[0].get("id"))
+                if isinstance(pending, (tuple, list)) and pending
+                else None
+            )
+            if pending_id and pending_id != deferred_picker_question:
+                if _answer_pending_intake_with_picker(runtime, console):
+                    deferred_picker_question = None
+                    _show_runtime_state(runtime, console)
+                    continue
+                deferred_picker_question = pending_id
+            elif pending_id is None:
+                deferred_picker_question = None
         try:
             line = console.prompt()
         except EOFError:

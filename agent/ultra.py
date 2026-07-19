@@ -2346,10 +2346,40 @@ class UltraOrchestrator:
     @staticmethod
     def _requires_single_html_artifact(prompt: str) -> bool:
         text = str(prompt).casefold()
-        return "html" in text and any(
+        return bool(re.search(r"\bsingle[- ]file\b.{0,80}\bhtml\b", text)) or any(
             marker in text
-            for marker in ("three.js", "threejs", "webgl", "3d", "game", "لعبة")
+            for marker in (
+                "single self-contained html",
+                "single html",
+                "single-file html",
+                "one html file",
+                "one file",
+                "ملف واحد",
+            )
         )
+
+    @staticmethod
+    def _requires_visual_artifact(prompt: str) -> bool:
+        text = str(prompt).casefold()
+        return any(
+            marker in text
+            for marker in (
+                "three.js", "threejs", "webgl", "3d", "game", "visual",
+                "dashboard", "landing page", "لعبة", "واجهة", "تصميم",
+            )
+        )
+
+    @classmethod
+    def _final_output_paths(cls, prompt: str) -> tuple[str, ...]:
+        text = str(prompt).casefold()
+        if cls._requires_single_html_artifact(prompt):
+            return ("index.html",)
+        if any(
+            marker in text
+            for marker in ("multi-file", "multi file", "multi-file project", "ملفات متعددة")
+        ):
+            return ("index.html", "src")
+        return ("index.html", "components")
 
     @classmethod
     def _enforce_goal_artifact_contract(
@@ -2357,20 +2387,21 @@ class UltraOrchestrator:
         prompt: str,
         goal: GoalSpecV1,
     ) -> GoalSpecV1:
-        if not cls._requires_single_html_artifact(prompt):
+        if not cls._requires_visual_artifact(prompt):
             return goal
+        final_paths = cls._final_output_paths(prompt)
         return replace(
             goal,
             constraints=tuple(
                 dict.fromkeys(
                     (
                         *goal.constraints,
-                        "The final deliverable is one self-contained index.html file.",
-                        "Only FinalAssembler may write index.html; specialists publish component packages.",
+                        f"The final deliverable uses approved packaging paths: {', '.join(final_paths)}.",
+                        "Only FinalAssembler may write final output paths; specialists publish materialized component packages.",
                     )
                 )
             ),
-            in_scope=tuple(dict.fromkeys((*goal.in_scope, "index.html", "playable browser runtime"))),
+            in_scope=tuple(dict.fromkeys((*goal.in_scope, *final_paths, "playable browser runtime"))),
             success_criteria=tuple(
                 dict.fromkeys(
                     (
@@ -2389,9 +2420,10 @@ class UltraOrchestrator:
         prompt: str,
         proposed: MasterPlanV1,
     ) -> MasterPlanV1:
-        if not cls._requires_single_html_artifact(prompt):
+        if not cls._requires_visual_artifact(prompt):
             return proposed
         inherited = proposed.modules[0]
+        final_paths = cls._final_output_paths(prompt)
         final_module = TaskContractV1(
             id=inherited.id,
             title="FinalAssembler for the Three.js vehicle game",
@@ -2411,8 +2443,8 @@ class UltraOrchestrator:
                 "Verify overall score >= 0.95 and every critical visual score >= 0.85",
             ),
             depends_on=(),
-            write_paths=("index.html",),
-            forbidden_changes=tuple(dict.fromkeys((*inherited.forbidden_changes, "Do not create split final source artifacts"))),
+            write_paths=final_paths,
+            forbidden_changes=inherited.forbidden_changes,
             owned_interfaces=tuple(
                 dict.fromkeys(
                     (
@@ -2429,17 +2461,23 @@ class UltraOrchestrator:
             metadata={
                 **dict(inherited.metadata),
                 "force_recursive_specialists": True,
-                "final_output_paths": ["index.html"],
+                "final_output_paths": list(final_paths),
+                "materialized_components_required": True,
+                "packaging": (
+                    "single_html"
+                    if len(final_paths) == 1
+                    else ("multi_file" if "src" in final_paths else "modular_best_final")
+                ),
                 "source_module_count": len(proposed.modules),
             },
         )
         return MasterPlanV1(
-            summary=proposed.summary + " Harness-enforced single-artifact recursive assembly.",
+            summary=proposed.summary + " Harness-enforced materialized recursive assembly.",
             modules=(final_module,),
             milestones=proposed.milestones,
             execution_strategy=(
                 proposed.execution_strategy.rstrip()
-                + "\nHarness invariant: specialists publish isolated packages; FinalAssembler alone writes index.html."
+                + "\nHarness invariant: specialists publish isolated materialized packages; FinalAssembler alone writes final outputs."
             ),
             revision=proposed.revision,
         )
@@ -2495,11 +2533,16 @@ class UltraOrchestrator:
 
     @staticmethod
     def _specialist_profile(node: WorkNode) -> SpecialistProfileV1:
+        default_interface = (
+            f"create{re.sub(r'[^A-Za-z0-9]+', ' ', node.contract.title).title().replace(' ', '')}"
+            "(context)"
+        )
+        owned_interfaces = node.contract.owned_interfaces or (default_interface,)
         expertise = tuple(
             dict.fromkeys(
                 (
                     node.contract.title,
-                    *node.contract.owned_interfaces,
+                    *owned_interfaces,
                     *tuple(str(item) for item in node.contract.metadata.get("expertise", ())),
                 )
             )
@@ -2515,7 +2558,7 @@ class UltraOrchestrator:
                 "verification": list(node.contract.verification),
                 "component_package_only": bool(node.contract.metadata.get("component_package_only")),
             },
-            owned_interfaces=node.contract.owned_interfaces,
+            owned_interfaces=owned_interfaces,
             deliverable=(
                 "A typed component package for the parent assembler"
                 if node.contract.metadata.get("component_package_only")
@@ -2530,24 +2573,47 @@ class UltraOrchestrator:
         )
 
     @staticmethod
+    def _interface_contract(node: WorkNode) -> Mapping[str, Any]:
+        profile = UltraOrchestrator._specialist_profile(node)
+        return {
+            "schema_name": "InterfaceContractV1",
+            "node_id": node.id,
+            "exports": list(profile.owned_interfaces),
+            "imports": list(node.depends_on),
+            "invariants": [
+                criterion
+                for criterion in node.contract.acceptance_criteria[:4]
+            ],
+            "integration_points": [
+                "Parent consumes the exact materialized file hashes and declared exports.",
+                "Specialist output never writes a final output path.",
+            ],
+            "version": 1,
+        }
+
+    @staticmethod
     def _deterministic_shared_artifact_children(parent: WorkNode) -> tuple[Mapping[str, Any], ...]:
         readiness = UltraOrchestrator._leaf_readiness(parent)
-        if readiness.ready or not (
-            len(parent.write_paths) == 1
-            and parent.write_paths[0].casefold().endswith((".html", ".htm"))
+        forced = bool(parent.contract.metadata.get("force_recursive_specialists"))
+        if not forced and (
+            readiness.ready
+            or not any(
+                path.casefold().endswith((".html", ".htm"))
+                for path in parent.write_paths
+            )
         ):
             return ()
         domains = (
-            ("world", "World, road, environment, lighting, spatial composition, and scene depth"),
-            ("vehicles", "Vehicle modeling including chassis, wheels, cabin, glass, lights, and materials"),
-            ("character", "Character modeling, pose, animation, control feedback, and visual readability"),
-            ("gameplay", "Gameplay state, traffic, collisions, scoring, progression, and input logic"),
-            ("presentation", "Camera, HUD, audio hooks, effects, responsiveness, and accessibility"),
-            ("qa", "Functional, visual, performance, browser, and accessibility acceptance evidence"),
+            ("world", "WorldPackage", "World, road, environment, lighting, spatial composition, and scene depth"),
+            ("vehicles", "VehiclePackage", "Vehicle modeling including chassis, wheels, cabin, glass, lights, and materials"),
+            ("character", "CharacterPackage", "Character modeling, pose, animation, control feedback, and visual readability"),
+            ("gameplay", "GameplayPackage", "Gameplay state, traffic, collisions, scoring, progression, and input logic"),
+            ("presentation", "PresentationPackage", "Camera, HUD, audio hooks, effects, responsiveness, and accessibility"),
+            ("qa", "QAPackage", "Functional, visual, performance, browser, and accessibility acceptance evidence"),
         )
         children: list[Mapping[str, Any]] = []
         previous: str | None = None
-        for suffix, objective in domains:
+        for suffix, owned_interface, objective in domains:
             child_id = f"{parent.id}.{suffix}"
             children.append(
                 {
@@ -2564,9 +2630,14 @@ class UltraOrchestrator:
                     ],
                     "depends_on": [previous] if previous and suffix in {"gameplay", "presentation", "qa"} else [],
                     "write_paths": [],
-                    "owned_interfaces": [],
+                    "owned_interfaces": (
+                        [owned_interface]
+                        if owned_interface in parent.contract.owned_interfaces
+                        else []
+                    ),
                     "metadata": {
                         "component_package_only": True,
+                        "materialized_components_required": True,
                         "final_output_paths": list(parent.write_paths),
                         "specialist_domain": suffix,
                     },
@@ -2581,7 +2652,7 @@ class UltraOrchestrator:
 
         metadata = parent.contract.metadata
         domain = str(metadata.get("specialist_domain") or "").casefold()
-        if not domain or metadata.get("component_leaf"):
+        if not domain:
             return ()
         parts: Mapping[str, tuple[tuple[str, str], ...]] = {
             "world": (
@@ -2616,8 +2687,34 @@ class UltraOrchestrator:
                 ("visual", "Modeling, composition, lighting, readability, feedback, and polish rubric"),
                 ("performance", "Frame stability, resize behavior, asset/runtime constraints, and accessibility checks"),
             ),
+            "world.road": (
+                ("geometry", "Reusable lane and verge geometry with stable dimensions and segment APIs"),
+                ("markings", "Lane markings, crossings, shoulders, palette, and distance readability"),
+                ("collision", "Collision surfaces, bounds, spawn-safe zones, and debug visualization"),
+            ),
+            "world.environment": (
+                ("terrain", "Terrain layers, boundaries, depth planes, and world extents"),
+                ("props", "Reusable stylized props, placement anchors, density, and variation"),
+                ("composition", "Background layering, palette rhythm, landmark spacing, and readability"),
+            ),
+            "world.lighting": (
+                ("rig", "Key, fill, ambient, and hemisphere lighting contracts"),
+                ("atmosphere", "Fog, sky, exposure, color treatment, and depth separation"),
+                ("shadows", "Shadow quality, contact cues, performance bounds, and material readability"),
+            ),
         }
         definitions = parts.get(domain, ())
+        if metadata.get("component_leaf") and not definitions:
+            return ()
+        root_domain = domain.split(".", 1)[0]
+        domain_interface = {
+            "world": "WorldPackage",
+            "vehicles": "VehiclePackage",
+            "character": "CharacterPackage",
+            "gameplay": "GameplayPackage",
+            "presentation": "PresentationPackage",
+            "qa": "QAPackage",
+        }.get(root_domain, f"{root_domain.title()}Package")
         return tuple(
             {
                 "id": f"{parent.id}.{suffix}",
@@ -2633,9 +2730,14 @@ class UltraOrchestrator:
                 ],
                 "depends_on": [],
                 "write_paths": [],
-                "owned_interfaces": [],
+                "owned_interfaces": (
+                    [domain_interface]
+                    if domain_interface in parent.contract.owned_interfaces
+                    else []
+                ),
                 "metadata": {
                     "component_package_only": True,
+                    "materialized_components_required": True,
                     "component_leaf": True,
                     "specialist_domain": f"{domain}.{suffix}",
                     "final_output_paths": list(metadata.get("final_output_paths", ())),
@@ -2643,6 +2745,79 @@ class UltraOrchestrator:
             }
             for suffix, objective in definitions
             for title in (suffix,)
+        )
+
+    @staticmethod
+    def _deterministic_cross_domain_children(
+        parent: WorkNode,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Give common large coding domains concrete, evaluable ownership."""
+
+        if parent.contract.metadata.get("component_package_only"):
+            return ()
+        text = " ".join(
+            (
+                parent.contract.title,
+                parent.contract.objective,
+                *parent.contract.acceptance_criteria,
+            )
+        ).casefold()
+        templates: tuple[tuple[str, str], ...] = ()
+        family = ""
+        if any(term in text for term in ("machine learning", "churn", "training pipeline", "ml project")):
+            family = "ml"
+            templates = (
+                ("data", "Data contracts, validation, leakage prevention, features, and reproducible splits"),
+                ("model", "Model architecture, baselines, calibration, and inference contract"),
+                ("training", "Training orchestration, configuration, reproducibility, and checkpoints"),
+                ("evaluation", "Metrics, slice analysis, robustness, regression, and acceptance evidence"),
+                ("serving", "Serving interface, schema validation, observability, and deployment fixture"),
+            )
+        elif any(term in text for term in ("appointment", "booking api", "backend api", "rest api")):
+            family = "backend"
+            templates = (
+                ("domain", "Domain entities, invariants, policies, and service contracts"),
+                ("api", "HTTP/API surface, schemas, validation, errors, and compatibility"),
+                ("persistence", "Persistence model, transactions, migrations, and repository interfaces"),
+                ("auth", "Authentication, authorization, abuse cases, and security boundaries"),
+                ("tests", "Contract, integration, concurrency, failure-path, and regression tests"),
+            )
+        elif any(term in text for term in ("dashboard", "frontend", "front-end", "web app")):
+            family = "frontend"
+            templates = (
+                ("layout", "Responsive information architecture, hierarchy, navigation, and layout"),
+                ("components", "Reusable UI components, states, interaction, and design-system contracts"),
+                ("data", "Data fetching, cache/state, loading, error, and empty-state behavior"),
+                ("accessibility", "Keyboard, focus, semantics, contrast, motion, and assistive feedback"),
+                ("visual_qa", "Screenshot fixtures, visual rubric, responsive regression, and polish evidence"),
+            )
+        if not templates:
+            return ()
+        return tuple(
+            {
+                "id": f"{parent.id}.{suffix}",
+                "title": f"{family.upper()} {suffix.replace('_', ' ').title()} specialist",
+                "objective": objective,
+                "acceptance_criteria": [
+                    f"The {suffix.replace('_', ' ')} deliverable is concrete and independently testable.",
+                    "The package exposes real files, explicit interfaces, tests, and a runnable review fixture.",
+                ],
+                "verification": [
+                    "Run the bounded component checks and preview/report fixture.",
+                    "Reject descriptions without materialized implementation evidence.",
+                ],
+                "depends_on": [],
+                "write_paths": [],
+                "owned_interfaces": [],
+                "metadata": {
+                    "component_package_only": True,
+                    "materialized_components_required": True,
+                    "component_leaf": True,
+                    "specialist_domain": f"{family}.{suffix}",
+                    "final_output_paths": list(parent.write_paths),
+                },
+            }
+            for suffix, objective in templates
         )
 
     def _validated_children(
@@ -2742,6 +2917,13 @@ class UltraOrchestrator:
         profile_saver = getattr(self.state, "save_specialist_profile", None)
         if callable(profile_saver):
             profile_saver(self.run_state.id, profile)
+        interface_saver = getattr(self.state, "save_interface_contract", None)
+        if callable(interface_saver):
+            interface_saver(
+                self.run_state.id,
+                node.id,
+                self._interface_contract(node),
+            )
         target_saver = getattr(self.state, "save_node_quality_target", None)
         if callable(target_saver):
             target_saver(self.run_state.id, target)
@@ -2749,26 +2931,60 @@ class UltraOrchestrator:
         self.nodes[node_id] = node
         self.state.save_work_node(self.run_state.id, node)
         context = self._new_context(node, AgentRole.PLANNER)
-        plan_response = self._invoke(
-            AgentRole.PLANNER,
-            InnerPhase.MINI_PLAN,
-            task={"contract": asdict(node.contract)},
-            context=context,
-            node_id=node.id,
+        contract_is_self_planning = bool(
+            node.contract.metadata.get("component_package_only")
+            and node.contract.objective
+            and node.contract.acceptance_criteria
+            and node.contract.verification
         )
+        try:
+            if contract_is_self_planning:
+                plan_response = self._deterministic_mini_plan(node)
+                self.events.publish(
+                    "ultra.mini_plan_derived",
+                    f"[{node.id}] derived mini-plan from the approved component contract",
+                    run_id=self.run_state.id,
+                    node_id=node.id,
+                    steps=list(plan_response.payload.get("steps", ())),
+                )
+            else:
+                plan_response = self._invoke(
+                    AgentRole.PLANNER,
+                    InnerPhase.MINI_PLAN,
+                    task={"contract": asdict(node.contract)},
+                    context=context,
+                    node_id=node.id,
+                )
+        except (AgentProtocolError, RuntimeError) as exc:
+            # The contract and specialist profile already contain all facts
+            # required for a bounded node plan. A small local model sometimes
+            # mistakes node ids for repository paths or exhausts JSON repair.
+            # That must not invalidate a previously approved, durable tree.
+            plan_response = self._deterministic_mini_plan(node)
+            self.events.publish(
+                "ultra.mini_plan_repaired",
+                f"[{node.id}] replaced invalid local mini-plan with a contract-derived plan",
+                run_id=self.run_state.id,
+                node_id=node.id,
+                error=str(exc),
+                steps=list(plan_response.payload.get("steps", ())),
+            )
         readiness = self._leaf_readiness(node)
         deterministic_children = self._deterministic_shared_artifact_children(node)
         specialist_children = self._deterministic_specialist_children(node)
+        cross_domain_children = self._deterministic_cross_domain_children(node)
         decompose_payload: Mapping[str, Any] = {}
-        if node.contract.metadata.get("component_leaf"):
-            raw_children: Any = ()
-        elif specialist_children:
+        if specialist_children:
             raw_children = specialist_children
+        elif node.contract.metadata.get("component_leaf"):
+            raw_children = ()
         elif deterministic_children:
             # The final artifact contract requires independently evaluable
             # domains. A weak model's generic "subtask 1" decomposition is not
             # a substitute for named specialist ownership.
             raw_children = deterministic_children
+        elif cross_domain_children:
+            raw_children = cross_domain_children
         elif node.contract.metadata.get("component_package_only"):
             raw_children = ()
         else:
@@ -2818,6 +3034,45 @@ class UltraOrchestrator:
         self.nodes[node_id] = node
         self.state.save_work_node(self.run_state.id, node)
 
+    @staticmethod
+    def _deterministic_mini_plan(node: WorkNode) -> AgentResponse:
+        """Build the smallest inspectable plan already implied by a node contract."""
+
+        contract = node.contract
+        steps = [
+            f"Implement the bounded objective: {contract.objective}",
+            *(
+                f"Verify acceptance criterion: {criterion}"
+                for criterion in contract.acceptance_criteria
+            ),
+            *(f"Collect evidence by: {check}" for check in contract.verification),
+        ]
+        if contract.metadata.get("component_package_only"):
+            steps.extend(
+                (
+                    "Publish real implementation, interface, tests, and a runnable preview "
+                    "through the typed component artifact contract.",
+                    "Revise only this component until runtime and independent visual gates pass.",
+                )
+            )
+        return AgentResponse.from_mapping(
+            {
+                "payload": {
+                    "steps": list(dict.fromkeys(step for step in steps if step.strip())),
+                    "research_required": bool(contract.metadata.get("research_required")),
+                    "source": "deterministic_contract_fallback",
+                },
+                "summary": "Contract-derived mini-plan",
+                "reasoning_summary": (
+                    "The approved task contract already provides the objective, acceptance "
+                    "criteria, verification, ownership, and artifact boundary."
+                ),
+            },
+            node_id=node.id,
+            provider="harness",
+            model="deterministic",
+        )
+
     def _ensure_expanded(self, node_id: str) -> None:
         """Resume-aware expansion that never recreates durable child nodes."""
 
@@ -2866,13 +3121,18 @@ class UltraOrchestrator:
         node: WorkNode,
         responses: tuple[AgentResponse, ...],
     ) -> tuple[Mapping[str, Any], ...]:
-        labels = (
+        labels = [
             "clean_code",
             "security",
             "runtime_tests",
             "test_quality",
             "triage",
-        )
+        ]
+        if len(responses) > len(labels):
+            labels.extend(
+                f"harness_gate_{index}"
+                for index in range(1, len(responses) - len(labels) + 1)
+            )
         records: list[Mapping[str, Any]] = []
         for label, response in zip(labels, responses):
             payload = response.payload
@@ -3030,10 +3290,131 @@ class UltraOrchestrator:
             metadata=metadata,
         )
 
+    def _materialize_component_gate(
+        self,
+        node: WorkNode,
+        candidate_response: AgentResponse,
+        *,
+        revision: int,
+    ) -> tuple[Mapping[str, Any], tuple[AgentResponse, ...]]:
+        if not node.contract.metadata.get("component_package_only"):
+            return {}, ()
+        materializer = getattr(self.state, "materialize_component_candidate", None)
+        if not callable(materializer):
+            # Lightweight engine adapters may omit filesystem integration.
+            # The production adapter always implements this gate.
+            return {}, ()
+        assert self.run_state
+        try:
+            result = dict(
+                materializer(
+                    self.run_state.id,
+                    node,
+                    candidate_response,
+                    revision=revision,
+                    child_packages={
+                        child_id: dict(self._results[child_id].component_package)
+                        for child_id in node.children
+                        if child_id in self._results
+                    },
+                )
+                or {}
+            )
+            passed = bool(result.get("passed"))
+            findings = tuple(_strings(result.get("findings")))
+            status = str(result.get("status") or ("accepted" if passed else "rejected"))
+            return result, (
+                AgentResponse(
+                    payload={
+                        "passed": passed,
+                        "success": passed,
+                        "findings": list(findings),
+                        "status": status,
+                        "materialized_component_gate": result,
+                        "confidence": 1.0,
+                    },
+                    summary=(
+                        f"Materialized component gate {status} for {node.id}"
+                    ),
+                    reasoning_summary=(
+                        "Harness-owned file hashes, preview runtime, and independent "
+                        "visual evidence determine this verdict."
+                    ),
+                    provider="harness",
+                    model="materialized-component-v2",
+                ),
+            )
+        except Exception as exc:
+            finding = f"materialized component gate failed: {exc}"
+            return {"passed": False, "status": "rejected", "findings": [finding]}, (
+                AgentResponse(
+                    payload={
+                        "passed": False,
+                        "success": False,
+                        "status": "rejected",
+                        "findings": [finding],
+                        "confidence": 1.0,
+                    },
+                    summary=f"Materialized component rejected for {node.id}",
+                    reasoning_summary="The specialist did not produce a valid runnable package.",
+                    provider="harness",
+                    model="materialized-component-v2",
+                ),
+            )
+
+    def _package_consumption_gate(
+        self,
+        node: WorkNode,
+    ) -> tuple[AgentResponse, ...]:
+        verifier = getattr(self.state, "verify_package_consumption", None)
+        if not callable(verifier) or not node.children or not node.write_paths:
+            return ()
+        assert self.run_state
+        try:
+            result = dict(
+                verifier(
+                    self.run_state.id,
+                    node,
+                    tuple(
+                        dict(self._results[child_id].component_package)
+                        for child_id in node.children
+                        if child_id in self._results
+                    ),
+                )
+                or {}
+            )
+            passed = bool(result.get("passed"))
+            findings = list(_strings(result.get("findings")))
+        except Exception as exc:
+            passed = False
+            findings = [f"package consumption verification failed: {exc}"]
+            result = {"passed": False, "findings": findings}
+        return (
+            AgentResponse(
+                payload={
+                    "passed": passed,
+                    "success": passed,
+                    "findings": findings,
+                    "package_consumption_gate": result,
+                    "confidence": 1.0,
+                },
+                summary=(
+                    f"Package consumption {'verified' if passed else 'rejected'} for {node.id}"
+                ),
+                reasoning_summary=(
+                    "The harness compared staged component hashes/content with final assembler outputs."
+                ),
+                provider="harness",
+                model="package-consumption-v1",
+            ),
+        )
+
     def _quality(
         self,
         node: WorkNode,
         candidate_response: AgentResponse,
+        *,
+        authoritative_responses: tuple[AgentResponse, ...] = (),
     ) -> QualityGateResultV1:
         candidate = self._review_candidate(candidate_response)
         evaluation_policy = {
@@ -3106,7 +3487,14 @@ class UltraOrchestrator:
             finding_recorder(node.id, "clean_code", self._records(clean_code, "findings"))
             finding_recorder(node.id, "security", self._records(security, "findings"))
             finding_recorder(node.id, "test_quality", self._records(test_quality, "findings"))
-        responses = (clean_code, security, tests, test_quality, triage)
+        responses = (
+            clean_code,
+            security,
+            tests,
+            test_quality,
+            triage,
+            *authoritative_responses,
+        )
         consensus = self._record_quality_consensus(node, responses)
         return QualityGateResultV1(responses=responses, consensus=consensus)
 
@@ -3179,7 +3567,35 @@ class UltraOrchestrator:
         )
         responses.append(implementation)
         candidate_response = implementation
-        quality_gate = self._quality(node, candidate_response)
+        materialized_component, materialized_gate = self._materialize_component_gate(
+            node,
+            candidate_response,
+            revision=1,
+        )
+        if materialized_component:
+            candidate_response = replace(
+                candidate_response,
+                payload={
+                    **dict(candidate_response.payload),
+                    "materialized_component_package": materialized_component.get("package", {}),
+                    "materialized_preview": materialized_component.get("preview", {}),
+                    "visual_evaluations": materialized_component.get("visual_evaluations", ()),
+                },
+            )
+        authoritative_gate = (
+            *materialized_gate,
+            *self._package_consumption_gate(node),
+        )
+        quality_gate = (
+            QualityGateResultV1(responses=authoritative_gate)
+            if authoritative_gate
+            and not all(self._passed(item) for item in authoritative_gate)
+            else self._quality(
+                node,
+                candidate_response,
+                authoritative_responses=authoritative_gate,
+            )
+        )
         responses.extend(quality_gate.responses)
         fixes = 0
         while not self._quality_gate_passed(quality_gate) and fixes < self.config.max_fix_attempts:
@@ -3227,7 +3643,35 @@ class UltraOrchestrator:
             )
             responses.append(fix)
             candidate_response = self._merge_candidate_response(candidate_response, fix)
-            quality_gate = self._quality(node, candidate_response)
+            materialized_component, materialized_gate = self._materialize_component_gate(
+                node,
+                candidate_response,
+                revision=fixes + 1,
+            )
+            if materialized_component:
+                candidate_response = replace(
+                    candidate_response,
+                    payload={
+                        **dict(candidate_response.payload),
+                        "materialized_component_package": materialized_component.get("package", {}),
+                        "materialized_preview": materialized_component.get("preview", {}),
+                        "visual_evaluations": materialized_component.get("visual_evaluations", ()),
+                    },
+                )
+            authoritative_gate = (
+                *materialized_gate,
+                *self._package_consumption_gate(node),
+            )
+            quality_gate = (
+                QualityGateResultV1(responses=authoritative_gate)
+                if authoritative_gate
+                and not all(self._passed(item) for item in authoritative_gate)
+                else self._quality(
+                    node,
+                    candidate_response,
+                    authoritative_responses=authoritative_gate,
+                )
+            )
             responses.extend(quality_gate.responses)
 
         if not self._quality_gate_passed(quality_gate):
@@ -3276,7 +3720,7 @@ class UltraOrchestrator:
             self.state.save_work_node(self.run_state.id, node)
             raise NodePipelineFailed(result)
 
-        if is_parent_assembler:
+        if is_parent_assembler or materialized_component:
             # Parent fixes are cumulative integration revisions. Publish the
             # exact candidate that passed the final quality gate, never the
             # stale first integration response.
@@ -3368,13 +3812,17 @@ class UltraOrchestrator:
             test_results=test_results,
             findings=self._findings(*responses),
             insights=tuple(insight for response in responses for insight in response.insights),
-            component_package=asdict(component_package),
+            component_package=(
+                dict(materialized_component.get("package", {}))
+                if materialized_component.get("package")
+                else asdict(component_package)
+            ),
             fix_attempts=fixes,
         )
         self._results[node.id] = result
         self.state.save_result_package(self.run_state.id, result)
         package_saver = getattr(self.state, "save_component_package", None)
-        if callable(package_saver):
+        if callable(package_saver) and not materialized_component.get("package"):
             package_saver(self.run_state.id, component_package)
         if not result.success:
             node = replace(node, status=NodeStatus.FAILED, phase=InnerPhase.INTEGRATE)

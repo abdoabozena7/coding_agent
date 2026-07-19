@@ -47,6 +47,62 @@ class IntakeStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class PromptSlotStatus(str, Enum):
+    EXPLICIT = "explicit"
+    DISCOVERED = "discovered"
+    SAFELY_INFERRED = "safely_inferred"
+    MISSING_CONSEQUENTIAL = "missing_consequential"
+
+
+@dataclass(frozen=True, slots=True)
+class PromptDecisionSlotV1:
+    name: str
+    status: PromptSlotStatus
+    value: str = ""
+    provenance: str = ""
+
+    @property
+    def complete(self) -> bool:
+        return self.status is not PromptSlotStatus.MISSING_CONSEQUENTIAL
+
+    def to_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["status"] = self.status.value
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class PromptCompletenessV1:
+    slots: tuple[PromptDecisionSlotV1, ...]
+    version: int = 1
+
+    @property
+    def complete(self) -> bool:
+        return all(slot.complete for slot in self.slots)
+
+    @property
+    def missing_consequential(self) -> tuple[str, ...]:
+        return tuple(
+            slot.name
+            for slot in self.slots
+            if slot.status is PromptSlotStatus.MISSING_CONSEQUENTIAL
+        )
+
+    def slot(self, name: str) -> PromptDecisionSlotV1:
+        for slot in self.slots:
+            if slot.name == name:
+                return slot
+        raise KeyError(name)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "slots": [slot.to_dict() for slot in self.slots],
+            "complete": self.complete,
+            "missing_consequential": list(self.missing_consequential),
+            "version": self.version,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class QuestionOptionV1:
     label: str
@@ -156,6 +212,7 @@ class ExecutionBriefV1:
 class IntakeDecisionV1:
     brief: ExecutionBriefV1
     complexity: TaskComplexityAssessmentV1
+    completeness: PromptCompletenessV1
     questions: tuple[ClarificationQuestionV1, ...] = ()
 
     @property
@@ -272,26 +329,172 @@ class IntentArchitect:
         )
 
     @staticmethod
-    def _needs_questions(prompt: str) -> bool:
-        value = str(prompt).strip()
-        words = re.findall(r"[\w.+#-]+", value, flags=re.UNICODE)
-        if not value or _VAGUE_ONLY.fullmatch(value):
-            return True
-        visual = bool(_contains(value, _VISUAL_TERMS))
-        artifact_matches = re.findall(
+    def _mentions(text: str, values: Iterable[str]) -> bool:
+        lowered = text.casefold()
+        return any(value.casefold() in lowered for value in values)
+
+    def evaluate_completeness(
+        self,
+        prompt: str,
+        *,
+        answers: Mapping[str, str] | None = None,
+        repository_facts: Sequence[str] = (),
+    ) -> PromptCompletenessV1:
+        """Classify consequential decisions semantically, never by prompt length."""
+
+        text = str(prompt).strip()
+        lowered = text.casefold()
+        answers = {
+            str(key).casefold(): str(value).strip()
+            for key, value in dict(answers or {}).items()
+            if str(value).strip()
+        }
+        discoverable_facts = tuple(
+            str(item).strip()
+            for item in repository_facts
+            if str(item).strip()
+            and not str(item).strip().casefold().startswith(
+                ("cross-run learned lesson:", "learned lesson:", "lesson:")
+            )
+        )
+        facts_text = "\n".join(discoverable_facts).casefold()
+        visual = bool(_contains(text, _VISUAL_TERMS))
+        explicit_artifact = re.search(
             r"\b[\w.-]+\.(?:html?|py|js|ts|tsx|jsx|css|json|md|ya?ml|toml)\b",
-            value,
+            text,
             re.I,
         )
-        # Library names such as Three.js describe technology, not a concrete
-        # owned output path that resolves product/platform decisions.
-        has_concrete_artifact = any(
-            not match.casefold().endswith("three.js")
-            for match in artifact_matches
+        slots: list[PromptDecisionSlotV1] = []
+
+        def add(
+            name: str,
+            status: PromptSlotStatus,
+            value: str,
+            provenance: str,
+        ) -> None:
+            slots.append(PromptDecisionSlotV1(name, status, value, provenance))
+
+        if text and not _VAGUE_ONLY.fullmatch(text):
+            add("goal_output", PromptSlotStatus.EXPLICIT, text, "user_prompt")
+        else:
+            add(
+                "goal_output",
+                PromptSlotStatus.MISSING_CONSEQUENTIAL,
+                "",
+                "user_prompt_does_not_identify_an_outcome",
+            )
+
+        platform_terms = (
+            "browser", "web", "desktop", "mobile", "android", "ios", "cli",
+            "terminal", "windows", "linux", "macos", "متصفح", "موبايل", "ديسكتوب",
         )
-        # A tiny visual request usually leaves platform, direction, and scope
-        # consequentially open.  A concrete repair/file request does not.
-        return len(words) < (16 if visual else 4) and not has_concrete_artifact
+        if "platform" in answers:
+            add("platform_audience", PromptSlotStatus.EXPLICIT, answers["platform"], "intake_answer")
+        elif self._mentions(lowered, platform_terms):
+            add("platform_audience", PromptSlotStatus.EXPLICIT, "declared in prompt", "user_prompt")
+        elif self._mentions(facts_text, platform_terms):
+            add("platform_audience", PromptSlotStatus.DISCOVERED, "repository platform", "repository_facts")
+        elif visual:
+            add(
+                "platform_audience",
+                PromptSlotStatus.MISSING_CONSEQUENTIAL,
+                "",
+                "input_controls_and_layout_depend_on_platform",
+            )
+        else:
+            add(
+                "platform_audience",
+                PromptSlotStatus.SAFELY_INFERRED,
+                "existing project platform",
+                "reversible repository-local default",
+            )
+
+        packaging_terms = (
+            "single html", "single-file", "single file", "one file", "self-contained",
+            "multi-file", "multiple files", "modular", "package", "ملف واحد",
+            "ملفات متعددة", "موديول",
+        )
+        if "packaging" in answers:
+            add("packaging", PromptSlotStatus.EXPLICIT, answers["packaging"], "intake_answer")
+        elif (
+            explicit_artifact
+            and not str(explicit_artifact.group(0)).casefold().endswith("three.js")
+        ):
+            add("packaging", PromptSlotStatus.EXPLICIT, explicit_artifact.group(0), "user_prompt")
+        elif self._mentions(lowered, packaging_terms):
+            add("packaging", PromptSlotStatus.EXPLICIT, "declared in prompt", "user_prompt")
+        elif visual:
+            add(
+                "packaging",
+                PromptSlotStatus.MISSING_CONSEQUENTIAL,
+                "",
+                "final_delivery_shape_affects_assembly_and_deployment",
+            )
+        else:
+            add(
+                "packaging",
+                PromptSlotStatus.SAFELY_INFERRED,
+                "follow repository conventions",
+                "reversible repository-local default",
+            )
+
+        visual_terms = (
+            "stylized", "realistic", "neon", "minimal", "material", "lighting",
+            "pixel", "low-poly", "art direction", "ستايل", "واقعي", "كرتوني",
+        )
+        if "visual_direction" in answers:
+            add(
+                "visual_direction",
+                PromptSlotStatus.EXPLICIT,
+                answers["visual_direction"],
+                "intake_answer",
+            )
+        elif not visual:
+            add(
+                "visual_direction",
+                PromptSlotStatus.SAFELY_INFERRED,
+                "not applicable",
+                "non_visual_task",
+            )
+        elif self._mentions(lowered, visual_terms):
+            add("visual_direction", PromptSlotStatus.EXPLICIT, "declared in prompt", "user_prompt")
+        else:
+            add(
+                "visual_direction",
+                PromptSlotStatus.MISSING_CONSEQUENTIAL,
+                "",
+                "visual_quality_requires_a_reviewable_art_direction",
+            )
+
+        constraint_terms = (
+            "must", "should", "accept", "test", "performance", "compatible",
+            "without", "no ", "لازم", "اختبار", "أداء", "متوافق", "بدون",
+        )
+        if self._mentions(lowered, constraint_terms):
+            add("constraints_acceptance", PromptSlotStatus.EXPLICIT, "declared in prompt", "user_prompt")
+        else:
+            add(
+                "constraints_acceptance",
+                PromptSlotStatus.SAFELY_INFERRED,
+                "functional, runtime, review, and regression gates",
+                "harness_quality_floor",
+            )
+
+        deployment_terms = ("deploy", "production", "publish", "hosting", "نشر", "إنتاج")
+        if self._mentions(lowered, deployment_terms):
+            add("deployment_irreversible", PromptSlotStatus.EXPLICIT, "declared in prompt", "user_prompt")
+        else:
+            add(
+                "deployment_irreversible",
+                PromptSlotStatus.SAFELY_INFERRED,
+                "local artifact only; no deployment",
+                "no irreversible side effect requested",
+            )
+        return PromptCompletenessV1(tuple(slots))
+
+    @staticmethod
+    def _needs_questions(completeness: PromptCompletenessV1) -> bool:
+        return not completeness.complete
 
     def _questions(self, prompt: str) -> tuple[ClarificationQuestionV1, ...]:
         visual = bool(_contains(prompt, _VISUAL_TERMS))
@@ -309,6 +512,17 @@ class IntentArchitect:
                     "reason": "Platform changes input, layout, and performance decisions.",
                 },
                 {
+                    "id": "packaging",
+                    "header": "Packaging",
+                    "question": "How should the finished experience be packaged?",
+                    "options": (
+                        {"label": "Modular staging, best final", "description": "Build isolated components and let the assembler choose the strongest final packaging."},
+                        {"label": "Single self-contained HTML", "description": "Deliver one portable HTML file with runtime code and assets embedded."},
+                        {"label": "Multi-file project", "description": "Deliver maintainable source modules and a browser entrypoint."},
+                    ),
+                    "reason": "Packaging changes component contracts, integration, and deployment.",
+                },
+                {
                     "id": "visual_direction",
                     "header": "Visual style",
                     "question": "Which visual direction should guide the specialists?",
@@ -318,17 +532,6 @@ class IntentArchitect:
                         {"label": "Arcade neon", "description": "Favor saturated color, speed effects, and dramatic feedback."},
                     ),
                     "reason": "A concrete art direction makes component reviews objective.",
-                },
-                {
-                    "id": "scope",
-                    "header": "Scope",
-                    "question": "What should the first accepted release prioritize?",
-                    "options": (
-                        {"label": "Playable vertical slice", "description": "Deliver a complete small experience with polished core gameplay."},
-                        {"label": "Visual prototype", "description": "Prioritize presentation and modeling over deep systems."},
-                        {"label": "Systems prototype", "description": "Prioritize mechanics and architecture over final polish."},
-                    ),
-                    "reason": "This sets the quality rubric and decomposition depth.",
                 },
             )
         else:
@@ -388,24 +591,66 @@ class IntentArchitect:
             if requested is RunMode.ULTRA
             else "; ".join(complexity.reasons)
         )
-        resolved_answers = {str(key): str(value) for key, value in dict(answers or {}).items() if str(value).strip()}
-        questions = () if resolved_answers or not self._needs_questions(original) else self._questions(original)
-        html_experience = "html" in original.casefold() and bool(_contains(original, _VISUAL_TERMS))
+        resolved_answers = {
+            str(key): str(value)
+            for key, value in dict(answers or {}).items()
+            if str(value).strip()
+        }
+        completeness = self.evaluate_completeness(
+            original,
+            answers=resolved_answers,
+            repository_facts=repository_facts,
+        )
+        question_by_slot = {
+            "platform_audience": "platform",
+            "packaging": "packaging",
+            "visual_direction": "visual_direction",
+            "goal_output": "outcome",
+        }
+        selected_question_ids = {
+            question_by_slot[name]
+            for name in completeness.missing_consequential
+            if name in question_by_slot
+        }
+        if "goal_output" in completeness.missing_consequential:
+            selected_question_ids.update({"outcome", "priority", "scope"})
+        questions = tuple(
+            item
+            for item in self._questions(original)
+            if item.id in selected_question_ids
+        )[:3]
+        visual_experience = bool(_contains(original, _VISUAL_TERMS))
+        packaging = resolved_answers.get("packaging", "")
+        single_html = (
+            "single" in packaging.casefold()
+            or "ملف واحد" in packaging
+            or bool(
+                re.search(
+                    r"\b(?:single[- ]file|one file|self-contained)\b",
+                    original,
+                    re.I,
+                )
+            )
+        )
         deliverable = (
             "A self-contained, playable index.html with integrated Three.js/runtime code and no split source output"
-            if html_experience
+            if visual_experience and single_html
             else (
-                "A complete, integrated implementation with executable verification"
-                if "analysis only" not in " ".join(resolved_answers.values()).casefold()
-                else "An evidence-backed analysis without workspace mutation"
+                "Materialized specialist components plus the strongest integrated browser packaging"
+                if visual_experience
+                else (
+                    "A complete, integrated implementation with executable verification"
+                    if "analysis only" not in " ".join(resolved_answers.values()).casefold()
+                    else "An evidence-backed analysis without workspace mutation"
+                )
             )
         )
         constraints = ["Preserve unrelated user work", "Use the real workspace and available tools"]
-        if html_experience:
+        if visual_experience:
             constraints.extend(
                 (
-                    "FinalAssembler is the only writer of index.html",
-                    "Specialists publish component packages and must not replace the final artifact",
+                    "FinalAssembler is the only writer of final output paths",
+                    "Specialists publish materialized component packages and cannot replace the final artifact",
                 )
             )
         success_criteria = [
@@ -413,7 +658,7 @@ class IntentArchitect:
             "Critical functional checks pass",
             "Independent review finds no unresolved blocking issue",
         ]
-        if html_experience:
+        if visual_experience:
             success_criteria.extend(
                 (
                     "The game is playable with zero browser console or WebGL runtime errors",
@@ -437,7 +682,12 @@ class IntentArchitect:
             route_reason=route_reason,
             answers=resolved_answers,
         )
-        return IntakeDecisionV1(brief=brief, complexity=complexity, questions=questions)
+        return IntakeDecisionV1(
+            brief=brief,
+            complexity=complexity,
+            completeness=completeness,
+            questions=questions,
+        )
 
 
 def answer_from_value(question: ClarificationQuestionV1, value: str) -> tuple[str, str]:
@@ -464,6 +714,9 @@ __all__ = [
     "IntakeDecisionV1",
     "IntakeStatus",
     "IntentArchitect",
+    "PromptCompletenessV1",
+    "PromptDecisionSlotV1",
+    "PromptSlotStatus",
     "QuestionOptionV1",
     "RunMode",
     "TaskComplexityAssessmentV1",

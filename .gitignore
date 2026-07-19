@@ -12,3 +12,5 @@ venv/
 
 # Workspace-local persistent harness state
 .coding-agent/
+**/run-artifacts/.ultra-staging/
+run-artifacts/*.log
