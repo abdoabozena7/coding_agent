@@ -55,6 +55,7 @@ from .ui import (
     SLASH_COMMANDS,
     ConsoleUI,
     HELP_TEXT,
+    render_agent_detail,
     render_agents,
     render_memory,
     render_plan,
@@ -77,6 +78,7 @@ class PickerBack(Exception):
 _PALETTE_COMMANDS_NEEDING_TEXT = {
     "/goal", "/reject", "/replan", "/answer", "/add", "/edit", "/remove",
     "/done", "/todo", "/block", "/skip", "/resolve", "/cancel", "/stop-process",
+    "/agent",
 }
 
 
@@ -1112,14 +1114,108 @@ def _show_agents(
     if run is None:
         console.write("Agents\n  (no ULTRA run yet)")
         return
-    node_titles = {
-        node.id: node.title for node in runtime.store.list_work_nodes(run.id)
-    }
+    nodes = runtime.store.list_work_nodes(run.id)
+    node_titles = {node.id: node.title for node in nodes}
     console.write(
         render_agents(
             runtime.store.list_agent_runs(run.id),
             include_finished=include_finished,
             node_titles=node_titles,
+            nodes=nodes,
+            run_id=run.id,
+        )
+    )
+
+
+def _show_agent(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -> None:
+    run = _current_ultra_run(runtime)
+    if run is None:
+        console.write("Specialist view | READ ONLY\n  (no ULTRA run yet)")
+        return
+    nodes = list(runtime.store.list_work_nodes(run.id))
+    agents = list(runtime.store.list_agent_runs(run.id))
+    if not target:
+        _show_agents(runtime, console, include_finished=False)
+        return
+
+    normalized = target.strip().casefold()
+    selected_node = None
+    selected_agent = None
+    display_index = None
+    if normalized.isdigit():
+        index = int(normalized)
+        if 1 <= index <= len(nodes):
+            display_index = index
+            selected_node = nodes[index - 1]
+    if selected_node is None:
+        selected_agent = next(
+            (
+                item
+                for item in reversed(agents)
+                if item.id.casefold() == normalized
+                or item.id.casefold().startswith(normalized)
+            ),
+            None,
+        )
+        node_target = selected_agent.work_node_id if selected_agent is not None else normalized
+        matches = [
+            (index, item)
+            for index, item in enumerate(nodes, 1)
+            if item.id.casefold() == str(node_target).casefold()
+            or item.id.casefold().startswith(str(node_target).casefold())
+            or item.title.casefold() == normalized
+        ]
+        if len(matches) == 1:
+            display_index, selected_node = matches[0]
+    if selected_node is None and selected_agent is None:
+        console.write(
+            f"Specialist view | READ ONLY\n  No unique agent or specialist matches {target!r}.\n"
+            "  Use /agents or /agents --all to copy a number or id."
+        )
+        return
+    if selected_node is not None and selected_agent is None:
+        selected_agent = next(
+            (
+                item
+                for item in reversed(agents)
+                if item.work_node_id == selected_node.id
+            ),
+            None,
+        )
+
+    node_id = selected_node.id if selected_node is not None else selected_agent.work_node_id
+    profiles = {
+        str(item.get("work_node_id")): item
+        for item in runtime.store.list_specialist_profiles(run.id)
+    }
+    trace = None
+    if selected_agent is not None:
+        traces = runtime.store.list_prompt_traces(
+            run.id,
+            agent_run_id=selected_agent.id,
+            limit=1,
+        )
+        trace = traces[0] if traces else None
+    if trace is None and node_id:
+        traces = runtime.store.list_prompt_traces(
+            run.id,
+            work_node_id=node_id,
+            limit=1,
+        )
+        trace = traces[0] if traces else None
+    ancestry = (
+        runtime.store.work_node_ancestors(selected_node.id)
+        if selected_node is not None
+        else ()
+    )
+    console.write(
+        render_agent_detail(
+            node=selected_node,
+            agent_run=selected_agent,
+            profile=profiles.get(str(node_id)),
+            trace=trace,
+            ancestry=ancestry,
+            display_index=display_index,
         )
     )
 
@@ -1724,6 +1820,9 @@ def execute_command(
     if command.kind == CommandKind.AGENTS:
         _show_agents(runtime, console, include_finished=bool(command.args.get("all")))
         return True
+    if command.kind == CommandKind.AGENT:
+        _show_agent(runtime, console, command.args.get("target"))
+        return True
     if command.kind == CommandKind.MEMORY:
         _show_memory(runtime, console, command.args.get("target"))
         return True
@@ -1896,7 +1995,7 @@ def interactive_loop(
             command = parse_command(line)
             if active_work is not None and command.kind in background_kinds:
                 console.write(
-                    "Work is already running. Use /status, /thinking, /agents, or /pause."
+                    "Work is already running. Use /status, /thinking, /agents, /agent, or /pause."
                 )
                 continue
             if active_work is not None and command.kind == CommandKind.QUIT:
@@ -2193,9 +2292,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                 if preferences.mode == InteractionMode.ULTRA:
                     if runtime.ultra_session is not None and runtime.ultra_session.running:
                         console.write(
-                            "ULTRA auto-wait is active. The approved run will remain live until completion or a real blocker."
+                            "ULTRA convergence is active. Quality-only specialist revisions "
+                            "will continue inside the approved scope until product acceptance "
+                            "or a real external/scope blocker."
                         )
-                        runtime.wait_for_ultra()
+                        runtime.converge_ultra()
                         _show_runtime_state(runtime, console)
                 else:
                     _run_auto(runtime, console)

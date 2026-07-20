@@ -1,0 +1,79 @@
+{
+  "schema_name": "PackageConsumptionEvidenceV1",
+  "assembler": "deterministic_lane_crossing_slice_v1",
+  "output": {
+    "path": "D:\\projects\\Ai\\coding_agent\\projects\\project-087\\ultra-output\\lane-crossing-game\\index.html",
+    "sha256": "2104fc7b0fe7e35cb99904d221975b1fa245102f929e951d63bb79f81dea6764"
+  },
+  "consumed": {
+    "road": {
+      "path": "D:\\projects\\Ai\\coding_agent\\projects\\project-087\\run-artifacts\\.ultra-staging\\ultra_e75026a2698a402aaa4dc70f4d037bad\\rc70f4d037bad.M001.world.road\\r2\\preview\\scene.js",
+      "sha256": "90b407d9bab9237e3eb8126be92869ef0f0311e6a9f7c8fd7f4d66b860b30f8a"
+    },
+    "vehicle": {
+      "path": "D:\\projects\\Ai\\coding_agent\\projects\\project-087\\run-artifacts\\.ultra-staging\\ultra_e75026a2698a402aaa4dc70f4d037bad\\rc70f4d037bad.M001.vehicles.compiled_vehicle_cut\\r3\\preview\\scene.js",
+      "sha256": "95af024621820c99b78ca07f311b8a2a12ec598dc28189829c73c0b8a7a53fd0"
+    },
+    "character": {
+      "path": "D:\\projects\\Ai\\coding_agent\\projects\\project-087\\run-artifacts\\.ultra-staging\\ultra_e75026a2698a402aaa4dc70f4d037bad\\rc70f4d037bad.M001.character.compiled_character_cut\\r3\\preview\\scene.js",
+      "sha256": "72977e178830dc57645e89f15a3aa5f50cf2eafb21c51a94fc8360033a48a3f8"
+    }
+  },
+  "specialist_specs": {
+    "path": "D:\\projects\\Ai\\coding_agent\\projects\\project-087\\ultra-output\\lane-crossing-game\\specs\\game-slice-specs.json",
+    "sha256": "ab4ebcbeb47d85b6bc74f57960c3e5e2661bb21fadc14fe4df827688d2b7d6f8",
+    "values": {
+      "gameplay": {
+        "lane_count": 4,
+        "hop_step": 1.0,
+        "hop_duration": 0.3,
+        "traffic_speeds": [
+          4.5,
+          6.2,
+          3.8,
+          5.5
+        ],
+        "score_per_crossing": 110,
+        "difficulty_gain": 0.07
+      },
+      "presentation": {
+        "camera_height": 14.0,
+        "camera_distance": 16.0,
+        "fog_near": 30.0,
+        "fog_far": 80.0,
+        "environment_density": 18,
+        "hud_accent": "#ffd34e",
+        "sky": "#A9D2FF",
+        "grass": "#7AA83E",
+        "key_intensity": 1.25,
+        "ambient_intensity": 0.48,
+        "rim_intensity": 0.25,
+        "fence_segments": 7,
+        "flower_clusters": 9,
+        "hay_bales": 3,
+        "character_scale": 0.53
+      },
+      "presentation_revision_evidence": {
+        "raw": {
+          "key_intensity": 1.25,
+          "ambient_intensity": 0.48,
+          "rim_intensity": 0.25,
+          "fence_segments": 7,
+          "flower_clusters": 9,
+          "hay_bales": 3,
+          "character_scale": 0.53
+        },
+        "normalized": {
+          "key_intensity": 1.25,
+          "ambient_intensity": 0.48,
+          "rim_intensity": 0.25,
+          "fence_segments": 7,
+          "flower_clusters": 9,
+          "hay_bales": 3,
+          "character_scale": 0.53
+        },
+        "finding": "flat_lighting_repetitive_roadside_small_character"
+      }
+    }
+  }
+}

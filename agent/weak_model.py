@@ -23,8 +23,12 @@ class WeakModelPolicy:
     persist_failed_hypotheses: bool = True
     harness_owns_lifecycle: bool = True
     independent_final_evaluation: bool = True
+    external_state_memory: bool = True
+    resumable_next_action_packets: bool = True
     accept_first_syntactic_result: bool = False
-    max_context_characters: int = 40_000
+    # Roughly a 4K-token action envelope. Complete history remains in
+    # SQLite/artifact storage and is retrieved by relevance, never replayed.
+    max_context_characters: int = 16_000
     max_equivalent_failed_approaches: int = 3
     expose_unverified_draft_as_final: bool = False
 
@@ -44,7 +48,13 @@ class WeakModelPolicy:
     def applied_rules(self, decision: str) -> tuple[str, ...]:
         """Return inspectable rule names that govern a runtime decision."""
         routes = {
-            "provider_call": ("one_primary_decision_per_call", "narrow_context", "harness_generated_ids"),
+            "provider_call": (
+                "one_primary_decision_per_call",
+                "narrow_context",
+                "external_state_memory",
+                "resumable_next_action_packets",
+                "harness_generated_ids",
+            ),
             "mutation": ("durable_checkpoints", "fresh_evaluation_after_mutation", "harness_owns_lifecycle"),
             "completion": ("mandatory_executable_evidence", "reject_prose_completion", "independent_final_evaluation", "accept_first_syntactic_result"),
             "retry": ("max_equivalent_failed_approaches", "persist_failed_hypotheses"),

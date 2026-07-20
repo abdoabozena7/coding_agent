@@ -370,7 +370,7 @@ class PersistenceV4Tests(unittest.TestCase):
             self.assertEqual(migrated.get_goal(goal_id).objective, "Quality test")
             check = sqlite3.connect(database)
             try:
-                self.assertEqual(check.execute("PRAGMA user_version").fetchone()[0], 9)
+                self.assertEqual(check.execute("PRAGMA user_version").fetchone()[0], 11)
             finally:
                 check.close()
             migrated._migrate_v4()

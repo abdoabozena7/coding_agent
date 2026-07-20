@@ -1,0 +1,23 @@
+{
+  "cold_index_seconds": 293.82754740002565,
+  "files": 1000,
+  "incremental_changed_files": 50,
+  "incremental_seconds": 3.8065356999868527,
+  "lines": 1000000,
+  "peak_bytes": 181668969,
+  "query_mean_seconds": 0.2958008166674214,
+  "query_p95_seconds": 0.49307409999892116,
+  "targets": {
+    "incremental_under_5s": true,
+    "lines_at_least_1m": true,
+    "peak_under_4gb": true,
+    "query_p95_under_2s": true
+  },
+  "update_stats": {
+    "loaded": 1000,
+    "removed": 0,
+    "reused": 950,
+    "seen": 1000,
+    "updated": 50
+  }
+}

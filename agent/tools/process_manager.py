@@ -201,10 +201,21 @@ def stop(process_id: str) -> str:
             pass
     if item.reader is not None:
         item.reader.join(timeout=2)
+    # Windows can report the process exited before the command tree releases
+    # its inherited current-directory handle. Close the pipe explicitly and
+    # allow that handle-release notification to settle before callers tear
+    # down a temporary workspace.
+    try:
+        if item.process.stdout is not None:
+            item.process.stdout.close()
+    except OSError:
+        pass
     try:
         item.log_handle.close()
     except OSError:
         pass
+    if os.name == "nt":
+        time.sleep(0.20)
     payload = item.snapshot()
     payload["stopped"] = True
     return json.dumps(payload, ensure_ascii=False)
@@ -230,7 +241,11 @@ def shutdown_workspace(workspace: str | Path) -> None:
                     _terminate(item.process)
                 if item.reader is not None:
                     item.reader.join(timeout=2)
+                if item.process.stdout is not None:
+                    item.process.stdout.close()
                 item.log_handle.close()
+                if os.name == "nt":
+                    time.sleep(0.20)
         except (OSError, ValueError):
             continue
 

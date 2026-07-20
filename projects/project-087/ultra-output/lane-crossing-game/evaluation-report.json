@@ -1,0 +1,73 @@
+{
+  "schema_name": "UltraSliceEvaluationV1",
+  "run_id": "ultra_e75026a2698a402aaa4dc70f4d037bad",
+  "artifact_sha256": "2104fc7b0fe7e35cb99904d221975b1fa245102f929e951d63bb79f81dea6764",
+  "builder": {
+    "model": "gemma4:e4b",
+    "execution": "sequential isolated specialists",
+    "processor": "100% GPU",
+    "context": 4096
+  },
+  "component_packages": {
+    "road_sha256": "90b407d9bab9237e3eb8126be92869ef0f0311e6a9f7c8fd7f4d66b860b30f8a",
+    "vehicle_sha256": "95af024621820c99b78ca07f311b8a2a12ec598dc28189829c73c0b8a7a53fd0",
+    "character_sha256": "72977e178830dc57645e89f15a3aa5f50cf2eafb21c51a94fc8360033a48a3f8"
+  },
+  "functional_gates": {
+    "webgl_ready": true,
+    "console_errors": 0,
+    "console_warnings": 0,
+    "keyboard_controls": true,
+    "touch_controls": true,
+    "traffic_vehicle_count": 12,
+    "crossing_score": 110,
+    "collision_state": "gameover",
+    "restart_state": {
+      "mode": "ready",
+      "score": 0,
+      "crossings": 0
+    },
+    "responsive_desktop_mobile": true
+  },
+  "strict_codex_scores": {
+    "functional_correctness": 1.0,
+    "integration": 1.0,
+    "performance": 0.97,
+    "responsive_layout": 0.96,
+    "accessibility": 0.90,
+    "visual_modeling": 0.94,
+    "visual_composition": 0.95,
+    "lighting_and_depth": 0.94,
+    "readability": 0.97,
+    "feedback": 0.95,
+    "polish": 0.94,
+    "overall": 0.956
+  },
+  "critical_findings": [],
+  "champion_challenger": {
+    "winner": "presentation_revision_r1",
+    "previous_screenshot": "output/playwright/ultra-slice-final.png",
+    "champion_screenshot": "output/playwright/ultra-slice-challenger2.png",
+    "champion_screenshot_sha256": "7603cb3a99f798906e0e59e1cb48750c424b288712c6e8254d92f10f5e98292e",
+    "reasons": [
+      "fences add roadside depth and clear spatial boundaries",
+      "flowers and hay break repetitive tree-only scenery",
+      "lower ambient plus controlled key/rim lighting improves silhouette separation",
+      "the larger character remains readable on desktop and mobile"
+    ]
+  },
+  "regression_suite": {
+    "passed": 445,
+    "skipped": 2,
+    "subtests_passed": 52,
+    "failed": 0,
+    "generic_coverage": [
+      "ML specialist template and multifile indexing",
+      "backend appointment contracts and durable memory",
+      "frontend specialist template and accessibility ownership",
+      "incremental hybrid retrieval",
+      "typed consensus and recovery",
+      "Windows managed-process cleanup"
+    ]
+  }
+}

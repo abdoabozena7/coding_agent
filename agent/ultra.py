@@ -440,7 +440,7 @@ class ComponentPackageV1:
 class NodeQualityTargetV1:
     node_id: str
     minimum_overall_score: float = 0.95
-    minimum_critical_score: float = 0.85
+    minimum_critical_score: float = 0.90
     critical_dimensions: tuple[str, ...] = ("functional", "integration")
     plateau_window: int = 3
     plateau_delta: float = 0.02
@@ -794,7 +794,12 @@ class InMemoryUltraState:
 
     def save_prompt_trace(self, trace: PromptTraceV1) -> None:
         with self._lock:
-            self.traces.append(trace)
+            for index, current in enumerate(self.traces):
+                if current.id == trace.id:
+                    self.traces[index] = trace
+                    break
+            else:
+                self.traces.append(trace)
 
     def save_result_package(self, run_id: str, result: ResultPackageV1) -> None:
         with self._lock:
@@ -1211,6 +1216,28 @@ class UltraOrchestrator:
         for attempt in range(1, self.config.provider_retries + 3):
             self.control.checkpoint()
             agent_id = _id("agent")
+            omitted = safe_context.get("_omitted", ())
+            trace = PromptTraceV1(
+                run_id=self.run_state.id,
+                role=role,
+                phase=phase_value,
+                system_prompt=redact_text(system)[:8_000],
+                context_package=safe_context,
+                self_prompt=redact_text(_json(safe_task))[:16_000],
+                node_id=node_id,
+                agent_run_id=agent_id,
+                omitted_context=_strings(omitted),
+            )
+            stage_next_action = getattr(self.state, "stage_next_action", None)
+            if callable(stage_next_action):
+                stage_next_action(
+                    agent_id,
+                    role=role.value,
+                    phase=phase_value,
+                    node_id=node_id,
+                    task=safe_task,
+                    context=safe_context,
+                )
             self.state.save_agent_run(
                 AgentRunV1(
                     id=agent_id,
@@ -1221,8 +1248,14 @@ class UltraOrchestrator:
                     provider=str(self.model_snapshot.get("provider", "")),
                     model=str(self.model_snapshot.get("model", "")),
                     node_id=node_id,
+                    prompt_trace_id=trace.id,
                 )
             )
+            # Save the exact redacted assignment before the local provider
+            # call, so the read-only observer remains useful during a long
+            # generation. Hidden chain-of-thought is never captured.
+            self.state.save_prompt_trace(trace)
+            response: AgentResponse | None = None
             try:
                 agent = self.agent_factory.create(
                     role, run_id=self.run_state.id, node_id=node_id
@@ -1259,24 +1292,14 @@ class UltraOrchestrator:
                     node_id=node_id,
                     usage=dict(response.usage),
                     summary=redact_text(response.summary)[:4_000],
+                    prompt_trace_id=trace.id,
                 )
                 self.state.save_agent_run(agent_run)
-                omitted = safe_context.get("_omitted", ())
-                trace = PromptTraceV1(
-                    run_id=self.run_state.id,
-                    role=role,
-                    phase=phase_value,
-                    system_prompt=redact_text(system)[:8_000],
-                    context_package=safe_context,
-                    self_prompt=redact_text(_json(safe_task))[:16_000],
+                trace = replace(
+                    trace,
                     reasoning_summary=redact_text(response.reasoning_summary)[:4_000],
-                    node_id=node_id,
-                    agent_run_id=agent_id,
-                    omitted_context=_strings(omitted),
                 )
                 self.state.save_prompt_trace(trace)
-                agent_run = replace(agent_run, prompt_trace_id=trace.id)
-                self.state.save_agent_run(agent_run)
                 for insight in response.insights:
                     self._insights.append(insight)
                     self.state.append_brain_entry(
@@ -1334,7 +1357,8 @@ class UltraOrchestrator:
                     phase=phase_value,
                     repair_attempt=1 if not typed_repair_used else 2,
                 )
-                if typed_repair_used:
+                unrecoverable_transport_token = "unused token" in str(exc).casefold()
+                if typed_repair_used or unrecoverable_transport_token:
                     raise AgentProtocolError(
                         f"ULTRA foundation/phase {phase_value} failed after one targeted typed-return repair: {exc}"
                     ) from exc
@@ -1344,7 +1368,11 @@ class UltraOrchestrator:
                     "typed_return_repair": {
                         "contract": phase_value,
                         "errors": [str(exc)],
-                        "previous_payload": redact_data(dict(response.payload)),
+                        "previous_payload": (
+                            redact_data(dict(response.payload))
+                            if response is not None
+                            else {}
+                        ),
                         "instruction": "Return one complete corrected payload. Repair only the listed contract defects.",
                     },
                 }
@@ -1876,11 +1904,56 @@ class UltraOrchestrator:
         if phase in {"review", "test", "global_review"} and not isinstance(
             normalized.get("passed"), bool
         ):
-            # Missing verdicts are never interpreted as success. Normalizing to
-            # false lets the bounded fix/review loop consume the finding instead
-            # of turning a weak-model schema omission into an engine crash.
-            normalized["passed"] = False
-            actions.append(f"{phase}.passed defaulted to false for safe remediation")
+            metadata = (
+                dict(task.get("contract", {}).get("metadata", {}))
+                if isinstance(task.get("contract"), Mapping)
+                and isinstance(task.get("contract", {}).get("metadata"), Mapping)
+                else {}
+            )
+            component_review = bool(metadata.get("component_package_only"))
+            if component_review and isinstance(normalized.get("success"), bool):
+                normalized["passed"] = bool(normalized["success"])
+                actions.append(
+                    f"{phase}.passed derived from explicit component success verdict"
+                )
+            else:
+                findings = (
+                    *_strings(normalized.get("issues")),
+                    *_strings(normalized.get("findings")),
+                )
+                evidence = normalized.get("evidence")
+                test_results = normalized.get("test_results")
+                typed_tests = tuple(
+                    item
+                    for item in (
+                        test_results
+                        if isinstance(test_results, Sequence)
+                        and not isinstance(test_results, (str, bytes))
+                        else ()
+                    )
+                    if isinstance(item, Mapping)
+                )
+                tests_observably_passed = bool(typed_tests) and all(
+                    bool(item.get("passed")) for item in typed_tests
+                )
+                evidence_backed_clear = bool(evidence) or tests_observably_passed
+                if component_review and not findings and evidence_backed_clear:
+                    # A clean-context reviewer occasionally omits the redundant
+                    # boolean while still returning typed evidence and no
+                    # finding. Preserve that observable verdict; never infer a
+                    # pass from prose or an empty payload.
+                    normalized["passed"] = True
+                    actions.append(
+                        f"{phase}.passed derived from finding-free typed component evidence"
+                    )
+                else:
+                    # Missing verdicts are never interpreted as success without
+                    # typed component evidence. False routes the result through
+                    # the bounded remediation loop instead of crashing.
+                    normalized["passed"] = False
+                    actions.append(
+                        f"{phase}.passed defaulted to false for safe remediation"
+                    )
         if phase in {"integrate", "global_integration", "final_evidence"} and not isinstance(
             normalized.get("success", normalized.get("passed")), bool
         ):
@@ -2023,6 +2096,210 @@ class UltraOrchestrator:
             return True
         return False
 
+    def _fallback_goal_spec(self, prompt: str) -> GoalSpecV1:
+        """Recover the durable envelope without pretending implementation exists."""
+
+        success = [
+            "The requested behavior is implemented as a runnable artifact.",
+            "Automated functional and integration checks pass with no runtime errors.",
+            "Unrelated project behavior and files remain unchanged.",
+            "Independent review finds no unresolved critical quality finding.",
+        ]
+        if self._requires_visual_artifact(prompt):
+            success.extend(
+                (
+                    "Component and final screenshots show intentional, non-placeholder visual design.",
+                    "The interactive artifact is usable through its documented controls and restart flow.",
+                )
+            )
+        return GoalSpecV1(
+            objective=prompt[:4_000],
+            success_criteria=tuple(success),
+            constraints=(
+                "Use bounded recursive specialists with isolated contracts and evidence.",
+                "Only the FinalAssembler owns final output paths.",
+                "Persist checkpoints, findings, packages, and lessons outside model context.",
+            ),
+            in_scope=(
+                "intent expansion",
+                "implementation",
+                "component verification",
+                "integration",
+                "independent quality evaluation",
+            ),
+            out_of_scope=(
+                "unrequested changes to unrelated project behavior",
+                "accepting prose or placeholder artifacts as completion",
+            ),
+            assumptions=(
+                "Reversible technical choices may be selected by the architecture harness.",
+            ),
+            questions=(),
+        )
+
+    def _fallback_architecture(
+        self,
+        prompt: str,
+        candidate_index: int,
+    ) -> ArchitectureSpecV1:
+        """Recover protocol shape without asking the builder to solve the whole task.
+
+        The local model still implements every component.  This fallback only
+        supplies the inspectable component/interface envelope that a malformed
+        architecture response failed to express.
+        """
+
+        assert self.goal_spec
+        if self._requires_visual_artifact(prompt):
+            components = (
+                ("World", "Road, environment, lighting, depth, and scene composition."),
+                ("Vehicles", "Chassis, wheels, cabin, glass, lights, materials, and variants."),
+                ("Character", "Readable body, animation states, controls, and feedback."),
+                ("Gameplay", "Traffic, collision, scoring, progression, and restart state."),
+                ("Presentation", "Camera, HUD, audio, effects, responsiveness, and accessibility."),
+                ("QA", "Functional, visual, performance, browser, and regression evidence."),
+            )
+            return ArchitectureSpecV1(
+                summary=(
+                    "Artifact-first recursive specialist architecture."
+                    if candidate_index % 2
+                    else "State-contract recursive specialist architecture."
+                ),
+                components=tuple(
+                    {
+                        "name": name,
+                        "responsibility": responsibility,
+                        "artifact_boundary": f"{name}Package",
+                        "independent_preview": True,
+                    }
+                    for name, responsibility in components
+                ),
+                interfaces=tuple(
+                    {
+                        "name": f"{name}Package",
+                        "producer": name,
+                        "consumer": "FinalAssembler",
+                        "requires": ["implementation", "preview", "tests", "evidence"],
+                    }
+                    for name, _responsibility in components
+                ),
+                decisions=(
+                    {
+                        "decision": "FinalAssembler owns final output paths.",
+                        "reason": "Specialists remain isolated and their exact packages are consumed.",
+                    },
+                    {
+                        "decision": "Every visual leaf has an independently runnable preview.",
+                        "reason": "Weak-model output is evaluated before integration.",
+                    },
+                ),
+                dependencies=(
+                    "Gameplay consumes World/Vehicle/Character contracts.",
+                    "Presentation observes Gameplay state.",
+                    "QA evaluates component and integrated artifacts.",
+                ),
+                invariants=(
+                    "No specialist writes the final artifact.",
+                    "No placeholder or documentation proxy can satisfy a visual package.",
+                    "Integration preserves accepted package hashes and interfaces.",
+                ),
+            )
+        scoped = tuple(self.goal_spec.in_scope) or ("implementation", "verification")
+        return ArchitectureSpecV1(
+            summary="Contract-first recursive delivery architecture.",
+            components=tuple(
+                {
+                    "name": f"Scope{index}",
+                    "responsibility": item,
+                    "artifact_boundary": f"Scope{index}Package",
+                }
+                for index, item in enumerate(scoped[:8], start=1)
+            ),
+            interfaces=(
+                {
+                    "name": "IntegratedDelivery",
+                    "producer": "specialist packages",
+                    "consumer": "FinalAssembler",
+                },
+            ),
+            decisions=(
+                {
+                    "decision": "Split by independently testable responsibility.",
+                    "reason": "Keep each local-model context bounded.",
+                },
+            ),
+            invariants=("Every component has observable acceptance evidence.",),
+        )
+
+    def _fallback_master_plan(self, prompt: str) -> MasterPlanV1:
+        assert self.goal_spec
+        paths = self._final_output_paths(prompt)
+        return MasterPlanV1(
+            summary="Harness-recovered goal plan with recursive specialist execution.",
+            modules=(
+                TaskContractV1(
+                    id=f"r{self.run_state.id[-12:]}.M001",
+                    title="Goal delivery and final assembly",
+                    objective=self.goal_spec.objective,
+                    acceptance_criteria=self.goal_spec.success_criteria,
+                    verification=tuple(
+                        f"Verify observable criterion: {criterion}"
+                        for criterion in self.goal_spec.success_criteria
+                    ),
+                    write_paths=paths,
+                    owned_interfaces=("IntegratedDelivery",),
+                    metadata={"force_recursive_specialists": True},
+                ),
+            ),
+            milestones=(
+                {"name": "materialized specialists", "evidence": "component packages"},
+                {"name": "integration", "evidence": "runtime and tests"},
+                {"name": "acceptance", "evidence": "final quality gate"},
+            ),
+            execution_strategy=(
+                "Build bounded specialists, verify each package, assemble exact accepted "
+                "artifacts, then run adversarial and final evidence gates."
+            ),
+        )
+
+    @staticmethod
+    def _compact_goal_for_model(goal: GoalSpecV1) -> Mapping[str, Any]:
+        """Project the durable north star into a small foundation packet."""
+
+        return {
+            "objective": goal.objective[:1_200],
+            "success_criteria": list(goal.success_criteria[:8]),
+            "constraints": list(goal.constraints[:8]),
+            "in_scope": list(goal.in_scope[:8]),
+            "out_of_scope": list(goal.out_of_scope[:6]),
+            "assumptions": list(goal.assumptions[:6]),
+        }
+
+    @staticmethod
+    def _compact_architecture_for_model(
+        architecture: ArchitectureSpecV1,
+    ) -> Mapping[str, Any]:
+        return {
+            "summary": architecture.summary[:1_200],
+            "components": [
+                {
+                    key: item.get(key)
+                    for key in ("name", "responsibility", "artifact_boundary")
+                    if item.get(key) not in (None, "", (), [], {})
+                }
+                for item in architecture.components[:12]
+            ],
+            "interfaces": [
+                {
+                    key: item.get(key)
+                    for key in ("name", "producer", "consumer", "contract")
+                    if item.get(key) not in (None, "", (), [], {})
+                }
+                for item in architecture.interfaces[:12]
+            ],
+            "invariants": list(architecture.invariants[:10]),
+        }
+
     def _finish_foundation(self, prompt: str) -> MasterPlanV1:
         """Continue Architecture -> Master Plan after goal decisions are complete."""
 
@@ -2036,53 +2313,89 @@ class UltraOrchestrator:
         candidate_specs: list[ArchitectureSpecV1] = []
         candidate_payloads: list[Mapping[str, Any]] = []
         for candidate_index in range(1, candidate_count + 1):
-            architecture_response = self._invoke(
-                AgentRole.ARCHITECT,
-                "architecture",
-                task={
-                    "goal_spec": asdict(self.goal_spec),
-                    "candidate_index": candidate_index,
-                    "candidate_count": candidate_count,
-                    "instruction": (
-                        "Produce an architecture materially different from the other candidates; "
-                        "optimize quality, specialist isolation, integration contracts, and verification."
+            try:
+                architecture_response = self._invoke(
+                    AgentRole.ARCHITECT,
+                    "architecture",
+                    task={
+                        "goal_spec": self._compact_goal_for_model(self.goal_spec),
+                        "candidate_index": candidate_index,
+                        "candidate_count": candidate_count,
+                        "instruction": (
+                            "Produce an architecture materially different from the other candidates; "
+                            "optimize quality, specialist isolation, integration contracts, and verification."
+                        ),
+                    },
+                    context={
+                        "prompt": prompt,
+                        "cross_run_project_lessons": lesson_context,
+                    },
+                )
+                candidate = ArchitectureSpecV1.from_mapping(architecture_response.payload)
+            except AgentProtocolError as exc:
+                candidate = self._fallback_architecture(prompt, candidate_index)
+                self.events.publish(
+                    "ultra.architecture_protocol_recovered",
+                    (
+                        f"Architecture candidate {candidate_index} used the typed harness "
+                        "fallback after malformed local-model output."
                     ),
-                },
-                context={
-                    "prompt": prompt,
-                    "cross_run_project_lessons": lesson_context,
-                },
-            )
-            candidate = ArchitectureSpecV1.from_mapping(architecture_response.payload)
+                    run_id=self.run_state.id,
+                    candidate_index=candidate_index,
+                    error=str(exc),
+                )
             candidate_specs.append(candidate)
             candidate_payloads.append(asdict(candidate))
-        critic = self._invoke(
-            AgentRole.REVIEWER,
-            "architecture_critique",
-            task={
-                "goal_spec": asdict(self.goal_spec),
-                "candidates": candidate_payloads,
-                "instruction": "Identify omissions, integration risks, weak-model failure modes, and unverifiable claims for every candidate.",
-            },
-            context={"prompt": prompt, "clean_context": True},
-        )
-        judge = self._invoke(
-            AgentRole.GOAL_CHECKER,
-            "architecture_judge",
-            task={
-                "goal_spec": asdict(self.goal_spec),
-                "candidates": candidate_payloads,
-                "critic_verdict": dict(critic.payload),
-                "instruction": "Select the strongest candidate or return a synthesized architecture and cite observable reasons.",
-            },
-            context={"prompt": prompt, "clean_context": True},
-        )
+        compact_candidates = [
+            self._compact_architecture_for_model(candidate)
+            for candidate in candidate_specs
+        ]
         try:
-            selected_index = int(judge.payload.get("selected_index", 1) or 1)
+            critic = self._invoke(
+                AgentRole.REVIEWER,
+                "architecture_critique",
+                task={
+                    "goal_spec": self._compact_goal_for_model(self.goal_spec),
+                    "candidates": compact_candidates,
+                    "instruction": "Identify omissions, integration risks, weak-model failure modes, and unverifiable claims for every candidate.",
+                },
+                context={"prompt": prompt, "clean_context": True},
+            )
+            critic_payload = dict(critic.payload)
+        except AgentProtocolError as exc:
+            critic_payload = {
+                "verdict": "harness_recovery",
+                "risks": [
+                    "Validate every specialist interface before integration.",
+                    "Reject packages without runnable evidence.",
+                ],
+                "protocol_error": str(exc),
+            }
+        try:
+            judge = self._invoke(
+                AgentRole.GOAL_CHECKER,
+                "architecture_judge",
+                task={
+                    "goal_spec": self._compact_goal_for_model(self.goal_spec),
+                    "candidates": compact_candidates,
+                    "critic_verdict": critic_payload,
+                    "instruction": "Select the strongest candidate or return a synthesized architecture and cite observable reasons.",
+                },
+                context={"prompt": prompt, "clean_context": True},
+            )
+            judge_payload = dict(judge.payload)
+        except AgentProtocolError as exc:
+            judge_payload = {
+                "selected_index": 1,
+                "verdict": "harness_recovery",
+                "protocol_error": str(exc),
+            }
+        try:
+            selected_index = int(judge_payload.get("selected_index", 1) or 1)
         except (TypeError, ValueError):
             selected_index = 1
         selected_index = min(max(1, selected_index), len(candidate_specs))
-        synthesized = judge.payload.get("architecture")
+        synthesized = judge_payload.get("architecture")
         self.architecture = (
             ArchitectureSpecV1.from_mapping({"architecture": synthesized})
             if isinstance(synthesized, Mapping)
@@ -2095,8 +2408,8 @@ class UltraOrchestrator:
                 {
                     "candidate_count": candidate_count,
                     "candidates": candidate_payloads,
-                    "critic": dict(critic.payload),
-                    "judge": dict(judge.payload),
+                    "critic": critic_payload,
+                    "judge": judge_payload,
                     "selected_index": selected_index,
                     "selected_summary": self.architecture.summary,
                 },
@@ -2104,29 +2417,38 @@ class UltraOrchestrator:
             )
         )
         self._set_phase(UltraPhase.MASTER_PLAN, "Building master plan")
-        plan_response = self._invoke(
-            AgentRole.PLANNER,
-            "master_plan",
-            task={
-                "goal_spec": asdict(self.goal_spec),
-                "architecture": asdict(self.architecture),
-                "module_bounds": {
-                    "preferred_min": self.config.min_top_modules,
-                    "maximum": self.config.max_top_modules,
+        try:
+            plan_response = self._invoke(
+                AgentRole.PLANNER,
+                "master_plan",
+                task={
+                    "goal_spec": self._compact_goal_for_model(self.goal_spec),
+                    "architecture": self._compact_architecture_for_model(
+                        self.architecture
+                    ),
+                    "module_bounds": {
+                        "preferred_min": self.config.min_top_modules,
+                        "maximum": self.config.max_top_modules,
+                    },
                 },
-            },
-            context={
-                "prompt": prompt,
-                "cross_run_project_lessons": self._foundation_project_lessons(
-                    f"{prompt} {self.architecture.summary}",
-                    "master_plan",
-                ),
-            },
-        )
-        proposed = self._enforce_master_artifact_contract(
-            prompt,
-            MasterPlanV1.from_mapping(plan_response.payload),
-        )
+                context={
+                    "prompt": prompt,
+                    "cross_run_project_lessons": self._foundation_project_lessons(
+                        f"{prompt} {self.architecture.summary}",
+                        "master_plan",
+                    ),
+                },
+            )
+            proposed_raw = MasterPlanV1.from_mapping(plan_response.payload)
+        except AgentProtocolError as exc:
+            proposed_raw = self._fallback_master_plan(prompt)
+            self.events.publish(
+                "ultra.master_plan_protocol_recovered",
+                "Master plan used the typed harness fallback after malformed local-model output.",
+                run_id=self.run_state.id,
+                error=str(exc),
+            )
+        proposed = self._enforce_master_artifact_contract(prompt, proposed_raw)
         quality_checklist = (
             "\n\nULTRA Quality Checklist (approval-bound): clean-code review; security review; "
             "tests and test-quality review; remediation Change Sets receive fresh reviews; "
@@ -2219,22 +2541,34 @@ class UltraOrchestrator:
         )
         self.state.save_ultra_run(self.run_state)
         try:
-            goal_response = self._invoke(
-                AgentRole.GOAL_UNDERSTANDING,
-                "goal_spec",
-                task={"prompt": prompt},
-                context={
-                    "instruction": (
-                        "Inspect the repository first. Derive GoalSpecV1 and ask at most three "
-                        "questions only for high-impact decisions that cannot be discovered."
-                    ),
-                    "cross_run_project_lessons": self._foundation_project_lessons(prompt, "goal_spec"),
-                },
-            )
-            self.goal_spec = self._enforce_goal_artifact_contract(
-                prompt,
-                GoalSpecV1.from_mapping(goal_response.payload),
-            )
+            try:
+                goal_response = self._invoke(
+                    AgentRole.GOAL_UNDERSTANDING,
+                    "goal_spec",
+                    task={"prompt": prompt},
+                    context={
+                        "instruction": (
+                            "Inspect the repository first. Derive GoalSpecV1 and ask at most three "
+                            "questions only for high-impact decisions that cannot be discovered."
+                        ),
+                        "cross_run_project_lessons": self._foundation_project_lessons(prompt, "goal_spec"),
+                    },
+                )
+                self.goal_spec = self._enforce_goal_artifact_contract(
+                    prompt,
+                    GoalSpecV1.from_mapping(goal_response.payload),
+                )
+            except AgentProtocolError as exc:
+                self.goal_spec = self._enforce_goal_artifact_contract(
+                    prompt,
+                    self._fallback_goal_spec(prompt),
+                )
+                self.events.publish(
+                    "ultra.goal_spec_protocol_recovered",
+                    "GoalSpec used the typed harness fallback after malformed local-model output.",
+                    run_id=self.run_state.id,
+                    error=str(exc),
+                )
             raw_questions = tuple(self.goal_spec.questions)
             questions = self._validated_questions(raw_questions)
             questions = tuple(
@@ -2408,7 +2742,7 @@ class UltraOrchestrator:
                         *goal.success_criteria,
                         "index.html runs with zero console, page, network, or WebGL errors",
                         "keyboard controls, gameplay loop, collision, scoring, and restart are playable",
-                        "overall quality >= 0.95 and critical visual dimensions >= 0.85",
+                        "overall quality >= 0.95 and critical visual dimensions >= 0.90",
                     )
                 )
             ),
@@ -2440,7 +2774,7 @@ class UltraOrchestrator:
             verification=(
                 "Run index.html in Playwright and inspect console, page, network, WebGL, and input state",
                 "Capture staged and final screenshots and score the visual quality rubric",
-                "Verify overall score >= 0.95 and every critical visual score >= 0.85",
+                "Verify overall score >= 0.95 and every critical visual score >= 0.90",
             ),
             depends_on=(),
             write_paths=final_paths,
@@ -2566,7 +2900,7 @@ class UltraOrchestrator:
             ),
             quality_rubric={
                 "minimum_overall_score": 0.95,
-                "minimum_critical_score": 0.85,
+                "minimum_critical_score": 0.90,
                 "dimensions": ["functional", "integration", "visual", "maintainability"],
             },
             dependencies=node.depends_on,
@@ -2697,10 +3031,107 @@ class UltraOrchestrator:
                 ("props", "Reusable stylized props, placement anchors, density, and variation"),
                 ("composition", "Background layering, palette rhythm, landmark spacing, and readability"),
             ),
+            "world.environment.terrain": (
+                ("banks", "Road-side bank geometry, contracted corridor clearance, grounding, and extents"),
+                ("verges", "Layered verge contours, drainage and edge transitions outside the road corridor"),
+                ("ground_cover", "Deterministic grass, soil, pebble, and low ground-cover variation outside the playable corridor"),
+            ),
+            "world.environment.props": (
+                ("trees", "Reusable broadleaf and pine prop models with coherent low-poly silhouettes"),
+                ("rocks", "Reusable faceted boulder and rock-cluster models with grounded variation"),
+                ("shrubs", "Reusable layered shrub, flower, and low vegetation clusters"),
+                ("roadside", "Reusable signpost, fence, bollard, and roadside-detail models"),
+            ),
+            "world.environment.composition": (
+                ("hills", "Distant rolling hill silhouettes and atmospheric depth separation"),
+                ("tree_line", "Irregular distant tree-line rhythm with controlled gaps and scale variation"),
+                ("landmarks", "Asymmetric farm landmarks outside the playable corridor for orientation and visual interest"),
+            ),
             "world.lighting": (
                 ("rig", "Key, fill, ambient, and hemisphere lighting contracts"),
                 ("atmosphere", "Fog, sky, exposure, color treatment, and depth separation"),
                 ("shadows", "Shadow quality, contact cues, performance bounds, and material readability"),
+            ),
+            "world.lighting.rig": (
+                ("lights", "Bounded production key, hemisphere fill, rim, and shadow-camera light set"),
+                ("fixture", "Compact neutral multi-material forms and receiver used to prove the light-set response"),
+            ),
+            "world.lighting.atmosphere": (
+                ("settings", "Reusable color-background, fog, tone-mapping, and exposure application contract"),
+                ("fixture", "Visible near/mid/far low-poly forms used to prove atmospheric depth separation"),
+            ),
+            "world.lighting.shadows": (
+                ("settings", "Reusable renderer and harness-key shadow configuration with bounded bias and map size"),
+                ("fixture", "Horizontal receiver and grounded casting forms used to prove contact-shadow readability"),
+            ),
+            "vehicles.chassis": (
+                ("shell", "Distinctive body shell silhouette, hood, roof, doors, and coherent proportions"),
+                ("structure", "Bumpers, grille, fenders, underbody, wheel arches, and structural detail"),
+                ("variants", "Reusable vehicle-size and style variants without losing a coherent design language"),
+            ),
+            "vehicles.chassis.shell": (
+                ("volumes", "Primary tub, hood, cabin, and rear-deck volumes with a fixed X-width/Z-length envelope"),
+                ("panels", "Fenders, doors, fascia, trim, and four wheel-mount cues aligned to the primary volumes"),
+            ),
+            "vehicles.wheels": (
+                ("tire", "Rounded tire geometry, tread/readability, believable width, and material response"),
+                ("rim", "Rim, spokes, hub, axle alignment, and visible rotational detail"),
+                ("contact", "Wheel placement, wheel-arch clearance, ground contact, steering pose, and shadow cues"),
+            ),
+            "vehicles.cabin": (
+                ("frame", "Cabin volume, roof pillars, windshield rake, side and rear window framing"),
+                ("glass", "Transparent glass treatment, reflections, tint, thickness cues, and readability"),
+                ("interior", "Seats, dashboard, steering-wheel hints, mirrors, and driver-facing detail"),
+            ),
+            "vehicles.materials": (
+                ("paint", "Layered body paint, palette variants, highlights, roughness, and visual hierarchy"),
+                ("lights", "Headlights, tail lights, indicators, emissive response, and lamp housings"),
+                ("surface", "Coherent tire, metal, chrome, glass, trim, and underside materials"),
+            ),
+            "character.body": (
+                ("silhouette", "Immediately readable stylized crossing character silhouette and proportions"),
+                ("anatomy", "Head, torso, wings or arms, legs, feet, facial cues, and coherent articulation"),
+                ("surface", "Character materials, color blocking, small details, and lighting readability"),
+            ),
+            "character.animation": (
+                ("rig", "Animation-ready pivots, articulated parts, pose invariants, and state hooks"),
+                ("locomotion", "Idle, hop, run, landing, hit, and celebration motion with clear timing"),
+                ("secondary", "Secondary overlap, squash/stretch, anticipation, and non-synchronized personality"),
+            ),
+            "character.controls": (
+                ("input", "Keyboard, pointer, and touch input mapping with buffered intent and focus safety"),
+                ("movement", "Grid/world movement, lane crossing, bounds, orientation, and deterministic timing"),
+                ("feedback", "Input acknowledgement, blocked movement, hit/recovery, and state-machine integration"),
+            ),
+            "gameplay.traffic": (
+                ("spawning", "Deterministic lane definitions, safe spawn rules, pooling, and density control"),
+                ("behavior", "Vehicle speed, direction, variety, spacing, despawn, and readable near misses"),
+                ("difficulty", "Progressive traffic pacing, fairness, recovery windows, and reproducible seeds"),
+            ),
+            "gameplay.collision": (
+                ("bounds", "Consistent player/vehicle collision volumes and lane/world coordinate contracts"),
+                ("resolution", "Hit detection, knockback or fail state, invulnerability, and restart safety"),
+                ("feedback", "Visible and audible impact feedback with deterministic test hooks"),
+            ),
+            "gameplay.progression": (
+                ("score", "Forward progress scoring, best score, milestones, and anti-farming rules"),
+                ("state", "Start, playing, paused, game-over, restart, and persistence transitions"),
+                ("rewards", "Difficulty curve, goals, celebratory feedback, and replay motivation"),
+            ),
+            "presentation.camera": (
+                ("framing", "Readable isometric/perspective framing, subject prominence, and world depth"),
+                ("follow", "Smooth follow, look-ahead, bounds, responsive resize, and stable orientation"),
+                ("impact", "Restrained shake, zoom, transitions, and reduced-motion alternatives"),
+            ),
+            "presentation.hud": (
+                ("hierarchy", "Score, best, state, and controls with restrained hierarchy and no card clutter"),
+                ("responsive", "Desktop/mobile placement, safe areas, touch targets, and typography scaling"),
+                ("states", "Start, pause, game-over, restart, help, and accessibility status messaging"),
+            ),
+            "presentation.effects": (
+                ("particles", "Landing dust, motion trails, collisions, pickups, and celebration particles"),
+                ("audio", "Event-driven music/SFX hooks, volume controls, and graceful no-audio fallback"),
+                ("polish", "Transitions, subtle environmental motion, varied timing, and performance bounds"),
             ),
         }
         definitions = parts.get(domain, ())
@@ -2740,6 +3171,10 @@ class UltraOrchestrator:
                     "materialized_components_required": True,
                     "component_leaf": True,
                     "specialist_domain": f"{domain}.{suffix}",
+                    "visual_required": f"{domain}.{suffix}" not in {
+                        "world.lighting.atmosphere.settings",
+                        "world.lighting.shadows.settings",
+                    },
                     "final_output_paths": list(metadata.get("final_output_paths", ())),
                 },
             }
@@ -3014,6 +3449,14 @@ class UltraOrchestrator:
             or node.contract.metadata.get("research_required")
         )
         if children:
+            topology_recorder = getattr(self.state, "record_specialist_topology", None)
+            if callable(topology_recorder):
+                topology_recorder(
+                    self.run_state.id,
+                    node,
+                    children,
+                    readiness,
+                )
             for child in children:
                 self.nodes[child.id] = child
                 self.state.save_work_node(self.run_state.id, child)
@@ -3137,9 +3580,29 @@ class UltraOrchestrator:
         for label, response in zip(labels, responses):
             payload = response.payload
             reasoning_evaluation = _mapping(payload.get("harness_reasoning_evaluation"))
-            raw_verdict = str(payload.get("consensus_vote") or payload.get("verdict") or "").strip().casefold()
-            if raw_verdict not in {"accept", "reject", "abstain"}:
-                raw_verdict = "accept" if self._passed(response) else "reject"
+            explicit_consensus_vote = str(
+                payload.get("consensus_vote") or ""
+            ).strip().casefold()
+            declared_verdict = str(
+                explicit_consensus_vote or payload.get("verdict") or ""
+            ).strip().casefold()
+            passed = self._passed(response)
+            # ``passed`` is the normalized typed quality verdict. Small local
+            # models sometimes emit a contradictory free-form ``verdict``
+            # field (for example passed=true plus verdict=reject). Letting that
+            # redundant field control consensus can turn six passing gates into
+            # a rejection with no finding. Consensus therefore votes from the
+            # typed gate result and retains the raw declaration only as audit
+            # evidence.
+            raw_verdict = "accept" if passed else "reject"
+            # ``consensus_vote`` is the formal typed swarm protocol and must
+            # remain authoritative even when a provider also emits a
+            # contradictory generic ``passed`` field. Free-form ``verdict``
+            # remains audit evidence only because weak models use it loosely.
+            if explicit_consensus_vote in {"reject", "rejected", "deny", "no"}:
+                raw_verdict = "reject"
+            elif explicit_consensus_vote in {"accept", "accepted", "approve", "yes"}:
+                raw_verdict = "accept" if passed else "reject"
             if reasoning_evaluation and not bool(reasoning_evaluation.get("passed", True)):
                 raw_verdict = "reject"
             try:
@@ -3154,10 +3617,11 @@ class UltraOrchestrator:
                     "role": label,
                     "verdict": raw_verdict,
                     "confidence": max(0.0, min(1.0, confidence)),
-                    "passed": self._passed(response),
+                    "passed": passed,
                     "summary": response.summary,
                     "rationale": response.reasoning_summary or response.summary,
                     "evidence": {
+                        "declared_verdict": declared_verdict,
                         "issues": list(_strings(payload.get("issues"))),
                         "findings": list(_strings(payload.get("findings"))),
                         "test_results": list(self._records(response, "test_results")),
@@ -3423,6 +3887,9 @@ class UltraOrchestrator:
             "do_not_invent_requirements_outside_contract": True,
             "component_package_only": bool(node.contract.metadata.get("component_package_only")),
             "component_packages_must_not_write_final_output": True,
+            "component_files_are_embedded_in_candidate": True,
+            "component_reads_use_package_relative_paths": True,
+            "review_is_read_only": True,
         }
         clean_code = self._invoke(
             AgentRole.CLEAN_CODE_REVIEWER,
@@ -3452,31 +3919,82 @@ class UltraOrchestrator:
             context=self._new_context(node, AgentRole.TEST_QUALITY_REVIEWER),
             node_id=node.id,
         )
-        triage = self._invoke(
-            AgentRole.QUALITY_TRIAGER,
-            InnerPhase.REVIEW,
-            task={
-                "contract": asdict(node.contract),
-                "candidate": candidate,
-                "evaluation_policy": evaluation_policy,
-                "read_only": True,
-                "normalize_and_deduplicate": True,
-                "review_summaries": [clean_code.summary, security.summary, tests.summary, test_quality.summary],
-                "review_verdicts": [
-                    {
-                        "role": role,
-                        "passed": self._passed(response),
-                        "payload": dict(response.payload),
-                    }
-                    for role, response in zip(
-                        ("clean_code", "security", "runtime_tests", "test_quality"),
-                        (clean_code, security, tests, test_quality),
-                    )
-                ],
-            },
-            context=self._new_context(node, AgentRole.QUALITY_TRIAGER),
-            node_id=node.id,
+        review_pairs = tuple(
+            zip(
+                ("clean_code", "security", "runtime_tests", "test_quality"),
+                (clean_code, security, tests, test_quality),
+            )
         )
+        if evaluation_policy["component_package_only"]:
+            # Component reviewers already operate in separate clean contexts.
+            # Normalization is deliberately deterministic: asking the same
+            # weak builder to reinterpret typed votes can invert a rejection
+            # or invent a finding, while adding no new evidence.
+            normalized_findings = self._findings(
+                clean_code,
+                security,
+                tests,
+                test_quality,
+            )
+            reviewers_passed = all(
+                self._passed(response) for _, response in review_pairs
+            )
+            triage = AgentResponse(
+                payload={
+                    "passed": reviewers_passed,
+                    "success": reviewers_passed,
+                    "issues": list(normalized_findings),
+                    "findings": list(normalized_findings),
+                    "evidence": [
+                        {
+                            "role": role,
+                            "passed": self._passed(response),
+                            "summary": response.summary,
+                        }
+                        for role, response in review_pairs
+                    ],
+                    "confidence": 1.0,
+                },
+                summary=(
+                    "Typed component review verdicts accepted."
+                    if reviewers_passed
+                    else "Typed component review verdicts require revision."
+                ),
+                reasoning_summary=(
+                    "The harness normalized and deduplicated independent typed "
+                    "verdicts without asking the builder model to reinterpret them."
+                ),
+                provider="harness",
+                model="deterministic-quality-triage-v1",
+            )
+        else:
+            triage = self._invoke(
+                AgentRole.QUALITY_TRIAGER,
+                InnerPhase.REVIEW,
+                task={
+                    "contract": asdict(node.contract),
+                    "candidate": candidate,
+                    "evaluation_policy": evaluation_policy,
+                    "read_only": True,
+                    "normalize_and_deduplicate": True,
+                    "review_summaries": [
+                        clean_code.summary,
+                        security.summary,
+                        tests.summary,
+                        test_quality.summary,
+                    ],
+                    "review_verdicts": [
+                        {
+                            "role": role,
+                            "passed": self._passed(response),
+                            "payload": dict(response.payload),
+                        }
+                        for role, response in review_pairs
+                    ],
+                },
+                context=self._new_context(node, AgentRole.QUALITY_TRIAGER),
+                node_id=node.id,
+            )
         recorder = getattr(self.state, "record_quality_review", None)
         if callable(recorder):
             recorder(node.id, "clean_code", self._passed(clean_code))
@@ -3543,28 +4061,66 @@ class UltraOrchestrator:
         )
         self.nodes[node.id] = node
         self.state.save_work_node(self.run_state.id, node)
-        implementation = self._invoke(
-            AgentRole.INTEGRATOR if is_parent_assembler else AgentRole.CODER,
-            InnerPhase.INTEGRATE if is_parent_assembler else InnerPhase.IMPLEMENT,
-            task={
-                "contract": asdict(node.contract),
-                "mini_plan": dict(self._prepared.get(node.id, ({}, {}))[1]),
-                "final_assembler": is_final_assembler,
-                "component_assembler": is_parent_assembler and not is_final_assembler,
-                "child_component_packages": {
-                    child_id: dict(self._results[child_id].component_package)
-                    for child_id in node.children
-                    if child_id in self._results
-                },
-                "prior_best_candidate": dict(prior_component.get("candidate", {})),
-                "prior_replan_guidance": dict(prior_component.get("replan", {})),
-                "prior_findings": list(prior_result.findings) if prior_result else [],
-            },
-            context=self._new_context(
-                node, AgentRole.INTEGRATOR if is_parent_assembler else AgentRole.CODER
-            ),
-            node_id=node.id,
+        restorer = getattr(self.state, "restore_passed_component_candidate", None)
+        revision_finding_reader = getattr(
+            self.state,
+            "component_revision_findings",
+            None,
         )
+        external_revision_findings = (
+            tuple(revision_finding_reader(self.run_state.id, node))
+            if callable(revision_finding_reader)
+            and node.contract.metadata.get("component_package_only")
+            and not is_parent_assembler
+            else ()
+        )
+        implementation = (
+            restorer(self.run_state.id, node)
+            if callable(restorer)
+            and node.contract.metadata.get("component_package_only")
+            and not is_parent_assembler
+            and not external_revision_findings
+            else None
+        )
+        if implementation is not None:
+            self.events.publish(
+                "ultra.component_checkpoint_restored",
+                f"[{node.id}] restored the last runtime-passing component package",
+                run_id=self.run_state.id,
+                node_id=node.id,
+                phase=InnerPhase.IMPLEMENT.value,
+            )
+        else:
+            implementation = self._invoke(
+                AgentRole.INTEGRATOR if is_parent_assembler else AgentRole.CODER,
+                InnerPhase.INTEGRATE if is_parent_assembler else InnerPhase.IMPLEMENT,
+                task={
+                    "contract": asdict(node.contract),
+                    "mini_plan": dict(self._prepared.get(node.id, ({}, {}))[1]),
+                    "final_assembler": is_final_assembler,
+                    "component_assembler": is_parent_assembler and not is_final_assembler,
+                    "child_component_packages": {
+                        child_id: dict(self._results[child_id].component_package)
+                        for child_id in node.children
+                        if child_id in self._results
+                    },
+                    "prior_best_candidate": dict(prior_component.get("candidate", {})),
+                    "prior_replan_guidance": dict(prior_component.get("replan", {})),
+                    "prior_findings": list(
+                        dict.fromkeys(
+                            (
+                                *(prior_result.findings if prior_result else ()),
+                                *external_revision_findings,
+                            )
+                        )
+                    ),
+                    "findings": list(external_revision_findings),
+                },
+                context=self._new_context(
+                    node, AgentRole.INTEGRATOR if is_parent_assembler else AgentRole.CODER
+                ),
+                node_id=node.id,
+            )
         responses.append(implementation)
         candidate_response = implementation
         materialized_component, materialized_gate = self._materialize_component_gate(
@@ -3629,7 +4185,21 @@ class UltraOrchestrator:
                     "contract": asdict(node.contract),
                     "findings": findings,
                     "attempt": fixes,
-                    "change_approach": fixes == self.config.max_fix_attempts,
+                    "change_approach": fixes >= 3,
+                    "optimization_variable": (
+                        "finding_specific_implementation"
+                        if fixes == 1
+                        else "specialist_prompt_and_contract"
+                        if fixes == 2
+                        else "specialist_topology_or_interface_boundary"
+                        if fixes == 3
+                        else "fresh_challenger_rebuild"
+                    ),
+                    "champion_challenger": {
+                        "preserve_previous_best": True,
+                        "do_not_patch_a_rejected_visual_placeholder": fixes >= 3,
+                        "candidate_must_win_pairwise": fixes > 1,
+                    },
                     "final_assembler": is_final_assembler,
                     "component_assembler": is_parent_assembler and not is_final_assembler,
                     "child_component_packages": {
@@ -3797,7 +4367,7 @@ class UltraOrchestrator:
             quality={
                 "overall_score": quality_score,
                 "consensus": dict(quality_gate.consensus),
-                "critical_minimum": 0.85,
+                "critical_minimum": 0.90,
                 "target": 0.95,
             },
             status="published" if self._passed(integration) else "rejected",

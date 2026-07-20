@@ -255,7 +255,7 @@ class OllamaVisionJudge:
             "the brief and component-specific rubric. Do not reward mere colorfulness, contrast, "
             "or edge density. Return strict JSON with accepted:boolean, confidence:0..1, summary, "
             "scores:{rubric_dimension:0..1}, findings:[{severity:critical|major|minor,"
-            "category,message,evidence}]. A critical finding or any critical score below 0.85 "
+            "category,message,evidence}]. A critical finding or any critical score below 0.90 "
             "must make accepted false.\nCONTEXT:\n"
             + json.dumps(context, ensure_ascii=False, sort_keys=True),
             (screenshot,),
@@ -282,7 +282,7 @@ class OllamaVisionJudge:
         missing_dimensions = tuple(
             item for item in required_dimensions if item not in scores
         )
-        threshold = _clamp(rubric.get("critical_minimum", 0.85))
+        threshold = _clamp(rubric.get("critical_minimum", 0.90))
         below_threshold = tuple(
             item for item in required_dimensions if scores.get(item, 0.0) < threshold
         )

@@ -84,6 +84,66 @@ def normalize_generated_tool_args(name: str, args: Mapping[str, Any]) -> dict[st
     """
 
     normalized = dict(args)
+    if str(name) == "stage_component_file":
+        nested = normalized.get("file")
+        if isinstance(nested, Mapping):
+            normalized = {**dict(nested), **normalized}
+            normalized.pop("file", None)
+        path = str(
+            normalized.get("path")
+            or normalized.get("file_path")
+            or normalized.get("filepath")
+            or normalized.get("filename")
+            or normalized.get("name")
+            or ""
+        ).strip()
+        content = normalized.get("content")
+        if not isinstance(content, str):
+            content = normalized.get(
+                "source",
+                normalized.get("code", normalized.get("text", normalized.get("contents", ""))),
+            )
+        content = str(content or "")
+        role = str(normalized.get("role") or normalized.get("type") or "").casefold()
+        if role not in {"implementation", "preview", "test", "asset"}:
+            lowered_path = path.casefold()
+            lowered_content = content.lstrip().casefold()
+            if lowered_path.endswith((".html", ".htm")) or lowered_content.startswith(
+                ("<!doctype html", "<html")
+            ):
+                role = "preview"
+            elif any(marker in lowered_path for marker in (".test.", ".spec.", "/test", "tests/")):
+                role = "test"
+            else:
+                role = "implementation"
+        if not path and content:
+            if role == "preview":
+                path = "preview/index.html"
+            elif role == "test":
+                path = "test/component.test.js"
+            else:
+                path = "src/component.js"
+        return {"path": path, "content": content, "role": role}
+    if str(name) == "publish_component":
+        nested = normalized.get("component")
+        if isinstance(nested, Mapping):
+            normalized = {**dict(nested), **normalized}
+            normalized.pop("component", None)
+        if not isinstance(normalized.get("interface"), Mapping):
+            exports = normalized.get("exports", ())
+            imports = normalized.get("imports", ())
+            normalized["interface"] = {
+                "exports": list(exports) if isinstance(exports, (list, tuple)) else [str(exports)] if exports else [],
+                "imports": list(imports) if isinstance(imports, (list, tuple)) else [str(imports)] if imports else [],
+            }
+        if not isinstance(normalized.get("preview"), Mapping):
+            entrypoint = str(
+                normalized.get("preview_entrypoint")
+                or normalized.get("entrypoint")
+                or "preview/index.html"
+            )
+            normalized["preview"] = {"entrypoint": entrypoint}
+        return normalized
     field = "content" if str(name) == "write_file" else "new_str" if str(name) == "edit_file" else ""
     if not field or not isinstance(normalized.get(field), str):
         return normalized

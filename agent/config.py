@@ -108,7 +108,7 @@ class RuntimeConfig:
     ultra_max_nodes: int = 1_000
     ultra_top_modules_min: int = 4
     ultra_top_modules_max: int = 12
-    ultra_fix_attempts: int = 3
+    ultra_fix_attempts: int = 6
     prompt_trace_chars: int = 256_000
     role_memory_ttl_hours: int = 168
     require_local_gpu: bool = False
@@ -136,7 +136,7 @@ class RuntimeConfig:
             ultra_max_nodes=_env_int("AGENT_ULTRA_MAX_NODES", 1_000, 10, 5_000),
             ultra_top_modules_min=_env_int("AGENT_ULTRA_MODULES_MIN", 4, 1, 32),
             ultra_top_modules_max=_env_int("AGENT_ULTRA_MODULES_MAX", 12, 1, 80),
-            ultra_fix_attempts=_env_int("AGENT_ULTRA_FIX_ATTEMPTS", 3, 1, 20),
+            ultra_fix_attempts=_env_int("AGENT_ULTRA_FIX_ATTEMPTS", 6, 1, 20),
             prompt_trace_chars=_env_int("AGENT_PROMPT_TRACE_CHARS", 256_000, 16_000, 2_000_000),
             role_memory_ttl_hours=_env_int("AGENT_ROLE_MEMORY_TTL_HOURS", 168, 1, 8_760),
             require_local_gpu=_env_bool("AGENT_REQUIRE_LOCAL_GPU", False),

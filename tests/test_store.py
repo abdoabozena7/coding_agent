@@ -165,7 +165,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get_plan(goal.id, plan.revision).fingerprint, plan.fingerprint)
         migrated = sqlite3.connect(path)
         try:
-            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 9)
+            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 11)
             self.assertIsNotNone(
                 migrated.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='ultra_runs'"

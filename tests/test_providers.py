@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from agent.providers import AssistantTurn, ProviderCapabilities, ToolCall, Usage
 from agent.providers.base import coerce_tool_args
@@ -260,8 +261,73 @@ class GeminiProviderTests(unittest.TestCase):
 
 
 class OllamaProviderTests(unittest.TestCase):
+    def test_request_timeout_scales_with_local_output_budget(self):
+        provider = OllamaProvider(model="offline")
+        self.assertAlmostEqual(provider.request_timeout, 300.0)
+        provider.max_output_tokens = 2048
+
+        with patch(
+            "agent.providers.ollama_provider.urllib.request.urlopen",
+            return_value=io.BytesIO(b"{}"),
+        ) as opened:
+            provider._post_json("/api/chat", {})
+        self.assertAlmostEqual(opened.call_args.kwargs["timeout"], 529.6)
+
+    def test_timeout_cancels_abandoned_ollama_generation_before_retry(self):
+        provider = OllamaProvider(model="offline", request_timeout=30)
+        with patch(
+            "agent.providers.ollama_provider.urllib.request.urlopen",
+            side_effect=[socket.timeout("timed out"), io.BytesIO(b"{}")],
+        ) as opened:
+            with self.assertRaises(ProviderRequestError):
+                provider._post_json("/api/chat", {"messages": []})
+
+        self.assertEqual(opened.call_count, 2)
+        cleanup_request = opened.call_args_list[1].args[0]
+        self.assertTrue(cleanup_request.full_url.endswith("/api/generate"))
+        cleanup_payload = json.loads(cleanup_request.data.decode("utf-8"))
+        self.assertEqual(cleanup_payload["keep_alive"], 0)
+        self.assertFalse(cleanup_payload["stream"])
+
+    def test_gpu_required_mode_rejects_partial_cpu_offload(self):
+        provider = OllamaProvider(model="offline", num_gpu=999)
+        provider.require_gpu = True
+        payload = {
+            "models": [
+                {
+                    "name": "offline",
+                    "size": 4_000,
+                    "size_vram": 2_000,
+                }
+            ]
+        }
+        with patch(
+            "agent.providers.ollama_provider.urllib.request.urlopen",
+            return_value=io.BytesIO(json.dumps(payload).encode()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "partial/CPU offload"):
+                provider._assert_gpu_residency()
+
+    def test_gpu_required_mode_accepts_full_residency(self):
+        provider = OllamaProvider(model="offline", num_gpu=999)
+        provider.require_gpu = True
+        payload = {
+            "models": [
+                {
+                    "name": "offline",
+                    "size": 4_000,
+                    "size_vram": 4_000,
+                }
+            ]
+        }
+        with patch(
+            "agent.providers.ollama_provider.urllib.request.urlopen",
+            return_value=io.BytesIO(json.dumps(payload).encode()),
+        ):
+            provider._assert_gpu_residency()
+
     def test_local_context_is_bounded_in_every_chat_request(self):
-        provider = OllamaProvider(model="offline", context_size=16_384, num_gpu=0, max_output_tokens=2048, force_json=True)
+        provider = OllamaProvider(model="offline", context_size=16_384, num_gpu=0, max_output_tokens=2048, force_json=True, temperature=0.25)
         provider.capability_profile = __import__("agent.local_provider", fromlist=["ModelCapabilityProfile"]).ModelCapabilityProfile(
             "offline", tool_call_support=True, thinking_support=True, health_status="reachable"
         )
@@ -273,6 +339,7 @@ class OllamaProviderTests(unittest.TestCase):
         self.assertEqual(payload["options"]["num_ctx"], 16_384)
         self.assertEqual(payload["options"]["num_gpu"], 0)
         self.assertEqual(payload["options"]["num_predict"], 2048)
+        self.assertEqual(payload["options"]["temperature"], 0.25)
         self.assertEqual(payload["think"], "medium")
         self.assertEqual(payload["format"], "json")
 
@@ -328,6 +395,45 @@ class OllamaProviderTests(unittest.TestCase):
         self.assertEqual(provider._post_json.call_count, 2)
         self.assertIn("tools", provider.capability_profile.known_unsupported_parameters)
         self.assertNotIn("tools", provider._post_json.call_args_list[1].args[1])
+
+    def test_cuda_runner_failure_unloads_then_retries_with_gpu_options_intact(self):
+        provider = OllamaProvider(
+            model="offline",
+            context_size=4096,
+            num_gpu=999,
+        )
+        provider.capability_profile = __import__(
+            "agent.local_provider", fromlist=["ModelCapabilityProfile"]
+        ).ModelCapabilityProfile("offline", health_status="reachable")
+        cuda_failure = ProviderRequestError(
+            __import__(
+                "agent.local_provider", fromlist=["ProviderDiagnostic"]
+            ).ProviderDiagnostic(
+                True,
+                ProviderFailureKind.HTTP_5XX,
+                "POST",
+                500,
+                "CUDA error: illegal memory access",
+                "/api/chat",
+            )
+        )
+        unloaded = io.BytesIO(b'{"done":true}\n')
+        valid = io.BytesIO(
+            b'{"message":{"content":"recovered"},"done":true}\n'
+        )
+        provider._post_json = Mock(
+            side_effect=[cuda_failure, unloaded, valid]
+        )
+
+        turn = provider.call([], [], "system")
+
+        self.assertEqual(turn.text, "recovered")
+        self.assertEqual(provider._post_json.call_count, 3)
+        unload_payload = provider._post_json.call_args_list[1].args[1]
+        retry_payload = provider._post_json.call_args_list[2].args[1]
+        self.assertEqual(unload_payload["keep_alive"], 0)
+        self.assertEqual(retry_payload["options"]["num_gpu"], 999)
+        self.assertEqual(retry_payload["options"]["num_ctx"], 4096)
 
     def test_completely_malformed_stream_is_classified_not_silently_accepted(self):
         provider = OllamaProvider(model="offline")

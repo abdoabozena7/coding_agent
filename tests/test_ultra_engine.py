@@ -183,6 +183,36 @@ def prepared_engine(
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_malformed_architecture_candidate_recovers_to_typed_harness_topology(self):
+        def handler(request: AgentRequest) -> AgentResponse:
+            response = standard_handler(request)
+            if request.phase == "architecture":
+                return AgentResponse(
+                    payload={"summary": "", "components": []},
+                    summary="malformed architecture envelope",
+                    provider="fake",
+                    model="scripted",
+                )
+            return response
+
+        factory = FakeFactory(handler)
+        engine = UltraOrchestrator(
+            factory,
+            execution_class=ExecutionClass.LOCAL,
+            config=UltraConfig(
+                min_top_modules=1,
+                max_top_modules=12,
+                provider_retries=1,
+            ),
+        )
+        plan = engine.prepare("Build a polished Three.js browser game")
+        self.assertIsNotNone(plan)
+        self.assertIn("recursive", engine.architecture.summary.casefold())
+        self.assertEqual(
+            {item["name"] for item in engine.architecture.components},
+            {"World", "Vehicles", "Character", "Gameplay", "Presentation", "QA"},
+        )
+
     def test_cross_run_lessons_are_injected_into_foundation_planning(self):
         state = ProjectMemoryState()
         engine, factory, _plan = prepared_engine(state=state)
@@ -255,6 +285,28 @@ class SchedulerTests(unittest.TestCase):
 
 
 class UltraEngineTests(unittest.TestCase):
+    def test_quality_consensus_uses_typed_passed_over_contradictory_declaration(self):
+        engine, _factory, _plan = prepared_engine()
+        node = next(iter(engine.nodes.values()))
+        records = engine._quality_vote_records(
+            node,
+            (
+                AgentResponse(
+                    payload={"passed": True, "verdict": "reject"},
+                    summary="Typed review passed.",
+                ),
+                AgentResponse(
+                    payload={"passed": False, "verdict": "accept"},
+                    summary="Typed review failed.",
+                ),
+            ),
+        )
+
+        self.assertEqual(records[0]["verdict"], "accept")
+        self.assertEqual(records[0]["evidence"]["declared_verdict"], "reject")
+        self.assertEqual(records[1]["verdict"], "reject")
+        self.assertEqual(records[1]["evidence"]["declared_verdict"], "accept")
+
     def test_agent_response_preserves_typed_envelope_reasoning_artifact(self):
         artifact = {
             "claim": "candidate passes",

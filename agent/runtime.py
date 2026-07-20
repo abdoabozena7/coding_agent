@@ -868,6 +868,124 @@ class AgentRuntime:
             raise RuntimeStateError("the ULTRA engine is not live in this process")
         return self.ultra_session.wait()
 
+    @staticmethod
+    def _plan_change_paths(plan: Plan | None) -> set[str]:
+        if plan is None:
+            return set()
+        return {
+            str(item.get("path") or "").strip().replace("\\", "/")
+            for item in plan.expected_changes
+            if str(item.get("path") or "").strip()
+        }
+
+    def _ultra_quality_feedback(self, result: Any) -> str:
+        findings: list[str] = []
+        for package in (
+            *tuple(getattr(result, "results", ()) or ()),
+            *(
+                (getattr(result, "global_result"),)
+                if getattr(result, "global_result", None) is not None
+                else ()
+            ),
+        ):
+            findings.extend(
+                str(item).strip()
+                for item in getattr(package, "findings", ())
+                if str(item).strip()
+            )
+        run_id = str(getattr(getattr(result, "run", None), "id", "") or "")
+        if run_id:
+            for item in self.store.list_quality_findings(run_id):
+                if item.status.value == "resolved":
+                    continue
+                owner = item.repair_node_id or "unassigned"
+                findings.append(
+                    f"[{item.severity.value}] {item.category.value} finding for "
+                    f"{owner}: {item.remediation}"
+                )
+        compact = tuple(dict.fromkeys(findings))[:24]
+        return (
+            "AUTONOMOUS QUALITY REVISION. Preserve the approved product scope and final "
+            "output paths. Change the specialist topology, narrow weak component contracts, "
+            "or replace the failed integration strategy; do not repeat the same approach. "
+            "Confirmed blockers:\n- "
+            + "\n- ".join(compact or ("the previous candidate failed its durable quality gate",))
+        )
+
+    def converge_ultra(self) -> Any:
+        """Keep quality-only Ultra revisions alive after the one user approval.
+
+        A revision is auto-approved only when its declared write paths remain
+        within the previously approved scope.  Scope expansion still stops at
+        the ordinary approval boundary.
+        """
+
+        if self.ultra_session is None:
+            raise RuntimeStateError("the ULTRA engine is not live in this process")
+        approved_scope = self._plan_change_paths(
+            self.store.get_accepted_plan(self.active_goal().id)
+            if self.active_goal()
+            else None
+        )
+        while True:
+            result = self.wait_for_ultra()
+            goal = self.active_goal() or self.store.get_latest_goal()
+            if goal is None or result is None:
+                return result
+            outcome = None
+            try:
+                outcome = self.store.get_goal_outcome_contract(goal.id)
+            except NotFoundError:
+                pass
+            if goal.status is GoalStatus.COMPLETED or (
+                outcome and outcome.get("state") == "accepted"
+            ):
+                return result
+            phase = str(getattr(getattr(result, "run", None), "phase", "")).casefold()
+            if "revision_required" not in phase:
+                return result
+            if outcome and not bool(dict(outcome.get("contract") or {}).get("auto_converge", True)):
+                return result
+            feedback = self._ultra_quality_feedback(result)
+            self.events.publish(
+                "ultra.strategy_revision",
+                "Quality remained below target; rebuilding the weak specialist boundary.",
+                findings=feedback,
+            )
+            proposed = self.replan_ultra(feedback)
+            while proposed is None:
+                questions = self.ultra_questions()
+                if not questions:
+                    return result
+                question = questions[0]
+                options = tuple(
+                    item for item in question.get("options", ()) if isinstance(item, Mapping)
+                )
+                if not options:
+                    return result
+                recommended = options[0]
+                answer = str(
+                    recommended.get("value")
+                    or recommended.get("label")
+                    or recommended.get("description")
+                    or ""
+                ).strip()
+                if not answer:
+                    return result
+                proposed = self.answer_ultra_question(str(question.get("id")), answer)
+            proposed_scope = self._plan_change_paths(proposed)
+            if approved_scope and not proposed_scope.issubset(approved_scope):
+                self.events.publish(
+                    "ultra.scope_expansion_blocked",
+                    "Autonomous quality revision requested paths outside the approved scope.",
+                    approved_scope=sorted(approved_scope),
+                    proposed_scope=sorted(proposed_scope),
+                )
+                return result
+            if not approved_scope:
+                approved_scope = set(proposed_scope)
+            self.approve_ultra(proposed.revision)
+
     def restore_ultra(self, run_id: str) -> Any:
         self.ultra_session = self._make_ultra_session()
         return self.ultra_session.restore(run_id)

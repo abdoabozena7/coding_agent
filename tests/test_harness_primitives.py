@@ -70,6 +70,8 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(parse_command("/permissions full").args["level"], "full")
         self.assertEqual(parse_command("/tree M001").args["target"], "M001")
         self.assertEqual(parse_command("/agents --all").args["all"], True)
+        self.assertEqual(parse_command("/agent 12").kind, CommandKind.AGENT)
+        self.assertEqual(parse_command("/agents node-api").args["target"], "node-api")
         self.assertEqual(parse_command("/trace latest").args["target"], "latest")
         self.assertEqual(
             parse_command("/answer platform Desktop").args,
@@ -806,6 +808,39 @@ class TerminalUITests(unittest.TestCase):
             node_titles={"node-physics": "Physics"},
         )
         self.assertIn("[coder] running · implement · Physics · qwen", rendered)
+
+    def test_live_agents_view_is_read_only_and_uses_stable_node_numbers(self):
+        rendered = render_agents(
+            [
+                {
+                    "id": "agent-1",
+                    "role": "coder",
+                    "status": "running",
+                    "phase": "implement",
+                    "work_node_id": "node-api",
+                    "model": "gemma4:e4b",
+                }
+            ],
+            nodes=[
+                {
+                    "id": "node-domain",
+                    "title": "Domain",
+                    "status": "completed",
+                    "depth": 1,
+                },
+                {
+                    "id": "node-api",
+                    "title": "Appointment API",
+                    "status": "running",
+                    "depth": 1,
+                },
+            ],
+            node_titles={"node-api": "Appointment API"},
+            run_id="ultra-backend",
+        )
+        self.assertIn("Swarm observer | READ ONLY", rendered)
+        self.assertIn("[02] Appointment API", rendered)
+        self.assertIn("/agent NUMBER|NODE_ID|AGENT_ID", rendered)
 
     def test_memory_view_shows_the_entry_content_without_cards(self):
         rendered = render_memory(

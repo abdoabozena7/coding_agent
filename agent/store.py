@@ -86,9 +86,21 @@ from .swarm_protocol import (
     SwarmMessageV1,
 )
 from .workflow import AgentRegistryEntryV1, AgentState
+from .goal_outcome import (
+    FinalAcceptanceEvidenceV1,
+    FinalAcceptanceGate,
+    GoalOutcomeContractV1,
+    GoalOutcomeState,
+    OptimizationExperimentV1,
+)
+from .durable_memory import (
+    AgentMemorySnapshotV1,
+    NextActionPacketV1,
+    NextActionStatus,
+)
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 
 DEFAULT_TRACE_MAX_BYTES = 256_000
 MAX_TRACE_MAX_BYTES = 2_000_000
@@ -402,6 +414,12 @@ class StateStore:
                     existing = 8
                 if existing < 9:
                     self._migrate_v9()
+                    existing = 9
+                if existing < 10:
+                    self._migrate_v10()
+                    existing = 10
+                if existing < 11:
+                    self._migrate_v11()
                 self._connection.execute(
                     "UPDATE managed_resources SET status='stale',updated_at=? WHERE status IN ('running','ready')",
                     (_iso(utc_now()),),
@@ -416,6 +434,37 @@ class StateStore:
                 self._connection.execute(
                     "UPDATE workflow_sessions SET sleep_state='off',ultra_profile='standard' "
                     "WHERE sleep_state<>'off' OR ultra_profile<>'standard'"
+                )
+                # Local reasoning/tool calls can legitimately take several
+                # minutes.  Ten minutes still detects abandoned processes
+                # promptly without misclassifying an active Gemma generation.
+                stale_before = utc_now() - timedelta(seconds=600)
+                self._connection.execute(
+                    "UPDATE scheduled_agent_actions AS action SET status=?,lease_token='',"
+                    "lease_expires_at=NULL,error=CASE WHEN error='' THEN ? ELSE error END,"
+                    "updated_at=? WHERE status=? AND NOT EXISTS ("
+                    "SELECT 1 FROM ultra_runs AS run "
+                    "JOIN goal_outcome_contracts AS outcome ON outcome.goal_id=run.goal_id "
+                    "WHERE run.id=action.ultra_run_id AND outcome.state=? "
+                    "AND outcome.heartbeat_at IS NOT NULL AND outcome.heartbeat_at>=?)",
+                    (
+                        NextActionStatus.RECOVERING.value,
+                        "Process stopped before the durable action reached a terminal checkpoint.",
+                        _iso(utc_now()),
+                        NextActionStatus.RUNNING.value,
+                        GoalOutcomeState.RUNNING.value,
+                        _iso(stale_before),
+                    ),
+                )
+                self._connection.execute(
+                    "UPDATE goal_outcome_contracts SET state=?,recovery_count=recovery_count+1,"
+                    "updated_at=? WHERE state=? AND (heartbeat_at IS NULL OR heartbeat_at<?)",
+                    (
+                        GoalOutcomeState.RECOVERING.value,
+                        _iso(utc_now()),
+                        GoalOutcomeState.RUNNING.value,
+                        _iso(stale_before),
+                    ),
                 )
                 self._fts5_available = self._ensure_brain_fts()
                 self._repository_fts5_available = self._ensure_repository_fts()
@@ -1269,6 +1318,108 @@ class StateStore:
         CREATE INDEX IF NOT EXISTS idx_package_consumption_assembler
             ON package_consumption_evidence(ultra_run_id,assembler_node_id,passed);
         PRAGMA user_version=9;
+        COMMIT;
+        """
+        self._connection.executescript(schema)
+
+    def _migrate_v10(self) -> None:
+        """Add outcome-level acceptance, heartbeats, and controlled optimization."""
+
+        schema = """
+        BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS goal_outcome_contracts (
+            goal_id TEXT PRIMARY KEY REFERENCES goals(id) ON DELETE CASCADE,
+            ultra_run_id TEXT REFERENCES ultra_runs(id) ON DELETE SET NULL,
+            contract_json TEXT NOT NULL,
+            state TEXT NOT NULL,
+            process_token TEXT NOT NULL,
+            heartbeat_at TEXT,
+            recovery_count INTEGER NOT NULL DEFAULT 0,
+            final_decision_json TEXT NOT NULL DEFAULT '{}',
+            accepted_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_goal_outcomes_state
+            ON goal_outcome_contracts(state,heartbeat_at,updated_at);
+        CREATE TABLE IF NOT EXISTS optimization_experiments (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            work_node_id TEXT REFERENCES work_nodes(id) ON DELETE SET NULL,
+            variable TEXT NOT NULL,
+            hypothesis TEXT NOT NULL,
+            baseline_json TEXT NOT NULL,
+            candidate_json TEXT NOT NULL,
+            before_score REAL NOT NULL,
+            after_score REAL NOT NULL,
+            delta REAL NOT NULL,
+            outcome TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_optimization_node
+            ON optimization_experiments(ultra_run_id,work_node_id,created_at);
+        CREATE TABLE IF NOT EXISTS final_acceptance_evidence (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL,
+            authority TEXT NOT NULL,
+            passed INTEGER NOT NULL,
+            score REAL NOT NULL,
+            critical_findings INTEGER NOT NULL,
+            artifact_hash TEXT NOT NULL,
+            details_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_final_acceptance_evidence
+            ON final_acceptance_evidence(ultra_run_id,kind,authority,created_at);
+        PRAGMA user_version=10;
+        COMMIT;
+        """
+        self._connection.executescript(schema)
+
+    def _migrate_v11(self) -> None:
+        """Persist specialist memory snapshots and resumable next actions."""
+
+        schema = """
+        BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS agent_memory_snapshots (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            work_node_id TEXT REFERENCES work_nodes(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(ultra_run_id,work_node_id,role,revision)
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_memory_latest
+            ON agent_memory_snapshots(ultra_run_id,work_node_id,role,revision DESC);
+        CREATE TABLE IF NOT EXISTS scheduled_agent_actions (
+            id TEXT PRIMARY KEY,
+            ultra_run_id TEXT NOT NULL REFERENCES ultra_runs(id) ON DELETE CASCADE,
+            work_node_id TEXT REFERENCES work_nodes(id) ON DELETE CASCADE,
+            agent_run_id TEXT,
+            role TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            packet_json TEXT NOT NULL,
+            context_fingerprint TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            lease_token TEXT NOT NULL DEFAULT '',
+            lease_expires_at TEXT,
+            error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_scheduled_actions_ready
+            ON scheduled_agent_actions(ultra_run_id,status,sequence,created_at);
+        CREATE INDEX IF NOT EXISTS idx_scheduled_actions_node
+            ON scheduled_agent_actions(ultra_run_id,work_node_id,role,phase,created_at);
+        PRAGMA user_version=11;
         COMMIT;
         """
         self._connection.executescript(schema)
@@ -4127,7 +4278,16 @@ class StateStore:
                 "INSERT INTO prompt_traces("
                 "id,ultra_run_id,work_node_id,agent_run_id,role,system_prompt_blob,context_blob,"
                 "self_prompt_blob,compression,raw_size,stored_size,redacted,truncated,reasoning_summary,"
-                "insights_json,omitted_json,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "insights_json,omitted_json,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "work_node_id=excluded.work_node_id,agent_run_id=excluded.agent_run_id,"
+                "role=excluded.role,system_prompt_blob=excluded.system_prompt_blob,"
+                "context_blob=excluded.context_blob,self_prompt_blob=excluded.self_prompt_blob,"
+                "compression=excluded.compression,raw_size=excluded.raw_size,"
+                "stored_size=excluded.stored_size,redacted=excluded.redacted,"
+                "truncated=excluded.truncated,reasoning_summary=excluded.reasoning_summary,"
+                "insights_json=excluded.insights_json,omitted_json=excluded.omitted_json,"
+                "metadata_json=excluded.metadata_json",
                 (
                     stored.id,
                     stored.ultra_run_id,
@@ -5258,6 +5418,383 @@ class StateStore:
             for row in rows
         )
 
+    def save_agent_memory_snapshot(
+        self,
+        item: AgentMemorySnapshotV1,
+    ) -> AgentMemorySnapshotV1:
+        """Append one immutable specialist checkpoint revision."""
+
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(revision),0) FROM agent_memory_snapshots "
+                "WHERE ultra_run_id=? AND work_node_id IS ? AND role=?",
+                (item.ultra_run_id, item.work_node_id, item.role),
+            ).fetchone()
+            revision = int(row[0]) + 1
+            stored = replace(item, revision=revision)
+            connection.execute(
+                "INSERT INTO agent_memory_snapshots(id,ultra_run_id,work_node_id,role,"
+                "revision,snapshot_json,fingerprint,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    stored.id,
+                    stored.ultra_run_id,
+                    stored.work_node_id,
+                    stored.role,
+                    stored.revision,
+                    _json(stored.to_dict()),
+                    stored.fingerprint,
+                    _iso(stored.created_at),
+                ),
+            )
+        return stored
+
+    def latest_agent_memory_snapshot(
+        self,
+        ultra_run_id: str,
+        *,
+        work_node_id: str | None,
+        role: str,
+    ) -> AgentMemorySnapshotV1 | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT snapshot_json FROM agent_memory_snapshots "
+                "WHERE ultra_run_id=? AND work_node_id IS ? AND role=? "
+                "ORDER BY revision DESC LIMIT 1",
+                (ultra_run_id, work_node_id, str(role)),
+            ).fetchone()
+        if row is None:
+            return None
+        return AgentMemorySnapshotV1.from_dict(_loads(row["snapshot_json"], {}))
+
+    def stage_scheduled_agent_action(
+        self,
+        action_id: str,
+        packet: NextActionPacketV1,
+        *,
+        agent_run_id: str | None = None,
+        status: NextActionStatus | str = NextActionStatus.RUNNING,
+    ) -> dict[str, Any]:
+        """Persist the exact bounded assignment before invoking a model."""
+
+        state = NextActionStatus(status)
+        now = utc_now()
+        with self.transaction() as connection:
+            sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence),0)+1 FROM scheduled_agent_actions "
+                    "WHERE ultra_run_id=?",
+                    (packet.ultra_run_id,),
+                ).fetchone()[0]
+            )
+            normalized = replace(packet, sequence=sequence)
+            connection.execute(
+                "INSERT INTO scheduled_agent_actions(id,ultra_run_id,work_node_id,"
+                "agent_run_id,role,phase,sequence,status,packet_json,context_fingerprint,"
+                "attempts,lease_token,lease_expires_at,error,created_at,updated_at,completed_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    action_id,
+                    normalized.ultra_run_id,
+                    normalized.work_node_id,
+                    agent_run_id,
+                    normalized.role,
+                    normalized.phase,
+                    normalized.sequence,
+                    state.value,
+                    _json(normalized.to_dict()),
+                    normalized.fingerprint,
+                    1 if state is NextActionStatus.RUNNING else 0,
+                    "",
+                    None,
+                    "",
+                    _iso(now),
+                    _iso(now),
+                    None,
+                ),
+            )
+        return self.get_scheduled_agent_action(action_id)
+
+    def transition_scheduled_agent_action(
+        self,
+        action_id: str,
+        status: NextActionStatus | str,
+        *,
+        error: str = "",
+    ) -> dict[str, Any] | None:
+        state = NextActionStatus(status)
+        now = utc_now()
+        terminal = state in {
+            NextActionStatus.COMPLETED,
+            NextActionStatus.FAILED,
+            NextActionStatus.CANCELLED,
+        }
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE scheduled_agent_actions SET status=?,error=?,updated_at=?,"
+                "completed_at=? WHERE id=?",
+                (
+                    state.value,
+                    str(error)[:4_000],
+                    _iso(now),
+                    _iso(now) if terminal else None,
+                    action_id,
+                ),
+            )
+        return self.get_scheduled_agent_action(action_id) if cursor.rowcount else None
+
+    def get_scheduled_agent_action(self, action_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM scheduled_agent_actions WHERE id=?",
+                (action_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Scheduled agent action not found: {action_id}")
+        value = dict(row)
+        value["packet"] = _loads(value.pop("packet_json"), {})
+        return value
+
+    def list_scheduled_agent_actions(
+        self,
+        ultra_run_id: str,
+        *,
+        status: NextActionStatus | str | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        sql = "SELECT * FROM scheduled_agent_actions WHERE ultra_run_id=?"
+        params: list[Any] = [ultra_run_id]
+        if status is not None:
+            sql += " AND status=?"
+            params.append(NextActionStatus(status).value)
+        sql += " ORDER BY sequence,created_at,id"
+        with self._lock:
+            rows = self._connection.execute(sql, params).fetchall()
+        values: list[dict[str, Any]] = []
+        for row in rows:
+            value = dict(row)
+            value["packet"] = _loads(value.pop("packet_json"), {})
+            values.append(value)
+        return tuple(values)
+
+    def save_goal_outcome_contract(
+        self,
+        contract: GoalOutcomeContractV1,
+        *,
+        ultra_run_id: str | None = None,
+        state: GoalOutcomeState = GoalOutcomeState.RUNNING,
+        process_token: str = "",
+    ) -> dict[str, Any]:
+        now = utc_now()
+        token = str(process_token or f"pid:{os.getpid()}")
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO goal_outcome_contracts(goal_id,ultra_run_id,contract_json,state,"
+                "process_token,heartbeat_at,recovery_count,final_decision_json,accepted_at,"
+                "created_at,updated_at) VALUES(?,?,?,?,?,?,0,'{}',NULL,?,?) "
+                "ON CONFLICT(goal_id) DO UPDATE SET "
+                "ultra_run_id=COALESCE(excluded.ultra_run_id,goal_outcome_contracts.ultra_run_id),"
+                "contract_json=excluded.contract_json,state=CASE "
+                "WHEN goal_outcome_contracts.state='accepted' THEN goal_outcome_contracts.state "
+                "ELSE excluded.state END,process_token=excluded.process_token,"
+                "heartbeat_at=excluded.heartbeat_at,updated_at=excluded.updated_at",
+                (
+                    contract.goal_id,
+                    ultra_run_id,
+                    _json(contract.to_dict()),
+                    state.value,
+                    token,
+                    _iso(now),
+                    _iso(now),
+                    _iso(now),
+                ),
+            )
+        return self.get_goal_outcome_contract(contract.goal_id)
+
+    def get_goal_outcome_contract(self, goal_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM goal_outcome_contracts WHERE goal_id=?",
+                (goal_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"goal outcome contract not found: {goal_id}")
+        return {
+            **dict(row),
+            "contract": _loads(row["contract_json"], {}),
+            "final_decision": _loads(row["final_decision_json"], {}),
+            "heartbeat_at": _dt(row["heartbeat_at"]),
+            "accepted_at": _dt(row["accepted_at"]),
+            "created_at": _dt(row["created_at"]),
+            "updated_at": _dt(row["updated_at"]),
+        }
+
+    def heartbeat_goal_outcome(
+        self,
+        goal_id: str,
+        *,
+        ultra_run_id: str | None = None,
+        process_token: str = "",
+    ) -> dict[str, Any]:
+        current = self.get_goal_outcome_contract(goal_id)
+        if current["state"] == GoalOutcomeState.ACCEPTED.value:
+            return current
+        now = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE goal_outcome_contracts SET ultra_run_id=COALESCE(?,ultra_run_id),"
+                "state=?,process_token=?,heartbeat_at=?,updated_at=? WHERE goal_id=?",
+                (
+                    ultra_run_id,
+                    GoalOutcomeState.RUNNING.value,
+                    str(process_token or f"pid:{os.getpid()}"),
+                    _iso(now),
+                    _iso(now),
+                    goal_id,
+                ),
+            )
+        return self.get_goal_outcome_contract(goal_id)
+
+    def set_goal_outcome_state(
+        self,
+        goal_id: str,
+        state: GoalOutcomeState,
+        *,
+        decision: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE goal_outcome_contracts SET state=?,final_decision_json=?,"
+                "accepted_at=?,updated_at=? WHERE goal_id=?",
+                (
+                    state.value,
+                    _json(dict(decision or {})),
+                    _iso(now) if state is GoalOutcomeState.ACCEPTED else None,
+                    _iso(now),
+                    goal_id,
+                ),
+            )
+        return self.get_goal_outcome_contract(goal_id)
+
+    def record_optimization_experiment(
+        self,
+        experiment: OptimizationExperimentV1,
+    ) -> dict[str, Any]:
+        value = experiment.to_dict()
+        with self.transaction() as connection:
+            node_ref = (
+                experiment.node_id
+                if connection.execute(
+                    "SELECT 1 FROM work_nodes WHERE id=? AND ultra_run_id=?",
+                    (experiment.node_id, experiment.ultra_run_id),
+                ).fetchone()
+                else None
+            )
+            connection.execute(
+                "INSERT INTO optimization_experiments(id,ultra_run_id,work_node_id,variable,"
+                "hypothesis,baseline_json,candidate_json,before_score,after_score,delta,outcome,"
+                "evidence_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    experiment.id,
+                    experiment.ultra_run_id,
+                    node_ref,
+                    experiment.variable,
+                    experiment.hypothesis,
+                    _json(dict(experiment.baseline)),
+                    _json(dict(experiment.candidate)),
+                    experiment.before_score,
+                    experiment.after_score,
+                    experiment.delta,
+                    experiment.outcome.value,
+                    _json(list(experiment.evidence)),
+                    _iso(experiment.created_at),
+                ),
+            )
+        return value
+
+    def list_optimization_experiments(
+        self,
+        ultra_run_id: str,
+        *,
+        work_node_id: str | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        sql = "SELECT * FROM optimization_experiments WHERE ultra_run_id=?"
+        params: list[Any] = [ultra_run_id]
+        if work_node_id is not None:
+            sql += " AND work_node_id=?"
+            params.append(work_node_id)
+        sql += " ORDER BY created_at,id"
+        with self._lock:
+            rows = self._connection.execute(sql, tuple(params)).fetchall()
+        return tuple(
+            {
+                **dict(row),
+                "baseline": _loads(row["baseline_json"], {}),
+                "candidate": _loads(row["candidate_json"], {}),
+                "evidence": _loads(row["evidence_json"], []),
+            }
+            for row in rows
+        )
+
+    def record_final_acceptance_evidence(
+        self,
+        evidence: FinalAcceptanceEvidenceV1,
+    ) -> dict[str, Any]:
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO final_acceptance_evidence(id,ultra_run_id,kind,authority,passed,"
+                "score,critical_findings,artifact_hash,details_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    evidence.id,
+                    evidence.ultra_run_id,
+                    evidence.kind,
+                    evidence.authority,
+                    int(evidence.passed),
+                    evidence.score,
+                    evidence.critical_findings,
+                    evidence.artifact_hash,
+                    _json(dict(evidence.details)),
+                    _iso(evidence.created_at),
+                ),
+            )
+        return evidence.to_dict()
+
+    def list_final_acceptance_evidence(
+        self,
+        ultra_run_id: str,
+    ) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM final_acceptance_evidence WHERE ultra_run_id=? "
+                "ORDER BY created_at,id",
+                (ultra_run_id,),
+            ).fetchall()
+        return tuple(
+            {
+                **dict(row),
+                "passed": bool(row["passed"]),
+                "details": _loads(row["details_json"], {}),
+            }
+            for row in rows
+        )
+
+    def evaluate_final_acceptance(
+        self,
+        goal_id: str,
+        ultra_run_id: str,
+    ) -> dict[str, Any]:
+        row = self.get_goal_outcome_contract(goal_id)
+        contract = GoalOutcomeContractV1.from_dict(row["contract"])
+        evidence = self.list_final_acceptance_evidence(ultra_run_id)
+        decision = FinalAcceptanceGate(contract).evaluate(evidence)
+        state = (
+            GoalOutcomeState.ACCEPTED
+            if decision.accepted
+            else GoalOutcomeState.QUALITY_BLOCKED
+        )
+        self.set_goal_outcome_state(goal_id, state, decision=decision.to_dict())
+        return decision.to_dict()
+
     def save_package_consumption_evidence(
         self,
         ultra_run_id: str,
@@ -5355,7 +5892,28 @@ class StateStore:
                     )
             for path in sorted(changed):
                 snapshot = index._file_snapshots[path]
-                entries = tuple(index.entries.get(path, ()))
+                raw_entries = tuple(index.entries.get(path, ()))
+                # Multi-layer parsers can legitimately discover the same
+                # symbol through AST and framework adapters. Persist one
+                # deterministic best record per schema key so incremental
+                # indexing never fails on parser overlap.
+                unique_entries: dict[tuple[str, str, int], Any] = {}
+                for entry in raw_entries:
+                    key = (str(entry.kind), str(entry.name), int(entry.start))
+                    current_entry = unique_entries.get(key)
+                    if current_entry is None or (
+                        float(entry.confidence),
+                        str(entry.provenance),
+                        int(entry.end),
+                    ) > (
+                        float(current_entry.confidence),
+                        str(current_entry.provenance),
+                        int(current_entry.end),
+                    ):
+                        unique_entries[key] = entry
+                entries = tuple(
+                    unique_entries[key] for key in sorted(unique_entries)
+                )
                 provenance = tuple(sorted({str(item.provenance) for item in entries}))
                 connection.execute(
                     "INSERT INTO repository_files(workspace_id,path,file_hash,size,mtime_ns,parser_confidence,"

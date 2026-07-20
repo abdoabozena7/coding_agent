@@ -30,6 +30,7 @@ class CommandKind(str, Enum):
     STOP_PROCESS = "stop_process"
     TREE = "tree"
     AGENTS = "agents"
+    AGENT = "agent"
     MEMORY = "memory"
     TRACE = "trace"
     THINKING = "thinking"
@@ -221,9 +222,13 @@ def parse_command(line: str) -> UserCommand:
             raise CommandParseError(f"{prefix}thinking does not take arguments.")
         return UserCommand(CommandKind.THINKING, raw=raw)
     if name == "agents":
-        if rest not in {"", "--all", "all"}:
-            raise CommandParseError(f"Usage: {usage('agents', '[--all]')}")
-        return UserCommand(CommandKind.AGENTS, {"all": bool(rest)}, raw)
+        if rest in {"", "--all", "all"}:
+            return UserCommand(CommandKind.AGENTS, {"all": bool(rest), "target": None}, raw)
+        if rest.startswith("--"):
+            raise CommandParseError(f"Usage: {usage('agents', '[--all|AGENT]')}")
+        return UserCommand(CommandKind.AGENT, {"target": rest}, raw)
+    if name == "agent":
+        return UserCommand(CommandKind.AGENT, {"target": rest or None}, raw)
     if name in {"questions", "metrics", "setup"}:
         if rest:
             raise CommandParseError(f"{prefix}{name} does not take arguments.")

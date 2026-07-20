@@ -158,6 +158,13 @@ class PackageConsumptionEvidenceV1:
 
 
 class _QuietHandler(SimpleHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path.split("?", 1)[0] == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
+        super().do_GET()
+
     def log_message(self, _format: str, *_args: object) -> None:
         return
 
@@ -351,6 +358,71 @@ class ComponentArtifactStore:
         ):
             raise ComponentArtifactError(
                 f"component {node_id} requires a materialized HTML preview entrypoint"
+            )
+        preview_blob = next(
+            data for path, data, _role in prepared if path == preview_entrypoint
+        )
+        preview_text = preview_blob.decode("utf-8", errors="replace")
+        preview_lower = preview_text.casefold()
+        if "<!doctype html" not in preview_lower and "<html" not in preview_lower:
+            raise ComponentArtifactError(
+                f"component {node_id} preview entrypoint must contain a real HTML document; "
+                "JavaScript or TypeScript source renamed to .html is invalid"
+            )
+        invalid_typescript = (
+            re.search(r"\bas\s+HTML[A-Za-z]*Element\b", preview_text)
+            or re.search(r"\b(?:interface|type)\s+[A-Za-z_$][\w$]*\s*[={]", preview_text)
+            or re.search(r"\bcatch\s*\([^)]*:\s*[A-Za-z_$]", preview_text)
+        )
+        if invalid_typescript:
+            raise ComponentArtifactError(
+                f"component {node_id} HTML preview contains TypeScript syntax that browsers "
+                "cannot execute directly"
+            )
+        local_references = tuple(
+            match.group(1).strip()
+            for pattern in (
+                r"""(?is)<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']""",
+                r"""(?is)<link\b[^>]*\bhref\s*=\s*["']([^"']+)["']""",
+            )
+            for match in re.finditer(pattern, preview_text)
+        )
+        missing_references: list[str] = []
+        preview_parent = PurePosixPath(preview_entrypoint).parent
+        for reference in local_references:
+            lowered = reference.casefold()
+            if lowered.startswith(("http://", "https://", "//", "data:", "blob:", "#")):
+                continue
+            clean = reference.split("#", 1)[0].split("?", 1)[0]
+            try:
+                resolved = _relative_path((preview_parent / clean).as_posix())
+            except ComponentArtifactError:
+                missing_references.append(reference)
+                continue
+            if resolved not in available:
+                missing_references.append(f"{reference} (expected {resolved})")
+        bare_imports = tuple(
+            match.group(1)
+            for match in re.finditer(
+                r"""(?m)\b(?:from\s*|import\s*\(\s*)["']([^"']+)["']""",
+                preview_text,
+            )
+            if not match.group(1).startswith((".", "/", "http://", "https://"))
+        )
+        if missing_references or bare_imports:
+            details = [
+                *(
+                    f"missing local preview reference {value}"
+                    for value in missing_references
+                ),
+                *(
+                    f"bare browser import {value!r} requires an import map or CDN URL"
+                    for value in bare_imports
+                ),
+            ]
+            raise ComponentArtifactError(
+                f"component {node_id} preview dependency preflight failed: "
+                + "; ".join(details)
             )
         interface = self._interface(node_id, component)
         root = self.package_root(run_id, node_id, revision)

@@ -44,7 +44,12 @@ from agent.ultra_models import (
 )
 from agent.models import utc_now
 from agent.sandbox import AccessLevel as PermissionAccessLevel
-from agent.ultra import ResultPackageV1 as EngineResult, UltraConfig
+from agent.ultra import (
+    BrainEntryV1 as EngineBrainEntryV1,
+    BrainSection as EngineBrainSection,
+    ResultPackageV1 as EngineResult,
+    UltraConfig,
+)
 from agent.ultra_session import StateStoreUltraAdapter
 from agent.workflow import AgentRegistryEntryV1, AgentState
 
@@ -142,7 +147,7 @@ class UltraStoreTests(unittest.TestCase):
         self.assertIs(AccessLevel, SandboxAccessLevel)
         connection = sqlite3.connect(self.store.path)
         try:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 9)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 11)
             tables = {
                 row[0]
                 for row in connection.execute(
@@ -352,6 +357,43 @@ class UltraStoreTests(unittest.TestCase):
         restored = self.store.search_project_memory("browser visual completion")[0]
         self.assertEqual(restored["id"], memory["id"])
         self.assertEqual(restored["reuse_count"], 1)
+
+    def test_large_engine_brain_payload_keeps_full_data_with_compact_search_content(self) -> None:
+        adapter = StateStoreUltraAdapter(
+            self.store,
+            self.goal.id,
+            ModelDescriptor("ollama", "gemma4", CatalogExecutionClass.LOCAL),
+            PermissionAccessLevel.NORMAL,
+            UltraConfig(),
+        )
+        adapter.run_id = self.run.id
+        graph = {
+            "nodes": [
+                {
+                    "id": f"node-{index}",
+                    "objective": "Preserve this durable graph detail " * 80,
+                }
+                for index in range(500)
+            ]
+        }
+
+        adapter.append_brain_entry(
+            EngineBrainEntryV1(
+                section=EngineBrainSection.TASK_GRAPH,
+                key="large-expanded-graph",
+                value=graph,
+                run_id=self.run.id,
+            )
+        )
+
+        stored = self.store.list_brain_entries(
+            self.run.id,
+            section=BrainSection.TASK_GRAPH,
+            limit=1,
+        )[0]
+        self.assertLess(len(stored.content), 100_000)
+        self.assertIn("stored in data_json", stored.content)
+        self.assertEqual(stored.data, graph)
 
     def test_foundation_project_context_reuses_cross_run_knowledge(self) -> None:
         module = self.store.sync_master_modules(self.run.id)[0]

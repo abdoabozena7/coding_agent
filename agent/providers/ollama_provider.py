@@ -48,7 +48,7 @@ class OllamaProvider:
         native_replay=True,
     )
 
-    def __init__(self, model: str | None = None, host: str | None = None, capability_profile: ModelCapabilityProfile | None = None, reasoning_effort: str = "medium", context_size: int | None = None, num_gpu: int | None = None, max_output_tokens: int | None = None, force_json: bool = False):
+    def __init__(self, model: str | None = None, host: str | None = None, capability_profile: ModelCapabilityProfile | None = None, reasoning_effort: str = "medium", context_size: int | None = None, num_gpu: int | None = None, max_output_tokens: int | None = None, force_json: bool = False, temperature: float | None = None, request_timeout: float | None = None):
         self.model = model or os.getenv("OLLAMA_MODEL") or MODEL_NAME
         self.host = (host or os.getenv("OLLAMA_HOST", DEFAULT_HOST)).rstrip("/")
         self.capability_profile = capability_profile or ModelCapabilityProfile(
@@ -69,9 +69,48 @@ class OllamaProvider:
             self.num_gpu = None if raw_num_gpu in {None, ""} else max(0, int(raw_num_gpu))
         except (TypeError, ValueError):
             self.num_gpu = None
+        self.require_gpu = str(
+            os.getenv("AGENT_REQUIRE_LOCAL_GPU", "")
+        ).strip().casefold() in {"1", "true", "yes", "on"}
+        if self.require_gpu and self.num_gpu is None:
+            # Ask Ollama to offload every layer. The post-call residency check
+            # below fails closed if the runner silently falls back to CPU.
+            self.num_gpu = 999
         self.max_output_tokens = (
             None if max_output_tokens is None else min(65_536, max(128, int(max_output_tokens)))
         )
+        raw_timeout = (
+            request_timeout
+            if request_timeout is not None
+            else os.getenv("OLLAMA_REQUEST_TIMEOUT")
+        )
+        self._request_timeout_explicit = raw_timeout not in {None, ""}
+        if raw_timeout in {None, ""}:
+            # Local generation time grows with the requested output. A fixed
+            # five-minute transport deadline can discard a valid GPU result
+            # just before Ollama returns it, especially on small local models.
+            predicted = 300.0
+            if self.max_output_tokens is not None:
+                predicted = 120.0 + (self.max_output_tokens * 0.20)
+            self.request_timeout = max(300.0, min(900.0, predicted))
+        else:
+            try:
+                self.request_timeout = max(30.0, min(1_800.0, float(raw_timeout)))
+            except (TypeError, ValueError):
+                self.request_timeout = 300.0
+        raw_temperature = (
+            temperature
+            if temperature is not None
+            else os.getenv("OLLAMA_TEMPERATURE")
+        )
+        try:
+            self.temperature = (
+                None
+                if raw_temperature in {None, ""}
+                else max(0.0, min(2.0, float(raw_temperature)))
+            )
+        except (TypeError, ValueError):
+            self.temperature = None
         self.force_json = bool(force_json)
 
     def _ensure_capabilities(self) -> None:
@@ -93,7 +132,13 @@ class OllamaProvider:
             method="POST",
         )
         try:
-            return urllib.request.urlopen(request, timeout=300)
+            timeout = self.request_timeout
+            if not self._request_timeout_explicit and self.max_output_tokens is not None:
+                timeout = max(
+                    300.0,
+                    min(900.0, 120.0 + (self.max_output_tokens * 0.20)),
+                )
+            return urllib.request.urlopen(request, timeout=timeout)
         except urllib.error.HTTPError as error:
             try:
                 body = error.read().decode("utf-8", errors="replace")
@@ -134,11 +179,98 @@ class OllamaProvider:
                 provider_message=safe_body, endpoint=f"{self.host}{path}", incompatible_field=field,
             )) from error
         except (TimeoutError, socket.timeout) as error:
+            self._cancel_active_generation()
             raise ProviderRequestError(ProviderDiagnostic(False, ProviderFailureKind.TIMEOUT, "POST", provider_message=str(error), endpoint=f"{self.host}{path}")) from error
         except urllib.error.URLError as error:
             reason = error.reason
             kind = ProviderFailureKind.CONNECTION_REFUSED if isinstance(reason, ConnectionRefusedError) else ProviderFailureKind.DNS_OR_SOCKET
             raise ProviderRequestError(ProviderDiagnostic(False, kind, "POST", provider_message=redact_provider_message(str(reason)), endpoint=f"{self.host}{path}")) from error
+
+    def _cancel_active_generation(self) -> None:
+        """Cancel work Ollama keeps running after a client-side timeout.
+
+        Closing the timed-out HTTP socket does not reliably stop local
+        inference. Without an explicit unload, every retry queues behind the
+        abandoned request while the GPU remains at 100 percent.
+        """
+
+        data = json.dumps(
+            {"model": self.model, "keep_alive": 0, "stream": False}
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.host}/api/generate",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                response.read()
+        except Exception:
+            # Preserve the original, correctly classified timeout. The next
+            # GPU-residency check still fails closed if cancellation failed.
+            pass
+
+    def reset_model_cache(self) -> None:
+        """Unload a degraded local runner so the next GPU call gets a clean KV cache."""
+
+        response = self._post_json(
+            "/api/generate",
+            {
+                "model": self.model,
+                "keep_alive": 0,
+                "stream": False,
+            },
+        )
+        with response:
+            response.read()
+
+    def _assert_gpu_residency(self) -> None:
+        """Fail closed unless the active model is fully resident on the GPU."""
+
+        if not self.require_gpu:
+            return
+        request = urllib.request.Request(
+            f"{self.host}/api/ps",
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError(
+                "GPU-only Ollama execution could not verify /api/ps residency"
+            ) from exc
+        models = data.get("models", ()) if isinstance(data, Mapping) else ()
+        normalized_target = self.model.casefold()
+        active = next(
+            (
+                item
+                for item in models
+                if isinstance(item, Mapping)
+                and str(item.get("name") or item.get("model") or "").casefold()
+                == normalized_target
+            ),
+            None,
+        )
+        if not isinstance(active, Mapping):
+            raise RuntimeError(
+                f"GPU-only Ollama execution cannot find active model {self.model!r}"
+            )
+        try:
+            total_size = int(active.get("size") or 0)
+            vram_size = int(active.get("size_vram") or 0)
+        except (TypeError, ValueError):
+            total_size = 0
+            vram_size = 0
+        if total_size <= 0 or vram_size < int(total_size * 0.98):
+            ratio = (vram_size / total_size) if total_size > 0 else 0.0
+            raise RuntimeError(
+                "GPU-only Ollama execution rejected partial/CPU offload: "
+                f"model={self.model}, vram={vram_size}, size={total_size}, "
+                f"gpu_fraction={ratio:.3f}"
+            )
 
     def _to_messages(self, conversation, system):
         messages = [{"role": "system", "content": str(system or "")}]
@@ -222,6 +354,8 @@ class OllamaProvider:
             payload["options"]["num_gpu"] = self.num_gpu
         if self.max_output_tokens is not None:
             payload["options"]["num_predict"] = self.max_output_tokens
+        if self.temperature is not None:
+            payload["options"]["temperature"] = self.temperature
 
         text_parts: list[str] = []
         thought_parts: list[str] = []
@@ -233,21 +367,29 @@ class OllamaProvider:
         try:
             response = self._post_json("/api/chat", payload)
         except ProviderRequestError as error:
-            field = error.diagnostic.incompatible_field
-            adaptable = field in {"think", "tools", "format"} and field in payload
-            if not adaptable:
-                raise
-            unsupported = tuple(dict.fromkeys((*self.capability_profile.known_unsupported_parameters, field)))
-            self.capability_profile = replace(
-                self.capability_profile,
-                tool_call_support=False if field == "tools" else self.capability_profile.tool_call_support,
-                structured_output_support=False if field == "format" else self.capability_profile.structured_output_support,
-                thinking_support=False if field == "think" else self.capability_profile.thinking_support,
-                known_unsupported_parameters=unsupported,
-            )
-            adapted_payload = dict(payload)
-            adapted_payload.pop(field, None)
-            response = self._post_json("/api/chat", adapted_payload)
+            provider_message = str(error.diagnostic.provider_message or "")
+            if "cuda error" in provider_message.casefold():
+                # Keep the execution class GPU-only: unload the corrupted
+                # runner/KV cache, then replay the exact governed request once
+                # so Ollama reloads it with num_gpu unchanged.
+                self.reset_model_cache()
+                response = self._post_json("/api/chat", payload)
+            else:
+                field = error.diagnostic.incompatible_field
+                adaptable = field in {"think", "tools", "format"} and field in payload
+                if not adaptable:
+                    raise
+                unsupported = tuple(dict.fromkeys((*self.capability_profile.known_unsupported_parameters, field)))
+                self.capability_profile = replace(
+                    self.capability_profile,
+                    tool_call_support=False if field == "tools" else self.capability_profile.tool_call_support,
+                    structured_output_support=False if field == "format" else self.capability_profile.structured_output_support,
+                    thinking_support=False if field == "think" else self.capability_profile.thinking_support,
+                    known_unsupported_parameters=unsupported,
+                )
+                adapted_payload = dict(payload)
+                adapted_payload.pop(field, None)
+                response = self._post_json("/api/chat", adapted_payload)
 
         with response:
             for raw_line in response:
@@ -302,6 +444,7 @@ class OllamaProvider:
                 operation="parse_stream", provider_message="Ollama returned no valid NDJSON chunks",
                 endpoint=f"{self.host}/api/chat",
             ))
+        self._assert_gpu_residency()
 
         tool_calls = []
         seen_ids: set[str] = set()

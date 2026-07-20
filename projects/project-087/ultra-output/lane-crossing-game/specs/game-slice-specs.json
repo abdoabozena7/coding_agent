@@ -1,0 +1,53 @@
+{
+  "gameplay": {
+    "lane_count": 4,
+    "hop_step": 1.0,
+    "hop_duration": 0.3,
+    "traffic_speeds": [
+      4.5,
+      6.2,
+      3.8,
+      5.5
+    ],
+    "score_per_crossing": 110,
+    "difficulty_gain": 0.07
+  },
+  "presentation": {
+    "camera_height": 14.0,
+    "camera_distance": 16.0,
+    "fog_near": 30.0,
+    "fog_far": 80.0,
+    "environment_density": 18,
+    "hud_accent": "#FFFFFF",
+    "sky": "#A9D2FF",
+    "grass": "#7AA83E",
+    "key_intensity": 1.25,
+    "ambient_intensity": 0.48,
+    "rim_intensity": 0.25,
+    "fence_segments": 7,
+    "flower_clusters": 9,
+    "hay_bales": 3,
+    "character_scale": 0.53
+  },
+  "presentation_revision_evidence": {
+    "raw": {
+      "key_intensity": 1.25,
+      "ambient_intensity": 0.48,
+      "rim_intensity": 0.25,
+      "fence_segments": 7,
+      "flower_clusters": 9,
+      "hay_bales": 3,
+      "character_scale": 0.53
+    },
+    "normalized": {
+      "key_intensity": 1.25,
+      "ambient_intensity": 0.48,
+      "rim_intensity": 0.25,
+      "fence_segments": 7,
+      "flower_clusters": 9,
+      "hay_bales": 3,
+      "character_scale": 0.53
+    },
+    "finding": "flat_lighting_repetitive_roadside_small_character"
+  }
+}

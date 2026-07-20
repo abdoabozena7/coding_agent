@@ -282,6 +282,10 @@ class RepositoryIndex:
     _CHUNK_OVERLAP = 20
     _MAX_ENTRY_CHARS = 24_000
     _MAX_EMBED_CHARS = 8_000
+    # Building an HNSW graph costs more than a dense cosine pass for small
+    # repositories, especially immediately after an incremental refresh.
+    # Keep HNSW for the large-repository path it is designed to accelerate.
+    _HNSW_MIN_VECTORS = 2_000
     _INDEXABLE_SUFFIXES = {
         ".py", ".html", ".htm", ".js", ".jsx", ".mjs", ".cjs",
         ".ts", ".tsx", ".css", ".json",
@@ -1209,7 +1213,7 @@ class RepositoryIndex:
         query_embedding = tuple(float(value) for value in self.embedding_provider.embed(query))
         hnsw_scores = (
             self._hnsw.search(query_embedding, limit=max(100, int(limit) * 8))
-            if self._ensure_hnsw()
+            if len(self._embeddings) >= self._HNSW_MIN_VECTORS and self._ensure_hnsw()
             else {}
         )
         scored: dict[tuple[str, str, str, int], tuple[float, IndexEntry, set[str]]] = {}

@@ -65,7 +65,8 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/model", "choose a model and reasoning effort"),
     ("/permissions", "switch NORMAL / FULL access"),
     ("/tree", "show the hierarchical project tree"),
-    ("/agents", "show active and recent agents"),
+    ("/agents", "open the read-only live specialist observer"),
+    ("/agent", "view one specialist's assignment and redacted prompt"),
     ("/memory", "inspect the Project Brain"),
     ("/trace", "inspect redacted prompts and run trace"),
     ("/thinking", "expand redacted thoughts captured in this session"),
@@ -128,7 +129,7 @@ COMMAND_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "Inspect",
         "Open status, activity, agents, memory, traces, and metrics",
         (
-            "/status", "/history", "/tree", "/agents", "/memory", "/trace", "/thinking",
+            "/status", "/history", "/tree", "/agents", "/agent", "/memory", "/trace", "/thinking",
             "/insights", "/questions", "/answer", "/metrics", "/doctor", "/skills", "/processes",
         ),
     ),
@@ -151,7 +152,7 @@ _CONTEXT_COMMANDS: dict[str, tuple[str, ...]] = {
     "discovering": ("/status", "/pause", "/model", "/thinking"),
     "revising": ("/status", "/pause", "/plan", "/thinking"),
     "awaiting_plan_approval": ("/approve", "/reject", "/plan", "/questions"),
-    "running": ("/status", "/pause", "/thinking", "/tree"),
+    "running": ("/status", "/agents", "/pause", "/thinking", "/tree"),
     "paused": ("/resume", "/status", "/resolve", "/trace"),
     "recovering": ("/resolve", "/status", "/trace", "/help"),
     "reviewing": ("/status", "/agents", "/trace", "/pause"),
@@ -512,7 +513,7 @@ def render_tree(nodes: Iterable[Any], *, root_id: str | None = None) -> str:
     return "\n".join(lines)
 
 
-def render_agents(
+def _render_agents_legacy(
     runs: Iterable[Any],
     *,
     include_finished: bool = False,
@@ -542,6 +543,205 @@ def render_agents(
         model = get("model", "-")
         node_label = (node_titles or {}).get(str(node), str(node))
         lines.append(f"  [{role}] {status} · {phase} · {node_label} · {model}")
+    return "\n".join(lines)
+
+
+def render_agents(
+    runs: Iterable[Any],
+    *,
+    include_finished: bool = False,
+    node_titles: Mapping[str, str] | None = None,
+    nodes: Iterable[Any] = (),
+    run_id: str | None = None,
+) -> str:
+    """Render a lightweight, stable, read-only view of the live swarm."""
+
+    all_runs = list(runs)
+    node_values = list(nodes)
+
+    def field(item: Any, name: str, default: Any = "") -> Any:
+        if isinstance(item, Mapping):
+            value = item.get(name, default)
+        else:
+            value = getattr(item, name, default)
+        return getattr(value, "value", value)
+
+    def status_of(item: Any) -> str:
+        return str(field(item, "status", "")).lower()
+
+    if not node_values:
+        return _render_agents_legacy(
+            all_runs,
+            include_finished=include_finished,
+            node_titles=node_titles,
+        )
+
+    node_index = {
+        str(field(item, "id")): index for index, item in enumerate(node_values, 1)
+    }
+    counts: dict[str, int] = {}
+    for item in node_values:
+        state = status_of(item) or "pending"
+        counts[state] = counts.get(state, 0) + 1
+    count_text = " · ".join(
+        f"{key} {counts[key]}"
+        for key in (
+            "running",
+            "in_progress",
+            "revision_required",
+            "failed",
+            "blocked",
+            "completed",
+            "pending",
+        )
+        if counts.get(key)
+    )
+    count_text = " | ".join(count_text.split(" · "))
+    lines = [
+        "Swarm observer | READ ONLY",
+        f"  run {run_id or '-'} | specialists {len(node_values)}"
+        + (f" | {count_text}" if count_text else ""),
+    ]
+
+    active_runs = (
+        list(all_runs)
+        if include_finished
+        else [
+            item
+            for item in all_runs
+            if status_of(item)
+            in {"queued", "pending", "running", "rate_limited", "paused", "uncertain"}
+        ]
+    )
+    lines.append("Working now" if active_runs else "Working now\n  (none active)")
+    for item in active_runs:
+        status = field(item, "status", "")
+        role = field(item, "role", field(item, "phase", "worker"))
+        node = field(
+            item,
+            "work_node_id",
+            field(item, "node_id", field(item, "task_id", "-")),
+        )
+        phase = field(item, "phase", "-")
+        model = field(item, "model", "-")
+        node_label = (node_titles or {}).get(str(node), str(node))
+        index_label = (
+            f"{node_index[str(node)]:02d}"
+            if str(node) in node_index
+            else str(field(item, "id", "-"))[:8]
+        )
+        lines.append(
+            f"  [{index_label}] {node_label} | {role}/{phase} | {status} | {model}"
+        )
+
+    if include_finished:
+        latest_by_node: dict[str, Any] = {}
+        for item in all_runs:
+            node_id = str(field(item, "work_node_id", ""))
+            if node_id:
+                latest_by_node[node_id] = item
+        lines.append("Specialist topology")
+        for item in node_values:
+            node_id = str(field(item, "id"))
+            latest = latest_by_node.get(node_id)
+            state = status_of(latest) if latest is not None else status_of(item)
+            depth = max(0, int(field(item, "depth", 1)) - 1)
+            title = str(field(item, "title", node_id))
+            lines.append(
+                f"  {'  ' * depth}[{node_index[node_id]:02d}] "
+                f"{title} | {state or 'pending'}"
+            )
+    lines.extend(
+        (
+            "",
+            "View only: /agent NUMBER|NODE_ID|AGENT_ID",
+            "All specialists: /agents --all",
+        )
+    )
+    return "\n".join(lines)
+
+
+def render_agent_detail(
+    *,
+    node: Any | None,
+    agent_run: Any | None,
+    profile: Mapping[str, Any] | None = None,
+    trace: Any | None = None,
+    ancestry: Iterable[Any] = (),
+    display_index: int | None = None,
+) -> str:
+    """Render one specialist assignment without exposing hidden reasoning."""
+
+    def field(item: Any, name: str, default: Any = "") -> Any:
+        if item is None:
+            return default
+        if isinstance(item, Mapping):
+            value = item.get(name, default)
+        else:
+            value = getattr(item, name, default)
+        return getattr(value, "value", value)
+
+    node_id = str(field(node, "id", field(agent_run, "work_node_id", "-")))
+    title = str(field(node, "title", field(agent_run, "role", "Agent")))
+    path = " > ".join(
+        [str(field(item, "title", field(item, "id", ""))) for item in ancestry]
+        + [title]
+    )
+    status = field(agent_run, "status", field(node, "status", "pending"))
+    phase = field(agent_run, "phase", field(node, "phase", "-"))
+    role = field(agent_run, "role", field(node, "assigned_role", "specialist"))
+    lines = [
+        "Specialist view | READ ONLY",
+        f"  specialist  {display_index if display_index is not None else '-'} | {title}",
+        f"  node        {node_id}",
+        f"  agent run   {field(agent_run, 'id', '(not started)')}",
+        f"  state       {status} | {role}/{phase}",
+        f"  path        {path}",
+    ]
+    mission = str((profile or {}).get("mission") or field(node, "objective", "")).strip()
+    deliverable = str((profile or {}).get("deliverable") or "").strip()
+    interfaces = list((profile or {}).get("owned_interfaces") or ())
+    dependencies = list((profile or {}).get("dependencies") or field(node, "depends_on", ()))
+    contract = field(node, "contract", None)
+    if contract is not None:
+        interfaces = interfaces or list(field(contract, "owned_interfaces", ()))
+        dependencies = dependencies or list(field(contract, "depends_on", ()))
+    if mission:
+        lines.extend(("", "Mission", mission))
+    if deliverable:
+        lines.extend(("", "Deliverable", deliverable))
+    lines.extend(
+        (
+            "",
+            "Owned interfaces",
+            "\n".join(f"  - {value}" for value in interfaces)
+            if interfaces
+            else "  (none recorded)",
+            "",
+            "Dependencies",
+            "\n".join(f"  - {value}" for value in dependencies)
+            if dependencies
+            else "  (none)",
+        )
+    )
+    if trace is not None:
+        lines.extend(("", "Current redacted prompt", render_trace(trace)))
+    else:
+        lines.extend(
+            (
+                "",
+                "Current redacted prompt",
+                "  (model call not started, or this run predates live prompt snapshots)",
+                "  The mission and typed contract above remain the authoritative assignment.",
+            )
+        )
+    summary = str(field(agent_run, "error", "") or "").strip()
+    result = field(agent_run, "result", None)
+    if not summary and result is not None:
+        summary = str(field(result, "summary", "")).strip()
+    if summary:
+        lines.extend(("", "Latest activity", summary))
+    lines.append("\nNo controls are available in this view.")
     return "\n".join(lines)
 
 
@@ -793,7 +993,8 @@ Execution
   /pause / /resume           cooperatively stop or continue
   /history / /status         inspect durable execution state
   /tree [NODE]               inspect the ULTRA module/submodule/task hierarchy
-  /agents [--all]            inspect active or recent role-isolated agents
+  /agents [--all|AGENT]      read-only live swarm list/topology
+  /agent NUMBER|ID           inspect one specialist and its redacted prompt
   /memory [SECTION]          inspect/search Project Brain entries
   /trace [latest|RUN_ID]     show redacted prompts, context, and reasoning summaries
   /thinking                  expand redacted thoughts captured this session

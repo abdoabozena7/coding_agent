@@ -20,6 +20,7 @@ class QualityCategory(str, Enum):
     API = "api"
     BACKWARD_COMPATIBILITY = "backward_compatibility"
     PERFORMANCE = "performance"
+    VISUAL = "visual"
 
 
 class FindingSeverity(str, Enum):
@@ -66,6 +67,7 @@ PRINCIPLES: tuple[str, ...] = (
     "secrets", "permissions", "unsafe_apis", "dependency_security",
     "testability", "determinism", "coverage", "architecture_consistency",
     "api_consistency", "backward_compatibility",
+    "visual_quality",
 )
 
 

@@ -124,14 +124,14 @@ context → mini-plan → decompose → research → implement
 
 Dynamic child nodes inherit their parent's forbidden changes and write scope.
 New interfaces, dependencies, or out-of-scope paths stop at a new master-plan
-approval. SQLite schema v9 stores prompt completeness, intake briefs/questions,
+approval. SQLite schema v10 stores prompt completeness, intake briefs/questions,
 AST and graph metadata, the hierarchical specialist task graph, staged component
 files, materialized package revisions, interface contracts, package-consumption
 evidence, independent visual verdicts/pairwise comparisons, typed messages,
 versioned decisions and lessons, evaluation runs, redacted prompt traces, memory
 access, and fenced path/leader leases. Component specialists stage one real file
 at a time and publish a manifest; only FinalAssembler owns final output paths.
-`/tree`, `/agents`, `/memory`,
+`/tree`, `/agents`, `/agent`, `/memory`,
 `/trace`, `/insights`, and `/metrics` keep the default scrollback uncluttered.
 
 `/permissions full` is fail-closed: it works only after `/setup` builds the
@@ -205,7 +205,8 @@ opens the redacted, session-only blocks again. Use `/trace`, `/history`, or
 | `/skills` | Show the real local tool registry, availability, risk, and approval policy |
 | `/processes`, `/stop-process ID` | Inspect or stop agent-owned processes and HTML previews |
 | `/sleep on\|off\|status` | Control the session-scoped Sleep profile; requires Ultra and ready Full Docker access |
-| `/tree [NODE]`, `/agents [--all]` | Inspect hierarchical work and isolated agent runs |
+| `/tree [NODE]`, `/agents [--all\|AGENT]` | Open the lightweight read-only live swarm topology |
+| `/agent NUMBER\|NODE_ID\|AGENT_ID` | Switch to one specialist's mission, interfaces, activity, and redacted live prompt |
 | `/memory [SECTION]`, `/trace [latest\|RUN_ID]` | Inspect Project Brain and redacted prompts/context/summaries |
 | `/thinking` | Expand redacted provider thoughts captured during this session |
 | `/insights [NODE]`, `/metrics` | Inspect durable findings and execution metrics |

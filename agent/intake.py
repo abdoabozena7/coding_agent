@@ -662,7 +662,7 @@ class IntentArchitect:
             success_criteria.extend(
                 (
                     "The game is playable with zero browser console or WebGL runtime errors",
-                    "Overall quality is at least 0.95 and every critical visual category is at least 0.85",
+                    "Overall quality is at least 0.95 and every critical visual category is at least 0.90",
                 )
             )
         brief = ExecutionBriefV1(

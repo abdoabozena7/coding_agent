@@ -11,6 +11,7 @@ from datetime import timedelta
 import json
 from typing import Any, Mapping
 
+from .durable_memory import NextActionPacketV1
 from .models import DomainError, utc_now
 from .store import StateStore
 from .ultra_models import (
@@ -358,24 +359,63 @@ class ProjectBrain:
         )
         for memory in (*project_lessons, *project_knowledge):
             self.store.record_project_memory_use(str(memory["id"]))
+        previous_snapshot = self.store.latest_agent_memory_snapshot(
+            self.ultra_run_id,
+            work_node_id=node.id,
+            role=role,
+        )
+        next_action = NextActionPacketV1(
+            ultra_run_id=self.ultra_run_id,
+            work_node_id=node.id,
+            role=role,
+            phase=node.checkpoint or node.assigned_role or "execute",
+            objective=node.objective[:3_000],
+            contract={
+                "success_criteria": list(node.contract.success_criteria),
+                "write_paths": list(node.contract.write_paths),
+                "read_paths": list(node.contract.read_paths),
+                "forbidden_changes": list(node.contract.forbidden_changes),
+                "interfaces": dict(node.contract.interfaces),
+            },
+            checkpoint={
+                "node_status": node.status.value,
+                "checkpoint": node.checkpoint,
+                "attempts": node.attempts,
+                "previous_memory_revision": (
+                    previous_snapshot.revision if previous_snapshot else 0
+                ),
+            },
+            dependency_evidence=tuple(
+                {
+                    "id": item.id,
+                    "kind": item.kind,
+                    "path": item.path,
+                    "content_hash": item.content_hash,
+                }
+                for item in dependency_artifacts[:12]
+            ),
+            relevant_memory=tuple(
+                {
+                    **self._project_memory_payload(item),
+                    "content": str(item.get("content", ""))[:600],
+                    "evidence_refs": list(item.get("evidence_refs", ()))[:4],
+                }
+                for item in (*project_lessons[:4], *project_knowledge[:4])
+            ),
+            required_outputs=tuple(node.contract.success_criteria),
+            context_budget_chars=max(2_000, min(budget_chars, 120_000)),
+        )
         candidates: list[tuple[str, Any, tuple[BrainEntry, ...]]] = [
+            ("next_action_packet", next_action.to_dict(), ()),
             ("task", self._node_payload(node), ()),
-            ("ancestor_contracts", [self._node_payload(item) for item in ancestors], ()),
-            ("architecture", [self._entry_payload(item) for item in architecture], architecture),
-            ("decisions", [self._entry_payload(item) for item in decisions], decisions),
-            ("constraints", [self._entry_payload(item) for item in constraints], constraints),
             (
                 "dependency_artifacts",
                 [self._artifact_payload(item) for item in dependency_artifacts],
                 (),
             ),
-            ("related_artifacts", [self._artifact_payload(item) for item in related_artifacts], ()),
-            ("role_memory", [self._entry_payload(item) for item in role_memory], role_memory),
-            ("knowledge", [self._entry_payload(item) for item in knowledge], knowledge),
-            ("lessons", [self._entry_payload(item) for item in lessons], lessons),
             (
-                "project_knowledge",
-                [self._project_memory_payload(item) for item in project_knowledge],
+                "previous_agent_memory",
+                previous_snapshot.to_dict() if previous_snapshot else {},
                 (),
             ),
             (
@@ -383,6 +423,19 @@ class ProjectBrain:
                 [self._project_memory_payload(item) for item in project_lessons],
                 (),
             ),
+            (
+                "project_knowledge",
+                [self._project_memory_payload(item) for item in project_knowledge],
+                (),
+            ),
+            ("role_memory", [self._entry_payload(item) for item in role_memory], role_memory),
+            ("knowledge", [self._entry_payload(item) for item in knowledge], knowledge),
+            ("lessons", [self._entry_payload(item) for item in lessons], lessons),
+            ("architecture", [self._entry_payload(item) for item in architecture], architecture),
+            ("constraints", [self._entry_payload(item) for item in constraints], constraints),
+            ("decisions", [self._entry_payload(item) for item in decisions], decisions),
+            ("ancestor_contracts", [self._node_payload(item) for item in ancestors], ()),
+            ("related_artifacts", [self._artifact_payload(item) for item in related_artifacts], ()),
         ]
         sections: dict[str, Any] = {}
         omitted: list[str] = []
