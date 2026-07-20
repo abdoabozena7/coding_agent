@@ -14,3 +14,15 @@ venv/
 .coding-agent/
 **/run-artifacts/.ultra-staging/
 run-artifacts/*.log
+
+# Local browser automation state and disposable captures
+.playwright-cli/
+output/playwright/
+
+# Per-run diagnostics (published evidence already tracked stays tracked)
+projects/*/run-artifacts/
+run-artifacts/*.err
+run-artifacts/*.out
+
+# One-off local state inspection helpers
+projects/*/check_state.py
