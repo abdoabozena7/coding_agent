@@ -16,15 +16,31 @@ from threading import Event, RLock, Thread
 from typing import Any, Iterable, Mapping, TextIO
 
 try:
+    from .action_policy import ApprovalRequirement, classify_action
     from .config import InteractionMode, runtime_setting_names
     from .events import UIEvent
     from .safety import redact_text
-    from .tui import inline_square_levels, terminal_supports_unicode
+    from .tui import ChoiceItem, select_horizontal_action, terminal_supports_unicode
+    from .ui_state import (
+        ApprovalDecision,
+        AttentionKind,
+        AttentionOption,
+        AttentionRequest,
+        WorkspaceUIStore,
+    )
 except ImportError:  # direct ``python agent/main.py`` compatibility
+    from action_policy import ApprovalRequirement, classify_action  # type: ignore
     from config import InteractionMode, runtime_setting_names  # type: ignore
     from events import UIEvent  # type: ignore
     from safety import redact_text  # type: ignore
-    from tui import inline_square_levels, terminal_supports_unicode  # type: ignore
+    from tui import ChoiceItem, select_horizontal_action, terminal_supports_unicode  # type: ignore
+    from ui_state import (  # type: ignore
+        ApprovalDecision,
+        AttentionKind,
+        AttentionOption,
+        AttentionRequest,
+        WorkspaceUIStore,
+    )
 
 try:  # Optional at import time; basic input and the bare-/ menu remain available.
     from prompt_toolkit import ANSI, PromptSession
@@ -48,6 +64,14 @@ BRAND_ART = (
 BRAND_WIDTH = max(len(line) for line in BRAND_ART)
 BRAND_SUBTITLE = "coding agent"
 LONG_PROMPT_RECEIPT_CHARS = 2_000
+
+
+class ApprovalPromptRequested(Exception):
+    """Internal wake-up: the main UI thread must present a pending approval."""
+
+
+class WorkspaceRefreshRequested(Exception):
+    """Internal wake-up: background state changed while the composer was open."""
 
 CODEX_SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/model", "choose what model and reasoning effort to use"),
@@ -429,6 +453,106 @@ def render_slash_menu() -> str:
     return "\n".join(lines)
 
 
+def _status_action(status: str, waiting: bool) -> str:
+    normalized = str(status).strip().lower()
+    if waiting:
+        return "Choose an answer to continue"
+    return {
+        "idle": "Describe what you want to build",
+        "new": "Describe what you want to build",
+        "discovering": "Workspace discovery is running",
+        "revising": "The plan is being revised",
+        "awaiting_plan_approval": "Review the plan, then approve or request changes",
+        "running": "Work is running; type guidance to queue it",
+        "paused": "Resume when you are ready",
+        "reviewing": "Reviewing the completed work",
+        "verifying": "Running verification",
+        "completed": "Review the outcome or start a new goal",
+        "blocked": "Open status details and resolve the blocker",
+    }.get(normalized, "Press Ctrl+K for available actions")
+
+
+def render_workspace(
+    view: DashboardView,
+    *,
+    access_level: str = "normal",
+    execution_class: str = "local",
+    active_agents: int = 0,
+    width: int | None = None,
+) -> str:
+    """Render the calm, cardless workspace shown after the welcome screen."""
+
+    completed = sum(task.status in {"done", "skipped"} for task in view.tasks)
+    width = max(44, min(width or shutil.get_terminal_size((112, 30)).columns, 160))
+
+    objective = str(view.objective or "").strip()
+    if objective.casefold().startswith("prompt:"):
+        objective = objective.partition(":")[2].lstrip()
+    status_label = str(view.status or "idle").replace("_", " ").upper()
+    header = _fit(
+        f"GA3BAD CODING AGENT  MODE {view.interaction_mode.upper()} / STATUS {status_label}",
+        max(18, width - len(f"{view.provider}/{view.model}") - 2),
+    ).rstrip()
+    model = f"{view.provider}/{view.model}"
+    header = _fit(header + " " * max(1, width - len(header) - len(model)) + model, width).rstrip()
+    rule = "-" * width
+    progress = f"{completed}/{len(view.tasks)} tasks" if view.tasks else "No checklist yet"
+    context = (
+        f"plan r{view.plan_revision}  |  {progress}  |  "
+        f"{access_level.upper()} {execution_class.upper()}  |  agents {active_agents}"
+    )
+
+    if width < 96:
+        lines = [
+            header,
+            rule,
+            _fit(view.workspace, width).rstrip(),
+            "",
+            "GOAL",
+            *_wrap(objective, width, max_lines=3),
+            "",
+            "NOW",
+            _fit(context, width).rstrip(),
+        ]
+        if view.waiting_question:
+            lines.extend(("", "INPUT NEEDED", *_wrap(view.waiting_question, width, max_lines=2)))
+        activity = view.activity[-2:]
+        if activity:
+            lines.extend(("", "RECENT", *(_fit(item, width).rstrip() for item in activity)))
+        lines.extend(("", _fit("> " + _status_action(view.status, bool(view.waiting_question)), width).rstrip()))
+        return "\n".join(lines)
+
+    divider = "  |  "
+    left_width = max(48, int(width * 0.64))
+    right_width = width - left_width - len(divider)
+    left = ["GOAL", *_wrap(objective, left_width, max_lines=3), "", "NOW"]
+    state_line = f"{status_label.title()}  -  {progress}"
+    left.append(_fit(state_line, left_width).rstrip())
+    if view.waiting_question:
+        left.extend(("", "INPUT NEEDED", *_wrap(view.waiting_question, left_width, max_lines=2)))
+    if view.activity:
+        left.extend(("", "RECENT"))
+        left.extend(_fit(item, left_width).rstrip() for item in view.activity[-3:])
+    right = [
+        "CONTEXT",
+        _fit(view.workspace, right_width).rstrip(),
+        "",
+        f"Plan       r{view.plan_revision}",
+        f"Progress   {progress}",
+        f"Access     {access_level.upper()} / {execution_class.upper()}",
+        f"Agents     {active_agents}",
+    ]
+    rows = max(len(left), len(right))
+    body = [
+        _fit(left[index] if index < len(left) else "", left_width)
+        + divider
+        + _fit(right[index] if index < len(right) else "", right_width).rstrip()
+        for index in range(rows)
+    ]
+    action = _fit("> " + _status_action(view.status, bool(view.waiting_question)), width).rstrip()
+    return "\n".join((header, rule, *body, "", rule, action))
+
+
 def render_status(
     view: DashboardView,
     *,
@@ -436,32 +560,14 @@ def render_status(
     execution_class: str = "local",
     active_agents: int = 0,
 ) -> str:
-    """Render a sparse Codex-like status summary without dashboard boxes."""
+    """Backward-compatible name for the post-landing workspace renderer."""
 
-    completed = sum(task.status in {"done", "skipped"} for task in view.tasks)
-    width = max(32, min(shutil.get_terminal_size((112, 30)).columns, 140))
-
-    def row(label: str, value: Any) -> str:
-        prefix = f"{label:<10}"
-        return prefix + _fit(value, max(1, width - len(prefix))).rstrip()
-
-    objective = str(view.objective or "").strip()
-    if objective.casefold().startswith("prompt:"):
-        objective = objective.partition(":")[2].lstrip()
-
-    lines = [
-        _fit(
-            f"GA3BAD CODING AGENT · MODE {view.interaction_mode.upper()} · STATUS {view.status.upper()} · {view.provider}/{view.model}",
-            width,
-        ).rstrip(),
-        row("workspace", view.workspace),
-        row("access", f"{access_level.upper()} · {execution_class.upper()} · agents {active_agents}"),
-        row("goal", objective),
-        row("progress", f"{completed}/{len(view.tasks)} · plan r{view.plan_revision}"),
-    ]
-    if view.waiting_question:
-        lines.append(row("input", view.waiting_question))
-    return "\n".join(lines)
+    return render_workspace(
+        view,
+        access_level=access_level,
+        execution_class=execution_class,
+        active_agents=active_agents,
+    )
 
 
 def render_tree(nodes: Iterable[Any], *, root_id: str | None = None) -> str:
@@ -874,7 +980,7 @@ def render_dashboard(view: DashboardView, width: int | None = None) -> str:
     return "\n".join(lines)
 
 
-def render_plan(view: DashboardView, width: int | None = None) -> str:
+def _render_plan_legacy(view: DashboardView, width: int | None = None) -> str:
     """Render the complete checklist (the dashboard intentionally shows a viewport)."""
     terminal_width = shutil.get_terminal_size((112, 30)).columns
     width = max(4, min(width or terminal_width, 140))
@@ -957,6 +1063,96 @@ def render_plan(view: DashboardView, width: int | None = None) -> str:
         render_tasks(view.tasks)
     lines.append("+" + "-" * inner + "+")
     return "\n".join(lines)
+
+
+def render_plan(view: DashboardView, width: int | None = None) -> str:
+    """Render a readable, cardless plan document for review and inspection."""
+
+    terminal_width = shutil.get_terminal_size((112, 30)).columns
+    width = max(44, min(width or terminal_width, 132))
+    execution_started = view.approved_revision is not None or view.status.lower() in {
+        "running", "paused", "reviewing", "verifying", "completed",
+    }
+    approval = (
+        f"approved r{view.approved_revision}"
+        if view.approved_revision is not None
+        else "approval needed"
+    )
+    lines = [
+        (
+            f"EXECUTION PLAN r{view.plan_revision}"
+            if execution_started
+            else f"PLAN REVIEW r{view.plan_revision}"
+        )
+        + f"  /  {str(view.status).replace('_', ' ').upper()}",
+        f"{approval}  /  fingerprint {view.plan_fingerprint[:12] or '-'}",
+        "-" * width,
+        "",
+        "GOAL",
+        *_wrap(view.objective, width, max_lines=5),
+    ]
+    if view.plan_summary:
+        lines.extend(("", "SUMMARY", *_wrap(view.plan_summary, width, max_lines=12)))
+    if view.execution_strategy:
+        lines.extend(("", "EXECUTION STRATEGY", *_wrap(view.execution_strategy, width, max_lines=12)))
+    if view.expected_changes and not execution_started:
+        lines.extend(("", "EXPECTED WORKSPACE CHANGES"))
+        for item in view.expected_changes:
+            path = str(item.get("path") or "-")
+            lines.append(f"  {path}")
+            lines.extend(
+                f"    {line}" for line in _wrap(item.get("intent", ""), max(20, width - 4), max_lines=5)
+            )
+    if view.plan_applicability and not execution_started:
+        lines.extend(("", "APPLICABILITY EVIDENCE"))
+        for item in view.plan_applicability:
+            lines.extend(
+                f"  - {line}" for line in _wrap(item.get("fact", ""), max(20, width - 4), max_lines=4)
+            )
+    lines.extend(("", f"TASKS  {len(view.tasks)}"))
+    if not view.tasks:
+        lines.append("  No checklist items.")
+
+    def render_tasks(tasks: Iterable[TaskView]) -> None:
+        for task in tasks:
+            dependencies = ",".join(task.depends_on) if task.depends_on else "-"
+            title_width = max(20, width - len(task.id) - 8)
+            title_lines = _wrap(task.title, title_width, max_lines=4)
+            lines.append(f"  {_task_mark(task.status)} {task.id}  {title_lines[0]}")
+            lines.extend(f"             {line}" for line in title_lines[1:])
+            lines.append(
+                f"             {task.status.replace('_', ' ')}  /  "
+                f"risk={task.risk}  /  depends_on={dependencies}"
+            )
+            for criterion in task.acceptance_criteria:
+                wrapped = _wrap(criterion, max(20, width - 15), max_lines=6)
+                lines.append(f"             Done when: {wrapped[0]}")
+                lines.extend(f"                        {line}" for line in wrapped[1:])
+            for check in task.verification:
+                wrapped = _wrap(check, max(20, width - 15), max_lines=6)
+                lines.append(f"             Verify:    {wrapped[0]}")
+                lines.extend(f"                        {line}" for line in wrapped[1:])
+            lines.append("")
+
+    if execution_started:
+        groups = (
+            ("IN USE", [task for task in view.tasks if task.status in {"pending", "in_progress", "blocked", "uncertain"}]),
+            ("COMPLETED", [task for task in view.tasks if task.status == "done"]),
+            ("NOT USED", [task for task in view.tasks if task.status == "skipped"]),
+        )
+        for label, tasks in groups:
+            if tasks:
+                lines.append(f"{label} ({len(tasks)})")
+                render_tasks(tasks)
+    else:
+        render_tasks(view.tasks)
+    lines.append("-" * width)
+    lines.append(
+        "A Approve  /  R Request changes  /  E Edit tasks  /  Esc Back"
+        if not execution_started
+        else "Use /status for the live workspace or /diff for current changes"
+    )
+    return "\n".join(lines).rstrip()
 
 
 HELP_TEXT = """\
@@ -1465,10 +1661,18 @@ class ConsoleUI:
         self._lock = RLock()
         self._event_lock = RLock()
         self._approval_lock = RLock()
+        self._approval_state_lock = RLock()
+        self._approval_done = Event()
+        self._pending_approval: dict[str, Any] | None = None
+        self._approval_result = False
+        self._approval_error: BaseException | None = None
+        self._workspace_store: WorkspaceUIStore | None = None
+        self._session_approval_groups: set[str] = set()
         self._stream_kind: str | None = None
         self._prompt_session: Any = None
         self._composer_active = False
         self._background_working = False
+        self._prompt_refresh_requested = False
         self._pasted_content: dict[str, str] = {}
         self._prompt_bindings: Any = None
         self._prompt_default = ""
@@ -1543,6 +1747,94 @@ class ConsoleUI:
         """Keep the composer available without tearing down live worker chrome."""
         self._background_working = bool(active)
 
+    def bind_workspace_store(self, store: WorkspaceUIStore | None) -> None:
+        """Route all interactive worker output through the persistent UI store."""
+
+        self._workspace_store = store
+        if store is not None:
+            store.update_identity(
+                workspace=self.workspace_label,
+                model=self.active_model,
+                status=self._current_status,
+            )
+
+    def _modal_available(self) -> bool:
+        # prompt_toolkit's patch_stdout() temporarily replaces sys.stdout while
+        # the composer is open.  The ConsoleUI stream still points at the real
+        # terminal, so identity with the current sys.stdout is not meaningful
+        # here (and made worker-requested approvals fall back to raw [y/N]).
+        return bool(
+            not self.plain
+            and PromptSession is not None
+            and self.input_func is input
+            and _isatty(sys.stdin)
+            and _isatty(self.stream)
+        )
+
+    def _interrupt_composer(self) -> None:
+        session = self._prompt_session
+        application = getattr(session, "app", None) if session is not None else None
+        loop = getattr(application, "loop", None)
+        if not self._composer_active or application is None or loop is None:
+            return
+
+        def exit_prompt() -> None:
+            try:
+                if application.is_running:
+                    application.exit(result="")
+            except Exception:
+                return
+
+        try:
+            loop.call_soon_threadsafe(exit_prompt)
+        except (AttributeError, RuntimeError):
+            return
+
+    def wake_prompt(self) -> None:
+        """Wake the main loop when background state reaches a new checkpoint."""
+
+        with self._event_lock:
+            self._prompt_refresh_requested = True
+        self._interrupt_composer()
+
+    def has_pending_approval(self) -> bool:
+        with self._approval_state_lock:
+            return self._pending_approval is not None
+
+    def resolve_pending_approval(self) -> bool:
+        """Present one worker-requested approval on the main input thread."""
+
+        with self._approval_state_lock:
+            request = dict(self._pending_approval or {})
+        if not request:
+            return False
+        allowed = False
+        error: BaseException | None = None
+        try:
+            allowed = self._select_approval(request)
+            return allowed
+        except BaseException as exc:
+            error = exc
+            self.write(f"Approval screen error: {exc}")
+            return False
+        finally:
+            with self._approval_state_lock:
+                self._approval_result = allowed
+                self._approval_error = error
+                self._pending_approval = None
+                self._approval_done.set()
+
+    def _consume_prompt_interrupt(self) -> None:
+        """Raise a private signal when the composer must yield to workspace UI."""
+
+        if self.has_pending_approval():
+            raise ApprovalPromptRequested
+        with self._event_lock:
+            refresh = self._prompt_refresh_requested
+            self._prompt_refresh_requested = False
+        if refresh:
+            raise WorkspaceRefreshRequested
+
     def set_vim_mode(self, enabled: bool | None = None) -> bool:
         self.vim_mode = (not self.vim_mode) if enabled is None else bool(enabled)
         self._prompt_session = None
@@ -1567,6 +1859,12 @@ class ConsoleUI:
             self.reasoning_effort = str(reasoning_effort)
         if workspace is not None:
             self.workspace_label = str(workspace)
+        if self._workspace_store is not None:
+            self._workspace_store.update_identity(
+                workspace=self.workspace_label,
+                model=self.active_model,
+                status=self._current_status,
+            )
 
     def thought_blocks(self) -> tuple[dict[str, Any], ...]:
         """Return redacted, session-only thought blocks for the inspector."""
@@ -1602,9 +1900,6 @@ class ConsoleUI:
         assert self._active_thought is not None
         combined = str(self._active_thought.get("text", "")) + str(fragment)
         self._active_thought["text"] = combined[-40_000:]
-        actual_label = _actual_activity_label(combined)
-        if actual_label:
-            self._live_activity.update_label(actual_label)
 
     def _finish_thought(self) -> None:
         block = self._active_thought
@@ -1626,25 +1921,36 @@ class ConsoleUI:
         }
         self._thought_blocks.append(finished)
         del self._thought_blocks[:-50]
-        visible_lines = _visible_thought_lines(text)
-        summary = visible_lines[-1] if visible_lines else _actual_activity_label(text)
-        if not summary:
-            summary = (
-                f"{str(finished.get('actor', 'agent')).replace('_', ' ').title()} "
-                f"step {finished.get('step', '?')}"
-            )
+        actor_label = str(finished.get("actor", "agent")).replace("_", " ").title()
+        summary = f"{actor_label} step {finished.get('step', '?')} complete"
         if ultra_live:
             self._live_activity.update_label(summary)
             return
-        for line in visible_lines:
-            self._live_line(">", line, self.thought_done)
         self._live_line(
             self._icon("◇", "[~]"),
-            f"{summary} · {duration}s · collapsed",
+            f"{summary} · {duration}s · details in /thinking",
             self.thought_done,
         )
 
     def write(self, text: str = "", *, end: str = "\n", flush: bool = True) -> None:
+        if self._workspace_store is not None:
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", str(text or "")).strip()
+            if clean:
+                self._workspace_store.append_log(clean)
+                lower = clean.casefold()
+                technical = (
+                    "\n" in clean
+                    or lower.startswith((
+                        "error:", "fatal:", "normal mode:", "ultra", "permissions =",
+                        "goal.", "plan.", "coordinator", "saved ", "ready ·",
+                    ))
+                    or "details in /thinking" in lower
+                    or "fingerprint" in lower
+                )
+                self._workspace_store.append_transcript(
+                    "assistant", clean, technical=technical
+                )
+            return
         self._finish_thought()
         self._live_activity.stop()
         self._last_activity_key = None
@@ -1693,11 +1999,61 @@ class ConsoleUI:
         view.interaction_mode = self.interaction_mode.value
         self.write(render_dashboard(view))
 
+    def _style_workspace(self, rendered: str) -> str:
+        if not self.color:
+            return rendered
+        accent = self.gold if self.interaction_mode is InteractionMode.ULTRA else self.green
+        styled: list[str] = []
+        for index, line in enumerate(rendered.splitlines()):
+            stripped = line.strip()
+            if index == 0:
+                styled.append(f"{self.bold}{accent}{line}{self.reset}")
+            elif stripped and set(stripped) == {"-"}:
+                styled.append(f"{self.dim}{line}{self.reset}")
+            elif line.startswith("> "):
+                styled.append(f"{self.bold}{accent}{line}{self.reset}")
+            elif stripped in {"GOAL", "NOW", "CONTEXT", "RECENT", "INPUT NEEDED"}:
+                styled.append(f"{self.bold}{line}{self.reset}")
+            else:
+                styled.append(line)
+        return "\n".join(styled)
+
     def show_status(self, view: DashboardView, *, force: bool = False) -> None:
         self._current_status = str(view.status or "idle")
         view.activity = view.activity or self.activity[-4:]
         view.interaction_mode = self.interaction_mode.value
         completed = sum(task.status in {"done", "skipped"} for task in view.tasks)
+        if self._workspace_store is not None:
+            status = self._current_status.casefold()
+            if status in {"idle", "new"}:
+                stage, summary, running = "idle", "Ready", False
+            elif status in {"discovering"}:
+                stage, summary, running = "understanding", "Understanding your request", True
+            elif status in {"revising", "awaiting_plan_approval"}:
+                stage = "paused" if status == "awaiting_plan_approval" else "planning"
+                summary = "Review the plan" if status == "awaiting_plan_approval" else "Preparing the plan"
+                running = status != "awaiting_plan_approval"
+            elif status in {"reviewing", "verifying"}:
+                stage, summary, running = "checking", "Checking the result", True
+            elif status in {"completed", "complete", "done"}:
+                stage, summary, running = "done", "Done", False
+            elif status in {"paused", "recovering"}:
+                stage, summary, running = "paused", "Waiting safely", False
+            else:
+                stage, summary, running = "building", "Working on the project", True
+            self._workspace_store.update_identity(
+                workspace=self.workspace_label,
+                model=self.active_model,
+                status=self._current_status,
+            )
+            self._workspace_store.set_activity(
+                stage,
+                summary,
+                completed=completed,
+                total=len(view.tasks),
+                running=running,
+            )
+            return
         signature = (
             view.status,
             view.plan_revision,
@@ -1709,26 +2065,31 @@ class ConsoleUI:
             self.execution_class,
             self.active_agents,
         )
-        if self.live_activity_enabled and not force and self._last_status_signature is not None:
-            if signature == self._last_status_signature:
+        if self.live_activity_enabled and self._last_status_signature is not None:
+            if not force and signature == self._last_status_signature:
                 return
             self._last_status_signature = signature
-            if self._last_event_kind in {"plan", "error", "warning", "checkpoint", "questions"}:
-                return
-            summary = (
-                f"{str(view.status).replace('_', ' ').title()} · "
-                f"{completed}/{len(view.tasks)} tasks · plan r{view.plan_revision}"
-            )
-            self._live_line(self._icon("◇", "[>]"), summary, self.cyan)
-            return
-        self._last_status_signature = signature
-        self.write(
-            render_status(
+            self._finish_thought()
+            self._live_activity.stop()
+            rendered = render_status(
                 view,
                 access_level=self.access_level,
                 execution_class=self.execution_class,
                 active_agents=self.active_agents,
             )
+            rendered = self._style_workspace(rendered)
+            with self._lock:
+                print("\033[2J\033[H", end="", file=self.stream)
+                print(rendered, file=self.stream, flush=True)
+            return
+        self._last_status_signature = signature
+        self.write(
+            self._style_workspace(render_status(
+                view,
+                access_level=self.access_level,
+                execution_class=self.execution_class,
+                active_agents=self.active_agents,
+            ))
         )
 
     def show_brand(self) -> None:
@@ -2095,6 +2456,10 @@ class ConsoleUI:
             self._live_line(self._icon("◇", "[>]"), message, self.cyan)
 
     def on_event(self, event: UIEvent) -> None:
+        if self._workspace_store is not None:
+            self._last_event_kind = event.kind
+            self._workspace_store.handle_event(event.kind, event.message, event.data)
+            return
         with self._event_lock:
             if self._full_screen_depth:
                 self._buffered_events.append(event)
@@ -2187,7 +2552,143 @@ class ConsoleUI:
 
     def confirm_action(self, name: str, args: dict, risk: str = "risky") -> bool:
         with self._approval_lock:
-            return self._confirm_action(name, args, risk)
+            decision = self.confirm_action_decision(name, args, risk)
+            if decision is ApprovalDecision.UI_ERROR:
+                raise RuntimeError("the approval interface could not collect a decision")
+            return decision.allowed
+
+    def confirm_action_decision(
+        self,
+        name: str,
+        args: dict,
+        risk: str = "risky",
+    ) -> ApprovalDecision:
+        """Return an explicit decision; UI failures and cancellation are not denials."""
+
+        with self._approval_lock:
+            return self._confirm_action_decision(name, args, risk)
+
+    def _confirm_action_decision(
+        self,
+        name: str,
+        args: dict,
+        risk: str = "risky",
+    ) -> ApprovalDecision:
+
+        if self._workspace_store is None:
+            return (
+                ApprovalDecision.ALLOW_ONCE
+                if self._confirm_action(name, args, risk)
+                else ApprovalDecision.DENY
+            )
+        policy = classify_action(
+            name,
+            args,
+            workspace=self.workspace_label or ".",
+            sandboxed=self.access_level == "full",
+        )
+        if policy.requirement is ApprovalRequirement.AUTO:
+            return ApprovalDecision.ALLOW_ONCE
+        if (
+            policy.requirement is ApprovalRequirement.SESSION
+            and policy.group in self._session_approval_groups
+        ):
+            return ApprovalDecision.ALLOW_SESSION
+
+        canonical = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
+        digest = hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()[:12]
+        options = [
+            AttentionOption(
+                "allow_once", "Allow once", ApprovalDecision.ALLOW_ONCE.value,
+                shortcut="y", primary=True,
+            )
+        ]
+        if policy.requirement is ApprovalRequirement.SESSION:
+            options.append(
+                AttentionOption(
+                    "allow_session", "Allow this session",
+                    ApprovalDecision.ALLOW_SESSION.value, shortcut="s",
+                )
+            )
+        options.append(
+            AttentionOption(
+                "deny", "Deny", ApprovalDecision.DENY.value, shortcut="n"
+            )
+        )
+        request = AttentionRequest(
+            id=f"approval:{digest}:{time.monotonic_ns()}",
+            kind=AttentionKind.APPROVAL,
+            title=f"Allow {str(name).replace('_', ' ')}?",
+            message=f"{policy.reason}. Scope: {policy.scope}.",
+            options=tuple(options),
+            details=canonical,
+            source=policy.group,
+        )
+        try:
+            resolution = self._workspace_store.request_attention(request)
+            decision = ApprovalDecision(resolution.value)
+        except (RuntimeError, TimeoutError, ValueError):
+            return ApprovalDecision.UI_ERROR
+        if decision is ApprovalDecision.ALLOW_SESSION:
+            self._session_approval_groups.add(policy.group)
+        return decision
+
+    def _select_approval(self, request: Mapping[str, Any]) -> bool:
+        if self._modal_available():
+            selected = select_horizontal_action(
+                (
+                    ChoiceItem(
+                        key="no",
+                        label="[N] No",
+                        description="Deny this action and return to the safe checkpoint.",
+                        value=False,
+                    ),
+                    ChoiceItem(
+                        key="yes",
+                        label="[Y] Yes",
+                        description="Allow this exact action once.",
+                        value=True,
+                    ),
+                ),
+                title="Allow this action once?",
+                subtitle="Press Y/N directly, or use Left/Right then Enter. Nothing is chosen automatically.",
+                step_label=(
+                    f"Approval · {request.get('risk', 'risky')} · "
+                    f"{request.get('name', 'action')}"
+                ),
+                body=str(request.get("body") or ""),
+                initial_key="no",
+                shortcuts={"n": "no", "y": "yes"},
+                input_func=self.input_func,
+                output=sys.stdout,
+                no_color=not self.color,
+                force=True,
+                require_explicit_selection=True,
+                cancelable=False,
+            )
+            if selected is None:
+                raise RuntimeError(
+                    "the approval screen closed before an explicit Yes or No selection"
+                )
+            return selected.key == "yes"
+
+        self.write(
+            f"{self.yellow}APPROVAL [{request.get('risk', 'risky')}] "
+            f"{request.get('name', 'action')} action={request.get('digest', '-')}{self.reset}"
+        )
+        for line in str(request.get("pretty") or "").splitlines():
+            self.write(f"  {line}")
+        try:
+            answer = self.input_func(
+                f"{self.bold}Allow this action once? [y/N]{self.reset} "
+            ).strip().lower()
+        except EOFError:
+            self.write("Approval denied: no interactive confirmation was received.")
+            return False
+        except KeyboardInterrupt:
+            self.write("\nApproval interrupted; checkpointing active work.")
+            raise
+        return answer in {"y", "yes"}
 
     def _confirm_action(self, name: str, args: dict, risk: str = "risky") -> bool:
         canonical = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
@@ -2204,24 +2705,33 @@ class ConsoleUI:
                 )
             else:
                 preview[key] = value
-        self.write(f"{self.yellow}APPROVAL [{risk}] {name} action={digest}{self.reset}")
         pretty = json.dumps(preview, ensure_ascii=False, indent=2, default=str)
-        for line in pretty.splitlines():
-            self.write(f"  {line}")
-        try:
-            answer = self.input_func(
-                f"{self.bold}Allow this action once? [y/N]{self.reset} "
-            ).strip().lower()
-        except EOFError:
-            self.write("Approval denied: no interactive confirmation was received.")
-            return False
-        except KeyboardInterrupt:
-            self.write("\nApproval interrupted; checkpointing active work.")
-            raise
-        allowed = answer in {"y", "yes"}
-        return allowed
+        request = {
+            "name": name,
+            "risk": risk,
+            "digest": digest,
+            "pretty": pretty,
+            "body": (
+                f"ACTION\n{name}\n\nRISK\n{risk}\n\nREFERENCE\n{digest}"
+                f"\n\nDETAILS\n{pretty}"
+            ),
+        }
+        if self._background_working and self._modal_available():
+            with self._approval_state_lock:
+                self._approval_result = False
+                self._approval_error = None
+                self._pending_approval = request
+                self._approval_done.clear()
+            self._interrupt_composer()
+            self._approval_done.wait()
+            with self._approval_state_lock:
+                if self._approval_error is not None:
+                    raise RuntimeError(str(self._approval_error)) from self._approval_error
+                return bool(self._approval_result)
+        return self._select_approval(request)
 
     def prompt(self) -> str:
+        self._consume_prompt_interrupt()
         if not self._background_working:
             self._finish_thought()
             self._live_activity.stop()
@@ -2319,7 +2829,12 @@ class ConsoleUI:
             default = self._prompt_default
             self._prompt_default = ""
             rich_label = [("class:prompt", self._prompt_mark() + " ")]
-            placeholder = [("class:placeholder", "Use /skills to list available skills")]
+            placeholder_text = (
+                "Working — type guidance to queue it for the next safe checkpoint"
+                if self._background_working
+                else "Describe what to build, or press Ctrl+K for actions"
+            )
+            placeholder = [("class:placeholder", placeholder_text)]
             self._pasted_content = {}
             self._composer_active = True
             try:
@@ -2345,6 +2860,12 @@ class ConsoleUI:
                 self._composer_active = False
             for token, pasted in self._pasted_content.items():
                 value = value.replace(token, pasted)
+            try:
+                self._consume_prompt_interrupt()
+            except (ApprovalPromptRequested, WorkspaceRefreshRequested):
+                if value:
+                    self._prompt_default = value
+                raise
             receipt = prompt_receipt(value)
             with self._lock:
                 receipt_color = self.cyan if receipt != value else ""

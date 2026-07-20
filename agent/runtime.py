@@ -109,7 +109,7 @@ except ImportError:  # pragma: no cover - direct-script compatibility
     ExecutionClass = ModelDescriptor = AccessLevel = PermissionAdapter = Any  # type: ignore
 
 
-ApprovalCallback = Callable[[str, dict[str, Any], str], bool]
+ApprovalCallback = Callable[[str, dict[str, Any], str], Any]
 
 READ_ONLY_TOOLS = tools.names(categories={"read"})
 MUTATING_TOOLS = tools.names(mutating=True)
@@ -1075,6 +1075,21 @@ class AgentRuntime:
     def active_goal(self) -> Goal | None:
         return self.store.load_active_goal()
 
+    def _approval_allowed(self, name: str, args: dict[str, Any], risk: str) -> bool:
+        """Normalize legacy booleans and explicit interactive decisions."""
+
+        decision = self.approval(name, args, risk)
+        if isinstance(decision, bool):
+            return decision
+        value = str(getattr(decision, "value", decision)).strip().casefold()
+        if value in {"allow_once", "allow_session", "allow", "yes"}:
+            return True
+        if value == "ui_error":
+            raise RuntimeStateError(
+                "The approval interface closed without a decision; the action is still waiting."
+            )
+        return False
+
     def version_history(self, limit: int = 20) -> tuple[Any, ...]:
         return self.version_control.history(limit)
 
@@ -1091,7 +1106,7 @@ class AgentRuntime:
             raise VersionControlError(
                 f"Only {len(selected)} accepted checkpoint(s) can be undone."
             )
-        approved = self.approval(
+        approved = self._approval_allowed(
             "undo_accepted_checkpoints",
             {
                 "steps": steps,
@@ -3416,7 +3431,7 @@ class AgentRuntime:
             # still needs direct user intent/approval.
             needs_approval = True
         action_id: str | None = None
-        if needs_approval and not self.approval(call.name, copy.deepcopy(args), risk):
+        if needs_approval and not self._approval_allowed(call.name, copy.deepcopy(args), risk):
             action_id = self.store.begin_action(
                 goal.id,
                 call.name,
@@ -4740,12 +4755,36 @@ class AgentRuntime:
     def apply_command(self, command: UserCommand) -> Any:
         kind, args = command.kind, command.args
         if kind == CommandKind.ANSWER:
+            question_id = str(args.get("question_id") or "").strip()
             if self.store.get_pending_intake(self.session_id) is not None:
-                return self.answer_intake_question(args["question_id"], args["value"])
+                pending = self.intake_questions()
+                if not pending:
+                    raise RuntimeStateError("there is no active intake question")
+                return self.answer_intake_question(
+                    question_id or str(pending[0].get("id", "")),
+                    args["value"],
+                )
             goal = self.active_goal()
             if goal and goal.metadata.get("ultra_run_id"):
-                return self.answer_ultra_question(args["question_id"], args["value"])
-            return self.answer_plan_question(args["question_id"], args["value"])
+                questions = self.ultra_questions()
+                answers = dict(goal.metadata.get("plan_answers", {}))
+                pending = [
+                    item for item in questions
+                    if not str(answers.get(str(item.get("id")), "")).strip()
+                ]
+                if not question_id and not pending:
+                    raise RuntimeStateError("there is no active ULTRA question")
+                return self.answer_ultra_question(
+                    question_id or str(pending[0].get("id", "")),
+                    args["value"],
+                )
+            pending = self.plan_questions()
+            if not question_id:
+                pending = [item for item in pending if not str(item.get("answer") or "").strip()]
+                if not pending:
+                    raise RuntimeStateError("there is no active planning question")
+                question_id = str(pending[0].get("id", ""))
+            return self.answer_plan_question(question_id, args["value"])
         if kind == CommandKind.GOAL:
             mode = self.store.get_workflow_session(self.session_id)["session_mode"]
             return self.submit_intent(args["objective"], requested_mode=mode)
@@ -4787,6 +4826,26 @@ class AgentRuntime:
                     raise RuntimeStateError("intake is ready but has not been routed")
                 return self.answer_intake_question(str(pending[0]["id"]), text)
             goal, plan = self.active_goal(), self.latest_plan()
+            if goal is not None:
+                answers = dict(goal.metadata.get("plan_answers", {}))
+                questions = (
+                    self.ultra_questions()
+                    if goal.metadata.get("ultra_run_id")
+                    else self.plan_questions()
+                )
+                pending_questions = [
+                    item
+                    for item in questions
+                    if not str(item.get("answer") or "").strip()
+                    and not str(answers.get(str(item.get("id")), "")).strip()
+                ]
+                if pending_questions:
+                    question_id = str(pending_questions[0].get("id", ""))
+                    return (
+                        self.answer_ultra_question(question_id, text)
+                        if goal.metadata.get("ultra_run_id")
+                        else self.answer_plan_question(question_id, text)
+                    )
             if (
                 goal is not None
                 and plan is not None
@@ -4904,7 +4963,7 @@ class AgentRuntime:
             mutating=spec.mutates_workspace,
         )
         self.events.publish("tool_call", call.name, args=redact_data(args), actor="chat", id=call.id)
-        if needs_approval and not self.approval(call.name, dict(args), risk):
+        if needs_approval and not self._approval_allowed(call.name, dict(args), risk):
             result = tools.ToolExecutionResult(False, "Permission denied by the user.", error_code="permission")
             self.store.complete_session_action(action_id, result.output, status="denied")
             return result, ()

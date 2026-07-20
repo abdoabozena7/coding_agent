@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from threading import Event, Thread
 from types import SimpleNamespace
 from unittest import mock
 
@@ -21,7 +22,15 @@ from agent.commands import CommandKind, parse_command
 from agent.config import InteractionMode, RuntimeConfig, SessionPreferences
 from agent.models import GoalStatus
 from agent.store import StateStore
-from agent.ui import ConsoleUI, DashboardView
+from agent.ui import ConsoleUI, DashboardView, WorkspaceRefreshRequested
+from agent.ui_state import WorkspaceUIStore
+
+
+class _TTY(io.StringIO):
+    encoding = "utf-8"
+
+    def isatty(self) -> bool:
+        return True
 
 
 class CLITests(unittest.TestCase):
@@ -386,6 +395,111 @@ class CLITests(unittest.TestCase):
         console = ConsoleUI(stream=output, color=False, input_func=lambda _prompt: (_ for _ in ()).throw(EOFError()))
         self.assertFalse(console.confirm_action("write_file", {"path": "x"}, "high"))
         self.assertIn("Approval denied", output.getvalue())
+
+    def test_persistent_simple_policy_allows_project_edits_without_interrupting(self):
+        console = ConsoleUI(stream=io.StringIO(), color=False)
+        store = WorkspaceUIStore()
+        console.bind_workspace_store(store)
+        self.assertTrue(console.confirm_action("write_file", {"path": "app.py"}, "risky"))
+        self.assertIsNone(store.active_attention())
+
+    def test_persistent_project_checks_ask_once_per_session(self):
+        console = ConsoleUI(stream=io.StringIO(), color=False)
+        store = WorkspaceUIStore()
+        console.bind_workspace_store(store)
+        results: list[bool] = []
+        worker = Thread(
+            target=lambda: results.append(
+                console.confirm_action(
+                    "run_bash", {"command": "python -m pytest -q"}, "risky"
+                )
+            )
+        )
+        worker.start()
+        for _ in range(100):
+            if store.active_attention() is not None:
+                break
+            Event().wait(0.01)
+        self.assertIsNotNone(store.active_attention())
+        self.assertTrue(store.resolve_attention("allow_session"))
+        worker.join(1)
+        self.assertEqual(results, [True])
+        self.assertTrue(
+            console.confirm_action(
+                "run_bash", {"command": "python -m pytest tests/test_cli.py"}, "risky"
+            )
+        )
+        self.assertIsNone(store.active_attention())
+
+    def test_background_approval_is_handed_to_the_main_ui_thread(self):
+        console = ConsoleUI(stream=io.StringIO(), color=False)
+        console.set_background_working(True)
+        ready = Event()
+        result: list[bool] = []
+
+        with mock.patch.object(console, "_modal_available", return_value=True), mock.patch.object(
+            console, "_interrupt_composer", side_effect=ready.set
+        ), mock.patch.object(console, "_select_approval", return_value=True):
+            worker = Thread(
+                target=lambda: result.append(
+                    console.confirm_action("run_bash", {"command": "mkdir gui logic"}, "critical")
+                ),
+                daemon=True,
+            )
+            worker.start()
+            self.assertTrue(ready.wait(1.0))
+            self.assertTrue(console.has_pending_approval())
+            self.assertTrue(console.resolve_pending_approval())
+            worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [True])
+
+    def test_approval_screen_failure_is_not_reported_as_user_denial(self):
+        console = ConsoleUI(stream=io.StringIO(), color=False)
+        console.set_background_working(True)
+        ready = Event()
+        errors: list[BaseException] = []
+
+        def request_approval() -> None:
+            try:
+                console.confirm_action("run_bash", {"command": "test"}, "critical")
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(console, "_modal_available", return_value=True), mock.patch.object(
+            console, "_interrupt_composer", side_effect=ready.set
+        ), mock.patch.object(
+            console,
+            "_select_approval",
+            side_effect=RuntimeError("approval UI unavailable"),
+        ):
+            worker = Thread(target=request_approval, daemon=True)
+            worker.start()
+            self.assertTrue(ready.wait(1.0))
+            self.assertFalse(console.resolve_pending_approval())
+            worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIn("approval UI unavailable", str(errors[0]))
+        self.assertIn("Approval screen error", console.stream.getvalue())
+
+    def test_modal_approval_survives_prompt_toolkit_patching_stdout(self):
+        terminal = _TTY()
+        console = ConsoleUI(stream=terminal, color=False)
+
+        with mock.patch("agent.ui.sys.stdin", _TTY()), mock.patch(
+            "agent.ui.sys.stdout", io.StringIO()
+        ):
+            self.assertTrue(console._modal_available())
+
+    def test_background_checkpoint_wakes_the_composer(self):
+        console = ConsoleUI(stream=io.StringIO(), color=False, input_func=lambda _prompt: "")
+        console.wake_prompt()
+
+        with self.assertRaises(WorkspaceRefreshRequested):
+            console.prompt()
 
     def test_ctrl_c_at_approval_propagates_to_the_checkpoint_handler(self):
         output = io.StringIO()

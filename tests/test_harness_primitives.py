@@ -49,6 +49,18 @@ class CommandTests(unittest.TestCase):
         criteria = parse_command(":edit T002 accept First proof || Second proof")
         self.assertEqual(criteria.args["field"], "accept")
 
+    def test_answer_shortcuts_target_the_current_decision(self):
+        self.assertEqual(
+            parse_command("/answer 1").args,
+            {"question_id": "", "value": "1"},
+        )
+        self.assertEqual(
+            parse_command("/ans 2").args,
+            {"question_id": "", "value": "2"},
+        )
+        with self.assertRaisesRegex(CommandParseError, "Example: /answer q1 1"):
+            parse_command("/answer")
+
     def test_revision_and_slice_are_validated(self):
         self.assertEqual(parse_command(":approve 7").args["revision"], 7)
         self.assertEqual(parse_command(":run 3").args["steps"], 3)
@@ -377,14 +389,13 @@ class TerminalUITests(unittest.TestCase):
             console.on_event(UIEvent("usage", data={"input_tokens": 1, "output_tokens": 1}))
 
         start.assert_called_with("plan", "Planner · step 1")
-        update_label.assert_any_call("Inspect the empty workspace first.")
-        self.assertIn("Inspect the empty workspace first.", output.getvalue())
-        self.assertIn("collapsed", output.getvalue())
+        self.assertNotIn("Inspect the empty workspace first.", output.getvalue())
+        self.assertIn("details in /thinking", output.getvalue())
         self.assertNotIn("Response", output.getvalue())
         self.assertIn("Inspect the empty workspace first.", console.thought_blocks()[0]["text"])
         self.assertIn("list_files", console.thought_blocks()[0]["text"])
 
-    def test_visible_thinking_keeps_prose_rows_but_filters_code(self):
+    def test_default_surface_hides_reasoning_but_keeps_it_in_the_inspector(self):
         output = io.StringIO()
         console = ConsoleUI(stream=output, color=False, plain=True)
         console.on_event(UIEvent("step", data={"actor": "planner", "step": 1}))
@@ -392,9 +403,11 @@ class TerminalUITests(unittest.TestCase):
         console.on_event(UIEvent("usage"))
 
         rendered = output.getvalue()
-        self.assertIn("Inspect files", rendered)
-        self.assertIn("Compare results", rendered)
+        self.assertNotIn("Inspect files", rendered)
+        self.assertNotIn("Compare results", rendered)
         self.assertNotIn("print('hidden')", rendered)
+        self.assertIn("details in /thinking", rendered)
+        self.assertIn("Inspect files", console.thought_blocks()[0]["text"])
 
     def test_live_thinking_uses_codex_working_row(self):
         class TTY(io.StringIO):
@@ -884,8 +897,9 @@ class TerminalUITests(unittest.TestCase):
             active_agents=4,
         )
         self.assertNotIn("+---", rendered)
-        self.assertIn("MODE ULTRA · STATUS RUNNING", rendered)
-        self.assertIn("FULL · CLOUD · agents 4", rendered)
+        self.assertIn("MODE ULTRA / STATUS RUNNING", rendered)
+        self.assertIn("Access FULL / CLOUD", rendered)
+        self.assertIn("Agents 4", rendered)
 
         output = io.StringIO()
         console = ConsoleUI(stream=output, color=True, interaction_mode="ultra")
@@ -910,8 +924,32 @@ class TerminalUITests(unittest.TestCase):
             rendered = render_status(view)
 
         self.assertTrue(all(len(line) <= 64 for line in rendered.splitlines()))
-        self.assertEqual(sum(line.startswith("goal") for line in rendered.splitlines()), 1)
-        self.assertEqual(sum(line.startswith("input") for line in rendered.splitlines()), 1)
+        self.assertEqual(rendered.splitlines().count("GOAL"), 1)
+        self.assertEqual(rendered.splitlines().count("INPUT NEEDED"), 1)
+        self.assertIn("Choose an answer to continue", rendered)
+
+    def test_workspace_reflows_at_supported_terminal_widths(self):
+        view = DashboardView(
+            objective="Build a responsive terminal workspace with a clear planning flow",
+            status="running",
+            plan_revision=3,
+            workspace="D:/projects/demo",
+            tasks=[TaskView("T001", "Build the shell", "in_progress")],
+            activity=["Workspace inspected", "Question flow normalized"],
+        )
+        for columns in (80, 120, 160):
+            with self.subTest(columns=columns), mock.patch(
+                "agent.ui.shutil.get_terminal_size"
+            ) as terminal_size:
+                terminal_size.return_value.columns = columns
+                rendered = render_status(view)
+            self.assertTrue(all(len(line) <= columns for line in rendered.splitlines()))
+            self.assertIn("GOAL", rendered)
+            self.assertIn("NOW", rendered)
+            if columns >= 96:
+                self.assertIn("CONTEXT", rendered)
+            else:
+                self.assertNotIn("CONTEXT", rendered)
 
     def test_agents_view_shows_role_phase_and_node_title(self):
         rendered = render_agents(

@@ -114,6 +114,7 @@ def parse_command(line: str) -> UserCommand:
     rest = command_parts[1].strip() if len(command_parts) == 2 else ""
 
     aliases = {
+        "ans": "answer",
         "exit": "quit",
         "q": "quit",
         "ls": "plan",
@@ -243,8 +244,18 @@ def parse_command(line: str) -> UserCommand:
         return UserCommand(CommandKind.SLEEP, {"action": action}, raw)
     if name == "answer":
         parts = rest.split(maxsplit=1)
+        if len(parts) == 1 and parts[0] in {"1", "2", "3"}:
+            return UserCommand(
+                CommandKind.ANSWER,
+                {"question_id": "", "value": parts[0]},
+                raw,
+            )
         if len(parts) != 2:
-            raise CommandParseError(f"Usage: {usage('answer', 'QUESTION_ID VALUE')}")
+            raise CommandParseError(
+                f"Usage: {usage('answer', 'QUESTION_ID VALUE')}. "
+                f"Example: {usage('answer', 'q1 1')}; or answer the current decision with "
+                f"{usage('answer', '1')}."
+            )
         return UserCommand(CommandKind.ANSWER, {"question_id": parts[0], "value": parts[1].strip()}, raw)
 
     if name == "goal":

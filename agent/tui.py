@@ -18,21 +18,31 @@ from dataclasses import dataclass
 from threading import Event, Thread
 from typing import Any, Callable, Iterable, Mapping, Sequence, TextIO
 
+from .ui_state import (
+    ActivityStage,
+    AttentionKind,
+    ExperienceMode,
+    WorkspaceSnapshot,
+    WorkspaceUIStore,
+)
+
 try:  # Optional at import time; line-mode callers must keep working without it.
     from prompt_toolkit.application import Application, get_app
+    from prompt_toolkit.buffer import Buffer
     from prompt_toolkit.formatted_text import FormattedText
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.layout import DynamicContainer, HSplit, Layout, VSplit, Window
-    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
     from prompt_toolkit.layout.dimension import Dimension
+    from prompt_toolkit.mouse_events import MouseEventType
     from prompt_toolkit.output.defaults import create_output
     from prompt_toolkit.styles import Style
 
     PROMPT_TOOLKIT_AVAILABLE = True
 except ImportError:  # pragma: no cover - covered through the public fallback API.
-    Application = get_app = FormattedText = KeyBindings = None  # type: ignore[assignment]
+    Application = get_app = Buffer = FormattedText = KeyBindings = None  # type: ignore[assignment]
     DynamicContainer = HSplit = Layout = VSplit = Window = None  # type: ignore[assignment]
-    FormattedTextControl = Dimension = Style = create_output = None  # type: ignore[assignment]
+    BufferControl = FormattedTextControl = Dimension = MouseEventType = Style = create_output = None  # type: ignore[assignment]
     PROMPT_TOOLKIT_AVAILABLE = False
 
 
@@ -463,6 +473,28 @@ def inline_square_levels(
     return tuple(frame.cells[index] for index in _NINE_DOT_TOPOLOGY)
 
 
+def loading_grid_levels(
+    state: str,
+    tick: int = 0,
+    *,
+    reduced_motion: bool = False,
+    no_color: bool = False,
+) -> tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]:
+    """Return the semantic loader as a visible three-by-three square grid."""
+
+    levels = inline_square_levels(
+        state,
+        tick,
+        reduced_motion=reduced_motion,
+        no_color=no_color,
+    )
+    return (
+        (levels[0], levels[1], levels[2]),
+        (levels[3], levels[4], levels[5]),
+        (levels[6], levels[7], levels[8]),
+    )
+
+
 def render_nine_dot(
     state: str,
     tick: int = 0,
@@ -776,6 +808,8 @@ _COLOR_STYLE = {
     "details.body": "#a8a8a8",
     "warning": "bold #f0b429",
     "filter": "#35d06f",
+    "composer.prompt": "bold #35d06f",
+    "composer.input": "#f0f0f0",
     "footer": "#777777",
     "loading.dots": "bold #35d06f",
     "loading.square.0": "#444444",
@@ -784,6 +818,18 @@ _COLOR_STYLE = {
     "loading.square.3": "#f0f0f0",
     "loading.title": "bold #f0f0f0",
     "loading.detail": "#8a8a8a",
+    "workspace.header": "bold #f0f0f0",
+    "workspace.mode": "bold #35d06f",
+    "workspace.user": "bold #35d06f",
+    "workspace.assistant": "#e8e8e8",
+    "workspace.muted": "#777777",
+    "workspace.stage.done": "#35d06f",
+    "workspace.stage.active": "bold #f0f0f0",
+    "workspace.stage.pending": "#555555",
+    "workspace.attention": "bold #f0b429",
+    "workspace.option": "#b8b8b8",
+    "workspace.option.selected": "bold #0b0b0b bg:#35d06f",
+    "workspace.error": "bold #ff6b6b",
 }
 _NO_COLOR_STYLE = {
     key: ("reverse bold" if key == "choice.selected" else "bold" if key in {"welcome.brand", "header.title", "details.title", "warning"} else "")
@@ -806,6 +852,440 @@ def _prompt_output(output: TextIO, app_output: Any | None) -> Any | None:
         # Windows prompt_toolkit can raise NoConsoleScreenBufferError for a
         # TTY-like wrapper that is not the real console screen buffer.
         return _UNUSABLE_OUTPUT
+
+
+_WORKSPACE_STAGE_ORDER = (
+    ActivityStage.UNDERSTANDING,
+    ActivityStage.PLANNING,
+    ActivityStage.BUILDING,
+    ActivityStage.CHECKING,
+    ActivityStage.DONE,
+)
+
+
+def _workspace_copy(locale: str, key: str) -> str:
+    values = {
+        "en": {
+            "understanding": "Understanding",
+            "planning": "Planning",
+            "building": "Building",
+            "checking": "Checking",
+            "done": "Done",
+            "ready": "Ready",
+            "simple": "Simple",
+            "advanced": "Advanced",
+            "write": "Write a message",
+            "guide": "Send guidance while work continues",
+            "details": "Details",
+        },
+        "ar": {
+            "understanding": "فهم الطلب",
+            "planning": "التخطيط",
+            "building": "التنفيذ",
+            "checking": "التحقق",
+            "done": "تم",
+            "ready": "جاهز",
+            "simple": "بسيط",
+            "advanced": "متقدم",
+            "write": "اكتب رسالة",
+            "guide": "أرسل توجيهًا أثناء استمرار العمل",
+            "details": "التفاصيل",
+        },
+    }
+    return values.get(locale, values["en"]).get(key, values["en"].get(key, key))
+
+
+def _workspace_stage_progress(stage: ActivityStage) -> str:
+    if stage in {ActivityStage.IDLE, ActivityStage.PAUSED, ActivityStage.PROBLEM}:
+        return ""
+    try:
+        active = _WORKSPACE_STAGE_ORDER.index(stage)
+    except ValueError:
+        active = 0
+    parts = []
+    for index, item in enumerate(_WORKSPACE_STAGE_ORDER):
+        mark = "✓" if index < active else "●" if index == active else "○"
+        parts.append(f"{mark} {item.value.title()}")
+    return "  ".join(parts)
+
+
+def render_persistent_workspace(
+    snapshot: WorkspaceSnapshot,
+    *,
+    width: int = 100,
+    height: int = 30,
+    now: float | None = None,
+) -> str:
+    """Render a deterministic plain-text snapshot of the persistent workspace."""
+
+    width, height = max(44, int(width)), max(16, int(height))
+    mode = _workspace_copy(snapshot.locale, snapshot.mode.value)
+    header_left = f"GA3BAD  {mode.upper()}"
+    header_right = " · ".join(item for item in (snapshot.model, snapshot.workspace) if item)
+    header = _fit(
+        header_left + " " * max(1, width - len(header_left) - len(header_right)) + header_right,
+        width,
+    ).rstrip()
+    lines = [header, "─" * width if width > 50 else "-" * width]
+    entries = snapshot.transcript[-8:]
+    if not entries:
+        lines.extend(("", _workspace_copy(snapshot.locale, "ready"), ""))
+    for entry in entries:
+        label = "You" if entry.role == "user" else "GA3BAD"
+        lines.append(f"{label}  {textwrap.shorten(entry.text, width=max(12, width - len(label) - 2), placeholder='…')}")
+        lines.append("")
+    activity = snapshot.activity
+    elapsed = activity.elapsed_seconds(now)
+    if snapshot.running or activity.stage not in {ActivityStage.IDLE, ActivityStage.DONE}:
+        suffix = f"  ·  {elapsed // 60:02d}:{elapsed % 60:02d}" if elapsed else ""
+        lines.extend((f"{activity.stage.value.upper()}  {activity.summary}{suffix}",))
+        progress = _workspace_stage_progress(activity.stage)
+        if progress:
+            lines.append(progress)
+        if activity.last_success:
+            lines.append(f"✓ {activity.last_success}")
+    if snapshot.attention is not None:
+        lines.extend(("", f"! {snapshot.attention.title}"))
+        if snapshot.attention.message:
+            lines.extend(textwrap.wrap(snapshot.attention.message, width=width)[:3])
+        options = []
+        for index, option in enumerate(snapshot.attention.options):
+            marker = "[" if index == snapshot.attention_index else " "
+            closer = "]" if index == snapshot.attention_index else " "
+            options.append(f"{marker}{option.label}{closer}")
+        if options:
+            lines.append("   ".join(options))
+    footer_space = 3
+    lines = lines[: max(1, height - footer_space)]
+    while len(lines) < height - footer_space:
+        lines.append("")
+    placeholder = (
+        _workspace_copy(snapshot.locale, "guide")
+        if snapshot.running
+        else _workspace_copy(snapshot.locale, "write")
+    )
+    lines.extend(("› " + placeholder, "─" * width if width > 50 else "-" * width))
+    queue = f" · queued {snapshot.queued_count}" if snapshot.queued_count else ""
+    lines.append(f"F2 Advanced  ·  / Actions  ·  Ctrl+C Stop safely{queue}")
+    return "\n".join(lines[:height])
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceInput:
+    text: str = ""
+    queued: bool = False
+    kind: str = "message"
+
+
+class PersistentWorkspaceApp:
+    """One long-lived prompt_toolkit application for the complete work session."""
+
+    def __init__(
+        self,
+        store: WorkspaceUIStore,
+        *,
+        on_input: Callable[[WorkspaceInput], None],
+        on_interrupt: Callable[[], None],
+        on_exit: Callable[[], None],
+        output: TextIO = sys.stdout,
+        no_color: bool = False,
+        app_input: Any | None = None,
+        app_output: Any | None = None,
+    ) -> None:
+        if not PROMPT_TOOLKIT_AVAILABLE:
+            raise RuntimeError("prompt_toolkit is required for the persistent workspace")
+        self.store = store
+        self.on_input = on_input
+        self.on_interrupt = on_interrupt
+        self.on_exit = on_exit
+        self.output = output
+        self.no_color = no_color
+        self._application: Any | None = None
+        self._last_mode = store.snapshot().mode
+        self._buffer = Buffer(multiline=False)
+        self._bindings = KeyBindings()
+        self._install_bindings()
+
+        transcript = Window(
+            content=FormattedTextControl(self._transcript_fragments),
+            wrap_lines=True,
+            always_hide_cursor=True,
+            height=Dimension(weight=1),
+        )
+        activity = Window(
+            content=FormattedTextControl(self._activity_fragments),
+            wrap_lines=True,
+            always_hide_cursor=True,
+            height=4,
+        )
+        attention = Window(
+            content=FormattedTextControl(self._attention_fragments),
+            wrap_lines=True,
+            always_hide_cursor=True,
+            height=Dimension(min=1, max=7, preferred=5),
+        )
+        composer = Window(
+            content=BufferControl(buffer=self._buffer, focusable=True),
+            height=2,
+            wrap_lines=True,
+        )
+        root = HSplit(
+            [
+                Window(content=FormattedTextControl(self._header_fragments), height=1),
+                Window(height=1, char="─" if terminal_supports_unicode(output) else "-"),
+                transcript,
+                activity,
+                attention,
+                Window(content=FormattedTextControl(self._composer_prompt_fragments), height=1),
+                composer,
+                Window(height=1, char="─" if terminal_supports_unicode(output) else "-"),
+                Window(content=FormattedTextControl(self._footer_fragments), height=1),
+            ]
+        )
+        kwargs: dict[str, Any] = {}
+        prompt_output = _prompt_output(output, app_output)
+        if prompt_output is _UNUSABLE_OUTPUT:
+            raise RuntimeError("the terminal output cannot host the persistent workspace")
+        if app_input is not None:
+            kwargs["input"] = app_input
+        if prompt_output is not None:
+            kwargs["output"] = prompt_output
+        self._application = Application(
+            layout=Layout(root, focused_element=composer),
+            key_bindings=self._bindings,
+            style=_make_style(no_color),
+            full_screen=True,
+            mouse_support=True,
+            refresh_interval=1.0,
+            **kwargs,
+        )
+        store.subscribe(self.request_redraw)
+
+    @property
+    def application(self) -> Any:
+        return self._application
+
+    def _install_bindings(self) -> None:
+        @self._bindings.add("f2", eager=True)
+        def _toggle_mode(event: Any) -> None:
+            self.store.toggle_mode()
+            event.app.invalidate()
+
+        @self._bindings.add("left", eager=True)
+        def _attention_left(event: Any) -> None:
+            if self.store.active_attention() is not None:
+                self.store.move_attention(-1)
+                event.app.invalidate()
+            else:
+                self._buffer.cursor_left(count=1)
+
+        @self._bindings.add("right", eager=True)
+        def _attention_right(event: Any) -> None:
+            if self.store.active_attention() is not None:
+                self.store.move_attention(1)
+                event.app.invalidate()
+            else:
+                self._buffer.cursor_right(count=1)
+
+        @self._bindings.add("enter", eager=True)
+        def _submit(event: Any) -> None:
+            value = self._buffer.text.strip()
+            attention = self.store.active_attention()
+            if attention is not None:
+                if value and attention.allow_custom:
+                    self._buffer.reset()
+                    self.store.resolve_attention("custom", text=value)
+                elif not value:
+                    self.store.resolve_selected_attention()
+                return
+            if value:
+                self._buffer.reset()
+                self.on_input(WorkspaceInput(text=value))
+
+        @self._bindings.add("tab", eager=True)
+        def _queue(event: Any) -> None:
+            snapshot = self.store.snapshot()
+            value = self._buffer.text.strip()
+            if snapshot.mode is ExperienceMode.ADVANCED and snapshot.running and value:
+                self._buffer.reset()
+                self.on_input(WorkspaceInput(text=value, queued=True))
+                return
+            if value:
+                self._buffer.insert_text("\t")
+
+        @self._bindings.add("c-c", eager=True)
+        def _interrupt(event: Any) -> None:
+            if self._buffer.text:
+                self._buffer.reset()
+                return
+            self.on_interrupt()
+
+        @self._bindings.add("c-q", eager=True)
+        def _exit(event: Any) -> None:
+            self.on_exit()
+            event.app.exit(result=None)
+
+        for key in tuple("123456789") + (
+            "y", "n", "a", "b", "c", "d", "f", "k", "o", "p", "r", "s"
+        ):
+            def _shortcut(event: Any, pressed: str = key) -> None:
+                request = self.store.active_attention()
+                if request is None:
+                    self._buffer.insert_text(pressed)
+                    return
+                match = next(
+                    (
+                        option
+                        for index, option in enumerate(request.options, 1)
+                        if option.shortcut.casefold() == pressed.casefold()
+                        or str(index) == pressed
+                    ),
+                    None,
+                )
+                if match is not None:
+                    self.store.resolve_attention(match.key)
+
+            self._bindings.add(key, eager=True)(_shortcut)
+
+    def _header_fragments(self) -> Any:
+        snapshot = self.store.snapshot()
+        mode = _workspace_copy(snapshot.locale, snapshot.mode.value).upper()
+        right = " · ".join(item for item in (snapshot.model, snapshot.workspace) if item)
+        return FormattedText(
+            [
+                ("class:workspace.header", " GA3BAD  "),
+                ("class:workspace.mode", mode),
+                ("class:workspace.muted", f"    {right}" if right else ""),
+            ]
+        )
+
+    def _transcript_fragments(self) -> Any:
+        snapshot = self.store.snapshot()
+        fragments: list[tuple[Any, ...]] = []
+        if not snapshot.transcript:
+            fragments.append(("class:workspace.muted", "\n Ready — describe what you want to build.\n"))
+        for entry in snapshot.transcript[-14:]:
+            if entry.role == "user":
+                fragments.extend(
+                    (("class:workspace.user", "\n You\n"), ("class:workspace.assistant", f" {entry.text}\n"))
+                )
+            else:
+                fragments.extend(
+                    (("class:workspace.mode", "\n GA3BAD\n"), ("class:workspace.assistant", f" {entry.text}\n"))
+                )
+        if snapshot.mode is ExperienceMode.ADVANCED and snapshot.advanced_log:
+            fragments.append(("class:workspace.muted", "\n Details\n"))
+            fragments.extend(
+                ("class:workspace.muted", f" · {line}\n") for line in snapshot.advanced_log[-10:]
+            )
+        return FormattedText(fragments)
+
+    def _activity_fragments(self) -> Any:
+        snapshot = self.store.snapshot()
+        activity = snapshot.activity
+        if not snapshot.running and activity.stage is ActivityStage.IDLE:
+            return FormattedText([("class:workspace.muted", " Ready\n")])
+        elapsed = activity.elapsed_seconds()
+        quiet = 0 if activity.last_signal_at is None else max(0, int(time.monotonic() - activity.last_signal_at))
+        summary = activity.summary
+        if snapshot.running and quiet >= 60:
+            summary = snapshot.locale == "ar" and "الأمر يستغرق وقتًا أطول — Ctrl+C للإيقاف بأمان" or "Taking longer than usual — Ctrl+C stops safely"
+        elif snapshot.running and quiet >= 10:
+            summary = snapshot.locale == "ar" and "ما زلت أعمل" or "Still working"
+        style = "class:workspace.error" if activity.stage is ActivityStage.PROBLEM else "class:workspace.stage.active"
+        fragments: list[tuple[str, str]] = [
+            (style, f" {activity.stage.value.upper()}  {summary}"),
+            ("class:workspace.muted", f"  ·  {elapsed // 60:02d}:{elapsed % 60:02d}\n"),
+        ]
+        progress = _workspace_stage_progress(activity.stage)
+        if progress:
+            fragments.append(("class:workspace.muted", f" {progress}\n"))
+        if activity.last_success:
+            fragments.append(("class:workspace.stage.done", f" ✓ {activity.last_success}\n"))
+        return FormattedText(fragments)
+
+    def _attention_fragments(self) -> Any:
+        snapshot = self.store.snapshot()
+        request = snapshot.attention
+        if request is None:
+            return FormattedText([("", "")])
+        fragments: list[tuple[Any, ...]] = [
+            ("class:workspace.attention", f" ! {request.title}\n"),
+        ]
+        if request.message:
+            fragments.append(("class:workspace.assistant", f"   {request.message}\n\n"))
+
+        def handler_for(key: str) -> Callable[[Any], None]:
+            def handler(mouse_event: Any) -> None:
+                if MouseEventType is not None and mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    self.store.resolve_attention(key)
+            return handler
+
+        for index, option in enumerate(request.options):
+            selected = index == snapshot.attention_index
+            style = "class:workspace.option.selected" if selected else "class:workspace.option"
+            shortcut = option.shortcut.upper() if option.shortcut else str(index + 1)
+            fragments.append((style, f"  [{shortcut}] {option.label}  ", handler_for(option.key)))
+            fragments.append(("", "   "))
+        if request.allow_custom:
+            fragments.append(("class:workspace.muted", "\n   Or type your answer below."))
+        if snapshot.mode is ExperienceMode.ADVANCED and request.details:
+            detail = textwrap.shorten(
+                " ".join(request.details.split()), width=180, placeholder="…"
+            )
+            fragments.append(("class:workspace.muted", f"\n   Details: {detail}"))
+        return FormattedText(fragments)
+
+    def _composer_prompt_fragments(self) -> Any:
+        snapshot = self.store.snapshot()
+        label = _workspace_copy(snapshot.locale, "guide" if snapshot.running else "write")
+        if snapshot.attention is not None and snapshot.attention.allow_custom:
+            label = "Type a custom answer, or choose above"
+        return FormattedText(
+            [("class:composer.prompt", " › "), ("class:workspace.muted", label)]
+        )
+
+    def _footer_fragments(self) -> Any:
+        snapshot = self.store.snapshot()
+        queue = f" · queued {snapshot.queued_count}" if snapshot.queued_count else ""
+        mode_hint = "F2 Simple" if snapshot.mode is ExperienceMode.ADVANCED else "F2 Advanced"
+        return FormattedText(
+            [("class:footer", f" {mode_hint}  ·  / Actions  ·  Ctrl+C Stop safely{queue}")]
+        )
+
+    def request_redraw(self) -> None:
+        application = self._application
+        if application is None:
+            return
+        loop = getattr(application, "loop", None)
+        try:
+            if loop is not None and getattr(application, "is_running", False):
+                loop.call_soon_threadsafe(application.invalidate)
+            else:
+                application.invalidate()
+        except (RuntimeError, AttributeError):
+            return
+
+    def stop(self) -> None:
+        application = self._application
+        if application is None:
+            return
+        loop = getattr(application, "loop", None)
+
+        def close() -> None:
+            if getattr(application, "is_running", False):
+                application.exit(result=None)
+
+        try:
+            if loop is not None:
+                loop.call_soon_threadsafe(close)
+            else:
+                close()
+        except (RuntimeError, AttributeError):
+            return
+
+    def run(self) -> None:
+        self._application.run()
 
 
 def _welcome_fragments(
@@ -1008,26 +1488,32 @@ def run_loading_task(
 
     def content() -> Any:
         tick = int((time.monotonic() - started) / 0.12) if animate else 0
-        levels = inline_square_levels(
+        grid = loading_grid_levels(
             state,
             tick,
             reduced_motion=reduced_motion,
             no_color=no_color,
         )
         square = "▪" if use_unicode else "#"
-        fragments: list[tuple[str, str]] = [
-            (f"class:loading.square.{level}", square) for level in levels
-        ]
-        fragments.extend((("", "  "), ("class:loading.title", _clean_line(title))))
-        if detail:
-            fragments.append(("class:loading.detail", "\n" + _clean_line(detail)))
+        fragments: list[tuple[str, str]] = []
+        for row_index, row in enumerate(grid):
+            for column_index, level in enumerate(row):
+                fragments.append((f"class:loading.square.{level}", square))
+                if column_index < 2:
+                    fragments.append(("", " "))
+            if row_index == 0:
+                fragments.extend((("", "   "), ("class:loading.title", _clean_line(title))))
+            elif row_index == 1 and detail:
+                fragments.extend((("", "   "), ("class:loading.detail", _clean_line(detail))))
+            if row_index < 2:
+                fragments.append(("", "\n"))
         return FormattedText(fragments)
 
     main = Window(
         content=FormattedTextControl(content),
         align="CENTER",
         always_hide_cursor=True,
-        height=Dimension(preferred=2 if detail else 1),
+        height=Dimension(preferred=3),
     )
     root = HSplit(
         [
@@ -1540,6 +2026,346 @@ def _detail_fragments(state: ChoiceListState) -> Any:
     return FormattedText(fragments)
 
 
+def prompt_text(
+    *,
+    title: str,
+    subtitle: str = "",
+    step_label: str = "",
+    initial: str = "",
+    input_func: Callable[[str], str] = input,
+    output: TextIO = sys.stdout,
+    no_color: bool = False,
+    force: bool = False,
+    app_input: Any | None = None,
+    app_output: Any | None = None,
+) -> str | None:
+    """Collect one free-form answer in the same full-screen visual language."""
+
+    def plain_fallback() -> str | None:
+        try:
+            value = input_func(f"{title}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        return value or None
+
+    if not PROMPT_TOOLKIT_AVAILABLE:
+        return plain_fallback()
+    if not force and not rich_terminal_available(input_func, output):
+        return plain_fallback()
+
+    buffer = Buffer(multiline=False)
+    buffer.text = str(initial)
+    feedback = {"text": ""}
+    bindings = KeyBindings()
+
+    @bindings.add("enter")
+    def _submit(event: Any) -> None:
+        value = buffer.text.strip()
+        if not value:
+            feedback["text"] = "Write an answer before continuing."
+            event.app.invalidate()
+            return
+        event.app.exit(result=value)
+
+    @bindings.add("escape")
+    @bindings.add("c-c")
+    def _cancel(event: Any) -> None:
+        event.app.exit(result=None)
+
+    @bindings.add("c-q")
+    def _exit_session(event: Any) -> None:
+        event.app.exit(result=_EXIT_SELECTION)
+
+    header_parts: list[tuple[str, str]] = []
+    if step_label:
+        header_parts.append(("class:header.step", step_label + "\n"))
+    header_parts.append(("class:header.title", title + "\n"))
+    if subtitle:
+        header_parts.append(("class:header.subtitle", subtitle))
+    header = Window(
+        content=FormattedTextControl(FormattedText(header_parts)),
+        height=1 + bool(step_label) + bool(subtitle),
+        always_hide_cursor=True,
+    )
+    input_window = Window(
+        content=BufferControl(buffer=buffer, focusable=True),
+        style="class:composer.input",
+        height=1,
+    )
+    composer = VSplit(
+        [
+            Window(
+                content=FormattedTextControl(
+                    FormattedText([("class:composer.prompt", "> ")])
+                ),
+                width=2,
+                always_hide_cursor=True,
+            ),
+            input_window,
+        ]
+    )
+
+    def feedback_fragments() -> Any:
+        return FormattedText([("class:warning", feedback["text"])])
+
+    root = HSplit(
+        [
+            header,
+            Window(height=2),
+            composer,
+            Window(height=1),
+            Window(
+                content=FormattedTextControl(feedback_fragments),
+                height=1,
+                always_hide_cursor=True,
+            ),
+            Window(height=Dimension(weight=1)),
+            Window(
+                content=FormattedTextControl(
+                    FormattedText([("class:footer", "Enter Save · Esc Back · Ctrl+Q Exit")])
+                ),
+                height=1,
+                always_hide_cursor=True,
+            ),
+        ]
+    )
+    kwargs: dict[str, Any] = {}
+    prompt_output = _prompt_output(output, app_output)
+    if prompt_output is _UNUSABLE_OUTPUT:
+        return plain_fallback()
+    if app_input is not None:
+        kwargs["input"] = app_input
+    if prompt_output is not None:
+        kwargs["output"] = prompt_output
+    application = Application(
+        layout=Layout(root, focused_element=input_window),
+        key_bindings=bindings,
+        style=_make_style(no_color),
+        full_screen=True,
+        mouse_support=False,
+        **kwargs,
+    )
+    try:
+        result = application.run()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if result is _EXIT_SELECTION:
+        raise UserExitRequested()
+    return str(result) if isinstance(result, str) and result.strip() else None
+
+
+def _horizontal_action_fragments(state: ChoiceListState) -> Any:
+    fragments: list[tuple[str, str]] = []
+    for index, item in enumerate(state.items):
+        selected = index == state.selected_index
+        style = (
+            "class:choice.selected"
+            if selected
+            else "class:choice.disabled"
+            if item.disabled
+            else "class:choice"
+        )
+        label = f"  {item.label}  "
+        fragments.append((style, label))
+        if index < len(state.items) - 1:
+            fragments.append(("", "   "))
+    return FormattedText(fragments)
+
+
+def select_horizontal_action(
+    items: Iterable[ChoiceItem],
+    *,
+    title: str,
+    body: str = "",
+    subtitle: str = "",
+    step_label: str = "",
+    initial_key: str | None = None,
+    shortcuts: Mapping[str, str] | None = None,
+    input_func: Callable[[str], str] = input,
+    output: TextIO = sys.stdout,
+    no_color: bool = False,
+    force: bool = False,
+    app_input: Any | None = None,
+    app_output: Any | None = None,
+    require_explicit_selection: bool = False,
+    cancelable: bool = True,
+) -> ChoiceItem | None:
+    """Choose from a fixed horizontal action bar with Left/Right and Enter."""
+
+    values = tuple(items)
+    if not values:
+        raise ValueError("horizontal action selector requires at least one item")
+    if not PROMPT_TOOLKIT_AVAILABLE:
+        return None
+    if not force and not rich_terminal_available(input_func, output):
+        return None
+
+    state = ChoiceListState.create(
+        values,
+        initial_key=initial_key,
+        page_size=len(values),
+        filterable=False,
+    )
+    selection_armed = not require_explicit_selection
+    bindings = KeyBindings()
+
+    def redraw(event: Any) -> None:
+        event.app.invalidate()
+
+    def move(amount: int) -> None:
+        nonlocal selection_armed
+        indices = state.matching_indices
+        if not indices:
+            return
+        try:
+            position = indices.index(state.selected_index)
+        except ValueError:
+            position = 0
+        for offset in range(1, len(indices) + 1):
+            candidate = indices[(position + amount * offset) % len(indices)]
+            if not state.items[candidate].disabled:
+                state.selected_index = candidate
+                state.feedback = ""
+                selection_armed = True
+                return
+
+    @bindings.add("left")
+    @bindings.add("s-tab")
+    def _left(event: Any) -> None:
+        move(-1)
+        redraw(event)
+
+    @bindings.add("right")
+    @bindings.add("tab")
+    def _right(event: Any) -> None:
+        move(1)
+        redraw(event)
+
+    @bindings.add("enter")
+    def _enter(event: Any) -> None:
+        if not selection_armed:
+            state.feedback = "Choose with Left/Right first, or press the highlighted letter."
+            redraw(event)
+            return
+        selected = state.activate()
+        if selected is not None:
+            event.app.exit(result=selected)
+        else:
+            redraw(event)
+
+    @bindings.add("escape")
+    @bindings.add("c-c")
+    def _cancel(event: Any) -> None:
+        if cancelable:
+            event.app.exit(result=None)
+            return
+        state.feedback = "Choose Yes or No explicitly; this request is still waiting."
+        redraw(event)
+
+    @bindings.add("c-q")
+    def _exit_session(event: Any) -> None:
+        event.app.exit(result=_EXIT_SELECTION)
+
+    for shortcut, target_key in dict(shortcuts or {}).items():
+        normalized = str(shortcut).strip().lower()
+        if not normalized:
+            continue
+
+        def _shortcut(event: Any, key: str = str(target_key)) -> None:
+            if not state.select_key(key):
+                state.feedback = "That action is unavailable."
+                redraw(event)
+                return
+            selected = state.activate()
+            if selected is not None:
+                event.app.exit(result=selected)
+            else:
+                redraw(event)
+
+        bindings.add(normalized)(_shortcut)
+
+    header_parts: list[tuple[str, str]] = []
+    if step_label:
+        header_parts.append(("class:header.step", step_label + "\n"))
+    header_parts.append(("class:header.title", title + "\n"))
+    if subtitle:
+        header_parts.append(("class:header.subtitle", subtitle))
+    header = Window(
+        content=FormattedTextControl(FormattedText(header_parts)),
+        height=1 + bool(step_label) + bool(subtitle),
+        always_hide_cursor=True,
+    )
+    body_window = Window(
+        content=FormattedTextControl(
+            FormattedText([("class:details.body", str(body).strip())])
+        ),
+        wrap_lines=True,
+        always_hide_cursor=True,
+        height=Dimension(weight=1),
+    )
+    feedback = Window(
+        content=FormattedTextControl(
+            lambda: FormattedText([("class:warning", state.feedback)])
+        ),
+        height=1,
+        always_hide_cursor=True,
+    )
+    actions = Window(
+        content=FormattedTextControl(lambda: _horizontal_action_fragments(state)),
+        align="CENTER",
+        wrap_lines=True,
+        height=2,
+        always_hide_cursor=True,
+    )
+    shortcut_hint = ""
+    if shortcuts:
+        shortcut_hint = " · " + "/".join(str(key).upper() for key in shortcuts) + " Quick select"
+    footer = Window(
+        content=FormattedTextControl(
+            FormattedText(
+                [("class:footer", "←/→ Switch · Enter Select · Esc Back" + shortcut_hint)]
+            )
+        ),
+        align="CENTER",
+        height=1,
+        always_hide_cursor=True,
+    )
+    root = HSplit(
+        [
+            header,
+            Window(height=1),
+            body_window,
+            feedback,
+            Window(height=1, char="─" if terminal_supports_unicode(output) else "-"),
+            actions,
+            footer,
+        ]
+    )
+    kwargs: dict[str, Any] = {}
+    prompt_output = _prompt_output(output, app_output)
+    if prompt_output is _UNUSABLE_OUTPUT:
+        return None
+    if app_input is not None:
+        kwargs["input"] = app_input
+    if prompt_output is not None:
+        kwargs["output"] = prompt_output
+    application = Application(
+        layout=Layout(root),
+        key_bindings=bindings,
+        style=_make_style(no_color),
+        full_screen=True,
+        mouse_support=False,
+        **kwargs,
+    )
+    try:
+        result = application.run()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if result is _EXIT_SELECTION:
+        raise UserExitRequested()
+    return result if isinstance(result, ChoiceItem) else None
+
+
 def select_choice(
     items: Iterable[ChoiceItem],
     *,
@@ -1557,6 +2383,7 @@ def select_choice(
     force: bool = False,
     app_input: Any | None = None,
     app_output: Any | None = None,
+    shortcuts: Mapping[str, str] | None = None,
 ) -> ChoiceItem | None:
     """Open a full-screen keyboard selector and return its item, or ``None``.
 
@@ -1640,6 +2467,27 @@ def select_choice(
     def _exit_session(event: Any) -> None:
         event.app.exit(result=_EXIT_SELECTION)
 
+    for shortcut, target_key in dict(shortcuts or {}).items():
+        normalized_shortcut = str(shortcut).strip().lower()
+        if not normalized_shortcut or normalized_shortcut in {
+            "up", "down", "home", "end", "pageup", "pagedown", "enter",
+            "escape", "c-c", "c-q", "backspace", "c-u",
+        }:
+            continue
+
+        def _shortcut(event: Any, key: str = str(target_key)) -> None:
+            if not state.select_key(key):
+                state.feedback = "That shortcut is unavailable."
+                redraw(event)
+                return
+            selected = state.activate()
+            if selected is not None:
+                event.app.exit(result=selected)
+            else:
+                redraw(event)
+
+        bindings.add(normalized_shortcut)(_shortcut)
+
     @bindings.add("<any>")
     def _filter(event: Any) -> None:
         if filterable and event.data and event.data.isprintable():
@@ -1707,8 +2555,21 @@ def select_choice(
         always_hide_cursor=True,
     )
     def footer_fragments() -> Any:
+        shortcut_hint = ""
+        if shortcuts:
+            labels = ", ".join(str(key).upper() for key in shortcuts)
+            shortcut_hint = f" · {labels} Quick action"
         return FormattedText(
-            [("class:footer", _choice_footer(_app_columns(), action_label, filterable, unicode))]
+            [
+                (
+                    "class:footer",
+                    _fit(
+                        _choice_footer(_app_columns(), action_label, filterable, unicode)
+                        + shortcut_hint,
+                        _app_columns(),
+                    ).rstrip(),
+                )
+            ]
         )
 
     footer = Window(
@@ -1749,12 +2610,18 @@ __all__ = [
     "NINE_DOT_STATES",
     "NineDotFrame",
     "PROMPT_TOOLKIT_AVAILABLE",
+    "PersistentWorkspaceApp",
     "UserExitRequested",
+    "WorkspaceInput",
     "nine_dot_frame",
     "inline_square_levels",
+    "loading_grid_levels",
     "render_choices",
     "render_nine_dot",
     "render_welcome",
+    "render_persistent_workspace",
+    "prompt_text",
+    "select_horizontal_action",
     "rich_terminal_available",
     "run_loading_task",
     "run_swarm_inspector",

@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from agent.commands import parse_command
 from agent.events import EventBus
 from agent.model_catalog import ExecutionClass, ModelDescriptor
 from agent.models import GoalStatus
@@ -1646,6 +1647,31 @@ animate();
                 self.assertIsNotNone(plan)
                 self.assertIn("Desktop", plan.execution_strategy)
                 self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
+            finally:
+                runtime.close()
+                store.close()
+
+    def test_plain_text_answers_the_visible_plan_question(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            runtime = AgentRuntime(
+                PlanningQuestionProvider(),
+                store,
+                workspace,
+                events=EventBus(),
+            )
+            try:
+                self.assertIsNone(runtime.start_goal("Create an application"))
+
+                plan = runtime.apply_command(parse_command("Desktop"))
+
+                self.assertIsNotNone(plan)
+                self.assertIn("Desktop", plan.execution_strategy)
+                self.assertEqual(
+                    runtime.active_goal().status,
+                    GoalStatus.AWAITING_PLAN_APPROVAL,
+                )
             finally:
                 runtime.close()
                 store.close()

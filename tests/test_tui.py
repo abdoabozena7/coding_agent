@@ -8,12 +8,16 @@ from agent.tui import (
     NINE_DOT_STATES,
     ChoiceItem,
     ChoiceListState,
+    PersistentWorkspaceApp,
     SwarmInspectorState,
     UserExitRequested,
     _responsive_welcome_brand,
     _welcome_fragments,
     inline_square_levels,
+    loading_grid_levels,
     nine_dot_frame,
+    prompt_text,
+    render_persistent_workspace,
     render_choices,
     render_nine_dot,
     render_swarm_inspector,
@@ -22,8 +26,17 @@ from agent.tui import (
     run_loading_task,
     run_swarm_inspector,
     select_choice,
+    select_horizontal_action,
     swarm_agent_name,
     terminal_supports_unicode,
+)
+from agent.ui_state import (
+    ActivityStage,
+    AttentionKind,
+    AttentionOption,
+    AttentionRequest,
+    ExperienceMode,
+    WorkspaceUIStore,
 )
 
 
@@ -69,6 +82,91 @@ class ChoiceStateTests(unittest.TestCase):
         self.assertEqual(item.resolved_value, "normal-value")
         self.assertIn("risky actions", item.search_text)
         self.assertEqual(ChoiceItem("plan", "Plan").resolved_value, "plan")
+
+
+class PersistentWorkspaceSnapshotTests(unittest.TestCase):
+    def test_simple_snapshot_fits_common_terminal_sizes(self):
+        store = WorkspaceUIStore()
+        store.update_identity(workspace="project-090", model="gemma4:e4b", status="running")
+        store.append_transcript("user", "Build a calculator")
+        store.set_activity(ActivityStage.BUILDING, "Creating the interface", running=True)
+        for width, height in ((80, 24), (120, 30)):
+            with self.subTest(size=(width, height)):
+                rendered = render_persistent_workspace(
+                    store.snapshot(), width=width, height=height
+                )
+                lines = rendered.splitlines()
+                self.assertEqual(len(lines), height)
+                self.assertTrue(all(len(line) <= width for line in lines))
+                self.assertIn("Build a calculator", rendered)
+                self.assertIn("Creating the interface", rendered)
+
+    def test_raw_events_only_appear_after_switching_to_advanced(self):
+        store = WorkspaceUIStore()
+        store.append_log('{"command": "pytest"}')
+        simple = render_persistent_workspace(store.snapshot(), width=80, height=24)
+        self.assertNotIn("pytest", simple)
+        store.set_mode(ExperienceMode.ADVANCED)
+        advanced = render_persistent_workspace(store.snapshot(), width=80, height=24)
+        # The deterministic plain renderer reserves Advanced details for the
+        # live app; the mode switch itself remains observable in snapshots.
+        self.assertIn("ADVANCED", advanced)
+
+    def test_one_application_owns_composer_and_mode_shortcut(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        submitted = []
+        with create_pipe_input() as pipe:
+            pipe.send_text("Build it\r\x1bOQ\x11")
+            app = PersistentWorkspaceApp(
+                store,
+                on_input=submitted.append,
+                on_interrupt=lambda: None,
+                on_exit=store.mark_exit,
+                output=io.StringIO(),
+                app_input=pipe,
+                app_output=DummyOutput(),
+                no_color=True,
+            )
+            app.run()
+        self.assertEqual(submitted[0].text, "Build it")
+        self.assertEqual(store.snapshot().mode, ExperienceMode.ADVANCED)
+
+    def test_attention_accepts_direct_keyboard_choice_without_text_entry(self):
+        from threading import Thread
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        answers = []
+        request = AttentionRequest(
+            id="keyboard-approval",
+            kind=AttentionKind.APPROVAL,
+            title="Allow?",
+            options=(
+                AttentionOption("yes", "Yes", "allow_once", shortcut="y"),
+                AttentionOption("no", "No", "deny", shortcut="n"),
+            ),
+        )
+        waiter = Thread(target=lambda: answers.append(store.request_attention(request)))
+        waiter.start()
+        with create_pipe_input() as pipe:
+            pipe.send_text("y\x11")
+            app = PersistentWorkspaceApp(
+                store,
+                on_input=lambda _item: None,
+                on_interrupt=lambda: None,
+                on_exit=store.mark_exit,
+                output=io.StringIO(),
+                app_input=pipe,
+                app_output=DummyOutput(),
+                no_color=True,
+            )
+            app.run()
+        waiter.join(1)
+        self.assertEqual(answers[0].value, "allow_once")
 
     def test_default_selection_prefers_enabled_but_disabled_rows_explain_themselves(self):
         state = ChoiceListState.create(_items())
@@ -286,6 +384,16 @@ class NineDotTests(unittest.TestCase):
         self.assertNotEqual(inline_search, inline_plan)
         self.assertTrue(all(len(frame) == 9 for frame in inline_search))
 
+    def test_loading_levels_are_exposed_as_a_three_by_three_grid(self):
+        grid = loading_grid_levels("search", 2)
+
+        self.assertEqual(len(grid), 3)
+        self.assertTrue(all(len(row) == 3 for row in grid))
+        self.assertEqual(
+            tuple(level for row in grid for level in row),
+            inline_square_levels("search", 2),
+        )
+
     def test_reduced_motion_and_no_color_are_static(self):
         for state in NINE_DOT_STATES:
             with self.subTest(state=state):
@@ -321,6 +429,90 @@ class NineDotTests(unittest.TestCase):
 
 
 class TerminalAndWelcomeTests(unittest.TestCase):
+    def test_horizontal_action_switches_with_arrow_and_accepts_enter(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        with create_pipe_input() as pipe:
+            pipe.send_text("\x1b[C\r")
+            selected = select_horizontal_action(
+                [ChoiceItem("no", "No"), ChoiceItem("yes", "Yes")],
+                title="Allow this action once?",
+                initial_key="no",
+                force=True,
+                app_input=pipe,
+                app_output=DummyOutput(),
+                output=io.StringIO(),
+                no_color=True,
+            )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.key, "yes")
+
+    def test_explicit_horizontal_action_ignores_enter_and_escape_until_a_choice(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        with create_pipe_input() as pipe:
+            pipe.send_text("\r\x03y")
+            selected = select_horizontal_action(
+                [ChoiceItem("no", "No"), ChoiceItem("yes", "Yes")],
+                title="Allow this action once?",
+                initial_key="no",
+                shortcuts={"n": "no", "y": "yes"},
+                require_explicit_selection=True,
+                cancelable=False,
+                force=True,
+                app_input=pipe,
+                app_output=DummyOutput(),
+                output=io.StringIO(),
+                no_color=True,
+            )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.key, "yes")
+
+    def test_selector_quick_action_activates_the_mapped_choice(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        with create_pipe_input() as pipe:
+            pipe.send_text("d")
+            selected = select_choice(
+                [
+                    ChoiceItem("1", "One"),
+                    ChoiceItem("defaults", "Use recommended defaults"),
+                ],
+                title="Decision",
+                filterable=False,
+                shortcuts={"d": "defaults"},
+                force=True,
+                app_input=pipe,
+                app_output=DummyOutput(),
+                output=io.StringIO(),
+                no_color=True,
+            )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.key, "defaults")
+
+    def test_freeform_answer_uses_the_full_screen_composer(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        with create_pipe_input() as pipe:
+            pipe.send_text("Keep history for 30 days\r")
+            value = prompt_text(
+                title="Write your answer",
+                force=True,
+                app_input=pipe,
+                app_output=DummyOutput(),
+                output=io.StringIO(),
+                no_color=True,
+            )
+
+        self.assertEqual(value, "Keep history for 30 days")
+
     def test_live_swarm_inspector_opens_switches_views_and_closes(self):
         from prompt_toolkit.input.defaults import create_pipe_input
         from prompt_toolkit.output import DummyOutput

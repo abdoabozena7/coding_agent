@@ -104,6 +104,14 @@ adds off-device backup. A clearly marked no-Git option has no version-based undo
 (Ultra still protects its current rejected attempt), and Refresh rechecks setup
 performed in another terminal.
 
+After setup, the welcome gives way to a cardless working surface: goal and live
+work stay in the primary column, while plan, access, task progress, and agent count
+form a compact context inspector on wide terminals. Narrow terminals reflow into a
+single readable column. Intake, Normal-plan, and ULTRA decisions all use the same
+full-screen one-question flow; `D` accepts every remaining Recommended choice.
+Free-form answers and plan revision feedback use a focused composer. Provider
+reasoning is folded by default and remains available through `/thinking`.
+
 The chat opens in Normal, which automatically promotes complex work to
 Ultra; press F2 before submitting a prompt when you want to lock Ultra explicitly.
 The focused row always includes its description; Esc moves back without changing
@@ -249,9 +257,9 @@ opens the redacted, session-only blocks again. Use `/trace`, `/history`, or
 | `/memory [SECTION]`, `/trace [latest\|RUN_ID]` | Inspect Project Brain and redacted prompts/context/summaries |
 | `/thinking` | Expand redacted provider thoughts captured during this session |
 | `/insights [NODE]`, `/metrics` | Inspect durable findings and execution metrics |
-| `/questions`, `/answer ID VALUE` | Advanced fallback for intake/planning questions; plain text, `1/2/3`, and `4 custom text` work directly |
+| `/questions`, `/answer ID VALUE` | Advanced fallback for decisions; reply normally, use `/answer 1` for the current question, or `/answer q1 1` for an explicit ID (`/ans` is an alias) |
 | plain text / `/goal TEXT` | Enter the same Intent Architect gate when idle; otherwise add durable user guidance |
-| `/plan`, `/status` | Render the complete plan or a compact scrollback status |
+| `/plan`, `/status` | Render the cardless complete plan or refresh the responsive working surface |
 | `/approve [REV]` | Approve the exact latest plan revision |
 | `/reject FEEDBACK`, `/replan FEEDBACK` | Reject and regenerate with feedback |
 | `/add TEXT :: CRITERIA` | Add a checklist item as a new plan revision |
@@ -395,6 +403,7 @@ remaining production extensions.
 Key modules:
 
 - `runtime.py` — deterministic lifecycle, planning, execution, delegation, review
+- `ui_state.py` — one normalized question session across Intake, Normal, and ULTRA
 - `models.py` / `store.py` — typed domain state and transactional SQLite journal
 - `control.py` / `prompts.py` — validated control protocol and stable cached prompts
 - `tools/` — central registry for contained file/search/edit/patch/shell,
