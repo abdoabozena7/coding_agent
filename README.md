@@ -131,6 +131,17 @@ evidence, independent visual verdicts/pairwise comparisons, typed messages,
 versioned decisions and lessons, evaluation runs, redacted prompt traces, memory
 access, and fenced path/leader leases. Component specialists stage one real file
 at a time and publish a manifest; only FinalAssembler owns final output paths.
+
+Before execution, ULTRA derives a typed concern-coverage matrix from the task
+family and repository evidence, not from prompt length. Critical concerns receive
+named owners and executable acceptance checks: spatial semantics, progression,
+world continuity, and frame performance for games; security, data integrity,
+concurrency, recovery, and operability for backends; async states, accessibility,
+client security, and rendering performance for frontends; and leakage,
+reproducibility, evaluation validity, and serving reliability for ML. Existing
+master modules receive those contracts directly; a new specialist swarm is
+created only when the approved plan has not already divided the responsibility.
+
 `/tree`, `/agents`, `/agent`, `/memory`,
 `/trace`, `/insights`, and `/metrics` keep the default scrollback uncluttered.
 

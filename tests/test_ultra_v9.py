@@ -19,7 +19,14 @@ from agent.local_provider import normalize_generated_tool_args
 from agent.providers.base import AssistantTurn, ToolCall
 from agent.store import StateStore
 from agent.tui import ChoiceItem, ChoiceListState
-from agent.ultra import AgentRequest, AgentRole, TaskContractV1, UltraOrchestrator, WorkNode
+from agent.ultra import (
+    AgentRequest,
+    AgentRole,
+    MasterPlanV1,
+    TaskContractV1,
+    UltraOrchestrator,
+    WorkNode,
+)
 from agent.ultra_session import (
     StateStoreUltraAdapter,
     UltraSession,
@@ -653,8 +660,8 @@ class MaterializedPackageV9Tests(unittest.TestCase):
     def test_workforce_templates_cover_ml_backend_and_frontend(self) -> None:
         cases = (
             ("ML churn project", {"data", "model", "training", "evaluation", "serving"}),
-            ("Backend appointment booking API", {"domain", "api", "persistence", "auth", "tests"}),
-            ("Frontend analytics dashboard", {"layout", "components", "data", "accessibility", "visual_qa"}),
+            ("Backend appointment booking API", {"domain", "api", "persistence", "auth", "operations", "tests"}),
+            ("Frontend analytics dashboard", {"layout", "components", "data", "accessibility", "quality", "visual_qa"}),
         )
         for title, expected in cases:
             with self.subTest(title=title):
@@ -676,6 +683,144 @@ class MaterializedPackageV9Tests(unittest.TestCase):
                 self.assertTrue(
                     all(item["metadata"]["materialized_components_required"] for item in children)
                 )
+
+    def test_minimal_game_prompt_infers_logic_and_spatial_concerns(self) -> None:
+        matrix = UltraOrchestrator._concern_coverage_matrix(
+            "اعمل لي لعبة 3D بـThree.js"
+        )
+        self.assertEqual(matrix.task_family, "interactive_game")
+        self.assertTrue(
+            {
+                "spatial_semantics",
+                "gameplay_state",
+                "progression_pacing",
+                "world_scale",
+                "runtime_performance",
+            }.issubset({item.id for item in matrix.concerns})
+        )
+
+        node = WorkNode(
+            TaskContractV1(
+                id="ROOT",
+                title="Final game assembler",
+                objective="اعمل لي لعبة 3D بـThree.js",
+                acceptance_criteria=("The game is playable.",),
+                verification=("Play a complete session.",),
+                write_paths=("index.html",),
+                metadata={"force_recursive_specialists": True},
+            )
+        )
+        children = UltraOrchestrator._deterministic_shared_artifact_children(node)
+        owned = {
+            concern
+            for child in children
+            for concern in child["metadata"]["concern_ids"]
+        }
+        self.assertFalse(matrix.missing_critical_owners(children))
+        self.assertIn("spatial_semantics", owned)
+        self.assertIn("progression_pacing", owned)
+
+        character = next(child for child in children if child["id"].endswith(".character"))
+        character_node = WorkNode(TaskContractV1.from_mapping(character))
+        character_children = UltraOrchestrator._deterministic_specialist_children(character_node)
+        controls = next(
+            child for child in character_children if child["id"].endswith(".controls")
+        )
+        movement_parent = WorkNode(TaskContractV1.from_mapping(controls))
+        movement = next(
+            child
+            for child in UltraOrchestrator._deterministic_specialist_children(movement_parent)
+            if child["id"].endswith(".movement")
+        )
+        self.assertIn("spatial_semantics", movement["metadata"]["concern_ids"])
+        self.assertTrue(
+            any("faces and animates" in item for item in movement["acceptance_criteria"])
+        )
+
+    def test_concern_coverage_is_domain_specific_not_game_hard_coded(self) -> None:
+        cases = {
+            "Backend appointment booking API": {
+                "security_boundaries",
+                "data_integrity",
+                "concurrency_idempotency",
+                "operability",
+            },
+            "Frontend analytics dashboard": {
+                "ui_state_integrity",
+                "frontend_accessibility",
+                "frontend_security",
+                "frontend_performance",
+            },
+            "ML churn project": {
+                "data_leakage",
+                "ml_reproducibility",
+                "evaluation_validity",
+                "ml_serving_reliability",
+            },
+        }
+        for prompt, required in cases.items():
+            with self.subTest(prompt=prompt):
+                matrix = UltraOrchestrator._concern_coverage_matrix(prompt)
+                self.assertTrue(required.issubset({item.id for item in matrix.concerns}))
+                node = WorkNode(
+                    TaskContractV1(
+                        id="ROOT",
+                        title=prompt,
+                        objective=f"Build {prompt}",
+                        acceptance_criteria=("Works end to end.",),
+                        verification=("Run the complete checks.",),
+                        write_paths=("src",),
+                    )
+                )
+                children = UltraOrchestrator._deterministic_cross_domain_children(node)
+                self.assertFalse(matrix.missing_critical_owners(children))
+
+    def test_frontend_visual_prompt_is_not_rewritten_as_vehicle_game(self) -> None:
+        self.assertFalse(
+            UltraOrchestrator._requires_game_artifact("Frontend analytics dashboard")
+        )
+        self.assertTrue(
+            UltraOrchestrator._requires_visual_artifact("Frontend analytics dashboard")
+        )
+
+    def test_existing_master_modules_receive_concerns_without_duplicate_swarms(self) -> None:
+        modules = tuple(
+            TaskContractV1(
+                id=f"M{index}",
+                title=title,
+                objective=f"Implement {title}",
+                acceptance_criteria=("Works.",),
+                verification=("Test it.",),
+                write_paths=("src",),
+            )
+            for index, title in enumerate(
+                ("Domain", "API", "Persistence", "Authentication", "Operations", "Tests"),
+                start=1,
+            )
+        )
+        plan = MasterPlanV1(summary="Backend plan", modules=modules)
+        enriched = UltraOrchestrator._enforce_concern_coverage_contract(
+            "Backend appointment booking API",
+            plan,
+        )
+        owned = {
+            concern
+            for module in enriched.modules
+            for concern in module.metadata["concern_ids"]
+        }
+        matrix = UltraOrchestrator._concern_coverage_matrix(
+            "Backend appointment booking API"
+        )
+        self.assertTrue(set(matrix.critical_ids).issubset(owned))
+        self.assertTrue(
+            all(module.metadata["cross_domain_template_root"] is False for module in enriched.modules)
+        )
+        self.assertTrue(
+            all(
+                not UltraOrchestrator._deterministic_cross_domain_children(WorkNode(module))
+                for module in enriched.modules
+            )
+        )
 
     def test_oversized_world_leaves_have_recursive_specialists(self) -> None:
         road = WorkNode(

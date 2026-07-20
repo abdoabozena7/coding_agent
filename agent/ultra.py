@@ -413,6 +413,68 @@ class SpecialistProfileV1:
 
 
 @dataclass(frozen=True, slots=True)
+class ConcernRequirementV1:
+    """An observable quality concern that must have an owner and verifier.
+
+    Concerns are derived by the harness from the task family and repository
+    evidence.  They are deliberately not dependent on the user knowing which
+    engineering risks to mention in the prompt.
+    """
+
+    id: str
+    title: str
+    objective: str
+    acceptance_criteria: tuple[str, ...]
+    verification: tuple[str, ...]
+    owner_hint: str
+    critical: bool = True
+    source: str = "harness_inferred"
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[a-z][a-z0-9_]{1,63}", self.id):
+            raise AgentProtocolError(f"invalid concern id: {self.id!r}")
+        if not self.title.strip() or not self.objective.strip():
+            raise AgentProtocolError(f"concern {self.id!r} requires a title and objective")
+        if not self.acceptance_criteria or not self.verification:
+            raise AgentProtocolError(
+                f"concern {self.id!r} requires acceptance criteria and verification"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ConcernCoverageMatrixV1:
+    """Typed, inspectable proof that important task risks are owned."""
+
+    task_family: str
+    concerns: tuple[ConcernRequirementV1, ...]
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        ids = [item.id for item in self.concerns]
+        if not self.task_family.strip() or not self.concerns:
+            raise AgentProtocolError("ConcernCoverageMatrixV1 requires a family and concerns")
+        if len(ids) != len(set(ids)):
+            raise AgentProtocolError("ConcernCoverageMatrixV1 concern ids must be unique")
+
+    @property
+    def critical_ids(self) -> tuple[str, ...]:
+        return tuple(item.id for item in self.concerns if item.critical)
+
+    def missing_critical_owners(
+        self,
+        children: Iterable[Mapping[str, Any]],
+    ) -> tuple[str, ...]:
+        owned = {
+            str(concern)
+            for child in children
+            if isinstance(child, Mapping)
+            for concern in _strings(_mapping(child.get("metadata")).get("concern_ids"))
+        }
+        return tuple(item for item in self.critical_ids if item not in owned)
+
+
+@dataclass(frozen=True, slots=True)
 class LeafReadinessV1:
     node_id: str
     ready: bool
@@ -2449,6 +2511,7 @@ class UltraOrchestrator:
                 error=str(exc),
             )
         proposed = self._enforce_master_artifact_contract(prompt, proposed_raw)
+        proposed = self._enforce_concern_coverage_contract(prompt, proposed)
         quality_checklist = (
             "\n\nULTRA Quality Checklist (approval-bound): clean-code review; security review; "
             "tests and test-quality review; remediation Change Sets receive fresh reviews; "
@@ -2693,6 +2756,265 @@ class UltraOrchestrator:
         )
 
     @staticmethod
+    def _task_family(value: str) -> str:
+        text = str(value).casefold()
+        if any(
+            marker in text
+            for marker in (
+                "three.js", "threejs", "webgl", "game", "gameplay", "crossy",
+                "لعبة", "جيم", "ثري.js",
+            )
+        ):
+            return "interactive_game"
+        if any(
+            marker in text
+            for marker in (
+                "machine learning", "ml project", "training pipeline", "churn",
+                "classification model", "regression model", "تعلم آلي",
+            )
+        ):
+            return "ml"
+        if any(
+            marker in text
+            for marker in (
+                "backend", "back-end", "rest api", "graphql", "appointment",
+                "booking api", "microservice", "خلفية", "واجهة برمجة",
+            )
+        ):
+            return "backend"
+        if any(
+            marker in text
+            for marker in (
+                "frontend", "front-end", "dashboard", "web app", "landing page",
+                "react", "vue", "واجهة", "لوحة تحكم",
+            )
+        ):
+            return "frontend"
+        return "general"
+
+    @classmethod
+    def _requires_game_artifact(cls, prompt: str) -> bool:
+        return cls._task_family(prompt) == "interactive_game"
+
+    @classmethod
+    def _concern_coverage_matrix(cls, value: str) -> ConcernCoverageMatrixV1:
+        """Derive concern ownership needs from semantics, never prompt length."""
+
+        family = cls._task_family(value)
+
+        def concern(
+            id: str,
+            title: str,
+            objective: str,
+            acceptance: str,
+            verification: str,
+            owner: str,
+            *,
+            critical: bool = True,
+        ) -> ConcernRequirementV1:
+            return ConcernRequirementV1(
+                id=id,
+                title=title,
+                objective=objective,
+                acceptance_criteria=(acceptance,),
+                verification=(verification,),
+                owner_hint=owner,
+                critical=critical,
+            )
+
+        common = (
+            concern(
+                "functional_correctness", "Functional correctness",
+                "Preserve explicit invariants and complete the requested behavior.",
+                "Core happy paths and consequential edge cases match the approved brief.",
+                "Run deterministic behavior checks that assert outputs and state transitions.",
+                "implementation",
+            ),
+            concern(
+                "integration_contracts", "Integration contracts",
+                "Keep component interfaces, data shapes, and lifecycle ordering coherent.",
+                "All consumed interfaces are compatible and no accepted component is reinvented.",
+                "Run contract and end-to-end integration checks against materialized artifacts.",
+                "integration",
+            ),
+            concern(
+                "regression_safety", "Regression safety",
+                "Protect unrelated behavior and repository boundaries while changing the target.",
+                "Existing relevant behavior remains green and changes stay inside approved scope.",
+                "Run focused regression tests and inspect the final diff and dependency surface.",
+                "verification",
+            ),
+        )
+        families: dict[str, tuple[ConcernRequirementV1, ...]] = {
+            "interactive_game": (
+                concern(
+                    "spatial_semantics", "Spatial and input semantics",
+                    "Keep facing, movement intent, camera axes, lane direction, and animation coherent.",
+                    "Every moving actor faces and animates consistently with its actual movement direction.",
+                    "Exercise every input direction and assert pose, heading, displacement, and camera response.",
+                    "character_controls",
+                ),
+                concern(
+                    "gameplay_state", "Gameplay state machine",
+                    "Define deterministic start, play, collision, win, game-over, and restart transitions.",
+                    "No state can become stuck, skip required feedback, or retain stale round data.",
+                    "Run a full playable session covering collision, success, restart, and repeated rounds.",
+                    "gameplay_state",
+                ),
+                concern(
+                    "progression_pacing", "Progression and pacing",
+                    "Create a fair, measurable difficulty curve and meaningful replay progression.",
+                    "Success advances difficulty through bounded speed, density, timing, or layout changes.",
+                    "Compare deterministic early and later rounds and assert increasing challenge without impossible states.",
+                    "gameplay_progression",
+                ),
+                concern(
+                    "world_scale", "World scale and continuity",
+                    "Size and extend the traversable world to support the intended session and progression.",
+                    "The world does not visibly end or exhaust meaningful traversal during normal play.",
+                    "Play beyond the initial viewport and inspect segment generation, cleanup, and collision continuity.",
+                    "world",
+                ),
+                concern(
+                    "runtime_performance", "Runtime performance",
+                    "Bound rendering, update, allocation, and entity lifecycle costs.",
+                    "Frame pacing remains stable during a representative late-game load.",
+                    "Measure frame/update time, entity counts, and memory across an extended session.",
+                    "qa_performance",
+                ),
+                concern(
+                    "interactive_accessibility", "Interactive accessibility",
+                    "Provide readable feedback, keyboard/touch reachability, and reduced-motion-safe behavior.",
+                    "Core play and status feedback remain usable across supported input and viewport modes.",
+                    "Test keyboard, touch-sized controls, responsive layout, focus, and reduced motion.",
+                    "presentation",
+                    critical=False,
+                ),
+            ),
+            "backend": (
+                concern(
+                    "security_boundaries", "Security boundaries",
+                    "Enforce authentication, authorization, validation, secret handling, and abuse controls.",
+                    "No trust boundary accepts unauthorized or unvalidated operations.",
+                    "Run authorization, injection, malformed-input, rate-limit, and secret-leak tests.",
+                    "auth",
+                ),
+                concern(
+                    "data_integrity", "Data integrity",
+                    "Preserve transactional invariants, migrations, and durable consistency.",
+                    "Concurrent and failed operations cannot corrupt or partially commit domain state.",
+                    "Run rollback, migration, constraint, and persistence recovery tests.",
+                    "persistence",
+                ),
+                concern(
+                    "concurrency_idempotency", "Concurrency and idempotency",
+                    "Handle races, retries, duplicate delivery, and ordering explicitly.",
+                    "Repeated or concurrent requests have deterministic safe outcomes.",
+                    "Run race, duplicate-request, retry, and transaction-boundary tests.",
+                    "persistence",
+                ),
+                concern(
+                    "failure_recovery", "Failure and recovery",
+                    "Expose stable errors and recover safely from dependency failures and partial work.",
+                    "Failure paths are bounded, observable, and do not leak inconsistent state.",
+                    "Inject dependency, timeout, malformed-input, and restart failures.",
+                    "api",
+                ),
+                concern(
+                    "operability", "Performance and operability",
+                    "Meet latency/resource budgets with actionable logs, metrics, and health signals.",
+                    "Representative load stays within budget and operational failures are diagnosable.",
+                    "Run bounded load checks and inspect logs, metrics, health, and trace correlation.",
+                    "operations",
+                ),
+            ),
+            "frontend": (
+                concern(
+                    "ui_state_integrity", "UI state integrity",
+                    "Handle loading, empty, error, stale, optimistic, and recovered states coherently.",
+                    "Every async path has a usable state and cannot display contradictory data.",
+                    "Exercise delayed, empty, failed, stale, and recovered data fixtures.",
+                    "data",
+                ),
+                concern(
+                    "frontend_accessibility", "Frontend accessibility",
+                    "Provide semantic, keyboard, focus, contrast, and motion-safe interaction.",
+                    "Core journeys pass keyboard and automated accessibility checks.",
+                    "Run keyboard journeys, focus assertions, semantics audit, contrast, and reduced-motion checks.",
+                    "accessibility",
+                ),
+                concern(
+                    "frontend_security", "Frontend security",
+                    "Prevent unsafe rendering, token leakage, untrusted navigation, and insecure client assumptions.",
+                    "Untrusted content cannot execute and sensitive state is not exposed.",
+                    "Run XSS fixtures, URL validation, storage inspection, and authorization-boundary checks.",
+                    "quality",
+                ),
+                concern(
+                    "frontend_performance", "Frontend performance",
+                    "Bound initial load, rendering churn, asset cost, and long-task behavior.",
+                    "Representative pages remain responsive within explicit performance budgets.",
+                    "Measure bundle/load behavior, long tasks, rendering, and representative interactions.",
+                    "quality",
+                ),
+                concern(
+                    "visual_responsiveness", "Visual and responsive quality",
+                    "Maintain hierarchy, readability, and interaction across supported viewports.",
+                    "Critical layouts have no clipping, overlap, unreadable states, or visual regressions.",
+                    "Capture and compare deterministic desktop/mobile screenshots and interaction states.",
+                    "visual_qa",
+                ),
+            ),
+            "ml": (
+                concern(
+                    "data_leakage", "Data leakage prevention",
+                    "Keep target, future, identity, and split leakage out of features and evaluation.",
+                    "Training and evaluation separation is provable at data and transformation boundaries.",
+                    "Run schema, temporal split, duplicate/entity overlap, and target-proxy checks.",
+                    "data",
+                ),
+                concern(
+                    "ml_reproducibility", "ML reproducibility",
+                    "Version inputs/configuration and make training outcomes reproducible within tolerance.",
+                    "A clean rerun records lineage and reproduces metrics within declared tolerance.",
+                    "Repeat training from pinned inputs and compare artifacts, metrics, and lineage.",
+                    "training",
+                ),
+                concern(
+                    "evaluation_validity", "Evaluation validity",
+                    "Use relevant baselines, metrics, slices, calibration, and robustness evidence.",
+                    "Model acceptance is supported by baseline and slice results, not a single aggregate metric.",
+                    "Run baseline, holdout, slice, calibration, robustness, and threshold checks.",
+                    "evaluation",
+                ),
+                concern(
+                    "ml_serving_reliability", "Serving reliability",
+                    "Keep training-serving schemas aligned with bounded latency and drift observability.",
+                    "Serving rejects invalid inputs and exposes latency, version, and drift signals.",
+                    "Run schema parity, invalid-input, latency, versioning, and drift-monitor fixtures.",
+                    "serving",
+                ),
+            ),
+            "general": (
+                concern(
+                    "failure_recovery", "Failure and recovery",
+                    "Handle consequential failures without corrupting state or hiding partial work.",
+                    "Failure paths are explicit, recoverable where appropriate, and observable.",
+                    "Exercise boundary failures, interruption, retry, and restart behavior.",
+                    "integration",
+                ),
+                concern(
+                    "risk_security_performance", "Security and performance risks",
+                    "Discover and test relevant trust-boundary and resource risks for this task.",
+                    "No material security or performance risk remains unassessed.",
+                    "Run a task-specific threat/resource review and its highest-risk executable checks.",
+                    "quality_risk",
+                ),
+            ),
+        }
+        return ConcernCoverageMatrixV1(task_family=family, concerns=(*common, *families[family]))
+
+    @staticmethod
     def _requires_visual_artifact(prompt: str) -> bool:
         text = str(prompt).casefold()
         return any(
@@ -2724,6 +3046,29 @@ class UltraOrchestrator:
         if not cls._requires_visual_artifact(prompt):
             return goal
         final_paths = cls._final_output_paths(prompt)
+        if not cls._requires_game_artifact(prompt):
+            return replace(
+                goal,
+                constraints=tuple(
+                    dict.fromkeys(
+                        (
+                            *goal.constraints,
+                            f"The final deliverable uses approved packaging paths: {', '.join(final_paths)}.",
+                            "Visual acceptance requires real browser evidence at supported viewports.",
+                        )
+                    )
+                ),
+                in_scope=tuple(dict.fromkeys((*goal.in_scope, *final_paths, "browser runtime"))),
+                success_criteria=tuple(
+                    dict.fromkeys(
+                        (
+                            *goal.success_criteria,
+                            "The browser runtime has zero console, page, or network errors.",
+                            "Responsive, accessibility, async-state, security, and performance checks pass.",
+                        )
+                    )
+                ),
+            )
         return replace(
             goal,
             constraints=tuple(
@@ -2749,12 +3094,117 @@ class UltraOrchestrator:
         )
 
     @classmethod
+    def _enforce_concern_coverage_contract(
+        cls,
+        prompt: str,
+        proposed: MasterPlanV1,
+    ) -> MasterPlanV1:
+        semantic_source = " ".join(
+            (
+                prompt,
+                proposed.summary,
+                *(f"{module.title} {module.objective}" for module in proposed.modules),
+            )
+        )
+        matrix = cls._concern_coverage_matrix(semantic_source)
+        modules = list(proposed.modules)
+        assignments: dict[int, list[ConcernRequirementV1]] = defaultdict(list)
+        owner_terms: Mapping[str, tuple[str, ...]] = {
+            "implementation": ("implementation", "domain", "model", "component", "gameplay"),
+            "integration": ("integration", "test", "evaluation", "qa", "component"),
+            "verification": ("test", "evaluation", "qa", "verification", "visual"),
+            "world": ("world", "road", "environment"),
+            "character_controls": ("character", "control", "input", "movement"),
+            "gameplay_state": ("gameplay", "state", "logic", "progression"),
+            "gameplay_progression": ("progression", "difficulty", "traffic", "gameplay"),
+            "qa_performance": ("performance", "qa", "test"),
+            "presentation": ("presentation", "accessibility", "hud", "ui"),
+            "auth": ("auth", "security"),
+            "persistence": ("persistence", "database", "storage", "repository"),
+            "api": ("api", "http", "interface"),
+            "operations": ("operation", "observability", "performance", "deploy"),
+            "data": ("data", "feature"),
+            "training": ("training", "pipeline"),
+            "evaluation": ("evaluation", "metric", "test"),
+            "serving": ("serving", "inference", "deploy", "api"),
+            "accessibility": ("accessibility", "a11y"),
+            "quality": ("quality", "security", "performance"),
+            "visual_qa": ("visual", "qa", "test"),
+            "quality_risk": ("quality", "risk", "security", "performance"),
+        }
+        searchable = [
+            " ".join((module.title, module.objective)).casefold()
+            for module in modules
+        ]
+        for position, item in enumerate(matrix.concerns):
+            terms = owner_terms.get(item.owner_hint, (item.owner_hint,))
+            owner_index = next(
+                (
+                    index
+                    for index, text in enumerate(searchable)
+                    if any(term in text for term in terms)
+                ),
+                # Verification/integration concerns naturally belong to the
+                # last approved module; other unmatched concerns are spread
+                # deterministically instead of duplicating an entire swarm.
+                len(modules) - 1
+                if item.owner_hint in {"verification", "integration", "qa_performance"}
+                else position % len(modules),
+            )
+            assignments[owner_index].append(item)
+
+        enriched: list[TaskContractV1] = []
+        for index, module in enumerate(modules):
+            owned = assignments.get(index, [])
+            enriched.append(
+                replace(
+                    module,
+                    acceptance_criteria=tuple(
+                        dict.fromkeys(
+                            (
+                                *module.acceptance_criteria,
+                                *(criterion for item in owned for criterion in item.acceptance_criteria),
+                            )
+                        )
+                    ),
+                    verification=tuple(
+                        dict.fromkeys(
+                            (
+                                *module.verification,
+                                *(check for item in owned for check in item.verification),
+                            )
+                        )
+                    ),
+                    metadata={
+                        **dict(module.metadata),
+                        "task_family": matrix.task_family,
+                        "concern_source": semantic_source[:4_000],
+                        "concern_coverage_matrix": asdict(matrix),
+                        "critical_concern_ids": list(matrix.critical_ids),
+                        "concern_ids": [item.id for item in owned],
+                        "concern_contracts": [asdict(item) for item in owned],
+                        "require_complete_concern_ownership": True,
+                        "cross_domain_template_root": len(modules) == 1,
+                    },
+                )
+            )
+        return replace(
+            proposed,
+            modules=tuple(enriched),
+            execution_strategy=(
+                proposed.execution_strategy.rstrip()
+                + "\nHarness invariant: every inferred critical concern must have a named "
+                "specialist owner and executable verification evidence before acceptance."
+            ),
+        )
+
+    @classmethod
     def _enforce_master_artifact_contract(
         cls,
         prompt: str,
         proposed: MasterPlanV1,
     ) -> MasterPlanV1:
-        if not cls._requires_visual_artifact(prompt):
+        if not cls._requires_game_artifact(prompt):
             return proposed
         inherited = proposed.modules[0]
         final_paths = cls._final_output_paths(prompt)
@@ -2865,6 +3315,94 @@ class UltraOrchestrator:
             recommended_children=0 if ready else min(8, max(3, len(matched))),
         )
 
+    @classmethod
+    def _concerns_for_owner(
+        cls,
+        matrix: ConcernCoverageMatrixV1,
+        *owners: str,
+    ) -> tuple[ConcernRequirementV1, ...]:
+        wanted = {str(item).casefold() for item in owners if str(item).strip()}
+        return tuple(
+            item
+            for item in matrix.concerns
+            if item.owner_hint.casefold() in wanted
+        )
+
+    @staticmethod
+    def _with_concern_contract(
+        child: Mapping[str, Any],
+        concerns: Sequence[ConcernRequirementV1],
+        *,
+        family: str,
+    ) -> dict[str, Any]:
+        value = dict(child)
+        metadata = _mapping(value.get("metadata"))
+        existing_ids = _strings(metadata.get("concern_ids"))
+        metadata.update(
+            {
+                "task_family": family,
+                "concern_ids": list(dict.fromkeys((*existing_ids, *(item.id for item in concerns)))),
+                "concern_contracts": [asdict(item) for item in concerns],
+            }
+        )
+        value["metadata"] = metadata
+        acceptance = list(_strings(value.get("acceptance_criteria")))
+        verification = list(_strings(value.get("verification")))
+        for item in concerns:
+            acceptance.extend(item.acceptance_criteria)
+            verification.extend(item.verification)
+        value["acceptance_criteria"] = list(dict.fromkeys(acceptance))
+        value["verification"] = list(dict.fromkeys(verification))
+        return value
+
+    @staticmethod
+    def _inherited_concerns_for_child(
+        parent: WorkNode,
+        child_domain: str,
+    ) -> tuple[ConcernRequirementV1, ...]:
+        targets: Mapping[str, tuple[str, ...]] = {
+            "functional_correctness": ("qa.functional",),
+            "integration_contracts": ("qa.functional",),
+            "regression_safety": ("qa.functional",),
+            "spatial_semantics": ("character.controls.movement",),
+            "gameplay_state": ("gameplay.progression.state",),
+            "progression_pacing": (
+                "gameplay.traffic.difficulty",
+                "gameplay.progression.rewards",
+            ),
+            "world_scale": ("world.road.geometry",),
+            "runtime_performance": ("qa.performance",),
+            "interactive_accessibility": ("presentation.accessibility",),
+        }
+        selected: list[ConcernRequirementV1] = []
+        for raw in parent.contract.metadata.get("concern_contracts", ()):
+            if not isinstance(raw, Mapping):
+                continue
+            concern_id = str(raw.get("id", ""))
+            destinations = targets.get(concern_id, ())
+            if destinations and not any(
+                target == child_domain or target.startswith(child_domain + ".")
+                for target in destinations
+            ):
+                continue
+            if not destinations:
+                # Unmapped concerns stay owned by the parent integrator rather
+                # than being copied into every leaf.
+                continue
+            selected.append(
+                ConcernRequirementV1(
+                    id=concern_id,
+                    title=str(raw.get("title", concern_id)),
+                    objective=str(raw.get("objective", concern_id)),
+                    acceptance_criteria=_strings(raw.get("acceptance_criteria")),
+                    verification=_strings(raw.get("verification")),
+                    owner_hint=str(raw.get("owner_hint", "implementation")),
+                    critical=bool(raw.get("critical", True)),
+                    source=str(raw.get("source", "harness_inferred")),
+                )
+            )
+        return tuple(selected)
+
     @staticmethod
     def _specialist_profile(node: WorkNode) -> SpecialistProfileV1:
         default_interface = (
@@ -2891,6 +3429,12 @@ class UltraOrchestrator:
                 "acceptance_criteria": list(node.contract.acceptance_criteria),
                 "verification": list(node.contract.verification),
                 "component_package_only": bool(node.contract.metadata.get("component_package_only")),
+                "task_family": str(node.contract.metadata.get("task_family", "general")),
+                "owned_concerns": list(node.contract.metadata.get("concern_contracts", ())),
+                "instruction": (
+                    "Treat every owned concern as a required engineering contract. "
+                    "Produce executable evidence for it; do not replace it with a prose claim."
+                ),
             },
             owned_interfaces=owned_interfaces,
             deliverable=(
@@ -2901,7 +3445,19 @@ class UltraOrchestrator:
             quality_rubric={
                 "minimum_overall_score": 0.95,
                 "minimum_critical_score": 0.90,
-                "dimensions": ["functional", "integration", "visual", "maintainability"],
+                "dimensions": list(
+                    dict.fromkeys(
+                        (
+                            "functional",
+                            "integration",
+                            "maintainability",
+                            *tuple(
+                                str(item)
+                                for item in node.contract.metadata.get("concern_ids", ())
+                            ),
+                        )
+                    )
+                ),
             },
             dependencies=node.depends_on,
         )
@@ -2929,6 +3485,12 @@ class UltraOrchestrator:
     def _deterministic_shared_artifact_children(parent: WorkNode) -> tuple[Mapping[str, Any], ...]:
         readiness = UltraOrchestrator._leaf_readiness(parent)
         forced = bool(parent.contract.metadata.get("force_recursive_specialists"))
+        source = str(parent.contract.metadata.get("concern_source") or " ".join(
+            (parent.contract.title, parent.contract.objective)
+        ))
+        family = str(parent.contract.metadata.get("task_family") or UltraOrchestrator._task_family(source))
+        if family != "interactive_game":
+            return ()
         if not forced and (
             readiness.ready
             or not any(
@@ -2946,11 +3508,21 @@ class UltraOrchestrator:
             ("qa", "QAPackage", "Functional, visual, performance, browser, and accessibility acceptance evidence"),
         )
         children: list[Mapping[str, Any]] = []
+        matrix = UltraOrchestrator._concern_coverage_matrix(source)
+        concern_owners = {
+            "world": ("world",),
+            "vehicles": ("implementation",),
+            "character": ("character_controls",),
+            "gameplay": ("implementation", "gameplay_state", "gameplay_progression"),
+            "presentation": ("presentation",),
+            "qa": ("integration", "verification", "qa_performance"),
+        }
         previous: str | None = None
         for suffix, owned_interface, objective in domains:
             child_id = f"{parent.id}.{suffix}"
             children.append(
-                {
+                UltraOrchestrator._with_concern_contract(
+                    {
                     "id": child_id,
                     "title": suffix.replace("_", " ").title() + " specialist",
                     "objective": objective,
@@ -2975,9 +3547,20 @@ class UltraOrchestrator:
                         "final_output_paths": list(parent.write_paths),
                         "specialist_domain": suffix,
                     },
-                }
+                    },
+                    UltraOrchestrator._concerns_for_owner(
+                        matrix, *concern_owners.get(suffix, ())
+                    ),
+                    family=matrix.task_family,
+                )
             )
             previous = child_id
+        missing = matrix.missing_critical_owners(children)
+        if missing:
+            raise AgentProtocolError(
+                "interactive game specialist tree leaves critical concerns without owners: "
+                + ", ".join(missing)
+            )
         return tuple(children)
 
     @staticmethod
@@ -3146,13 +3729,16 @@ class UltraOrchestrator:
             "presentation": "PresentationPackage",
             "qa": "QAPackage",
         }.get(root_domain, f"{root_domain.title()}Package")
-        return tuple(
-            {
+        children: list[Mapping[str, Any]] = []
+        family = str(metadata.get("task_family", "interactive_game"))
+        for suffix, objective in definitions:
+            child_domain = f"{domain}.{suffix}"
+            child = {
                 "id": f"{parent.id}.{suffix}",
-                "title": f"{title.replace('_', ' ').title()} specialist",
+                "title": f"{suffix.replace('_', ' ').title()} specialist",
                 "objective": objective,
                 "acceptance_criteria": [
-                    f"The {title.replace('_', ' ')} package is concrete and directly integrable.",
+                    f"The {suffix.replace('_', ' ')} package is concrete and directly integrable.",
                     "Implementation, interface, tests, preview fixture, and evidence are explicit.",
                 ],
                 "verification": [
@@ -3170,17 +3756,22 @@ class UltraOrchestrator:
                     "component_package_only": True,
                     "materialized_components_required": True,
                     "component_leaf": True,
-                    "specialist_domain": f"{domain}.{suffix}",
-                    "visual_required": f"{domain}.{suffix}" not in {
+                    "specialist_domain": child_domain,
+                    "visual_required": child_domain not in {
                         "world.lighting.atmosphere.settings",
                         "world.lighting.shadows.settings",
                     },
                     "final_output_paths": list(metadata.get("final_output_paths", ())),
                 },
             }
-            for suffix, objective in definitions
-            for title in (suffix,)
-        )
+            children.append(
+                UltraOrchestrator._with_concern_contract(
+                    child,
+                    UltraOrchestrator._inherited_concerns_for_child(parent, child_domain),
+                    family=family,
+                )
+            )
+        return tuple(children)
 
     @staticmethod
     def _deterministic_cross_domain_children(
@@ -3190,6 +3781,11 @@ class UltraOrchestrator:
 
         if parent.contract.metadata.get("component_package_only"):
             return ()
+        if parent.contract.metadata.get("cross_domain_template_root") is False:
+            # The approved master plan already split the work. Its concern
+            # contracts were distributed across those modules, so expanding
+            # every module into the same family template would be brute force.
+            return ()
         text = " ".join(
             (
                 parent.contract.title,
@@ -3197,39 +3793,47 @@ class UltraOrchestrator:
                 *parent.contract.acceptance_criteria,
             )
         ).casefold()
-        templates: tuple[tuple[str, str], ...] = ()
-        family = ""
-        if any(term in text for term in ("machine learning", "churn", "training pipeline", "ml project")):
-            family = "ml"
+        source = str(parent.contract.metadata.get("concern_source") or text)
+        templates: tuple[tuple[str, str, tuple[str, ...]], ...] = ()
+        family = str(parent.contract.metadata.get("task_family") or UltraOrchestrator._task_family(source))
+        if family == "ml":
             templates = (
-                ("data", "Data contracts, validation, leakage prevention, features, and reproducible splits"),
-                ("model", "Model architecture, baselines, calibration, and inference contract"),
-                ("training", "Training orchestration, configuration, reproducibility, and checkpoints"),
-                ("evaluation", "Metrics, slice analysis, robustness, regression, and acceptance evidence"),
-                ("serving", "Serving interface, schema validation, observability, and deployment fixture"),
+                ("data", "Data contracts, validation, leakage prevention, features, and reproducible splits", ("data",)),
+                ("model", "Model architecture, baselines, calibration, and inference contract", ("implementation",)),
+                ("training", "Training orchestration, configuration, reproducibility, and checkpoints", ("training",)),
+                ("evaluation", "Metrics, slice analysis, robustness, regression, and acceptance evidence", ("evaluation", "verification", "integration")),
+                ("serving", "Serving interface, schema validation, observability, and deployment fixture", ("serving",)),
             )
-        elif any(term in text for term in ("appointment", "booking api", "backend api", "rest api")):
-            family = "backend"
+        elif family == "backend":
             templates = (
-                ("domain", "Domain entities, invariants, policies, and service contracts"),
-                ("api", "HTTP/API surface, schemas, validation, errors, and compatibility"),
-                ("persistence", "Persistence model, transactions, migrations, and repository interfaces"),
-                ("auth", "Authentication, authorization, abuse cases, and security boundaries"),
-                ("tests", "Contract, integration, concurrency, failure-path, and regression tests"),
+                ("domain", "Domain entities, invariants, policies, and service contracts", ("implementation",)),
+                ("api", "HTTP/API surface, schemas, validation, stable errors, and compatibility", ("api",)),
+                ("persistence", "Persistence model, transactions, concurrency, idempotency, migrations, and recovery", ("persistence",)),
+                ("auth", "Authentication, authorization, validation, abuse cases, and security boundaries", ("auth",)),
+                ("operations", "Latency/resource budgets, health, logs, metrics, traces, and deployment failure behavior", ("operations",)),
+                ("tests", "Contract, integration, concurrency, failure-path, security, load, and regression tests", ("verification", "integration")),
             )
-        elif any(term in text for term in ("dashboard", "frontend", "front-end", "web app")):
-            family = "frontend"
+        elif family == "frontend":
             templates = (
-                ("layout", "Responsive information architecture, hierarchy, navigation, and layout"),
-                ("components", "Reusable UI components, states, interaction, and design-system contracts"),
-                ("data", "Data fetching, cache/state, loading, error, and empty-state behavior"),
-                ("accessibility", "Keyboard, focus, semantics, contrast, motion, and assistive feedback"),
-                ("visual_qa", "Screenshot fixtures, visual rubric, responsive regression, and polish evidence"),
+                ("layout", "Responsive information architecture, hierarchy, navigation, and layout", ()),
+                ("components", "Reusable UI components, states, interaction, and design-system contracts", ("implementation", "integration")),
+                ("data", "Data fetching, cache/state, loading, error, stale, and empty-state behavior", ("data",)),
+                ("accessibility", "Keyboard, focus, semantics, contrast, motion, and assistive feedback", ("accessibility",)),
+                ("quality", "Client security boundaries, rendering/load performance, and resource budgets", ("quality",)),
+                ("visual_qa", "Screenshot fixtures, visual rubric, responsive regression, and polish evidence", ("visual_qa", "verification")),
             )
-        if not templates:
+        elif family == "general":
+            # For an unknown task family the model-authored decomposition owns
+            # the domain split. The harness still injects generic concerns into
+            # approved contracts, but does not blindly manufacture four extra
+            # agents for every small task.
             return ()
-        return tuple(
-            {
+        if not templates or family == "interactive_game":
+            return ()
+        matrix = UltraOrchestrator._concern_coverage_matrix(source)
+        children = tuple(
+            UltraOrchestrator._with_concern_contract(
+                {
                 "id": f"{parent.id}.{suffix}",
                 "title": f"{family.upper()} {suffix.replace('_', ' ').title()} specialist",
                 "objective": objective,
@@ -3251,9 +3855,18 @@ class UltraOrchestrator:
                     "specialist_domain": f"{family}.{suffix}",
                     "final_output_paths": list(parent.write_paths),
                 },
-            }
-            for suffix, objective in templates
+                },
+                UltraOrchestrator._concerns_for_owner(matrix, *owners),
+                family=family,
+            )
+            for suffix, objective, owners in templates
         )
+        missing = matrix.missing_critical_owners(children)
+        if missing:
+            raise AgentProtocolError(
+                f"{family} specialist tree leaves critical concerns without owners: {', '.join(missing)}"
+            )
+        return children
 
     def _validated_children(
         self,
