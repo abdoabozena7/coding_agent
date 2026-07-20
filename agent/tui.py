@@ -16,7 +16,7 @@ import textwrap
 import time
 from dataclasses import dataclass
 from threading import Event, Thread
-from typing import Any, Callable, Iterable, Sequence, TextIO
+from typing import Any, Callable, Iterable, Mapping, Sequence, TextIO
 
 try:  # Optional at import time; line-mode callers must keep working without it.
     from prompt_toolkit.application import Application, get_app
@@ -1102,6 +1102,403 @@ def _app_columns(default: int = 100) -> int:
         return default
 
 
+def _swarm_field(item: Any, name: str, default: Any = "") -> Any:
+    if item is None:
+        return default
+    value = item.get(name, default) if isinstance(item, Mapping) else getattr(item, name, default)
+    return getattr(value, "value", value)
+
+
+def _swarm_node_metadata(item: Any) -> Mapping[str, Any]:
+    contract = _swarm_field(item, "contract", None)
+    value = _swarm_field(contract, "metadata", {}) if contract is not None else {}
+    return value if isinstance(value, Mapping) else {}
+
+
+def swarm_agent_name(node: Any, nodes: Iterable[Any] = ()) -> str:
+    """Return a short stable persona name derived from the specialist path."""
+
+    metadata = _swarm_node_metadata(node)
+    domain = str(metadata.get("specialist_domain") or "").strip(".")
+    if domain:
+        parts = [part.replace("_", " ").title() for part in domain.split(".")]
+        return " · ".join(parts[-2:])
+    title = str(_swarm_field(node, "title", _swarm_field(node, "id", "Agent")))
+    title = title.replace(" specialist", "").replace(" Specialist", "").strip()
+    parent_id = str(_swarm_field(node, "parent_id", "") or "")
+    if parent_id:
+        parent = next(
+            (item for item in nodes if str(_swarm_field(item, "id")) == parent_id),
+            None,
+        )
+        if parent is not None:
+            parent_title = str(_swarm_field(parent, "title", "")).replace(" specialist", "").strip()
+            if parent_title and parent_title.casefold() not in title.casefold():
+                return f"{parent_title} · {title}"
+    return title or "Agent"
+
+
+@dataclass
+class SwarmInspectorState:
+    """Pure navigation state for the read-only live specialist inspector."""
+
+    selected_index: int = 0
+    tab: str = "agents"
+    prompt_expanded: bool = False
+
+    def clamp(self, snapshot: Mapping[str, Any]) -> None:
+        nodes = list(snapshot.get("nodes") or ())
+        self.selected_index = max(0, min(self.selected_index, max(0, len(nodes) - 1)))
+
+    def move(self, snapshot: Mapping[str, Any], delta: int) -> None:
+        self.clamp(snapshot)
+        nodes = list(snapshot.get("nodes") or ())
+        if nodes:
+            self.selected_index = max(0, min(len(nodes) - 1, self.selected_index + int(delta)))
+
+    def select_tab(self, value: str) -> None:
+        if value in {"agents", "tree"}:
+            self.tab = value
+
+
+def _swarm_status_mark(status: str, unicode: bool) -> str:
+    normalized = str(status).casefold()
+    if normalized in {"running", "in_progress", "planning", "reviewing", "testing"}:
+        return "◉" if unicode else ">"
+    if normalized in {"completed", "done"}:
+        return "●" if unicode else "x"
+    if normalized in {"failed", "blocked", "revision_required", "uncertain"}:
+        return "!"
+    if normalized in {"cancelled", "skipped"}:
+        return "–" if unicode else "-"
+    return "○" if unicode else "o"
+
+
+def _swarm_latest_by_node(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    latest: dict[str, Any] = {}
+    for agent in snapshot.get("agents") or ():
+        node_id = str(_swarm_field(agent, "work_node_id", "") or "")
+        if node_id:
+            latest[node_id] = agent
+    return latest
+
+
+def _swarm_node_status(node: Any, latest: Mapping[str, Any]) -> str:
+    node_id = str(_swarm_field(node, "id", ""))
+    agent = latest.get(node_id)
+    return str(_swarm_field(agent, "status", _swarm_field(node, "status", "pending")))
+
+
+def _swarm_ancestry(node: Any, nodes: Sequence[Any]) -> str:
+    by_id = {str(_swarm_field(item, "id")): item for item in nodes}
+    path = [swarm_agent_name(node, nodes)]
+    parent_id = str(_swarm_field(node, "parent_id", "") or "")
+    seen: set[str] = set()
+    while parent_id and parent_id not in seen and parent_id in by_id:
+        seen.add(parent_id)
+        parent = by_id[parent_id]
+        path.append(swarm_agent_name(parent, nodes))
+        parent_id = str(_swarm_field(parent, "parent_id", "") or "")
+    return " › ".join(reversed(path))
+
+
+def _swarm_tree_lines(
+    nodes: Sequence[Any],
+    *,
+    selected_id: str,
+    unicode: bool,
+) -> list[str]:
+    by_parent: dict[str | None, list[Any]] = {}
+    for node in nodes:
+        parent = _swarm_field(node, "parent_id", None)
+        parent_key = str(parent) if parent not in {None, ""} else None
+        by_parent.setdefault(parent_key, []).append(node)
+    for children in by_parent.values():
+        children.sort(key=lambda item: (int(_swarm_field(item, "position", 0) or 0), str(_swarm_field(item, "id"))))
+    latest: dict[str, Any] = {}
+    lines: list[str] = []
+
+    def visit(parent_id: str | None, prefix: str = "") -> None:
+        children = by_parent.get(parent_id, [])
+        for index, node in enumerate(children):
+            last = index == len(children) - 1
+            node_id = str(_swarm_field(node, "id"))
+            branch = ("└─" if last else "├─") if unicode else ("`-" if last else "|-")
+            continuation = "  " if last else ("│ " if unicode else "| ")
+            selected = "›" if unicode and node_id == selected_id else ">" if node_id == selected_id else " "
+            status = _swarm_node_status(node, latest)
+            phase = str(_swarm_field(node, "checkpoint", _swarm_field(node, "phase", "")) or "")
+            suffix = f" · {phase.replace('_', ' ')}" if phase else ""
+            lines.append(
+                f"{selected} {prefix}{branch} {_swarm_status_mark(status, unicode)} "
+                f"{swarm_agent_name(node, nodes)} · {status.replace('_', ' ')}{suffix}"
+            )
+            visit(node_id, prefix + continuation)
+
+    visit(None)
+    return lines
+
+
+def render_swarm_inspector(
+    snapshot: Mapping[str, Any],
+    state: SwarmInspectorState,
+    *,
+    width: int = 120,
+    height: int = 34,
+    unicode: bool = True,
+) -> str:
+    """Render one responsive frame of the live read-only swarm inspector."""
+
+    def finish(value: str) -> str:
+        if unicode:
+            return value
+        return value.translate(
+            str.maketrans(
+                {
+                    "·": "|",
+                    "›": ">",
+                    "│": "|",
+                    "─": "-",
+                    "↑": "^",
+                    "↓": "v",
+                    "←": "<",
+                    "→": ">",
+                    "…": "...",
+                    "–": "-",
+                    "◉": ">",
+                    "●": "x",
+                    "○": "o",
+                }
+            )
+        )
+
+    nodes = list(snapshot.get("nodes") or ())
+    state.clamp(snapshot)
+    latest = _swarm_latest_by_node(snapshot)
+    selected = nodes[state.selected_index] if nodes else None
+    selected_id = str(_swarm_field(selected, "id", ""))
+    statuses = [_swarm_node_status(node, latest).casefold() for node in nodes]
+    running = sum(item in {"running", "in_progress", "planning", "reviewing", "testing"} for item in statuses)
+    completed = sum(item in {"completed", "done"} for item in statuses)
+    failed = sum(item in {"failed", "blocked", "revision_required", "uncertain"} for item in statuses)
+    tabs = "[AGENTS]  TREE" if state.tab == "agents" else " AGENTS  [TREE]"
+    header = (
+        f"SWARM INSPECTOR  ·  {tabs}  ·  {len(nodes)} agents  ·  "
+        f"{running} working  ·  {completed} done"
+        + (f"  ·  {failed} attention" if failed else "")
+    )
+    rule = "─" * max(8, width) if unicode else "-" * max(8, width)
+    if not nodes:
+        return finish("\n".join((header[:width], rule[:width], "No specialists have been materialized yet.", "Esc close · R refresh")))
+
+    if state.tab == "tree":
+        tree = _swarm_tree_lines(nodes, selected_id=selected_id, unicode=unicode)
+        body = tree[: max(4, height - 5)]
+        hidden = len(tree) - len(body)
+        if hidden > 0:
+            body.append(f"… {hidden} more nodes" if unicode else f"... {hidden} more nodes")
+        return finish("\n".join(
+            [header[:width], rule[:width], *(_fit(line, width).rstrip() for line in body), rule[:width], "↑↓ select · ←→/Tab view · Enter prompt · R refresh · Esc close"]
+        ))
+
+    left_width = max(28, min(42, int(width * 0.36)))
+    right_width = max(28, width - left_width - 3)
+    list_height = max(7, height - 6)
+    half = list_height // 2
+    start = max(0, min(max(0, len(nodes) - list_height), state.selected_index - half))
+    visible = nodes[start : start + list_height]
+    left: list[str] = []
+    for offset, node in enumerate(visible, start=start):
+        node_id = str(_swarm_field(node, "id"))
+        status = _swarm_node_status(node, latest)
+        cursor = "›" if unicode and offset == state.selected_index else ">" if offset == state.selected_index else " "
+        left.append(
+            _fit(
+                f"{cursor} {offset + 1:02d} {_swarm_status_mark(status, unicode)} {swarm_agent_name(node, nodes)}",
+                left_width,
+            ).rstrip()
+        )
+
+    profiles = snapshot.get("profiles") or {}
+    traces = snapshot.get("traces") or {}
+    profile = profiles.get(selected_id, {}) if isinstance(profiles, Mapping) else {}
+    trace = traces.get(selected_id) if isinstance(traces, Mapping) else None
+    agent = latest.get(selected_id)
+    status = _swarm_node_status(selected, latest)
+    phase = str(_swarm_field(agent, "phase", _swarm_field(selected, "checkpoint", "pending")))
+    role = str(_swarm_field(agent, "role", _swarm_field(selected, "assigned_role", "specialist")))
+    mission = str(profile.get("mission") or _swarm_field(selected, "objective", "")).strip()
+    deliverable = str(profile.get("deliverable") or "Materialized, independently verified component package.").strip()
+    expertise = list(profile.get("expertise") or ())
+    interfaces = list(profile.get("owned_interfaces") or ())
+    concerns = list(_swarm_node_metadata(selected).get("concern_ids") or ())
+    capability_values = [*expertise[:3], *concerns[:3], *interfaces[:2]]
+    capabilities = ", ".join(dict.fromkeys(str(item) for item in capability_values if str(item).strip())) or "Bounded implementation and verification"
+    prompt = ""
+    if trace is not None:
+        prompt = str(_swarm_field(trace, "self_prompt", "") or _swarm_field(trace, "system_prompt", "")).strip()
+    right: list[str] = [
+        swarm_agent_name(selected, nodes).upper(),
+        f"{_swarm_status_mark(status, unicode)} {status.replace('_', ' ')}  ·  {role}/{phase}",
+        f"Path  {_swarm_ancestry(selected, nodes)}",
+        "",
+        "CAN DO",
+        *textwrap.wrap(capabilities, width=right_width)[:3],
+        "",
+        "ASSIGNMENT",
+        *textwrap.wrap(mission or "Waiting for its typed assignment.", width=right_width)[:4],
+        "",
+        "DELIVERS",
+        *textwrap.wrap(deliverable, width=right_width)[:2],
+        "",
+        "CURRENT PROMPT · REDACTED",
+    ]
+    prompt_rows = max(3, height - len(right) - 5) if state.prompt_expanded else 4
+    right.extend(textwrap.wrap(" ".join(prompt.split()), width=right_width)[:prompt_rows] or ["(model call has not started yet)"])
+    rows = max(len(left), len(right))
+    body = [
+        _fit(left[index] if index < len(left) else "", left_width)
+        + " │ "
+        + _fit(right[index] if index < len(right) else "", right_width).rstrip()
+        for index in range(rows)
+    ]
+    return finish("\n".join(
+        [header[:width], rule[:width], *body[: max(8, height - 4)], rule[:width], "↑↓ switch agent · ←→/Tab tree · Enter expand prompt · R refresh · Esc close"]
+    ))
+
+
+def run_swarm_inspector(
+    snapshot_provider: Callable[[], Mapping[str, Any]],
+    *,
+    initial_tab: str = "agents",
+    input_func: Callable[[str], str] = input,
+    output: TextIO = sys.stdout,
+    no_color: bool = False,
+    reduced_motion: bool = False,
+    force: bool = False,
+    app_input: Any | None = None,
+    app_output: Any | None = None,
+) -> None:
+    """Open a live, keyboard-navigable, read-only swarm workspace."""
+
+    if not PROMPT_TOOLKIT_AVAILABLE:
+        return
+    if not force and not rich_terminal_available(input_func, output):
+        return
+    state = SwarmInspectorState(tab=initial_tab if initial_tab in {"agents", "tree"} else "agents")
+    holder: dict[str, Mapping[str, Any]] = {"snapshot": snapshot_provider()}
+    unicode = terminal_supports_unicode(output)
+    bindings = KeyBindings()
+
+    def redraw(event: Any) -> None:
+        state.clamp(holder["snapshot"])
+        event.app.invalidate()
+
+    @bindings.add("up")
+    def _up(event: Any) -> None:
+        state.move(holder["snapshot"], -1)
+        redraw(event)
+
+    @bindings.add("down")
+    def _down(event: Any) -> None:
+        state.move(holder["snapshot"], 1)
+        redraw(event)
+
+    @bindings.add("pageup")
+    def _page_up(event: Any) -> None:
+        state.move(holder["snapshot"], -8)
+        redraw(event)
+
+    @bindings.add("pagedown")
+    def _page_down(event: Any) -> None:
+        state.move(holder["snapshot"], 8)
+        redraw(event)
+
+    @bindings.add("left")
+    def _left(event: Any) -> None:
+        state.select_tab("agents")
+        redraw(event)
+
+    @bindings.add("right")
+    def _right(event: Any) -> None:
+        state.select_tab("tree")
+        redraw(event)
+
+    @bindings.add("tab")
+    def _tab(event: Any) -> None:
+        state.select_tab("tree" if state.tab == "agents" else "agents")
+        redraw(event)
+
+    @bindings.add("enter")
+    @bindings.add("p")
+    def _prompt(event: Any) -> None:
+        state.prompt_expanded = not state.prompt_expanded
+        redraw(event)
+
+    @bindings.add("r")
+    def _refresh(event: Any) -> None:
+        holder["snapshot"] = snapshot_provider()
+        redraw(event)
+
+    @bindings.add("escape")
+    @bindings.add("c-c")
+    def _close(event: Any) -> None:
+        event.app.exit(result=None)
+
+    def frame() -> Any:
+        try:
+            size = get_app().output.get_size()
+            width, height = int(size.columns), int(size.rows)
+        except (AttributeError, RuntimeError, ValueError):
+            width, height = 120, 34
+        rendered = render_swarm_inspector(
+            holder["snapshot"],
+            state,
+            width=max(60, width - 1),
+            height=max(18, height - 1),
+            unicode=unicode,
+        )
+        return FormattedText([("class:details.body", rendered)])
+
+    root = Window(
+        content=FormattedTextControl(frame),
+        wrap_lines=False,
+        always_hide_cursor=True,
+    )
+    kwargs: dict[str, Any] = {}
+    prompt_output = _prompt_output(output, app_output)
+    if prompt_output is _UNUSABLE_OUTPUT:
+        return
+    if app_input is not None:
+        kwargs["input"] = app_input
+    if prompt_output is not None:
+        kwargs["output"] = prompt_output
+    application = Application(
+        layout=Layout(root),
+        key_bindings=bindings,
+        style=_make_style(no_color),
+        full_screen=True,
+        mouse_support=False,
+        **kwargs,
+    )
+
+    async def refresher() -> None:
+        interval = 1.5 if reduced_motion else 0.75
+        while True:
+            await asyncio.sleep(interval)
+            holder["snapshot"] = snapshot_provider()
+            state.clamp(holder["snapshot"])
+            get_app().invalidate()
+
+    def pre_run() -> None:
+        get_app().create_background_task(refresher())
+
+    try:
+        application.run(pre_run=pre_run)
+    except (EOFError, KeyboardInterrupt):
+        return
+
+
 def _list_fragments(state: ChoiceListState, unicode: bool) -> Any:
     width = max(28, int(_app_columns() * (0.45 if _app_columns() >= 88 else 0.9)))
     fragments: list[tuple[str, str]] = []
@@ -1348,6 +1745,7 @@ def select_choice(
 __all__ = [
     "ChoiceItem",
     "ChoiceListState",
+    "SwarmInspectorState",
     "NINE_DOT_STATES",
     "NineDotFrame",
     "PROMPT_TOOLKIT_AVAILABLE",
@@ -1359,7 +1757,10 @@ __all__ = [
     "render_welcome",
     "rich_terminal_available",
     "run_loading_task",
+    "run_swarm_inspector",
     "run_welcome_screen",
     "select_choice",
+    "render_swarm_inspector",
+    "swarm_agent_name",
     "terminal_supports_unicode",
 ]

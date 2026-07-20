@@ -8,6 +8,7 @@ from agent.tui import (
     NINE_DOT_STATES,
     ChoiceItem,
     ChoiceListState,
+    SwarmInspectorState,
     UserExitRequested,
     _responsive_welcome_brand,
     _welcome_fragments,
@@ -15,10 +16,13 @@ from agent.tui import (
     nine_dot_frame,
     render_choices,
     render_nine_dot,
+    render_swarm_inspector,
     render_welcome,
     rich_terminal_available,
     run_loading_task,
+    run_swarm_inspector,
     select_choice,
+    swarm_agent_name,
     terminal_supports_unicode,
 )
 
@@ -142,6 +146,121 @@ class ChoiceStateTests(unittest.TestCase):
         self.assertIn("Ctrl+Q Exit", rendered)
 
 
+class SwarmInspectorTests(unittest.TestCase):
+    @staticmethod
+    def snapshot():
+        nodes = [
+            {
+                "id": "root",
+                "parent_id": None,
+                "title": "Final assembler",
+                "status": "running",
+                "position": 1,
+                "objective": "Integrate accepted packages.",
+            },
+            {
+                "id": "character",
+                "parent_id": "root",
+                "title": "Character specialist",
+                "status": "running",
+                "position": 1,
+                "objective": "Build the character.",
+                "contract": {
+                    "metadata": {
+                        "specialist_domain": "character.controls",
+                        "concern_ids": ["spatial_semantics"],
+                    }
+                },
+            },
+            {
+                "id": "progression",
+                "parent_id": "root",
+                "title": "Progression specialist",
+                "status": "pending",
+                "position": 2,
+                "objective": "Build difficulty progression.",
+                "contract": {
+                    "metadata": {"specialist_domain": "gameplay.progression"}
+                },
+            },
+        ]
+        return {
+            "run_id": "run-1",
+            "nodes": nodes,
+            "agents": [
+                {
+                    "id": "agent-1",
+                    "work_node_id": "character",
+                    "status": "running",
+                    "role": "coder",
+                    "phase": "implement",
+                }
+            ],
+            "profiles": {
+                "character": {
+                    "mission": "Make movement direction and facing agree.",
+                    "deliverable": "Character package and movement tests.",
+                    "expertise": ["controls", "animation"],
+                    "owned_interfaces": ["CharacterPackage"],
+                }
+            },
+            "traces": {
+                "character": {
+                    "self_prompt": "Implement the bounded movement contract with executable evidence."
+                }
+            },
+        }
+
+    def test_agent_view_exposes_names_capabilities_assignment_and_redacted_prompt(self):
+        snapshot = self.snapshot()
+        state = SwarmInspectorState(selected_index=1)
+        rendered = render_swarm_inspector(snapshot, state, width=120, height=34)
+
+        self.assertIn("SWARM INSPECTOR", rendered)
+        self.assertIn("3 agents", rendered)
+        self.assertIn("Character · Controls", rendered)
+        self.assertIn("CAN DO", rendered)
+        self.assertIn("spatial_semantics", rendered)
+        self.assertIn("Make movement direction", rendered)
+        self.assertIn("CURRENT PROMPT · REDACTED", rendered)
+        self.assertIn("bounded movement contract", rendered)
+        self.assertIn("↑↓ switch agent", rendered)
+
+    def test_tree_view_is_hierarchical_status_aware_and_switchable(self):
+        snapshot = self.snapshot()
+        state = SwarmInspectorState(selected_index=2, tab="tree")
+        rendered = render_swarm_inspector(snapshot, state, width=100, height=28)
+
+        self.assertIn("[TREE]", rendered)
+        self.assertIn("└─", rendered)
+        self.assertIn("├─", rendered)
+        self.assertIn("Gameplay · Progression", rendered)
+        self.assertIn("pending", rendered)
+        state.select_tab("agents")
+        state.move(snapshot, -1)
+        self.assertEqual(state.tab, "agents")
+        self.assertEqual(state.selected_index, 1)
+
+    def test_simple_agent_names_come_from_dynamic_domain_not_game_hardcoding(self):
+        backend = {
+            "id": "auth",
+            "title": "Backend auth specialist",
+            "contract": {"metadata": {"specialist_domain": "backend.auth"}},
+        }
+        self.assertEqual(swarm_agent_name(backend), "Backend · Auth")
+
+    def test_ascii_swarm_view_is_safe_for_legacy_windows_code_pages(self):
+        rendered = render_swarm_inspector(
+            self.snapshot(),
+            SwarmInspectorState(selected_index=1),
+            width=100,
+            height=26,
+            unicode=False,
+        )
+        self.assertTrue(rendered.isascii())
+        self.assertIn("Character | Controls", rendered)
+
+
 class NineDotTests(unittest.TestCase):
     def test_every_semantic_state_produces_a_valid_immutable_frame(self):
         for state in NINE_DOT_STATES:
@@ -202,6 +321,23 @@ class NineDotTests(unittest.TestCase):
 
 
 class TerminalAndWelcomeTests(unittest.TestCase):
+    def test_live_swarm_inspector_opens_switches_views_and_closes(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        snapshot = SwarmInspectorTests.snapshot()
+        with create_pipe_input() as pipe:
+            pipe.send_text("\x1b[C\x1b[B\r\x1b")
+            run_swarm_inspector(
+                lambda: snapshot,
+                force=True,
+                app_input=pipe,
+                app_output=DummyOutput(),
+                output=io.StringIO(),
+                no_color=True,
+                reduced_motion=True,
+            )
+
     def test_ctrl_q_from_selector_requests_session_exit_not_back_navigation(self):
         from prompt_toolkit.input.defaults import create_pipe_input
         from prompt_toolkit.output import DummyOutput

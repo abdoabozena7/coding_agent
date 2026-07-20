@@ -48,6 +48,7 @@ from .tui import (
     UserExitRequested,
     rich_terminal_available,
     run_loading_task,
+    run_swarm_inspector,
     select_choice,
 )
 from .ui import (
@@ -1065,10 +1066,63 @@ def _answer_pending_intake_with_picker(
     return True
 
 
+def _swarm_inspector_snapshot(runtime: AgentRuntime, run: Any) -> Mapping[str, Any]:
+    """Read one consistent-enough observer frame from durable ULTRA state."""
+
+    nodes = list(runtime.store.list_work_nodes(run.id))
+    agents = list(runtime.store.list_agent_runs(run.id))
+    profiles = {
+        str(item.get("work_node_id")): item
+        for item in runtime.store.list_specialist_profiles(run.id)
+    }
+    traces: dict[str, Any] = {}
+    for trace in runtime.store.list_prompt_traces(run.id, limit=1_000):
+        node_id = str(getattr(trace, "work_node_id", "") or "")
+        if node_id and node_id not in traces:
+            traces[node_id] = trace
+    return {
+        "run_id": run.id,
+        "status": getattr(getattr(run, "status", ""), "value", getattr(run, "status", "")),
+        "nodes": nodes,
+        "agents": agents,
+        "profiles": profiles,
+        "traces": traces,
+    }
+
+
+def _open_swarm_inspector(
+    runtime: AgentRuntime,
+    console: ConsoleUI,
+    run: Any,
+    *,
+    initial_tab: str,
+) -> bool:
+    if not (
+        rich_terminal_available(input_func=console.input_func, output=console.stream)
+        and not console.plain
+        and console.stream is sys.stdout
+    ):
+        return False
+    with console.full_screen_modal(coalesce_events=True):
+        run_swarm_inspector(
+            lambda: _swarm_inspector_snapshot(runtime, run),
+            initial_tab=initial_tab,
+            input_func=console.input_func,
+            output=console.stream,
+            no_color=not console.color,
+            reduced_motion=console.reduced_motion,
+        )
+    return True
+
+
 def _show_tree(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -> None:
     run = _current_ultra_run(runtime)
     if run is None:
         console.write("Project tree\n  (no ULTRA run yet)")
+        return
+    if target is None and _open_swarm_inspector(
+        runtime, console, run, initial_tab="tree"
+    ):
         return
     nodes = runtime.store.list_work_nodes(run.id, parent_id=target, recursive=True)
     if target:
@@ -1113,6 +1167,10 @@ def _show_agents(
     run = _current_ultra_run(runtime)
     if run is None:
         console.write("Agents\n  (no ULTRA run yet)")
+        return
+    if not include_finished and _open_swarm_inspector(
+        runtime, console, run, initial_tab="agents"
+    ):
         return
     nodes = runtime.store.list_work_nodes(run.id)
     node_titles = {node.id: node.title for node in nodes}

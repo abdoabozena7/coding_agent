@@ -153,6 +153,16 @@ local-model request is labeled `model call open`; a prolonged quiet period is
 labeled `long model call` rather than being mistaken for completion. `/agents`
 opens the read-only detail view, while Esc/Ctrl+C requests a safe checkpoint.
 
+`/agents` now opens a live full-screen Swarm Inspector on interactive terminals.
+Every materialized specialist receives a short path-derived name and a read-only
+workspace showing its status, role/phase, capabilities, owned concerns and
+interfaces, assignment, deliverable, and latest redacted prompt. Up/Down switches
+specialists without affecting execution; Tab or Left/Right switches between the
+agent workspace and a status-aware hierarchy map. The view refreshes from durable
+SQLite state while the local model continues running. `/tree` opens the same
+inspector directly on the hierarchy tab, and plain/redirected terminals retain
+the compact text fallback.
+
 `/permissions full` is fail-closed: it works only after `/setup` builds the
 versioned non-root Docker image. The workspace is the only writable bind mount;
 the host home, Docker socket, and credentials are never mounted or injected.

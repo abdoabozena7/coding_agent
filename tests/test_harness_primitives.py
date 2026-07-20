@@ -607,6 +607,25 @@ class TerminalUITests(unittest.TestCase):
 
         self.assertEqual(rendered, [f"event-{index:03d}" for index in range(600)])
 
+    def test_live_inspector_modal_coalesces_background_noise_but_keeps_blockers(self):
+        console = ConsoleUI(stream=io.StringIO(), color=False)
+        rendered: list[str] = []
+        with mock.patch.object(
+            console,
+            "_render_event",
+            side_effect=lambda event: rendered.append(f"{event.kind}:{event.message}"),
+        ):
+            with console.full_screen_modal(coalesce_events=True):
+                for index in range(50):
+                    console.on_event(UIEvent("ultra.agent", f"agent-{index}"))
+                console.on_event(UIEvent("warning", "Provider retry needs attention"))
+                console.on_event(UIEvent("ultra.completed", "Run completed"))
+
+        self.assertEqual(
+            rendered,
+            ["warning:Provider retry needs attention", "ultra.completed:Run completed"],
+        )
+
     def test_plain_activity_pairs_tools_and_suppresses_internal_plan_retries(self):
         output = io.StringIO()
         console = ConsoleUI(stream=output, color=False, plain=True, reduced_motion=True)

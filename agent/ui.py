@@ -1650,7 +1650,7 @@ class ConsoleUI:
         self._live_activity.stop()
 
     @contextmanager
-    def full_screen_modal(self):
+    def full_screen_modal(self, *, coalesce_events: bool = False):
         """Buffer worker events while an alternate-screen picker owns stdout."""
 
         self._live_activity.stop()
@@ -1664,6 +1664,18 @@ class ConsoleUI:
                 if self._full_screen_depth == 0:
                     buffered = self._buffered_events
                     self._buffered_events = []
+                    if coalesce_events and buffered:
+                        terminal_kinds = {
+                            "error",
+                            "warning",
+                            "questions",
+                            "plan",
+                            "ultra.completed",
+                            "ultra.cancelled",
+                            "ultra.revision_required",
+                        }
+                        important = [event for event in buffered if event.kind in terminal_kinds]
+                        buffered = important[-8:]
                     # Keep the event lock while replaying so a newly arriving
                     # worker event cannot overtake older buffered activity.
                     for event in buffered:
