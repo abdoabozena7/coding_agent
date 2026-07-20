@@ -3078,6 +3078,37 @@ class UltraOrchestrator:
     @classmethod
     def _final_output_paths(cls, prompt: str) -> tuple[str, ...]:
         text = str(prompt).casefold()
+        refinement = any(
+            marker in text
+            for marker in (
+                "more advanced", "improve", "improved", "enhance", "upgrade",
+                "polish", "make it better", "make this better", "طور", "تطوير",
+                "حسن", "تحسين", "خليه أحسن",
+            )
+        )
+        if refinement:
+            contextual = re.findall(
+                r"Discovered repository context:\s+([^\s]*index\.html)\b",
+                str(prompt),
+                re.I,
+            )
+            discovered = tuple(
+                dict.fromkeys(
+                    match.replace("\\", "/").removeprefix("./")
+                    for match in (
+                        *contextual,
+                        *re.findall(
+                            r"(?<![A-Za-z0-9_.-])((?:[A-Za-z0-9_.-]+[\\/])+index\.html)\b",
+                            str(prompt),
+                            re.I,
+                        ),
+                    )
+                )
+            )
+            if discovered:
+                # A refinement must promote back into the discovered artifact,
+                # not manufacture a second root index.html beside it.
+                return (max(discovered, key=lambda item: (item.count("/"), len(item))),)
         if cls._requires_single_html_artifact(prompt):
             return ("index.html",)
         if any(
@@ -3258,18 +3289,45 @@ class UltraOrchestrator:
             return proposed
         inherited = proposed.modules[0]
         final_paths = cls._final_output_paths(prompt)
+        refinement = any(
+            marker in str(prompt).casefold()
+            for marker in (
+                "more advanced", "improve", "improved", "enhance", "upgrade",
+                "polish", "make it better", "make this better", "طور", "تطوير",
+                "حسن", "تحسين", "خليه أحسن",
+            )
+        )
         final_module = TaskContractV1(
             id=inherited.id,
-            title="FinalAssembler for the Three.js vehicle game",
+            title=(
+                "FinalAssembler for the existing Three.js game refinement"
+                if refinement
+                else "FinalAssembler for the Three.js vehicle game"
+            ),
             objective=(
-                "Build a polished playable 3D vehicle game and compose the World, Vehicles, Character, "
-                "Gameplay, Presentation, and QA component packages into one self-contained index.html."
+                (
+                    "Improve the accepted existing game in place and compose only approved World, Vehicles, "
+                    "Character, Gameplay, Presentation, and QA deltas. Preserve every working baseline behavior "
+                    "unless the challenger proves a non-regressing improvement."
+                )
+                if refinement
+                else (
+                    "Build a polished playable 3D vehicle game and compose the World, Vehicles, Character, "
+                    "Gameplay, Presentation, and QA component packages into one self-contained index.html."
+                )
             ),
             acceptance_criteria=(
                 "index.html contains a visibly modeled road/world, detailed vehicles, and readable character",
                 "Keyboard input drives a complete collision, scoring/progression, game-over, and restart loop",
                 "Camera, HUD, lighting, effects, responsiveness, and accessibility form one cohesive presentation",
                 "Browser, WebGL, functional, visual, and performance evidence passes with no runtime errors",
+                *(
+                    (
+                        "The challenger wins against the pre-change artifact and introduces no functional, visual, performance, or repository regression",
+                    )
+                    if refinement
+                    else ()
+                ),
             ),
             verification=(
                 "Run index.html in Playwright and inspect console, page, network, WebGL, and input state",

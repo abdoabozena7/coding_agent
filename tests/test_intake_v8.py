@@ -54,6 +54,24 @@ class IntentArchitectTests(unittest.TestCase):
         self.assertIs(decision.brief.routed_mode, RunMode.ULTRA)
         self.assertIn("Discovered repository context: src/game.js", decision.brief.assumptions)
 
+    def test_short_existing_game_refinement_preserves_baseline_without_reasking_project_shape(self) -> None:
+        decision = IntentArchitect().analyze(
+            "make this game more advanced",
+            requested_mode="ultra",
+            repository_facts=(
+                "Discovered repository context: index.html -> Three.js playable game runtime",
+            ),
+        )
+
+        self.assertIs(decision.brief.routed_mode, RunMode.ULTRA)
+        self.assertEqual(decision.questions, ())
+        self.assertTrue(
+            any("accepted baseline" in item for item in decision.brief.constraints)
+        )
+        self.assertTrue(
+            any("wins an evidence-backed comparison" in item for item in decision.brief.success_criteria)
+        )
+
 
 class PersistenceAndProtocolV8Tests(unittest.TestCase):
     def test_intake_answer_survives_store_reopen(self) -> None:

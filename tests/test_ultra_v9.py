@@ -228,6 +228,60 @@ class PromptCompletenessV9Tests(unittest.TestCase):
             ["platform", "packaging", "visual_direction"],
         )
 
+    def test_existing_game_refinement_targets_discovered_nested_artifact(self) -> None:
+        prompt = (
+            "make this game more advanced\n"
+            "Discovered repository context: ultra-output/lane-crossing-game/index.html "
+            "-> html_document index.html"
+        )
+
+        self.assertEqual(
+            UltraOrchestrator._final_output_paths(prompt),
+            ("ultra-output/lane-crossing-game/index.html",),
+        )
+
+    def test_existing_single_file_game_refinement_preserves_root_packaging(self) -> None:
+        prompt = (
+            "make this game more advanced\n"
+            "Discovered repository context: index.html -> html_document index.html"
+        )
+
+        self.assertEqual(UltraOrchestrator._final_output_paths(prompt), ("index.html",))
+
+
+class WorkspaceRecoveryV9Tests(unittest.TestCase):
+    def test_rejected_refinement_restores_only_agent_recorded_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "index.html").write_text("accepted", encoding="utf-8")
+            (workspace / "notes.txt").write_text("user baseline", encoding="utf-8")
+            session = UltraSession.__new__(UltraSession)
+            session.workspace = workspace
+            session._capture_workspace_baseline("run-refinement")
+
+            (workspace / "index.html").write_text("rejected challenger", encoding="utf-8")
+            (workspace / "generated.js").write_text("new rejected file", encoding="utf-8")
+            # Simulate unrelated user work while Ultra is active. Because it is
+            # not in the run's Change Sets, rollback must leave it alone.
+            (workspace / "notes.txt").write_text("user changed this", encoding="utf-8")
+
+            report = session._restore_workspace_baseline(
+                "run-refinement",
+                ("index.html", "generated.js"),
+                reason="candidate lost baseline comparison",
+            )
+
+            self.assertEqual((workspace / "index.html").read_text(encoding="utf-8"), "accepted")
+            self.assertFalse((workspace / "generated.js").exists())
+            self.assertEqual((workspace / "notes.txt").read_text(encoding="utf-8"), "user changed this")
+            self.assertEqual(report["restored"], ("index.html",))
+            self.assertEqual(report["removed"], ("generated.js",))
+            rejected = list(
+                (workspace / ".coding-agent" / "recovery" / "run-refinement" / "rejected").rglob("index.html")
+            )
+            self.assertEqual(len(rejected), 1)
+            self.assertEqual(rejected[0].read_text(encoding="utf-8"), "rejected challenger")
+
 
 class MaterializedPackageV9Tests(unittest.TestCase):
     def test_component_review_missing_boolean_uses_typed_evidence_not_prose(self) -> None:

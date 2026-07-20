@@ -7511,6 +7511,163 @@ class UltraSession:
                 continue
         return values
 
+    @staticmethod
+    def _recoverable_workspace_path(value: str) -> bool:
+        """Keep source/config artifacts recoverable without snapshotting caches or VCS internals."""
+
+        path = PurePosixPath(str(value).replace("\\", "/"))
+        if path.is_absolute() or ".." in path.parts or not path.parts:
+            return False
+        blocked_roots = {
+            ".coding-agent",
+            ".git",
+            ".hg",
+            ".svn",
+            ".venv",
+            "venv",
+            "node_modules",
+            "run-artifacts",
+            "__pycache__",
+        }
+        if path.parts[0] in blocked_roots or "__pycache__" in path.parts:
+            return False
+        return not (
+            len(path.parts) >= 2
+            and path.parts[0] == "output"
+            and path.parts[1] == "playwright"
+        )
+
+    def _recovery_root(self, run_id: str) -> Path:
+        safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(run_id))[:160] or "ultra-run"
+        return self.workspace / ".coding-agent" / "recovery" / safe_run_id
+
+    def _capture_workspace_baseline(self, run_id: str) -> Mapping[str, Any]:
+        """Create one project-scoped recovery snapshot before the approval boundary."""
+
+        recovery_root = self._recovery_root(run_id)
+        baseline_root = recovery_root / "baseline"
+        manifest_path = recovery_root / "manifest.json"
+        if manifest_path.is_file():
+            try:
+                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                existing = None
+            if isinstance(existing, Mapping) and existing.get("files"):
+                return dict(existing)
+
+        files: dict[str, str] = {}
+        baseline_root.mkdir(parents=True, exist_ok=True)
+        for source in self.workspace.rglob("*"):
+            if not source.is_file() or source.is_symlink():
+                continue
+            relative = source.relative_to(self.workspace).as_posix()
+            if not self._recoverable_workspace_path(relative):
+                continue
+            try:
+                digest = hashlib.sha256(source.read_bytes()).hexdigest()
+                destination = baseline_root / PurePosixPath(relative)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+            except OSError:
+                continue
+            files[relative] = digest
+        manifest = {
+            "schema": "WorkspaceRecoveryBaselineV1",
+            "run_id": str(run_id),
+            "captured_at": utc_now().isoformat(),
+            "files": files,
+        }
+        temporary = manifest_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, manifest_path)
+        return manifest
+
+    def _restore_workspace_baseline(
+        self,
+        run_id: str,
+        changed_paths: Iterable[str],
+        *,
+        reason: str,
+    ) -> Mapping[str, Any]:
+        """Restore only agent-recorded mutations; unrelated concurrent user files remain untouched."""
+
+        recovery_root = self._recovery_root(run_id)
+        manifest_path = recovery_root / "manifest.json"
+        if not manifest_path.is_file():
+            return {"restored": (), "removed": (), "preserved": (), "reason": reason}
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        baseline_files = {
+            str(path): str(digest)
+            for path, digest in dict(manifest.get("files") or {}).items()
+        }
+        baseline_root = recovery_root / "baseline"
+        rollback_stamp = utc_now().isoformat().replace(":", "-")
+        rejection_root = recovery_root / "rejected" / rollback_stamp
+        restored: list[str] = []
+        removed: list[str] = []
+        preserved: list[str] = []
+        for raw_path in sorted(set(str(item) for item in changed_paths if str(item).strip())):
+            relative = PurePosixPath(raw_path.replace("\\", "/"))
+            normalized = relative.as_posix().removeprefix("./")
+            if not self._recoverable_workspace_path(normalized):
+                continue
+            target = self.workspace / relative
+            if target.is_file() and not target.is_symlink():
+                rejected = rejection_root / relative
+                rejected.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, rejected)
+                preserved.append(normalized)
+            if normalized in baseline_files:
+                source = baseline_root / relative
+                if not source.is_file():
+                    raise RuntimeError(f"recovery baseline is missing {normalized!r}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_name(f".{target.name}.ga3bad-restore-{os.getpid()}")
+                shutil.copy2(source, temporary)
+                os.replace(temporary, target)
+                restored.append(normalized)
+            elif target.exists():
+                if target.is_file() or target.is_symlink():
+                    target.unlink()
+                    removed.append(normalized)
+        report = {
+            "schema": "WorkspaceRollbackReportV1",
+            "run_id": str(run_id),
+            "reason": str(reason),
+            "restored": tuple(restored),
+            "removed": tuple(removed),
+            "preserved": tuple(preserved),
+            "completed_at": utc_now().isoformat(),
+        }
+        rejection_root.mkdir(parents=True, exist_ok=True)
+        (rejection_root / "rollback-report.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return report
+
+    def _rollback_rejected_changes(self, reason: str) -> Mapping[str, Any]:
+        if not self.run_id:
+            return {"restored": (), "removed": (), "preserved": (), "reason": reason}
+        changed_paths = tuple(
+            dict.fromkeys(
+                path
+                for change_set in self.store.list_change_sets(self.run_id)
+                for path in change_set.changed_files
+            )
+        )
+        report = self._restore_workspace_baseline(
+            self.run_id,
+            changed_paths,
+            reason=reason,
+        )
+        self.events.publish(
+            "ultra.workspace_rolled_back",
+            "Rejected Ultra changes were removed and the accepted workspace baseline was restored.",
+            **dict(report),
+        )
+        return report
+
     @property
     def running(self) -> bool:
         return bool(self.future and not self.future.done())
@@ -8093,6 +8250,13 @@ class UltraSession:
             ended_at=utc_now(),
         )
         self.store.save_quality_cycle(baseline)
+        recovery_manifest = self._capture_workspace_baseline(self.adapter.run_id)
+        self.events.publish(
+            "ultra.workspace_baseline_captured",
+            "Accepted workspace baseline captured before approval; rejected changes can be rolled back.",
+            run_id=self.adapter.run_id,
+            file_count=len(dict(recovery_manifest.get("files") or {})),
+        )
         brain = ProjectBrain(self.store, self.adapter.run_id)
         brain.write(
             BrainSection.QUALITY_POLICY,
@@ -8750,8 +8914,15 @@ class UltraSession:
         try:
             result = self.orchestrator.run()
         except Exception as exc:
+            self._rollback_rejected_changes(
+                f"Ultra engine failed before acceptance: {redact_text(exc, 500)}"
+            )
             self._record_engine_failure(exc)
             raise
+        if not result.successful:
+            self._rollback_rejected_changes(
+                "Ultra candidate did not pass component/global acceptance gates."
+            )
         self._finalize_result(result)
         return result
 
@@ -8804,6 +8975,9 @@ class UltraSession:
                         if unreviewed:
                             details.append(f"{len(unreviewed)} unreviewed Change Set(s)")
                         if goal.status is GoalStatus.RUNNING:
+                            self._rollback_rejected_changes(
+                                "Ultra completion was rejected because findings or Change Sets remain open."
+                            )
                             self.store.transition_goal(
                                 self.goal_id,
                                 GoalStatus.BLOCKED,
@@ -8833,6 +9007,9 @@ class UltraSession:
                             reason="GoalOutcomeContract final acceptance gate passed",
                         )
                     else:
+                        self._rollback_rejected_changes(
+                            "GoalOutcomeContract rejected the candidate; preserving the previously accepted workspace."
+                        )
                         self.store.transition_goal(
                             self.goal_id,
                             GoalStatus.BLOCKED,

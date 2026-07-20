@@ -237,11 +237,30 @@ _VAGUE_ONLY = re.compile(
     r"^(?:make|build|create|fix|improve|do|اعمل|سوي|سوّي|ظبط|اضبط|حسن|صلح)(?:\s+(?:it|this|ده|دي|الحاجة))?$",
     re.IGNORECASE,
 )
+_REFINEMENT_TERMS = (
+    "more advanced",
+    "improve",
+    "improved",
+    "enhance",
+    "upgrade",
+    "polish",
+    "make it better",
+    "make this better",
+    "طور",
+    "تطوير",
+    "حسن",
+    "تحسين",
+    "خليه أحسن",
+)
 
 
 def _contains(text: str, terms: Iterable[str]) -> tuple[str, ...]:
     lowered = text.casefold()
     return tuple(term for term in terms if term.casefold() in lowered)
+
+
+def _is_refinement_request(text: str) -> bool:
+    return bool(_contains(str(text), _REFINEMENT_TERMS))
 
 
 def _option(label: str, description: str, recommended: bool = False) -> QuestionOptionV1:
@@ -358,6 +377,7 @@ class IntentArchitect:
             )
         )
         facts_text = "\n".join(discoverable_facts).casefold()
+        refinement = _is_refinement_request(text) and bool(discoverable_facts)
         visual = bool(_contains(text, _VISUAL_TERMS))
         explicit_artifact = re.search(
             r"\b[\w.-]+\.(?:html?|py|js|ts|tsx|jsx|css|json|md|ya?ml|toml)\b",
@@ -394,6 +414,13 @@ class IntentArchitect:
             add("platform_audience", PromptSlotStatus.EXPLICIT, "declared in prompt", "user_prompt")
         elif self._mentions(facts_text, platform_terms):
             add("platform_audience", PromptSlotStatus.DISCOVERED, "repository platform", "repository_facts")
+        elif refinement:
+            add(
+                "platform_audience",
+                PromptSlotStatus.DISCOVERED,
+                "preserve existing project platform and audience",
+                "repository_refinement_baseline",
+            )
         elif visual:
             add(
                 "platform_audience",
@@ -423,6 +450,13 @@ class IntentArchitect:
             add("packaging", PromptSlotStatus.EXPLICIT, explicit_artifact.group(0), "user_prompt")
         elif self._mentions(lowered, packaging_terms):
             add("packaging", PromptSlotStatus.EXPLICIT, "declared in prompt", "user_prompt")
+        elif refinement:
+            add(
+                "packaging",
+                PromptSlotStatus.DISCOVERED,
+                "preserve existing project packaging",
+                "repository_refinement_baseline",
+            )
         elif visual:
             add(
                 "packaging",
@@ -448,6 +482,13 @@ class IntentArchitect:
                 PromptSlotStatus.EXPLICIT,
                 answers["visual_direction"],
                 "intake_answer",
+            )
+        elif refinement:
+            add(
+                "visual_direction",
+                PromptSlotStatus.DISCOVERED,
+                "preserve and polish the existing visual direction",
+                "repository_refinement_baseline",
             )
         elif not visual:
             add(
@@ -646,6 +687,16 @@ class IntentArchitect:
             )
         )
         constraints = ["Preserve unrelated user work", "Use the real workspace and available tools"]
+        refinement = _is_refinement_request(original) and bool(repository_facts)
+        if refinement:
+            constraints.extend(
+                (
+                    "Treat the current working project as the accepted baseline; improve it instead of rebuilding it",
+                    "Preserve working behavior, public interfaces, packaging, and unrelated files unless an approved finding requires a change",
+                    "Build and evaluate a challenger against pre-change functional, visual, and repository baselines before promotion",
+                    "If the challenger does not measurably improve the project without regression, restore the accepted baseline",
+                )
+            )
         if visual_experience:
             constraints.extend(
                 (
@@ -658,6 +709,14 @@ class IntentArchitect:
             "Critical functional checks pass",
             "Independent review finds no unresolved blocking issue",
         ]
+        if refinement:
+            success_criteria.extend(
+                (
+                    "The candidate wins an evidence-backed comparison against the pre-change baseline",
+                    "Previously working functional, visual, performance, and integration checks do not regress",
+                    "Rejected or interrupted candidates leave the accepted workspace unchanged",
+                )
+            )
         if visual_experience:
             success_criteria.extend(
                 (
@@ -676,7 +735,16 @@ class IntentArchitect:
                 "Quality is preferred over execution speed",
                 *tuple(str(item).strip() for item in repository_facts if str(item).strip()),
             ),
-            risks=("Ambiguous requirements are resolved before mutation",),
+            risks=(
+                "Ambiguous requirements are resolved before mutation",
+                *(
+                    (
+                        "A broad refinement request could cause speculative rewrites; transactional baseline promotion is required",
+                    )
+                    if refinement
+                    else ()
+                ),
+            ),
             requested_mode=requested,
             routed_mode=routed,
             route_reason=route_reason,
