@@ -95,6 +95,7 @@ from .run_context import GoalContractV1, is_goal_escalation_approval
 from .weak_model import WeakModelPolicy
 from .repository_index import OllamaEmbeddingProvider, RepositoryIndex
 from .diagnostics import ErrorSignature, FailureDomain, normalize_error_message
+from .version_control import GitProtectionManager, VersionControlError
 from .local_provider import (
     extract_first_json_object,
     normalize_action_proposal,
@@ -201,6 +202,7 @@ class AgentRuntime:
         self.provider = provider
         self.store = store
         self.workspace = Path(workspace).resolve(strict=True)
+        self.version_control = GitProtectionManager(self.workspace)
         self.events = events or EventBus()
         self.approval = approval or (lambda _name, _args, _risk: False)
         self.config = config or RuntimeConfig.from_env()
@@ -594,6 +596,7 @@ class AgentRuntime:
             ),
             agent_steps=self.config.subagent_steps,
             reasoning_effort=self.reasoning_effort,
+            version_control=self.version_control,
         )
 
     def start_ultra(self, objective: str) -> Any:
@@ -1071,6 +1074,53 @@ class AgentRuntime:
 
     def active_goal(self) -> Goal | None:
         return self.store.load_active_goal()
+
+    def version_history(self, limit: int = 20) -> tuple[Any, ...]:
+        return self.version_control.history(limit)
+
+    def undo_versions(self, steps: int = 1) -> tuple[str, ...]:
+        if self.active_goal() is not None:
+            raise RuntimeStateError(
+                "Undo is disabled while a goal is active; finish or cancel it first."
+            )
+        ultra_future = getattr(self.ultra_session, "future", None)
+        if ultra_future is not None and not ultra_future.done():
+            raise RuntimeStateError("Undo is disabled while Ultra is still working.")
+        selected = list(self.version_control.undo_candidates(max(steps, 1)))[:steps]
+        if len(selected) < steps:
+            raise VersionControlError(
+                f"Only {len(selected)} accepted checkpoint(s) can be undone."
+            )
+        approved = self.approval(
+            "undo_accepted_checkpoints",
+            {
+                "steps": steps,
+                "commits": [item.commit for item in selected],
+                "subjects": [item.subject for item in selected],
+            },
+            "high",
+        )
+        if not approved:
+            raise RuntimeStateError("Undo cancelled; the workspace was not changed.")
+        reverted = self.version_control.undo(steps)
+        self.store.append_event(
+            "version_control.undo",
+            payload={"steps": steps, "reverted_commits": list(reverted)},
+        )
+        return reverted
+
+    def _checkpoint_accepted_goal(self, goal: Goal, *, source: str) -> str | None:
+        commit = self.version_control.create_checkpoint(
+            f"{goal.objective[:120]} ({source})",
+            kind="accepted",
+        )
+        if commit:
+            self.store.append_event(
+                "version_control.checkpoint",
+                goal_id=goal.id,
+                payload={"commit": commit, "source": source},
+            )
+        return commit
 
     def latest_plan(self) -> Plan | None:
         goal = self.active_goal()
@@ -2726,6 +2776,10 @@ class AgentRuntime:
                 latest_evaluation=evaluation,
                 waiting_question="",
             )
+            self._checkpoint_accepted_goal(
+                self.store.get_goal(goal.id),
+                source="user_visual_acceptance",
+            )
             self.store.transition_goal(goal.id, GoalStatus.REVIEWING, reason="user accepted only the unresolved subjective visual dimension")
             self.store.transition_goal(goal.id, GoalStatus.COMPLETED, reason="correctness gates and independent review passed; user accepted subjective visual quality")
             self._record_global_learning(
@@ -4314,6 +4368,10 @@ class AgentRuntime:
                     },
                 )
                 return "Candidate verified structurally, but subjective visual quality requires user review; it was not released as a verified final result."
+            self._checkpoint_accepted_goal(
+                self.store.get_goal(goal.id),
+                source="independent_final_review",
+            )
             self.store.transition_goal(
                 goal.id,
                 GoalStatus.COMPLETED,

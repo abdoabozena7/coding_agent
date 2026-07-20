@@ -138,6 +138,7 @@ from .reasoning import (
     reasoning_debate_protocol_for,
     reasoning_scaffold_for,
 )
+from .version_control import GitProtectionManager
 
 
 _READ_TOOLS = tools.names(categories={"read"})
@@ -7483,6 +7484,7 @@ class UltraSession:
         config: UltraConfig,
         agent_steps: int,
         reasoning_effort: str = "medium",
+        version_control: GitProtectionManager | None = None,
     ) -> None:
         self.store = store
         self.workspace = workspace
@@ -7493,6 +7495,7 @@ class UltraSession:
         self.config = config
         self.agent_steps = agent_steps
         self.reasoning_effort = str(reasoning_effort)
+        self.version_control = version_control
         self.goal_id: str | None = None
         self.adapter: StateStoreUltraAdapter | None = None
         self.orchestrator: UltraOrchestrator | None = None
@@ -9001,6 +9004,20 @@ class UltraSession:
                         self.run_id,
                     )
                     if bool(decision.get("accepted")):
+                        if self.version_control is not None:
+                            commit = self.version_control.create_checkpoint(
+                                f"{goal.objective[:120]} (ultra_final_acceptance)",
+                                kind="accepted",
+                            )
+                            if commit:
+                                self.store.append_event(
+                                    "version_control.checkpoint",
+                                    goal_id=self.goal_id,
+                                    payload={
+                                        "commit": commit,
+                                        "source": "ultra_final_acceptance",
+                                    },
+                                )
                         self.store.transition_goal(
                             self.goal_id,
                             GoalStatus.COMPLETED,

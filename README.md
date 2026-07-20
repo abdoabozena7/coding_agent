@@ -95,8 +95,16 @@ python -m agent
 ```
 
 The interactive terminal opens on a full-screen `GA3BAD` welcome. Press Enter,
-then use the arrow keys and Enter to choose one workspace, model, and access level
-at a time. The chat opens in Normal, which automatically promotes complex work to
+then use the arrow keys and Enter to choose one workspace, project-protection tier,
+model, and access level at a time. Before any model can change files, GA3BAD checks
+for a dedicated local Git repository and GitHub remote. If authenticated GitHub CLI
+is available, Enter creates a private repository and pushes the baseline; otherwise
+Enter enables local Git history. Local Git provides multi-step undo, while GitHub
+adds off-device backup. A clearly marked no-Git option has no version-based undo
+(Ultra still protects its current rejected attempt), and Refresh rechecks setup
+performed in another terminal.
+
+The chat opens in Normal, which automatically promotes complex work to
 Ultra; press F2 before submitting a prompt when you want to lock Ultra explicitly.
 The focused row always includes its description; Esc moves back without changing
 the current selection. Model discovery and
@@ -254,6 +262,9 @@ opens the redacted, session-only blocks again. Use `/trace`, `/history`, or
 | `/auto` | Retry and self-prompt without an attempt limit until verified completion or real input/approval |
 | `/pause`, `/resume` | Cooperatively checkpoint and continue |
 | `/history` | Show durable events and generated worker roles/results |
+| `/versions` | List protected baseline/accepted checkpoints and their file-change summaries |
+| `/diff [NUMBER\|COMMIT]` | Show redacted current staged/unstaged/untracked changes, or a checkpoint patch |
+| `/undo [STEPS]` | With explicit approval, safely revert accepted checkpoints while preserving the undo in Git history; blocked during active work or with dirty files |
 | `/resolve ENTITY_ID applied\|not-run NOTE` | Reconcile an uncertain crash-window action or worker after inspecting real workspace state |
 | `/cancel CANCEL` | Explicitly abandon an unfinished goal |
 | `/quit` / `exit` | Exit without losing the goal |

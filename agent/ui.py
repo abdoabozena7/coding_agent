@@ -95,6 +95,9 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/auto", "continue the approved goal until a checkpoint"),
     ("/status", "show the dashboard"),
     ("/history", "show durable activity"),
+    ("/diff", "show current changes or one checkpoint diff"),
+    ("/versions", "show accepted project checkpoints"),
+    ("/undo", "safely revert accepted checkpoints: /undo [steps]"),
     ("/pause", "checkpoint active work"),
     ("/resume", "continue paused work"),
     ("/resolve", "reconcile uncertain crash-window work"),
@@ -129,14 +132,14 @@ COMMAND_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "Inspect",
         "Open status, activity, agents, memory, traces, and metrics",
         (
-            "/status", "/history", "/tree", "/agents", "/agent", "/memory", "/trace", "/thinking",
+            "/status", "/history", "/diff", "/versions", "/tree", "/agents", "/agent", "/memory", "/trace", "/thinking",
             "/insights", "/questions", "/answer", "/metrics", "/doctor", "/skills", "/processes",
         ),
     ),
     (
         "Session",
         "Change mode, model, access, and terminal settings",
-        ("/mode", "/model", "/permissions", "/settings", "/setup", "/sleep", "/stop-process"),
+        ("/mode", "/model", "/permissions", "/settings", "/setup", "/sleep", "/stop-process", "/undo"),
     ),
     (
         "Help & exit",
@@ -992,6 +995,9 @@ Execution
   /auto                      retry/self-prompt without limit until completion or real user input
   /pause / /resume           cooperatively stop or continue
   /history / /status         inspect durable execution state
+  /versions                  list protected accepted checkpoints and change summaries
+  /diff [NUMBER|COMMIT]      show current changes or one redacted checkpoint patch
+  /undo [STEPS]              safely revert accepted checkpoints after explicit approval
   /tree [NODE]               inspect the ULTRA module/submodule/task hierarchy
   /agents [--all|AGENT]      read-only live swarm list/topology
   /agent NUMBER|ID           inspect one specialist and its redacted prompt

@@ -66,6 +66,7 @@ from .ui import (
     contextual_commands,
 )
 from .ultra_models import AgentRunStatus, BrainSection
+from .version_control import GitProtectionManager, GitProtectionStatus
 
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -188,7 +189,7 @@ def choose_workspace(
             subtitle="Open an existing project or explicitly create a new one.",
             initial_key=str(recent) if recent is not None else "__create__",
             filterable=True,
-            step_label="Setup 1 of 3",
+            step_label="Setup 1 of 4",
             action_label="Open",
             no_color=no_color,
             reduced_motion=reduced_motion,
@@ -248,7 +249,7 @@ def choose_model(
     output: TextIO = sys.stdout,
     rich: bool | None = None,
     initial: str | None = None,
-    step_label: str = "Setup 2 of 3",
+    step_label: str = "Setup 3 of 4",
     no_color: bool = False,
     reduced_motion: bool = False,
 ) -> ModelDescriptor:
@@ -369,7 +370,7 @@ def choose_access_level(
     sandbox: DockerSandbox | None = None,
     rich: bool | None = None,
     initial: str | AccessLevel = AccessLevel.NORMAL,
-    step_label: str = "Setup 3 of 3",
+    step_label: str = "Setup 4 of 4",
     no_color: bool = False,
     reduced_motion: bool = False,
 ) -> AccessLevel:
@@ -461,6 +462,194 @@ def choose_access_level(
         if choice in {"", "1", "normal"}:
             return AccessLevel.NORMAL
         print("Choose normal or full.", file=output)
+
+
+def choose_project_protection(
+    workspace: str | os.PathLike[str],
+    *,
+    input_func: Callable[[str], str] = input,
+    output: TextIO = sys.stdout,
+    rich: bool | None = None,
+    no_color: bool = False,
+    reduced_motion: bool = False,
+) -> GitProtectionStatus:
+    """Choose an honest recovery tier before model execution can modify files."""
+
+    manager = GitProtectionManager(workspace)
+    use_rich = (
+        rich_terminal_available(input_func=input_func, output=output)
+        if rich is None
+        else bool(rich)
+    )
+    while True:
+        status = (
+            run_loading_task(
+                manager.inspect,
+                title="Checking project protection",
+                detail="Inspecting local Git history and GitHub backup",
+                state="sync",
+                input_func=input_func,
+                output=output,
+                no_color=no_color,
+                reduced_motion=reduced_motion,
+            )
+            if use_rich
+            else manager.inspect()
+        )
+        if status is None:
+            raise PickerBack()
+
+        github_unavailable_reason = ""
+        if not status.gh_available:
+            github_unavailable_reason = (
+                "GitHub CLI is not installed. Install `gh`, run `gh auth login`, then Refresh."
+            )
+        elif not status.gh_authenticated:
+            github_unavailable_reason = (
+                "GitHub CLI is not signed in. Run `gh auth login`, then Refresh."
+            )
+
+        if status.github_connected:
+            choices = (
+                ChoiceItem(
+                    key="continue_github",
+                    label="Continue with GitHub protection",
+                    description=(
+                        "Accepted results become local checkpoints and are backed up to "
+                        f"{status.remote_url}."
+                    ),
+                    meta="Recommended",
+                    value="continue_github",
+                ),
+                ChoiceItem(
+                    key="refresh",
+                    label="Refresh connection",
+                    description="Check Git and GitHub again without changing the project.",
+                    meta="Recheck",
+                    value="refresh",
+                ),
+                ChoiceItem(
+                    key="local",
+                    label="Keep checkpoints local",
+                    description="Keep multi-step undo, but do not push new checkpoints to GitHub.",
+                    meta="No remote sync",
+                    value="local",
+                ),
+            )
+            initial_key = "continue_github"
+        else:
+            connect_description = (
+                "Create a private GitHub repository, connect origin, and push the protected baseline."
+                if not github_unavailable_reason
+                else f"Unavailable: {github_unavailable_reason}"
+            )
+            if status.dedicated_repository:
+                local_label = "Continue with local Git history"
+                local_description = (
+                    f"Keep {status.commit_count} existing checkpoint(s) locally. "
+                    "Multi-step undo works; there is no off-device backup."
+                )
+            else:
+                local_label = "Enable local Git history"
+                local_description = (
+                    "Create a dedicated repository and protected baseline now. "
+                    "This enables multi-step undo without publishing anything."
+                )
+            can_connect = not bool(github_unavailable_reason)
+            choices = (
+                ChoiceItem(
+                    key="github",
+                    label="Create private GitHub backup",
+                    description=connect_description,
+                    meta="Recommended" if can_connect else "Unavailable",
+                    value="github",
+                    disabled=not can_connect,
+                    disabled_reason=github_unavailable_reason,
+                ),
+                ChoiceItem(
+                    key="local",
+                    label=local_label,
+                    description=local_description,
+                    meta="Recommended" if not can_connect else "Local only",
+                    value="local",
+                    disabled=not status.git_available,
+                    disabled_reason="Git is not installed." if not status.git_available else "",
+                ),
+                ChoiceItem(
+                    key="refresh",
+                    label="Refresh connection",
+                    description=(
+                        "Use this after installing/signing in to GitHub CLI or connecting origin yourself."
+                    ),
+                    meta="Recheck",
+                    value="refresh",
+                ),
+                ChoiceItem(
+                    key="snapshot",
+                    label="Continue without Git history",
+                    description=(
+                        "No version-based undo is available. Ultra can still roll back its current rejected "
+                        "attempt, but older accepted versions cannot be selected later."
+                    ),
+                    meta="Limited undo",
+                    value="snapshot",
+                ),
+            )
+            initial_key = "github" if can_connect else "local" if status.git_available else "snapshot"
+
+        if use_rich:
+            selected = select_choice(
+                choices,
+                title="Protect this project before starting",
+                subtitle=(
+                    f"{status.detail} GitHub adds remote backup; local Git provides the version history."
+                ),
+                initial_key=initial_key,
+                filterable=False,
+                step_label="Setup 2 of 4",
+                action_label="Continue",
+                no_color=no_color,
+                reduced_motion=reduced_motion,
+                input_func=input_func,
+                output=output,
+            )
+            if selected is None:
+                raise PickerBack()
+            action = str(selected.value)
+        else:
+            print("Project protection", file=output)
+            print(f"  {status.detail}", file=output)
+            available = [item for item in choices if not item.disabled]
+            for index, item in enumerate(available, start=1):
+                recommended = " [Recommended]" if item.key == initial_key else ""
+                print(f"  {index}. {item.label}{recommended}", file=output)
+                print(f"     {item.description}", file=output)
+            while True:
+                raw = input_func("protection [1]> ").strip()
+                if not raw:
+                    action = initial_key
+                    break
+                if raw.isdigit() and 1 <= int(raw) <= len(available):
+                    action = str(available[int(raw) - 1].value)
+                    break
+                print("Choose one available protection option.", file=output)
+
+        if action == "refresh":
+            continue
+        if action == "github":
+            return manager.connect_github_private()
+        if action == "local":
+            protected = manager.ensure_local_history()
+            # An already-connected repository can intentionally disable auto-push.
+            if status.github_connected:
+                manager.configure(auto_checkpoint=True, auto_push=False, provider="local_git")
+                return manager.inspect()
+            return protected
+        if action == "continue_github":
+            manager.configure(auto_checkpoint=True, auto_push=True, provider="github")
+            return manager.inspect()
+        if action == "snapshot":
+            return manager.use_snapshot_only()
 
 
 def choose_interaction_mode(
@@ -702,6 +891,24 @@ def _show_history(runtime: AgentRuntime, console: ConsoleUI) -> None:
             console.write(
                 f"  {worker.id}  task={worker.task_id} role={worker.role.name}"
             )
+
+
+def _show_versions(runtime: AgentRuntime, console: ConsoleUI) -> None:
+    status = runtime.version_control.inspect()
+    checkpoints = runtime.version_history(30)
+    console.write(f"Project protection: {status.detail}")
+    if status.remote_url:
+        console.write(f"GitHub: {status.remote_url}")
+    if not checkpoints:
+        console.write("No protected checkpoints yet.")
+        return
+    console.write("Protected checkpoints (newest first)")
+    for index, item in enumerate(checkpoints, start=1):
+        summary = runtime.version_control.change_summary(item.commit)
+        console.write(
+            f"  {index:>2}. {item.commit[:8]}  {item.kind:<9}  "
+            f"{item.created_at[:19]}  {item.subject}\n      {summary}"
+        )
 
 
 def _show_runtime_state(
@@ -1944,6 +2151,19 @@ def execute_command(
     if command.kind == CommandKind.HISTORY:
         _show_history(runtime, console)
         return True
+    if command.kind == CommandKind.DIFF:
+        console.write(runtime.version_control.diff(command.args.get("target")))
+        return True
+    if command.kind == CommandKind.VERSIONS:
+        _show_versions(runtime, console)
+        return True
+    if command.kind == CommandKind.UNDO:
+        reverted = runtime.undo_versions(int(command.args.get("steps") or 1))
+        console.write(
+            f"Undo complete: reverted {len(reverted)} accepted checkpoint(s). "
+            "The undo itself is preserved in Git history."
+        )
+        return True
     if command.kind == CommandKind.AUTO:
         if preferences.mode == InteractionMode.ULTRA:
             console.write("ULTRA execution already runs in the background after master approval.")
@@ -2063,6 +2283,8 @@ def interactive_loop(
         CommandKind.TRACE,
         CommandKind.INSIGHTS,
         CommandKind.HISTORY,
+        CommandKind.DIFF,
+        CommandKind.VERSIONS,
         CommandKind.PROCESSES,
         CommandKind.HELP,
         CommandKind.KEYMAP,
@@ -2202,6 +2424,7 @@ def _interactive_setup(
     stages = []
     if workspace is None:
         stages.append("workspace")
+    stages.append("protection")
     if descriptor is None:
         stages.append("model")
     if requested_access is None:
@@ -2219,6 +2442,16 @@ def _interactive_setup(
                     output=console.stream,
                     rich=rich,
                     initial=workspace,
+                    no_color=not console.color,
+                    reduced_motion=console.reduced_motion,
+                )
+            elif stage == "protection":
+                assert workspace is not None
+                choose_project_protection(
+                    workspace,
+                    input_func=console.input_func,
+                    output=console.stream,
+                    rich=rich,
                     no_color=not console.color,
                     reduced_motion=console.reduced_motion,
                 )

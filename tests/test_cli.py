@@ -11,6 +11,7 @@ from unittest import mock
 from agent.cli import (
     choose_access_level,
     choose_interaction_mode,
+    choose_project_protection,
     choose_workspace,
     execute_command,
     interactive_loop,
@@ -24,6 +25,23 @@ from agent.ui import ConsoleUI, DashboardView
 
 
 class CLITests(unittest.TestCase):
+    def test_plain_project_protection_defaults_to_local_git_when_gh_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            with mock.patch("agent.version_control.shutil.which") as which:
+                which.side_effect = lambda name: "git" if name == "git" else None
+                status = choose_project_protection(
+                    directory,
+                    rich=False,
+                    input_func=lambda _prompt: "",
+                    output=output,
+                )
+
+            self.assertTrue(status.dedicated_repository)
+            self.assertFalse(status.github_connected)
+            self.assertIn("Recommended", output.getvalue())
+            self.assertTrue((Path(directory) / ".git").is_dir())
+
     def test_plain_access_picker_cannot_select_full_when_docker_is_not_ready(self):
         answers = iter(("2", "1"))
         output = io.StringIO()
@@ -89,6 +107,11 @@ class CLITests(unittest.TestCase):
         self.assertEqual(parse_command("/doctor --record --live").args, {"record": True, "live": True})
         self.assertEqual(parse_command("/skills").kind, CommandKind.SKILLS)
         self.assertEqual(parse_command("/processes").kind, CommandKind.PROCESSES)
+        self.assertEqual(parse_command("/versions").kind, CommandKind.VERSIONS)
+        self.assertEqual(parse_command("/diff").args, {"target": None})
+        self.assertEqual(parse_command("/diff 2").args, {"target": "2"})
+        self.assertEqual(parse_command("/undo").args, {"steps": 1})
+        self.assertEqual(parse_command("/undo 3").args, {"steps": 3})
         stopped = parse_command("/stop-process preview-123")
         self.assertEqual(stopped.kind, CommandKind.STOP_PROCESS)
         self.assertEqual(stopped.args["resource_id"], "preview-123")

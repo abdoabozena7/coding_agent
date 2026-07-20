@@ -55,6 +55,9 @@ class CommandKind(str, Enum):
     RESUME = "resume"
     STATUS = "status"
     HISTORY = "history"
+    DIFF = "diff"
+    VERSIONS = "versions"
+    UNDO = "undo"
     RESOLVE = "resolve"
     CANCEL = "cancel"
     HELP = "help"
@@ -260,10 +263,24 @@ def parse_command(line: str) -> UserCommand:
         return UserCommand(kind, {"feedback": feedback}, raw)
     if name == "help":
         return UserCommand(CommandKind.HELP, {"topic": rest.lower() or None}, raw)
-    if name in {"plan", "status", "history", "auto", "pause", "resume", "quit"}:
+    if name in {"plan", "status", "history", "versions", "auto", "pause", "resume", "quit"}:
         if rest:
             raise CommandParseError(f"{prefix}{name} does not take arguments.")
         return UserCommand(CommandKind(name), raw=raw)
+    if name == "undo":
+        steps = 1
+        if rest:
+            try:
+                steps = int(rest)
+            except ValueError as exc:
+                raise CommandParseError(f"Usage: {usage('undo', '[STEPS]')}") from exc
+            if steps < 1:
+                raise CommandParseError("Undo steps must be a positive integer.")
+        return UserCommand(CommandKind.UNDO, {"steps": steps}, raw=raw)
+    if name == "diff":
+        if len(rest.split()) > 1:
+            raise CommandParseError(f"Usage: {usage('diff', '[CHECKPOINT_OR_COMMIT]')}")
+        return UserCommand(CommandKind.DIFF, {"target": rest or None}, raw=raw)
     if name == "cancel":
         return UserCommand(CommandKind.CANCEL, {"confirmation": rest}, raw)
     if name == "resolve":
