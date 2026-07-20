@@ -8,7 +8,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from agent.cli import choose_workspace, execute_command, interactive_loop, main
+from agent.cli import (
+    choose_access_level,
+    choose_interaction_mode,
+    choose_workspace,
+    execute_command,
+    interactive_loop,
+    main,
+)
 from agent.commands import CommandKind, parse_command
 from agent.config import InteractionMode, RuntimeConfig, SessionPreferences
 from agent.models import GoalStatus
@@ -17,6 +24,38 @@ from agent.ui import ConsoleUI, DashboardView
 
 
 class CLITests(unittest.TestCase):
+    def test_plain_access_picker_cannot_select_full_when_docker_is_not_ready(self):
+        answers = iter(("2", "1"))
+        output = io.StringIO()
+        sandbox = SimpleNamespace(
+            status=lambda: SimpleNamespace(ready=False, reason="Docker is not ready.")
+        )
+
+        selected = choose_access_level(
+            rich=False,
+            input_func=lambda _prompt: next(answers),
+            output=output,
+            sandbox=sandbox,
+        )
+
+        self.assertEqual(selected.value, "normal")
+        self.assertIn("Full access is unavailable", output.getvalue())
+
+    def test_mode_picker_cannot_select_ultra_when_runtime_prerequisite_is_missing(self):
+        answers = iter(("2", "1"))
+        output = io.StringIO()
+
+        selected = choose_interaction_mode(
+            rich=False,
+            input_func=lambda _prompt: next(answers),
+            output=output,
+            ultra_disabled_reason="A usable local GPU was not detected.",
+        )
+
+        self.assertEqual(selected, InteractionMode.NORMAL)
+        self.assertIn("Ultra is unavailable", output.getvalue())
+        self.assertIn("usable local GPU", output.getvalue())
+
     def test_status_command_is_offline_import_safe_and_creates_durable_state(self):
         with tempfile.TemporaryDirectory() as directory:
             output = io.StringIO()

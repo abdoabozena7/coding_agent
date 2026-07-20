@@ -555,6 +555,15 @@ class AgentRuntime:
             )
         return self.model_descriptor, self.permission_adapter
 
+    def ultra_readiness_issue(self) -> str | None:
+        """Return the exact reason Ultra cannot start, for disabled UI choices."""
+
+        try:
+            self._require_ultra_setup()
+        except RuntimeStateError as exc:
+            return str(exc)
+        return None
+
     def _make_ultra_session(self) -> Any:
         descriptor, permission_adapter = self._require_ultra_setup()
         from .ultra import UltraConfig

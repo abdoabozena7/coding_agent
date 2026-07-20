@@ -188,7 +188,7 @@ def choose_workspace(
             subtitle="Open an existing project or explicitly create a new one.",
             initial_key=str(recent) if recent is not None else "__create__",
             filterable=True,
-            step_label="Setup 1 of 4",
+            step_label="Setup 1 of 3",
             action_label="Open",
             no_color=no_color,
             reduced_motion=reduced_motion,
@@ -248,7 +248,7 @@ def choose_model(
     output: TextIO = sys.stdout,
     rich: bool | None = None,
     initial: str | None = None,
-    step_label: str = "Setup 2 of 4",
+    step_label: str = "Setup 2 of 3",
     no_color: bool = False,
     reduced_motion: bool = False,
 ) -> ModelDescriptor:
@@ -369,7 +369,7 @@ def choose_access_level(
     sandbox: DockerSandbox | None = None,
     rich: bool | None = None,
     initial: str | AccessLevel = AccessLevel.NORMAL,
-    step_label: str = "Setup 3 of 4",
+    step_label: str = "Setup 3 of 3",
     no_color: bool = False,
     reduced_motion: bool = False,
 ) -> AccessLevel:
@@ -378,8 +378,8 @@ def choose_access_level(
         if rich is None
         else bool(rich)
     )
+    sandbox = sandbox or DockerSandbox()
     if use_rich:
-        sandbox = sandbox or DockerSandbox()
         status = run_loading_task(
             sandbox.status,
             title="Checking Full access",
@@ -438,16 +438,29 @@ def choose_access_level(
         if selected is None:
             raise PickerBack()
         return selected.value
+    status = sandbox.status()
+    full_reason = status.reason or "Run /setup once before enabling Full access."
     print("Permissions", file=output)
     print("  1. normal  approvals stay enabled", file=output)
-    print("  2. full    no workspace confirmations; Docker sandbox required", file=output)
-    choice = input_func("permissions [normal]> ").strip().lower()
-    if choice in {"2", "full"}:
-        return AccessLevel.FULL
-    if choice in {"", "1", "normal"}:
-        return AccessLevel.NORMAL
-    print("Unknown choice; using normal.", file=output)
-    return AccessLevel.NORMAL
+    print(
+        "  2. full    "
+        + (
+            "no workspace confirmations; isolated Docker sandbox is ready"
+            if status.ready
+            else f"unavailable: {full_reason}"
+        ),
+        file=output,
+    )
+    while True:
+        choice = input_func("permissions [normal]> ").strip().lower()
+        if choice in {"2", "full"}:
+            if not status.ready:
+                print(f"Full access is unavailable: {full_reason}", file=output)
+                continue
+            return AccessLevel.FULL
+        if choice in {"", "1", "normal"}:
+            return AccessLevel.NORMAL
+        print("Choose normal or full.", file=output)
 
 
 def choose_interaction_mode(
@@ -456,9 +469,10 @@ def choose_interaction_mode(
     output: TextIO = sys.stdout,
     rich: bool | None = None,
     initial: str | InteractionMode = InteractionMode.NORMAL,
-    step_label: str = "Setup 4 of 4",
+    step_label: str = "Session · Mode",
     no_color: bool = False,
     reduced_motion: bool = False,
+    ultra_disabled_reason: str = "",
 ) -> InteractionMode:
     use_rich = (
         rich_terminal_available(input_func=input_func, output=output)
@@ -488,11 +502,17 @@ def choose_interaction_mode(
                     ),
                     meta="Current" if selected_mode is InteractionMode.ULTRA else "Deep workflow",
                     value=InteractionMode.ULTRA,
+                    disabled=bool(ultra_disabled_reason),
+                    disabled_reason=ultra_disabled_reason,
                 ),
             ),
             title="Choose how GA3BAD should work",
             subtitle="You can switch at any time with F2 or /mode.",
-            initial_key=selected_mode.value,
+            initial_key=(
+                InteractionMode.NORMAL.value
+                if selected_mode is InteractionMode.ULTRA and ultra_disabled_reason
+                else selected_mode.value
+            ),
             filterable=False,
             step_label=step_label,
             action_label="Use mode",
@@ -506,11 +526,22 @@ def choose_interaction_mode(
         return selected.value
     print("Mode", file=output)
     print("  1. normal  intent intake, durable goal, plan, review, and automatic execution", file=output)
-    print("  2. ultra   recursive specialists, component packages, and deeper quality gates", file=output)
+    print(
+        "  2. ultra   "
+        + (
+            f"unavailable: {ultra_disabled_reason}"
+            if ultra_disabled_reason
+            else "recursive specialists, component packages, and deeper quality gates"
+        ),
+        file=output,
+    )
     while True:
         choice = input_func("mode> ").strip().lower()
         aliases = {"1": "normal", "2": "ultra"}
         choice = aliases.get(choice, choice)
+        if choice == "ultra" and ultra_disabled_reason:
+            print(f"Ultra is unavailable: {ultra_disabled_reason}", file=output)
+            continue
         if choice in {"normal", "ultra", "chat", "plan", "goal"}:
             return InteractionMode.parse(choice)
         print("Choose normal or ultra.", file=output)
@@ -721,6 +752,10 @@ def _set_interaction_mode(
     detailed: bool = True,
 ) -> None:
     selected = InteractionMode.parse(mode)
+    if selected == InteractionMode.ULTRA:
+        issue = runtime.ultra_readiness_issue()
+        if issue:
+            raise ValueError(f"Ultra is unavailable: {issue}")
     runtime.transition_mode(selected.value)
     preferences.mode = selected
     console.set_mode(selected)
@@ -1758,6 +1793,7 @@ def execute_command(
                             step_label="Session · Mode",
                             no_color=not console.color,
                             reduced_motion=console.reduced_motion,
+                            ultra_disabled_reason=runtime.ultra_readiness_issue() or "",
                         )
                 except PickerBack:
                     return True
@@ -2014,6 +2050,24 @@ def interactive_loop(
         CommandKind.APPROVE,
         CommandKind.RESUME,
     }
+    active_observer_kinds = {
+        CommandKind.STATUS,
+        CommandKind.THINKING,
+        CommandKind.AGENTS,
+        CommandKind.AGENT,
+        CommandKind.TREE,
+        CommandKind.PLAN,
+        CommandKind.QUESTIONS,
+        CommandKind.METRICS,
+        CommandKind.MEMORY,
+        CommandKind.TRACE,
+        CommandKind.INSIGHTS,
+        CommandKind.HISTORY,
+        CommandKind.PROCESSES,
+        CommandKind.HELP,
+        CommandKind.KEYMAP,
+        CommandKind.PAUSE,
+    }
     while True:
         if active_work is not None and work_done.is_set():
             active_work.join()
@@ -2051,9 +2105,11 @@ def interactive_loop(
             continue
         try:
             command = parse_command(line)
-            if active_work is not None and command.kind in background_kinds:
+            if active_work is not None and command.kind not in active_observer_kinds:
                 console.write(
-                    "Work is already running. Use /status, /thinking, /agents, /agent, or /pause."
+                    "That action is locked while work is running. Use /status, /thinking, "
+                    "/agents, /agent, /tree, or /pause. Model, mode, access, settings, and "
+                    "new work can change only after the safe checkpoint."
                 )
                 continue
             if active_work is not None and command.kind == CommandKind.QUIT:

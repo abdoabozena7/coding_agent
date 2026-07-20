@@ -95,9 +95,11 @@ python -m agent
 ```
 
 The interactive terminal opens on a full-screen `GA3BAD` welcome. Press Enter,
-then use the arrow keys and Enter to choose one workspace, model, access level,
-and interaction mode at a time. The focused row always includes its description;
-Esc moves back without changing the current selection. Model discovery and
+then use the arrow keys and Enter to choose one workspace, model, and access level
+at a time. The chat opens in Normal, which automatically promotes complex work to
+Ultra; press F2 before submitting a prompt when you want to lock Ultra explicitly.
+The focused row always includes its description; Esc moves back without changing
+the current selection. Model discovery and
 Docker checks use a semantic inline-square activity indicator rather than blocking on
 an unexplained blank screen.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import socket
 import unittest
 from types import SimpleNamespace
@@ -261,6 +262,17 @@ class GeminiProviderTests(unittest.TestCase):
 
 
 class OllamaProviderTests(unittest.TestCase):
+    def setUp(self):
+        # Provider unit tests use an offline model and mocked HTTP responses.
+        # A developer's real GPU-only .env must not turn those mocks into live
+        # /api/ps residency checks; dedicated tests opt in explicitly below.
+        self._gpu_environment = patch.dict(
+            os.environ,
+            {"AGENT_REQUIRE_LOCAL_GPU": "0"},
+        )
+        self._gpu_environment.start()
+        self.addCleanup(self._gpu_environment.stop)
+
     def test_request_timeout_scales_with_local_output_budget(self):
         provider = OllamaProvider(model="offline")
         self.assertAlmostEqual(provider.request_timeout, 300.0)
