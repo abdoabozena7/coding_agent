@@ -420,6 +420,106 @@ class TerminalUITests(unittest.TestCase):
         self.assertNotIn("Inspecting the workspace", rendered)
         self.assertEqual(rendered.count("\n"), 1)
 
+    def test_ultra_live_loader_shows_truthful_progress_eta_and_current_work(self):
+        class TTY(io.StringIO):
+            encoding = "utf-8"
+
+            def isatty(self):
+                return True
+
+        output = TTY()
+        console = ConsoleUI(stream=output, color=False, reduced_motion=True)
+        activity = console._live_activity
+        activity._ultra_live = True
+        activity._ultra_phase = "module_waves"
+        activity._current_work = "Character controls · coder / implement"
+        activity._last_completed = "Vehicle wheels"
+        activity._next_work = "Gameplay progression"
+        activity._started = 100.0
+        activity._last_signal = 218.0
+        activity._total_nodes = 20
+        activity._completed_nodes = 5
+        activity._active_nodes = 1
+        activity._pending_nodes = 14
+        activity._node_durations = [30.0, 40.0, 35.0]
+
+        with mock.patch("agent.ui.time.monotonic", return_value=220.0), mock.patch.object(
+            activity, "_supports_esc_interrupt", return_value=True
+        ):
+            activity._draw(0)
+
+        rendered = output.getvalue()
+        self.assertIn("ULTRA MODULE WAVES", rendered)
+        self.assertIn("5/20", rendered)
+        self.assertIn("25%", rendered)
+        self.assertIn("ETA ~", rendered)
+        self.assertIn("Character controls", rendered)
+        self.assertIn("Vehicle wheels", rendered)
+        self.assertIn("Gameplay progression", rendered)
+        self.assertIn("live now", rendered)
+        self.assertEqual(activity._rendered_lines, 5)
+
+    def test_ultra_loader_reports_long_quiet_model_call_without_claiming_completion(self):
+        class TTY(io.StringIO):
+            encoding = "utf-8"
+
+            def isatty(self):
+                return True
+
+        output = TTY()
+        console = ConsoleUI(stream=output, color=False, reduced_motion=True)
+        activity = console._live_activity
+        activity._ultra_live = True
+        activity._ultra_phase = "expanding"
+        activity._current_work = "Workforce designer · planning"
+        activity._started = 0.0
+        activity._last_signal = 0.0
+
+        with mock.patch("agent.ui.time.monotonic", return_value=181.0):
+            activity._draw(0)
+
+        rendered = output.getvalue()
+        self.assertIn("long model call", rendered)
+        self.assertIn("no event 3m 01s", rendered)
+        self.assertIn("ETA learning", rendered)
+
+    def test_ultra_events_update_loader_instead_of_stopping_it_each_agent(self):
+        class TTY(io.StringIO):
+            encoding = "utf-8"
+
+            def isatty(self):
+                return True
+
+        console = ConsoleUI(stream=TTY(), color=False, reduced_motion=True)
+        with mock.patch.object(console._live_activity, "update_ultra") as update, mock.patch.object(
+            console._live_activity, "stop"
+        ) as stop:
+            console.on_event(
+                UIEvent(
+                    "ultra.agent_started",
+                    "coder started implement",
+                    {
+                        "run_id": "run-1",
+                        "role": "coder",
+                        "phase": "implement",
+                        "node_id": "character.controls",
+                        "total_nodes": 12,
+                        "completed_nodes": 3,
+                    },
+                )
+            )
+            console.on_event(
+                UIEvent(
+                    "ultra.agent",
+                    "coder finished implement",
+                    {"run_id": "run-1", "node_id": "character.controls"},
+                )
+            )
+
+        self.assertEqual(update.call_count, 2)
+        stop.assert_not_called()
+        self.assertEqual(console.active_agents, 0)
+
     def test_chat_code_is_response_not_thinking(self):
         output = io.StringIO()
         console = ConsoleUI(stream=output, color=False, plain=True)

@@ -1116,16 +1116,40 @@ class _LiveActivity:
         self._state = "idle"
         self._label = ""
         self._started = 0.0
+        self._last_signal = 0.0
+        self._ultra_live = False
+        self._ultra_run_id = ""
+        self._ultra_phase = ""
+        self._current_work = ""
+        self._last_completed = ""
+        self._next_work = ""
+        self._total_nodes = 0
+        self._completed_nodes = 0
+        self._active_nodes = 0
+        self._pending_nodes = 0
+        self._completed_node_ids: set[str] = set()
+        self._node_started_at: dict[str, float] = {}
+        self._node_durations: list[float] = []
+        self._rendered_lines = 0
         self._state_lock = RLock()
 
     def start(self, state: str, label: str) -> None:
         if not self.owner.live_activity_enabled:
             return
+        with self._state_lock:
+            if self._ultra_live and self._thread is not None and self._thread.is_alive():
+                self._state = "ultra"
+                self._label = " ".join(str(label).split())
+                self._current_work = self._label
+                self._last_signal = time.monotonic()
+                return
         self.stop()
         with self._state_lock:
             self._state = state
             self._label = " ".join(str(label).split())
             self._started = time.monotonic()
+            self._last_signal = self._started
+            self._ultra_live = False
         self._stop = Event()
         self._thread = Thread(target=self._run, name="ga3bad-ui-motion", daemon=True)
         self._thread.start()
@@ -1137,9 +1161,100 @@ class _LiveActivity:
             )
             self._key_thread.start()
 
+    @property
+    def ultra_live(self) -> bool:
+        with self._state_lock:
+            return self._ultra_live
+
     def update_label(self, text: str) -> None:
         with self._state_lock:
             self._label = " ".join(str(text).split())
+            self._last_signal = time.monotonic()
+
+    def update_ultra(self, kind: str, message: str, data: Mapping[str, Any]) -> None:
+        """Update the persistent ULTRA loader from observable runtime facts."""
+
+        if not self.owner.live_activity_enabled:
+            return
+        now = time.monotonic()
+        start_thread = False
+        with self._state_lock:
+            run_id = str(data.get("run_id") or self._ultra_run_id or "")
+            new_run = bool(run_id and run_id != self._ultra_run_id)
+            if not self._ultra_live or new_run:
+                self._ultra_live = True
+                self._ultra_run_id = run_id
+                if new_run or not self._started:
+                    self._started = now
+                    self._completed_node_ids.clear()
+                    self._node_started_at.clear()
+                    self._node_durations.clear()
+                start_thread = self._thread is None or not self._thread.is_alive()
+            self._last_signal = now
+            self._state = "ultra"
+            phase = str(data.get("ultra_phase") or data.get("phase") or "").strip()
+            if kind == "ultra.phase" and phase:
+                self._ultra_phase = phase
+            elif not self._ultra_phase:
+                self._ultra_phase = phase or "working"
+
+            for key, attribute in (
+                ("total_nodes", "_total_nodes"),
+                ("completed_nodes", "_completed_nodes"),
+                ("active_nodes", "_active_nodes"),
+                ("pending_nodes", "_pending_nodes"),
+            ):
+                if key in data:
+                    try:
+                        setattr(self, attribute, max(0, int(data.get(key) or 0)))
+                    except (TypeError, ValueError):
+                        pass
+
+            node_id = str(data.get("node_id") or data.get("current_node_id") or "").strip()
+            node_title = str(data.get("current_node_title") or node_id).strip()
+            status = str(data.get("status") or "").casefold()
+            role = str(data.get("role") or "").strip()
+            work_phase = str(data.get("current_node_phase") or data.get("phase") or "").strip()
+            if kind == "ultra.node" and status == "running" and node_id:
+                self._node_started_at.setdefault(node_id, now)
+            if kind == "ultra.node" and status == "completed" and node_id:
+                if node_id not in self._completed_node_ids:
+                    self._completed_node_ids.add(node_id)
+                    started = self._node_started_at.pop(node_id, None)
+                    if started is not None:
+                        self._node_durations.append(max(0.1, now - started))
+                        del self._node_durations[:-12]
+                self._last_completed = node_title or node_id
+            elif kind == "ultra.agent":
+                self._last_completed = " ".join(str(message).split())[:120]
+
+            if kind == "ultra.agent_started":
+                detail = " / ".join(item for item in (role, work_phase) if item)
+                self._current_work = node_title or "Preparing specialist"
+                if detail:
+                    self._current_work += f" · {detail}"
+            elif kind == "ultra.node" and status == "running":
+                self._current_work = node_title or "Running specialist"
+            elif kind == "ultra.phase":
+                self._current_work = " ".join(str(message).split())
+            elif kind == "ultra.graph_ready" and not self._current_work:
+                self._current_work = "Scheduling the first ready specialist"
+            next_titles = data.get("next_node_titles")
+            if isinstance(next_titles, (list, tuple)) and next_titles:
+                self._next_work = ", ".join(str(item) for item in next_titles[:2])
+            self._label = self._current_work or " ".join(str(message).split())
+
+        if start_thread:
+            self._stop = Event()
+            self._thread = Thread(target=self._run, name="ga3bad-ultra-live", daemon=True)
+            self._thread.start()
+            if self._supports_esc_interrupt():
+                self._key_thread = Thread(
+                    target=self._watch_escape,
+                    name="ga3bad-ui-escape",
+                    daemon=True,
+                )
+                self._key_thread.start()
 
     def _run(self) -> None:
         tick = 0
@@ -1154,7 +1269,34 @@ class _LiveActivity:
         with self._state_lock:
             label_value = self._label
             started = self._started
+            last_signal = self._last_signal
+            ultra_live = self._ultra_live
+            ultra_phase = self._ultra_phase
+            current_work = self._current_work
+            last_completed = self._last_completed
+            next_work = self._next_work
+            total_nodes = self._total_nodes
+            completed_nodes = self._completed_nodes
+            active_nodes = self._active_nodes
+            pending_nodes = self._pending_nodes
+            durations = tuple(self._node_durations)
         elapsed = max(0, int(time.monotonic() - started))
+        if ultra_live:
+            self._draw_ultra(
+                tick,
+                elapsed=elapsed,
+                signal_age=max(0, int(time.monotonic() - last_signal)),
+                phase=ultra_phase,
+                current=current_work or label_value,
+                last_completed=last_completed,
+                next_work=next_work,
+                total=total_nodes,
+                completed=completed_nodes,
+                active=active_nodes,
+                pending=pending_nodes,
+                durations=durations,
+            )
+            return
         columns = max(24, shutil.get_terminal_size((112, 30)).columns)
         label = _fit("Working", max(8, min(96, columns - 28))).rstrip()
         bullet = self.owner._icon("\u2022", "o")
@@ -1177,6 +1319,84 @@ class _LiveActivity:
                 f"{self.owner.dim}{interrupt}{self.owner.reset}",
                 file=self.owner.stream,
             )
+            self.owner.stream.flush()
+
+    @staticmethod
+    def _duration(value: float) -> str:
+        seconds = max(0, int(value))
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, seconds = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes}m {seconds:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes:02d}m"
+
+    def _draw_ultra(
+        self,
+        tick: int,
+        *,
+        elapsed: int,
+        signal_age: int,
+        phase: str,
+        current: str,
+        last_completed: str,
+        next_work: str,
+        total: int,
+        completed: int,
+        active: int,
+        pending: int,
+        durations: tuple[float, ...],
+    ) -> None:
+        columns = max(36, shutil.get_terminal_size((112, 30)).columns)
+        content_width = max(16, columns - 4)
+        frames = ("◐", "◓", "◑", "◒") if self.owner._can_encode("◐") else ("|", "/", "-", "\\")
+        pulse = frames[0 if self.owner.reduced_motion else tick % len(frames)]
+        percent = min(100, round(100 * completed / total)) if total else 0
+        bar_width = max(8, min(28, columns - 54))
+        filled = round(bar_width * completed / total) if total else 0
+        bar = "[" + "#" * filled + "-" * (bar_width - filled) + "]"
+        if total and completed and durations:
+            average = sum(durations) / len(durations)
+            remaining = max(0, total - completed)
+            estimate = average * remaining
+            eta = f"ETA ~{self._duration(estimate * 0.8)}–{self._duration(estimate * 1.25)}"
+        elif total and completed:
+            estimate = elapsed * max(0, total - completed) / max(1, completed)
+            eta = f"ETA ~{self._duration(estimate * 0.75)}–{self._duration(estimate * 1.35)}"
+        else:
+            eta = "ETA learning from first completed specialist"
+
+        if signal_age <= 15:
+            signal = "live now"
+        elif signal_age <= 120:
+            signal = f"model call open · quiet {self._duration(signal_age)}"
+        else:
+            signal = f"long model call · no event {self._duration(signal_age)}"
+        interrupt_key = "Esc" if self._supports_esc_interrupt() else "Ctrl+C"
+        phase_label = (phase or "working").replace("_", " ").upper()
+        progress_label = (
+            f"{bar} {completed}/{total} · {percent}% · active {active} · queued {pending} · {eta}"
+            if total
+            else f"mapping specialist graph · {eta}"
+        )
+        rows = [
+            f"{pulse} ULTRA {phase_label} · elapsed {self._duration(elapsed)} · {signal}",
+            f"  {progress_label}",
+            f"  now   {_fit(current or 'Preparing the next step', max(8, content_width - 6)).rstrip()}",
+            f"  done  {_fit((last_completed or 'No specialist completed yet') + ' · next ' + (next_work or 'scheduler deciding'), max(8, content_width - 6)).rstrip()}",
+            f"  {interrupt_key} checkpoints safely · /agents details · /status snapshot",
+        ]
+        rows = [_fit(row, columns).rstrip() for row in rows]
+        with self.owner._lock:
+            if self._visible and self._rendered_lines:
+                print(f"\033[{self._rendered_lines}A", end="", file=self.owner.stream)
+            else:
+                print("\033[?25l", end="", file=self.owner.stream)
+                self._visible = True
+            for row in rows:
+                print(f"\r\033[2K{row}", file=self.owner.stream)
+            self._rendered_lines = len(rows)
             self.owner.stream.flush()
 
     def _supports_esc_interrupt(self) -> bool:
@@ -1211,10 +1431,15 @@ class _LiveActivity:
         with self.owner._lock:
             if not self._visible:
                 return
-            print("\033[1A\r\033[2K", file=self.owner.stream)
-            print("\033[1A\r\033[?25h", end="", file=self.owner.stream)
+            lines = max(1, self._rendered_lines)
+            print(f"\033[{lines}A", end="", file=self.owner.stream)
+            for _ in range(lines):
+                print("\r\033[2K", file=self.owner.stream)
+            print(f"\033[{lines}A\r\033[?25h", end="", file=self.owner.stream)
             self.owner.stream.flush()
             self._visible = False
+            self._rendered_lines = 0
+            self._ultra_live = False
 
 
 class ConsoleUI:
@@ -1380,7 +1605,9 @@ class ConsoleUI:
         if block is None:
             return
         self._active_thought = None
-        self._live_activity.stop()
+        ultra_live = self._live_activity.ultra_live
+        if not ultra_live:
+            self._live_activity.stop()
         text = redact_text(str(block.get("text", "")), 40_000).strip()
         if not text:
             return
@@ -1400,6 +1627,9 @@ class ConsoleUI:
                 f"{str(finished.get('actor', 'agent')).replace('_', ' ').title()} "
                 f"step {finished.get('step', '?')}"
             )
+        if ultra_live:
+            self._live_activity.update_label(summary)
+            return
         for line in visible_lines:
             self._live_line(">", line, self.thought_done)
         self._live_line(
@@ -1663,6 +1893,33 @@ class ConsoleUI:
             return
 
         self._finish_live_stream()
+        if kind.startswith("ultra."):
+            if kind == "ultra.agent_started":
+                self.active_agents += 1
+            elif kind == "ultra.agent":
+                self.active_agents = max(0, self.active_agents - 1)
+            terminal_kinds = {
+                "ultra.foundation_ready",
+                "ultra.completed",
+                "ultra.cancelled",
+                "ultra.revision_required",
+                "ultra.paused",
+            }
+            if kind in terminal_kinds:
+                self._live_activity.stop()
+                color = self.green if kind == "ultra.completed" else self.gold
+                self._live_line(
+                    self._icon("✓", "[x]")
+                    if kind == "ultra.completed"
+                    else self._icon("◇", "[>]"),
+                    message or kind,
+                    color,
+                    dedupe_key=f"{kind}:{' '.join(str(message).split())[:240]}",
+                )
+            else:
+                self._live_activity.update_ultra(kind, message or kind, data)
+            return
+
         if kind == "tool_call":
             args = data.get("args", {})
             args = args if isinstance(args, Mapping) else {}
@@ -1681,7 +1938,8 @@ class ConsoleUI:
             return
 
         if kind == "tool_result":
-            self._live_activity.stop()
+            if not self._live_activity.ultra_live:
+                self._live_activity.stop()
             one_line = " ".join(str(message).split())
             tool_name = str(data.get("tool") or "operation")
             pending = self._take_pending_tool(data, tool_name)
@@ -1698,6 +1956,8 @@ class ConsoleUI:
                 return
 
             failed = one_line.startswith(("Error:", "Permission denied"))
+            if failed and self._live_activity.ultra_live:
+                self._live_activity.stop()
             if not failed and tool_name in {
                 "propose_plan",
                 "submit_plan_review",
@@ -1728,6 +1988,9 @@ class ConsoleUI:
                     args if isinstance(args, Mapping) else {},
                 )
                 dedupe_key = f"success:{tool_name}:{detail}:{summary}"
+            if self._live_activity.ultra_live and not failed:
+                self._live_activity.update_label(summary)
+                return
             self._live_line(
                 icon,
                 summary,

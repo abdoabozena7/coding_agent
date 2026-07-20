@@ -145,6 +145,14 @@ created only when the approved plan has not already divided the responsibility.
 `/tree`, `/agents`, `/agent`, `/memory`,
 `/trace`, `/insights`, and `/metrics` keep the default scrollback uncluttered.
 
+During a long ULTRA run, the interactive terminal keeps a five-line live region
+on screen with the current phase and specialist, completed/total nodes, queued
+work, elapsed time, an evidence-based ETA range, the latest completed component,
+the next scheduled component, and time since the last runtime signal. A quiet
+local-model request is labeled `model call open`; a prolonged quiet period is
+labeled `long model call` rather than being mistaken for completion. `/agents`
+opens the read-only detail view, while Esc/Ctrl+C requests a safe checkpoint.
+
 `/permissions full` is fail-closed: it works only after `/setup` builds the
 versioned non-root Docker image. The workspace is the only writable bind mount;
 the host home, Docker socket, and credentials are never mounted or injected.

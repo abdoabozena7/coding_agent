@@ -7,6 +7,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
+from agent.events import EventBus
 from agent.scheduler import (
     AdaptiveConcurrency,
     DeterministicWaveScheduler,
@@ -285,6 +286,39 @@ class SchedulerTests(unittest.TestCase):
 
 
 class UltraEngineTests(unittest.TestCase):
+    def test_live_progress_events_include_real_graph_counts_and_current_assignment(self):
+        events = EventBus()
+        captured = []
+        events.subscribe(captured.append)
+        modules = [module("M1", "src/one")]
+        factory = FakeFactory(lambda request: standard_handler(request, modules=modules))
+        engine = UltraOrchestrator(
+            factory,
+            execution_class=ExecutionClass.LOCAL,
+            events=events,
+            config=UltraConfig(min_top_modules=1, max_top_modules=4),
+        )
+        plan = engine.prepare("build the whole product")
+        engine.approve(plan.fingerprint)
+        result = engine.run()
+
+        self.assertTrue(result.successful)
+        graph = next(item for item in captured if item.kind == "ultra.graph_ready")
+        self.assertGreaterEqual(graph.data["total_nodes"], 1)
+        started = next(
+            item
+            for item in captured
+            if item.kind == "ultra.agent_started" and item.data.get("node_id")
+        )
+        self.assertEqual(started.data["total_nodes"], graph.data["total_nodes"])
+        self.assertTrue(started.data["current_node_title"])
+        completed = [
+            item
+            for item in captured
+            if item.kind == "ultra.node" and item.data.get("status") == "completed"
+        ]
+        self.assertEqual(completed[-1].data["completed_nodes"], graph.data["total_nodes"])
+
     def test_quality_consensus_uses_typed_passed_over_contradictory_declaration(self):
         engine, _factory, _plan = prepared_engine()
         node = next(iter(engine.nodes.values()))

@@ -1201,7 +1201,44 @@ class UltraOrchestrator:
         return self.run_state.phase if self.run_state else UltraPhase.NEW
 
     def _scheduler_event(self, kind: str, message: str, data: Mapping[str, Any]) -> None:
-        self.events.publish(kind, message, **dict(data))
+        payload = dict(data)
+        node_ids = _strings(payload.get("node_ids"))
+        if node_ids:
+            payload["next_node_titles"] = [
+                self.nodes[node_id].contract.title
+                for node_id in node_ids
+                if node_id in self.nodes
+            ]
+        self.events.publish(kind, message, **{**self._progress_snapshot(), **payload})
+
+    def _progress_snapshot(self, *, current_node_id: str | None = None) -> dict[str, Any]:
+        """Return truthful progress counters for the live UI.
+
+        The estimate itself belongs to the presentation layer because only it
+        knows elapsed wall time. The orchestrator supplies durable facts: graph
+        size, terminal nodes, active nodes, phase, and the current assignment.
+        """
+
+        nodes = tuple(self.nodes.values())
+        completed = sum(node.status is NodeStatus.COMPLETED for node in nodes)
+        active = sum(
+            node.status in {NodeStatus.PLANNING, NodeStatus.READY, NodeStatus.RUNNING}
+            and node.phase not in {None, InnerPhase.DECOMPOSE}
+            for node in nodes
+        )
+        current = self.nodes.get(str(current_node_id or ""))
+        return {
+            "total_nodes": len(nodes),
+            "completed_nodes": completed,
+            "active_nodes": active,
+            "pending_nodes": max(0, len(nodes) - completed - active),
+            "current_node_id": current.id if current is not None else current_node_id,
+            "current_node_title": current.contract.title if current is not None else "",
+            "current_node_phase": (
+                current.phase.value if current is not None and current.phase is not None else ""
+            ),
+            "ultra_phase": self.phase.value,
+        }
 
     def _save_run(self, **changes: Any) -> UltraRunV1:
         if self.run_state is None:
@@ -1223,6 +1260,7 @@ class UltraOrchestrator:
             message or phase.value.replace("_", " ").title(),
             run_id=self.run_state.id,
             phase=phase.value,
+            **self._progress_snapshot(),
         )
 
     def _new_context(self, node: WorkNode, role: AgentRole) -> Mapping[str, Any]:
@@ -1317,6 +1355,17 @@ class UltraOrchestrator:
             # call, so the read-only observer remains useful during a long
             # generation. Hidden chain-of-thought is never captured.
             self.state.save_prompt_trace(trace)
+            self.events.publish(
+                "ultra.agent_started",
+                f"{role.value} started {phase_value}",
+                run_id=self.run_state.id,
+                agent_run_id=agent_id,
+                role=role.value,
+                phase=phase_value,
+                node_id=node_id,
+                attempt=attempt,
+                **self._progress_snapshot(current_node_id=node_id),
+            )
             response: AgentResponse | None = None
             try:
                 agent = self.agent_factory.create(
@@ -1394,6 +1443,7 @@ class UltraOrchestrator:
                     role=role.value,
                     phase=phase_value,
                     node_id=node_id,
+                    **self._progress_snapshot(current_node_id=node_id),
                 )
                 return response
             except AgentProtocolError as exc:
@@ -4654,6 +4704,7 @@ class UltraOrchestrator:
             run_id=self.run_state.id,
             node_id=node.id,
             status="running",
+            **self._progress_snapshot(current_node_id=node.id),
         )
         responses: list[AgentResponse] = []
         if self._research_required.get(node.id, False):
@@ -5036,6 +5087,7 @@ class UltraOrchestrator:
             run_id=self.run_state.id,
             node_id=node.id,
             status="completed",
+            **self._progress_snapshot(current_node_id=node.id),
         )
         return result
 
@@ -5119,6 +5171,12 @@ class UltraOrchestrator:
             self._set_phase(UltraPhase.EXPANDING, "Expanding approved modules")
             for module in self.master_plan.modules:
                 self._ensure_expanded(module.id)
+            self.events.publish(
+                "ultra.graph_ready",
+                f"Specialist graph ready with {len(self.nodes)} node(s)",
+                run_id=self.run_state.id,
+                **self._progress_snapshot(),
+            )
             self.state.append_brain_entry(
                 BrainEntryV1(
                     BrainSection.TASK_GRAPH,
