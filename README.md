@@ -94,39 +94,31 @@ You can also launch the workspace chooser:
 python -m agent
 ```
 
-The interactive terminal opens on a full-screen `GA3BAD` welcome. Press Enter,
-then use the arrow keys and Enter to choose one workspace, project-protection tier,
-model, and access level at a time. Before any model can change files, GA3BAD checks
-for a dedicated local Git repository and GitHub remote. If authenticated GitHub CLI
-is available, Enter creates a private repository and pushes the baseline; otherwise
-Enter enables local Git history. Local Git provides multi-step undo, while GitHub
-adds off-device backup. A clearly marked no-Git option has no version-based undo
-(Ultra still protects its current rejected attempt), and Refresh rechecks setup
-performed in another terminal.
+The interactive terminal opens on the existing full-screen `GA3BAD` welcome. Press
+Enter and choose only the project. GA3BAD then chooses the best available model,
+local project protection, Normal mode, and safe access automatically; all of those
+choices remain available later when you actually need them.
 
-After setup, the welcome gives way to a cardless working surface: goal and live
-work stay in the primary column, while plan, access, task progress, and agent count
-form a compact context inspector on wide terminals. Narrow terminals reflow into a
-single readable column. Intake, Normal-plan, and ULTRA decisions all use the same
-full-screen one-question flow; `D` accepts every remaining Recommended choice.
-Free-form answers and plan revision feedback use a focused composer. Provider
-reasoning is folded by default and remains available through `/thinking`.
+After setup, there is one calm, persistent workspace rather than a sequence of
+screens. It always shows the conversation, one current-work cell, and a composer
+you can type in. `F2` switches between **Simple** (the default) and **Advanced**.
+Simple hides tool calls, JSON, coordinator steps, and stack traces. Advanced keeps
+the full diagnostic transcript without interrupting the work.
 
-The chat opens in Normal, which automatically promotes complex work to
-Ultra; press F2 before submitting a prompt when you want to lock Ultra explicitly.
-The focused row always includes its description; Esc moves back without changing
-the current selection. Model discovery and
-Docker checks use a semantic inline-square activity indicator rather than blocking on
-an unexplained blank screen.
+Questions, plan reviews, errors, and permissions appear in one small area directly
+above the composer. Use arrows, number keys, shortcut letters, the mouse, or type a
+custom answer. Ordinary project edits and isolated checks continue automatically;
+dependency installs, network/host actions, deletes, secrets, and out-of-project
+work stay visibly paused until an explicit choice. Closing a prompt never becomes a
+silent denial.
 
-At the prompt, `/` opens a contextual, nested command palette instead of dumping
-every command. F2, F3, and F4 reopen Mode, Model, and Access; Ctrl+Q exits safely.
-Direct commands and legacy `:command` syntax remain available for scripts and
-power users. Use `--plain` for the line-oriented/SSH UI or `--reduced-motion` for
-static, accessible motion. Ollama models are discovered first through `/api/tags`
-and `/api/show`; non-tool models are omitted. Local models use one sequential
-worker, while Ollama cloud/OpenAI/Gemini models run independent, write-disjoint
-nodes concurrently.
+While work runs, type guidance and press Enter; it is saved for the next safe point.
+After a quiet 10 seconds the status says it is still working; after 60 seconds it
+offers **Keep waiting** or **Stop safely**. `/` opens only six contextual actions in
+Simple: New task, Stop safely, Review changes, Open result, Permissions, and
+Advanced. Direct slash commands and legacy `:command` syntax remain available for
+scripts and power users. `Ctrl+Q` exits safely. Use `--plain` for the line-oriented
+SSH UI or `--reduced-motion` for static, accessible motion.
 
 ## ULTRA mode
 
@@ -358,8 +350,11 @@ history would be wasteful.
   have deterministic caps.
 - Writes use temp files, `fsync`, identity checks, and atomic replacement; a failed
   edit preserves the original.
-- Every shell command requires a separate user approval. Shell children use the
-  workspace as explicit `cwd` and inherit only an operational environment
+- Read/write work inside the selected project is automatic. Build/test/lint runs
+  are automatic in the Docker sandbox, or ask once per session outside it;
+  dependency installs, network, destructive, and host actions still require a
+  visible explicit decision. Shell children use the workspace as explicit `cwd`
+  and inherit only an operational environment
   allowlist—never API keys or arbitrary secrets.
 - Plan approval does not imply action approval. Tool output is redacted before it
   is sent back to a provider or written to durable events.

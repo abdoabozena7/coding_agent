@@ -3031,59 +3031,6 @@ def _interactive_setup(
     if args.mode:
         selected_mode = InteractionMode.parse(args.mode)
 
-    # The rich startup keeps the welcome screen, then asks only for the
-    # project. Protection, model, safe access, and Normal workflow receive
-    # deterministic defaults and remain changeable later from the workspace.
-    if rich:
-        if workspace is None:
-            workspace = choose_workspace(
-                args.projects_root,
-                input_func=console.input_func,
-                output=console.stream,
-                rich=True,
-                initial=workspace,
-                no_color=not console.color,
-                reduced_motion=console.reduced_motion,
-            )
-        protection = GitProtectionManager(workspace)
-        protection_status = protection.inspect()
-        if protection_status.github_connected:
-            protection.configure(auto_checkpoint=True, auto_push=True, provider="github")
-        elif protection_status.git_available:
-            protection.ensure_local_history()
-        else:
-            protection.use_snapshot_only()
-
-        if descriptor is None:
-            discovered = run_loading_task(
-                catalog.discover,
-                title="Preparing your workspace",
-                detail="Choosing the best available model and safe defaults",
-                state="search",
-                input_func=console.input_func,
-                output=console.stream,
-                no_color=not console.color,
-                reduced_motion=console.reduced_motion,
-            )
-            models = tuple(discovered or ())
-            if not models:
-                raise ValueError(
-                    "no tool-capable model is ready; start Ollama or configure one cloud provider, then retry"
-                )
-            descriptor = next(
-                (item for item in models if item.execution_class is ExecutionClass.CLOUD),
-                models[0],
-            )
-        requested_access = requested_access or AccessLevel.NORMAL
-        selected_mode = selected_mode or InteractionMode.NORMAL
-        return (
-            workspace,
-            descriptor,
-            sandbox,
-            requested_access,
-            SessionPreferences(mode=selected_mode),
-        )
-
     stages = []
     if workspace is None:
         stages.append("workspace")
@@ -3092,7 +3039,6 @@ def _interactive_setup(
         stages.append("model")
     if requested_access is None:
         stages.append("permissions")
-    # Chat-first startup deliberately has no mandatory mode-selection stage.
 
     index = 0
     while index < len(stages):
@@ -3138,15 +3084,6 @@ def _interactive_setup(
                     no_color=not console.color,
                     reduced_motion=console.reduced_motion,
                 )
-            else:
-                selected_mode = choose_interaction_mode(
-                    input_func=console.input_func,
-                    output=console.stream,
-                    rich=rich,
-                    initial=selected_mode or SessionPreferences.from_env().mode,
-                    no_color=not console.color,
-                    reduced_motion=console.reduced_motion,
-                )
         except UserExitRequested:
             return None
         except PickerBack:
@@ -3161,13 +3098,12 @@ def _interactive_setup(
     assert workspace is not None
     assert descriptor is not None
     assert requested_access is not None
-    assert selected_mode is not None
     return (
         workspace,
         descriptor,
         sandbox,
         requested_access,
-        SessionPreferences(mode=selected_mode),
+        SessionPreferences(mode=selected_mode or InteractionMode.NORMAL),
     )
 
 

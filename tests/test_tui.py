@@ -112,6 +112,17 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         # live app; the mode switch itself remains observable in snapshots.
         self.assertIn("ADVANCED", advanced)
 
+    def test_arabic_simple_snapshot_stays_compact_and_has_no_raw_log(self):
+        store = WorkspaceUIStore()
+        store.observe_user_text("اعمل آلة حاسبة")
+        store.append_transcript("user", "اعمل آلة حاسبة")
+        store.append_log('{"command": "technical"}')
+        store.set_activity(ActivityStage.UNDERSTANDING, "فهم الطلب", running=True)
+        rendered = render_persistent_workspace(store.snapshot(), width=80, height=24)
+        self.assertEqual(len(rendered.splitlines()), 24)
+        self.assertIn("اعمل آلة حاسبة", rendered)
+        self.assertNotIn("technical", rendered)
+
     def test_one_application_owns_composer_and_mode_shortcut(self):
         from prompt_toolkit.input.defaults import create_pipe_input
         from prompt_toolkit.output import DummyOutput
