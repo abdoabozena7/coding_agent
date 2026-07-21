@@ -133,6 +133,7 @@ def choose_workspace(
     output: TextIO = sys.stdout,
     rich: bool | None = None,
     initial: str | os.PathLike[str] | None = None,
+    step_label: str = "Setup 1 of 4",
     no_color: bool = False,
     reduced_motion: bool = False,
 ) -> Path:
@@ -211,7 +212,7 @@ def choose_workspace(
             subtitle="Open an existing project or explicitly create a new one.",
             initial_key=str(recent) if recent is not None else "__create__",
             filterable=True,
-            step_label="Setup 1 of 4",
+            step_label=step_label,
             action_label="Open",
             no_color=no_color,
             reduced_motion=reduced_motion,
@@ -492,6 +493,7 @@ def choose_project_protection(
     input_func: Callable[[str], str] = input,
     output: TextIO = sys.stdout,
     rich: bool | None = None,
+    step_label: str = "Setup 2 of 4",
     no_color: bool = False,
     reduced_motion: bool = False,
 ) -> GitProtectionStatus:
@@ -628,7 +630,7 @@ def choose_project_protection(
                 ),
                 initial_key=initial_key,
                 filterable=False,
-                step_label="Setup 2 of 4",
+                step_label=step_label,
                 action_label="Continue",
                 no_color=no_color,
                 reduced_motion=reduced_motion,
@@ -3008,7 +3010,7 @@ def _interactive_setup(
     workspace: Path | None = None
     descriptor: ModelDescriptor | None = None
     requested_access: AccessLevel | None = None
-    selected_mode: InteractionMode | None = InteractionMode.NORMAL
+    selected_mode: InteractionMode | None = None
 
     if args.workspace:
         workspace = _resolve_workspace(
@@ -3031,18 +3033,20 @@ def _interactive_setup(
     if args.mode:
         selected_mode = InteractionMode.parse(args.mode)
 
-    stages = []
+    steps = []
     if workspace is None:
-        stages.append("workspace")
-    stages.append("protection")
+        steps.append(("workspace", "1. Choose a workspace"))
+    steps.append(("protection", "2. Protect this project"))
     if descriptor is None:
-        stages.append("model")
+        steps.append(("model", "3. Choose a model"))
     if requested_access is None:
-        stages.append("permissions")
+        steps.append(("permissions", "4. Set permissions"))
+    steps.append(("mode", "5. Choose workflow mode"))
 
+    total = len(steps)
     index = 0
-    while index < len(stages):
-        stage = stages[index]
+    while index < total:
+        stage, step_label = steps[index]
         try:
             if stage == "workspace":
                 workspace = choose_workspace(
@@ -3051,6 +3055,7 @@ def _interactive_setup(
                     output=console.stream,
                     rich=rich,
                     initial=workspace,
+                    step_label=step_label,
                     no_color=not console.color,
                     reduced_motion=console.reduced_motion,
                 )
@@ -3061,6 +3066,7 @@ def _interactive_setup(
                     input_func=console.input_func,
                     output=console.stream,
                     rich=rich,
+                    step_label=step_label,
                     no_color=not console.color,
                     reduced_motion=console.reduced_motion,
                 )
@@ -3071,6 +3077,7 @@ def _interactive_setup(
                     output=console.stream,
                     rich=rich,
                     initial=descriptor.model if descriptor is not None else None,
+                    step_label=step_label,
                     no_color=not console.color,
                     reduced_motion=console.reduced_motion,
                 )
@@ -3081,8 +3088,20 @@ def _interactive_setup(
                     sandbox=sandbox,
                     rich=rich,
                     initial=requested_access or AccessLevel.NORMAL,
+                    step_label=step_label,
                     no_color=not console.color,
                     reduced_motion=console.reduced_motion,
+                )
+            elif stage == "mode":
+                selected_mode = choose_interaction_mode(
+                    input_func=console.input_func,
+                    output=console.stream,
+                    rich=rich,
+                    initial=selected_mode or InteractionMode.NORMAL,
+                    step_label=step_label,
+                    no_color=not console.color,
+                    reduced_motion=console.reduced_motion,
+                    ultra_disabled_reason="",
                 )
         except UserExitRequested:
             return None
