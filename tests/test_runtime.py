@@ -831,7 +831,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         self.assertTrue(goal.metadata["auto_retryable"])
         provider.assert_exhausted()
 
-    def test_provider_failure_schedules_unbounded_goal_retry_then_recovers(self):
+    def test_provider_failure_schedules_durable_retry_then_recovers(self):
         def fail_once(_request):
             raise RuntimeError("temporary provider outage")
 
@@ -875,6 +875,43 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         self.assertEqual(runtime.active_goal().metadata["consecutive_retries"], 0)
         provider.assert_exhausted()
 
+    def test_repeated_provider_failures_pause_with_actionable_recovery(self):
+        def fail(_request):
+            raise RuntimeError("bad model or credentials")
+
+        provider = ScriptedProvider(
+            [inspect_call(), plan_call(), plan_pass(), fail, fail]
+        )
+        runtime = AgentRuntime(
+            provider,
+            self.store,
+            self.workspace,
+            config=replace(
+                self.config,
+                max_provider_retries=0,
+                provider_failure_limit=2,
+                goal_retry_base_ms=0,
+                goal_retry_max_ms=0,
+            ),
+            sleeper=lambda _seconds: None,
+            approval=lambda _name, _args, _risk: True,
+        )
+        plan = runtime.start_goal("Pause when provider repair is required")
+        runtime.approve_plan(plan.revision)
+
+        first = runtime.run_slice(steps=1)
+        self.assertEqual(first.status, GoalStatus.RUNNING.value)
+        runtime.wait_for_scheduled_retry()
+        second = runtime.run_slice(steps=1)
+
+        self.assertEqual(second.status, GoalStatus.PAUSED.value)
+        self.assertTrue(second.needs_user)
+        goal = runtime.active_goal()
+        self.assertFalse(goal.metadata["auto_retryable"])
+        self.assertEqual(goal.metadata["retry_after_ms"], 0)
+        self.assertIn("Check the selected model", goal.metadata["waiting_question"])
+        provider.assert_exhausted()
+
     def test_auto_mode_retries_transient_planning_failures_until_plan_boundary(self):
         def fail(_request):
             raise RuntimeError("temporary planning outage")
@@ -901,7 +938,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         _run_auto(runtime, ConsoleUI(stream=output, color=False))
 
         self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
-        self.assertIn("unbounded retry loop", output.getvalue())
+        self.assertIn("durable retry policy", output.getvalue())
         provider.assert_exhausted()
 
     def test_repeated_no_progress_slices_self_reprompt_without_retry_limit(self):

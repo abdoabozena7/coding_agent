@@ -136,6 +136,40 @@ class WorkspaceStoreTests(unittest.TestCase):
         store.handle_event("tool_result", "updated", {"tool": "write_file"})
         self.assertIn("write file", store.snapshot().activity.last_success)
 
+    def test_retry_wait_and_recoverable_errors_do_not_claim_the_goal_is_paused(self):
+        store = WorkspaceUIStore()
+        store.set_activity(ActivityStage.BUILDING, "Working", running=True)
+        store.handle_event("retry_wait", "Retry 2 in 3.0s", {"delay_ms": 3000})
+        waiting = store.snapshot()
+        self.assertEqual(waiting.activity.stage, ActivityStage.CHECKING)
+        self.assertTrue(waiting.running)
+
+        store.handle_event("error", "temporary provider outage")
+        failed_attempt = store.snapshot()
+        self.assertTrue(failed_attempt.running)
+        self.assertNotEqual(failed_attempt.activity.stage, ActivityStage.PAUSED)
+
+        store.handle_event("checkpoint", "Context compacted", {"continues": True})
+        self.assertTrue(store.snapshot().running)
+        store.handle_event("checkpoint", "Stopped", {"paused": True})
+        self.assertFalse(store.snapshot().running)
+        self.assertEqual(store.snapshot().activity.stage, ActivityStage.PAUSED)
+
+    def test_nonblocking_attention_can_be_polled_by_the_controller(self):
+        store = WorkspaceUIStore()
+        request = AttentionRequest(
+            id="slow-work",
+            kind=AttentionKind.RECOVERY,
+            title="Still working",
+            options=(AttentionOption("keep", "Keep waiting", "keep"),),
+        )
+        event = store.present_attention(request)
+        self.assertFalse(event.is_set())
+        self.assertIsNone(store.take_attention_result(request.id))
+        store.resolve_attention("keep")
+        self.assertTrue(event.is_set())
+        self.assertEqual(store.take_attention_result(request.id).value, "keep")
+
     def test_attention_waits_for_an_explicit_decision(self):
         store = WorkspaceUIStore()
         request = AttentionRequest(

@@ -801,16 +801,16 @@ _COLOR_STYLE = {
     "header.title": "bold #f0f0f0",
     "header.subtitle": "#999999",
     "choice": "#c8c8c8",
-    "choice.meta": "#777777",
+    "choice.meta": "#a0a0a0",
     "choice.selected": "bold #ffffff bg:#164e63",
-    "choice.disabled": "#666666",
+    "choice.disabled": "#8a8a8a",
     "details.title": "bold #ffffff",
     "details.body": "#a8a8a8",
     "warning": "bold #f0b429",
     "filter": "#35d06f",
     "composer.prompt": "bold #35d06f",
     "composer.input": "#f0f0f0",
-    "footer": "#777777",
+    "footer": "#a0a0a0",
     "loading.dots": "bold #35d06f",
     "loading.square.0": "#444444",
     "loading.square.1": "#707070",
@@ -822,7 +822,7 @@ _COLOR_STYLE = {
     "workspace.mode": "bold #35d06f",
     "workspace.user": "bold #35d06f",
     "workspace.assistant": "#e8e8e8",
-    "workspace.muted": "#777777",
+    "workspace.muted": "#a0a0a0",
     "workspace.stage.done": "#35d06f",
     "workspace.stage.active": "bold #f0f0f0",
     "workspace.stage.pending": "#555555",
@@ -854,15 +854,6 @@ def _prompt_output(output: TextIO, app_output: Any | None) -> Any | None:
         return _UNUSABLE_OUTPUT
 
 
-_WORKSPACE_STAGE_ORDER = (
-    ActivityStage.UNDERSTANDING,
-    ActivityStage.PLANNING,
-    ActivityStage.BUILDING,
-    ActivityStage.CHECKING,
-    ActivityStage.DONE,
-)
-
-
 def _workspace_copy(locale: str, key: str) -> str:
     values = {
         "en": {
@@ -877,6 +868,14 @@ def _workspace_copy(locale: str, key: str) -> str:
             "write": "Write a message",
             "guide": "Send guidance while work continues",
             "details": "Details",
+            "you": "You",
+            "queued": "queued",
+            "stop_hint": "Ctrl+C Stop safely",
+            "clear_hint": "Ctrl+C Clear draft",
+            "model": "Model",
+            "permissions": "Permissions",
+            "actions": "Actions",
+            "custom": "Type a custom answer, or choose above",
         },
         "ar": {
             "understanding": "فهم الطلب",
@@ -890,23 +889,30 @@ def _workspace_copy(locale: str, key: str) -> str:
             "write": "اكتب رسالة",
             "guide": "أرسل توجيهًا أثناء استمرار العمل",
             "details": "التفاصيل",
+            "you": "أنت",
+            "queued": "في الانتظار",
+            "stop_hint": "Ctrl+C إيقاف آمن",
+            "clear_hint": "Ctrl+C مسح المسودة",
+            "model": "النموذج",
+            "permissions": "الصلاحيات",
+            "actions": "الإجراءات",
+            "custom": "اكتب إجابة مخصصة أو اختر من الأعلى",
         },
     }
     return values.get(locale, values["en"]).get(key, values["en"].get(key, key))
 
 
-def _workspace_stage_progress(stage: ActivityStage) -> str:
-    if stage in {ActivityStage.IDLE, ActivityStage.PAUSED, ActivityStage.PROBLEM}:
+def _workspace_stage_progress(
+    stage: ActivityStage,
+    *,
+    completed: int = 0,
+    total: int = 0,
+    locale: str = "en",
+) -> str:
+    if stage in {ActivityStage.IDLE, ActivityStage.PAUSED, ActivityStage.PROBLEM} or total <= 0:
         return ""
-    try:
-        active = _WORKSPACE_STAGE_ORDER.index(stage)
-    except ValueError:
-        active = 0
-    parts = []
-    for index, item in enumerate(_WORKSPACE_STAGE_ORDER):
-        mark = "✓" if index < active else "●" if index == active else "○"
-        parts.append(f"{mark} {item.value.title()}")
-    return "  ".join(parts)
+    label = "خطوات الخطة" if locale == "ar" else "Plan steps"
+    return f"{label}: {min(completed, total)}/{total} complete (not a time estimate)"
 
 
 def render_persistent_workspace(
@@ -921,7 +927,7 @@ def render_persistent_workspace(
     width, height = max(44, int(width)), max(16, int(height))
     mode = _workspace_copy(snapshot.locale, snapshot.mode.value)
     header_left = f"GA3BAD  {mode.upper()}"
-    header_right = " · ".join(item for item in (snapshot.model, snapshot.workspace) if item)
+    header_right = " · ".join(item for item in (snapshot.model, snapshot.status, snapshot.workspace) if item)
     header = _fit(
         header_left + " " * max(1, width - len(header_left) - len(header_right)) + header_right,
         width,
@@ -939,7 +945,12 @@ def render_persistent_workspace(
     if snapshot.running or activity.stage not in {ActivityStage.IDLE, ActivityStage.DONE}:
         suffix = f"  ·  {elapsed // 60:02d}:{elapsed % 60:02d}" if elapsed else ""
         lines.extend((f"{activity.stage.value.upper()}  {activity.summary}{suffix}",))
-        progress = _workspace_stage_progress(activity.stage)
+        progress = _workspace_stage_progress(
+            activity.stage,
+            completed=activity.completed,
+            total=activity.total,
+            locale=snapshot.locale,
+        )
         if progress:
             lines.append(progress)
         if activity.last_success:
@@ -952,9 +963,10 @@ def render_persistent_workspace(
         for index, option in enumerate(snapshot.attention.options):
             marker = "[" if index == snapshot.attention_index else " "
             closer = "]" if index == snapshot.attention_index else " "
-            options.append(f"{marker}{option.label}{closer}")
+            description = f" — {option.description}" if option.description else ""
+            options.append(f"{marker}{option.label}{closer}{description}")
         if options:
-            lines.append("   ".join(options))
+            lines.extend(options)
     footer_space = 3
     lines = lines[: max(1, height - footer_space)]
     while len(lines) < height - footer_space:
@@ -966,7 +978,16 @@ def render_persistent_workspace(
     )
     lines.extend(("› " + placeholder, "─" * width if width > 50 else "-" * width))
     queue = f" · queued {snapshot.queued_count}" if snapshot.queued_count else ""
-    lines.append(f"F2 Advanced  ·  / Actions  ·  Ctrl+C Stop safely{queue}")
+    interrupt = _workspace_copy(snapshot.locale, "stop_hint" if snapshot.running else "clear_hint")
+    lines.append(
+        _fit(
+            f"F2 {_workspace_copy(snapshot.locale, 'advanced')} · "
+            f"F3 {_workspace_copy(snapshot.locale, 'model')} · "
+            f"F4 {_workspace_copy(snapshot.locale, 'permissions')} · "
+            f"Ctrl+K {_workspace_copy(snapshot.locale, 'actions')} · {interrupt}{queue}",
+            width,
+        ).rstrip()
+    )
     return "\n".join(lines[:height])
 
 
@@ -986,7 +1007,7 @@ class PersistentWorkspaceApp:
         *,
         on_input: Callable[[WorkspaceInput], None],
         on_interrupt: Callable[[], None],
-        on_exit: Callable[[], None],
+        on_exit: Callable[[], bool | None],
         output: TextIO = sys.stdout,
         no_color: bool = False,
         app_input: Any | None = None,
@@ -1012,21 +1033,23 @@ class PersistentWorkspaceApp:
             always_hide_cursor=True,
             height=Dimension(weight=1),
         )
+        self._transcript_window = transcript
+        self._follow_transcript = True
         activity = Window(
             content=FormattedTextControl(self._activity_fragments),
             wrap_lines=True,
             always_hide_cursor=True,
-            height=4,
+            height=Dimension(min=1, max=5, preferred=3),
         )
         attention = Window(
             content=FormattedTextControl(self._attention_fragments),
             wrap_lines=True,
             always_hide_cursor=True,
-            height=Dimension(min=1, max=7, preferred=5),
+            height=Dimension(min=1, max=12, preferred=6),
         )
         composer = Window(
             content=BufferControl(buffer=self._buffer, focusable=True),
-            height=2,
+            height=Dimension(min=1, max=6, preferred=2),
             wrap_lines=True,
         )
         root = HSplit(
@@ -1069,6 +1092,32 @@ class PersistentWorkspaceApp:
         @self._bindings.add("f2", eager=True)
         def _toggle_mode(event: Any) -> None:
             self.store.toggle_mode()
+            event.app.invalidate()
+
+        @self._bindings.add("f3", eager=True)
+        def _choose_model(event: Any) -> None:
+            self.on_input(WorkspaceInput(kind="model"))
+
+        @self._bindings.add("f4", eager=True)
+        def _choose_permissions(event: Any) -> None:
+            self.on_input(WorkspaceInput(kind="permissions"))
+
+        @self._bindings.add("c-k", eager=True)
+        def _open_actions(event: Any) -> None:
+            self.on_input(WorkspaceInput(kind="actions"))
+
+        @self._bindings.add("pageup", eager=True)
+        def _transcript_up(event: Any) -> None:
+            self._follow_transcript = False
+            self._transcript_window.vertical_scroll = max(
+                0, int(self._transcript_window.vertical_scroll) - 8
+            )
+            event.app.invalidate()
+
+        @self._bindings.add("pagedown", eager=True)
+        def _transcript_down(event: Any) -> None:
+            self._transcript_window.vertical_scroll += 8
+            self._follow_transcript = True
             event.app.invalidate()
 
         @self._bindings.add("left", eager=True)
@@ -1115,22 +1164,23 @@ class PersistentWorkspaceApp:
 
         @self._bindings.add("c-c", eager=True)
         def _interrupt(event: Any) -> None:
-            if self._buffer.text:
+            if self.store.snapshot().running:
+                self.on_interrupt()
+            elif self._buffer.text:
                 self._buffer.reset()
-                return
-            self.on_interrupt()
 
         @self._bindings.add("c-q", eager=True)
         def _exit(event: Any) -> None:
-            self.on_exit()
-            event.app.exit(result=None)
+            if self.on_exit() is not False:
+                event.app.exit(result=None)
 
-        for key in tuple("123456789") + (
-            "y", "n", "a", "b", "c", "d", "f", "k", "o", "p", "r", "s"
-        ):
+        for key in tuple("123456789") + tuple("abcdefghijklmnopqrstuvwxyz"):
             def _shortcut(event: Any, pressed: str = key) -> None:
                 request = self.store.active_attention()
                 if request is None:
+                    self._buffer.insert_text(pressed)
+                    return
+                if self._buffer.text or (request.allow_custom and not pressed.isdigit()):
                     self._buffer.insert_text(pressed)
                     return
                 match = next(
@@ -1150,31 +1200,37 @@ class PersistentWorkspaceApp:
     def _header_fragments(self) -> Any:
         snapshot = self.store.snapshot()
         mode = _workspace_copy(snapshot.locale, snapshot.mode.value).upper()
-        right = " · ".join(item for item in (snapshot.model, snapshot.workspace) if item)
-        return FormattedText(
-            [
-                ("class:workspace.header", " GA3BAD  "),
-                ("class:workspace.mode", mode),
-                ("class:workspace.muted", f"    {right}" if right else ""),
-            ]
-        )
+        right = " · ".join(item for item in (snapshot.model, snapshot.status, snapshot.workspace) if item)
+        try:
+            width = max(24, get_app().output.get_size().columns)
+        except (AttributeError, RuntimeError, ValueError):
+            width = 100
+        left = f" GA3BAD  {mode}"
+        remaining = max(0, width - len(left) - 2)
+        right = textwrap.shorten(right, width=max(1, remaining), placeholder="…") if right else ""
+        gap = " " * max(1, width - len(left) - len(right))
+        return FormattedText([
+            ("class:workspace.header", " GA3BAD  "),
+            ("class:workspace.mode", mode),
+            ("class:workspace.muted", gap + right),
+        ])
 
     def _transcript_fragments(self) -> Any:
         snapshot = self.store.snapshot()
         fragments: list[tuple[Any, ...]] = []
         if not snapshot.transcript:
             fragments.append(("class:workspace.muted", "\n Ready — describe what you want to build.\n"))
-        for entry in snapshot.transcript[-14:]:
+        for entry in snapshot.transcript[-80:]:
             if entry.role == "user":
                 fragments.extend(
-                    (("class:workspace.user", "\n You\n"), ("class:workspace.assistant", f" {entry.text}\n"))
+                    (("class:workspace.user", f"\n {_workspace_copy(snapshot.locale, 'you')}\n"), ("class:workspace.assistant", f" {entry.text}\n"))
                 )
             else:
                 fragments.extend(
                     (("class:workspace.mode", "\n GA3BAD\n"), ("class:workspace.assistant", f" {entry.text}\n"))
                 )
         if snapshot.mode is ExperienceMode.ADVANCED and snapshot.advanced_log:
-            fragments.append(("class:workspace.muted", "\n Details\n"))
+            fragments.append(("class:workspace.muted", f"\n {_workspace_copy(snapshot.locale, 'details')}\n"))
             fragments.extend(
                 ("class:workspace.muted", f" · {line}\n") for line in snapshot.advanced_log[-10:]
             )
@@ -1197,7 +1253,12 @@ class PersistentWorkspaceApp:
             (style, f" {activity.stage.value.upper()}  {summary}"),
             ("class:workspace.muted", f"  ·  {elapsed // 60:02d}:{elapsed % 60:02d}\n"),
         ]
-        progress = _workspace_stage_progress(activity.stage)
+        progress = _workspace_stage_progress(
+            activity.stage,
+            completed=activity.completed,
+            total=activity.total,
+            locale=snapshot.locale,
+        )
         if progress:
             fragments.append(("class:workspace.muted", f" {progress}\n"))
         if activity.last_success:
@@ -1225,8 +1286,10 @@ class PersistentWorkspaceApp:
             selected = index == snapshot.attention_index
             style = "class:workspace.option.selected" if selected else "class:workspace.option"
             shortcut = option.shortcut.upper() if option.shortcut else str(index + 1)
-            fragments.append((style, f"  [{shortcut}] {option.label}  ", handler_for(option.key)))
-            fragments.append(("", "   "))
+            fragments.append((style, f"  [{shortcut}] {option.label}", handler_for(option.key)))
+            if option.description:
+                fragments.append(("class:workspace.muted", f" — {option.description}"))
+            fragments.append(("", "\n"))
         if request.allow_custom:
             fragments.append(("class:workspace.muted", "\n   Or type your answer below."))
         if snapshot.mode is ExperienceMode.ADVANCED and request.details:
@@ -1240,17 +1303,23 @@ class PersistentWorkspaceApp:
         snapshot = self.store.snapshot()
         label = _workspace_copy(snapshot.locale, "guide" if snapshot.running else "write")
         if snapshot.attention is not None and snapshot.attention.allow_custom:
-            label = "Type a custom answer, or choose above"
+            label = _workspace_copy(snapshot.locale, "custom")
         return FormattedText(
             [("class:composer.prompt", " › "), ("class:workspace.muted", label)]
         )
 
     def _footer_fragments(self) -> Any:
         snapshot = self.store.snapshot()
-        queue = f" · queued {snapshot.queued_count}" if snapshot.queued_count else ""
-        mode_hint = "F2 Simple" if snapshot.mode is ExperienceMode.ADVANCED else "F2 Advanced"
+        queue = f" · {_workspace_copy(snapshot.locale, 'queued')} {snapshot.queued_count}" if snapshot.queued_count else ""
+        target_mode = ExperienceMode.SIMPLE if snapshot.mode is ExperienceMode.ADVANCED else ExperienceMode.ADVANCED
+        mode_hint = f"F2 {_workspace_copy(snapshot.locale, target_mode.value)}"
+        interrupt = (
+            _workspace_copy(snapshot.locale, "stop_hint")
+            if snapshot.running
+            else _workspace_copy(snapshot.locale, "clear_hint")
+        )
         return FormattedText(
-            [("class:footer", f" {mode_hint}  ·  / Actions  ·  Ctrl+C Stop safely{queue}")]
+            [("class:footer", f" {mode_hint} · F3 {_workspace_copy(snapshot.locale, 'model')} · F4 {_workspace_copy(snapshot.locale, 'permissions')} · Ctrl+K {_workspace_copy(snapshot.locale, 'actions')} · {interrupt}{queue}")]
         )
 
     def request_redraw(self) -> None:
@@ -1259,6 +1328,8 @@ class PersistentWorkspaceApp:
             return
         loop = getattr(application, "loop", None)
         try:
+            if self._follow_transcript:
+                self._transcript_window.vertical_scroll = 10**9
             if loop is not None and getattr(application, "is_running", False):
                 loop.call_soon_threadsafe(application.invalidate)
             else:
@@ -1463,7 +1534,10 @@ def run_loading_task(
     if not PROMPT_TOOLKIT_AVAILABLE or (
         not force and not rich_terminal_available(input_func, output)
     ):
-        return task()
+        try:
+            return task()
+        except (EOFError, KeyboardInterrupt):
+            return None
 
     animate = not reduced_motion and not no_color and not _env_enabled(
         "GA3BAD_REDUCED_MOTION"
@@ -1487,6 +1561,7 @@ def run_loading_task(
     use_unicode = terminal_supports_unicode(output)
 
     def content() -> Any:
+        elapsed = max(0, int(time.monotonic() - started))
         tick = int((time.monotonic() - started) / 0.12) if animate else 0
         grid = loading_grid_levels(
             state,
@@ -1494,30 +1569,34 @@ def run_loading_task(
             reduced_motion=reduced_motion,
             no_color=no_color,
         )
-        square = "▪" if use_unicode else "#"
-        fragments: list[tuple[str, str]] = []
+        # Keep discovery compact and top-aligned: copy first, then a small,
+        # tightly packed 3x3 activity mark underneath it.
+        square = "·" if use_unicode else "."
+        fragments: list[tuple[str, str]] = [
+            ("class:loading.title", f"  {_clean_line(title)}\n"),
+        ]
+        if detail:
+            fragments.append(
+                ("class:loading.detail", f"  {_clean_line(detail)} · {elapsed}s\n")
+            )
+        fragments.append(("", "\n"))
         for row_index, row in enumerate(grid):
-            for column_index, level in enumerate(row):
+            fragments.append(("", "  "))
+            for level in row:
                 fragments.append((f"class:loading.square.{level}", square))
-                if column_index < 2:
-                    fragments.append(("", " "))
-            if row_index == 0:
-                fragments.extend((("", "   "), ("class:loading.title", _clean_line(title))))
-            elif row_index == 1 and detail:
-                fragments.extend((("", "   "), ("class:loading.detail", _clean_line(detail))))
-            if row_index < 2:
+            if row_index < len(grid) - 1:
                 fragments.append(("", "\n"))
         return FormattedText(fragments)
 
     main = Window(
         content=FormattedTextControl(content),
-        align="CENTER",
+        align="LEFT",
         always_hide_cursor=True,
-        height=Dimension(preferred=3),
+        height=Dimension(preferred=7),
     )
     root = HSplit(
         [
-            Window(height=Dimension(weight=1)),
+            Window(height=2),
             main,
             Window(height=Dimension(weight=1)),
             Window(
@@ -1544,7 +1623,7 @@ def run_loading_task(
         style=_make_style(no_color),
         full_screen=True,
         mouse_support=False,
-        refresh_interval=0.12 if animate else None,
+        refresh_interval=0.12 if animate else 1.0,
         **kwargs,
     )
 

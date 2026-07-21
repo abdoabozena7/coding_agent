@@ -1688,15 +1688,20 @@ class AgentRuntime:
         attempt = int(current.metadata.get("goal_attempt", 0)) + 1
         consecutive = int(current.metadata.get("consecutive_retries", 0)) + 1
         retry_ms = self._goal_retry_delay_ms(consecutive)
+        retryable = consecutive < self.config.provider_failure_limit
+        waiting = question if retryable else (
+            "Planning stopped after repeated provider failures. Check the selected model, "
+            "credentials, network, or local service, then use /model or /resume."
+        )
         self.store.update_goal_metadata(
             goal.id,
-            waiting_question=question,
+            waiting_question=waiting,
             resume_status=current.status.value,
             goal_attempt=attempt,
             consecutive_retries=consecutive,
             retry_reason=reason,
-            retry_after_ms=retry_ms,
-            auto_retryable=True,
+            retry_after_ms=retry_ms if retryable else 0,
+            auto_retryable=retryable,
         )
         self.store.transition_goal(goal.id, GoalStatus.PAUSED, reason=reason)
 
@@ -1852,18 +1857,63 @@ class AgentRuntime:
         )
         return updated
 
+    def _schedule_provider_retry(self, goal: Goal, reason: str) -> tuple[Goal, bool]:
+        """Retry transient provider failures, then stop at an actionable boundary."""
+
+        updated = self._schedule_goal_retry(goal, reason)
+        consecutive = int(updated.metadata.get("consecutive_retries", 0))
+        if consecutive < self.config.provider_failure_limit:
+            return updated, True
+        waiting = (
+            "Provider access failed repeatedly. Check the selected model, credentials, "
+            "network, or local service, then use /model or /resume."
+        )
+        updated = self.store.update_goal_metadata(
+            updated.id,
+            retry_after_ms=0,
+            auto_retryable=False,
+            waiting_question=waiting,
+            resume_status=GoalStatus.RUNNING.value,
+        )
+        if updated.status is GoalStatus.RUNNING:
+            updated = self.store.transition_goal(
+                updated.id,
+                GoalStatus.PAUSED,
+                reason="repeated provider failures require user action",
+            )
+        self.events.publish(
+            "checkpoint",
+            waiting,
+            paused=True,
+            retry_exhausted=True,
+            attempts=consecutive,
+        )
+        return updated, False
+
     def wait_for_scheduled_retry(self) -> int:
-        """Apply one bounded backoff delay; retry count itself remains unbounded."""
+        """Apply one bounded backoff delay for a retryable durable attempt."""
         goal = self.active_goal()
         if goal is None:
             return 0
         delay_ms = max(0, int(goal.metadata.get("retry_after_ms", 0)))
         if delay_ms:
             self.events.publish(
-                "checkpoint",
-                f"Goal retry {goal.metadata.get('goal_attempt', 0)} waits {delay_ms / 1000:.1f}s; Ctrl-C checkpoints safely.",
+                "retry_wait",
+                f"Retry {goal.metadata.get('goal_attempt', 0)} in {delay_ms / 1000:.1f}s",
+                delay_ms=delay_ms,
+                attempt=goal.metadata.get("goal_attempt", 0),
             )
-            self.sleeper(delay_ms / 1_000)
+            remaining = delay_ms / 1_000
+            while remaining > 0:
+                current = self.store.get_goal(goal.id)
+                if (
+                    not current.metadata.get("auto_retryable")
+                    or int(current.metadata.get("retry_after_ms", 0) or 0) <= 0
+                ):
+                    break
+                interval = min(0.25, remaining)
+                self.sleeper(interval)
+                remaining -= interval
             self.store.update_goal_metadata(goal.id, retry_after_ms=0)
         return delay_ms
 
@@ -3009,7 +3059,12 @@ class AgentRuntime:
             return goal
         if self.ultra_session is not None and self.ultra_session.running:
             self.ultra_session.pause()
-        self.store.update_goal_metadata(goal.id, resume_status=goal.status.value)
+        self.store.update_goal_metadata(
+            goal.id,
+            resume_status=goal.status.value,
+            auto_retryable=False,
+            retry_after_ms=0,
+        )
         result = self.store.transition_goal(goal.id, GoalStatus.PAUSED, reason=reason)
         self.events.publish("phase", "Goal paused safely; state is durable.")
         return result
@@ -3224,6 +3279,7 @@ class AgentRuntime:
         self.events.publish(
             "checkpoint",
             "Interrupt checkpoint saved. No unfinished side effect was replayed. Use /resume to continue.",
+            paused=True,
             uncertain_tasks=list(recovery.task_ids),
             uncertain_actions=list(recovery.action_ids),
         )
@@ -4564,16 +4620,20 @@ class AgentRuntime:
                     )
                 except ProviderUnavailableError as exc:
                     self.store.append_event("execution.checkpoint", goal_id=goal.id, payload={"error": redact_text(exc, 1_000)})
-                    current = self._schedule_goal_retry(
+                    current, retrying = self._schedule_provider_retry(
                         self.store.get_goal(goal.id),
                         f"provider unavailable after bounded transport retries: {redact_text(exc, 500)}",
                     )
                     self.events.publish("error", str(exc))
                     return SliceResult(
-                        GoalStatus.RUNNING.value,
-                        f"Provider unavailable; durable goal retry {current.metadata.get('goal_attempt')} scheduled.",
+                        current.status.value,
+                        (
+                            f"Provider unavailable; retry {current.metadata.get('goal_attempt')} scheduled."
+                            if retrying
+                            else str(current.metadata.get("waiting_question") or "Provider access needs attention.")
+                        ),
                         completed_steps,
-                        needs_user=False,
+                        needs_user=not retrying,
                     )
                 self._work_conversation.append(turn.to_message())
 
@@ -4644,6 +4704,7 @@ class AgentRuntime:
                     on_suspend=lambda count: self.events.publish(
                         "checkpoint",
                         f"Suspended {count} transient messages and revived a fresh model context from durable goal memory.",
+                        continues=True,
                     ),
                 )
                 if self.store.get_goal(goal.id).status != GoalStatus.RUNNING:
@@ -4695,7 +4756,13 @@ class AgentRuntime:
                 goal_id=goal.id,
                 payload={"steps": completed_steps, "status": current.status.value},
             )
-            self.events.publish("checkpoint", message)
+            self.events.publish(
+                "checkpoint",
+                message,
+                status=current.status.value,
+                paused=current.status is GoalStatus.PAUSED,
+                continues=current.status is GoalStatus.RUNNING,
+            )
             return SliceResult(current.status.value, message, completed_steps, completed, needs_user)
 
     def dashboard(self) -> DashboardView:

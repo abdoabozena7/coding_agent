@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 from urllib.parse import urlsplit
 
 from agent.model_catalog import ExecutionClass, ModelCatalog, ModelDescriptor
@@ -81,6 +82,23 @@ class ModelDescriptorTests(unittest.TestCase):
         self.assertIsNot(first, second)
         self.assertEqual(first.model, "coder:latest")
         self.assertEqual(first.host, "http://127.0.0.1:11435")
+
+    def test_local_gpu_requirement_never_applies_to_ollama_cloud_models(self):
+        cloud = ModelDescriptor(
+            provider="ollama",
+            model="gpt-oss:120b-cloud",
+            host="http://localhost:11434",
+            execution_class=ExecutionClass.CLOUD,
+        )
+        local = ModelDescriptor(
+            provider="ollama",
+            model="coder:latest",
+            host="http://localhost:11434",
+            execution_class=ExecutionClass.LOCAL,
+        )
+        with mock.patch.dict("os.environ", {"AGENT_REQUIRE_LOCAL_GPU": "1"}, clear=False):
+            self.assertFalse(cloud.create_provider().require_gpu)
+            self.assertTrue(local.create_provider().require_gpu)
 
     def test_invalid_values_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "execution class"):

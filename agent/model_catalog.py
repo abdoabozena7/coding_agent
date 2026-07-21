@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
@@ -202,6 +203,7 @@ class ModelCatalog:
 
         descriptors: list[ModelDescriptor] = []
         seen: set[str] = set()
+        candidates: list[tuple[str, Mapping[str, Any]]] = []
         for raw_model in raw_models:
             if not isinstance(raw_model, Mapping):
                 continue
@@ -209,6 +211,10 @@ class ModelCatalog:
             if not model or model in seen:
                 continue
             seen.add(model)
+            candidates.append((model, raw_model))
+
+        def inspect(candidate: tuple[str, Mapping[str, Any]]) -> tuple[str, Mapping[str, Any], Mapping[str, Any] | None, Exception | None]:
+            model, raw_model = candidate
             try:
                 shown = self._request(
                     "POST",
@@ -217,8 +223,20 @@ class ModelCatalog:
                     headers=headers,
                 )
             except Exception as exc:
-                self._diagnose(f"ollama:{model}", exc)
+                return model, raw_model, None, exc
+            return model, raw_model, shown, None
+
+        # /api/show calls are independent. A small pool caps discovery near one
+        # timeout window instead of multiplying startup delay by model count.
+        workers = min(4, max(1, len(candidates)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="model-probe") as pool:
+            inspected = tuple(pool.map(inspect, candidates))
+
+        for model, raw_model, shown, error in inspected:
+            if error is not None:
+                self._diagnose(f"ollama:{model}", error)
                 continue
+            assert shown is not None
 
             capabilities = _capabilities(shown)
             if not _supports_tools(capabilities):

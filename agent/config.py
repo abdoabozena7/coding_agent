@@ -96,6 +96,7 @@ class RuntimeConfig:
     max_delegation_depth: int = 4
     max_delegations_per_slice: int = 12
     max_provider_retries: int = 3
+    provider_failure_limit: int = 3
     repeated_action_limit: int = 2
     no_action_limit: int = 3
     stalled_slice_limit: int = 3
@@ -124,6 +125,7 @@ class RuntimeConfig:
             max_delegation_depth=_env_int("AGENT_MAX_DELEGATION_DEPTH", 4, 0, 12),
             max_delegations_per_slice=_env_int("AGENT_MAX_DELEGATIONS_PER_SLICE", 12, 0, 100),
             max_provider_retries=_env_int("AGENT_PROVIDER_RETRIES", 3, 0, 10),
+            provider_failure_limit=_env_int("AGENT_PROVIDER_FAILURE_LIMIT", 3, 1, 20),
             repeated_action_limit=_env_int("AGENT_REPEAT_LIMIT", 2, 1, 10),
             no_action_limit=_env_int("AGENT_NO_ACTION_LIMIT", 3, 1, 20),
             stalled_slice_limit=_env_int("AGENT_STALLED_SLICE_LIMIT", 3, 1, 20),
@@ -157,6 +159,7 @@ RUNTIME_SETTING_BOUNDS: dict[str, tuple[int, int]] = {
     "max_delegation_depth": (0, 12),
     "max_delegations_per_slice": (0, 100),
     "max_provider_retries": (0, 10),
+    "provider_failure_limit": (1, 20),
     "repeated_action_limit": (1, 10),
     "no_action_limit": (1, 20),
     "stalled_slice_limit": (1, 20),
@@ -187,6 +190,7 @@ RUNTIME_SETTING_ALIASES: dict[str, str] = {
     "delegation_depth": "max_delegation_depth",
     "delegations": "max_delegations_per_slice",
     "provider_retries": "max_provider_retries",
+    "provider_failures": "provider_failure_limit",
     "repeat_limit": "repeated_action_limit",
     "context_chars": "conversation_chars",
     "concurrency": "ultra_cloud_concurrency",

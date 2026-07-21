@@ -179,6 +179,64 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         waiter.join(1)
         self.assertEqual(answers[0].value, "allow_once")
 
+    def test_custom_answer_typing_is_not_consumed_by_letter_shortcuts(self):
+        from threading import Thread
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        answers = []
+        request = AttentionRequest(
+            id="custom-answer",
+            kind=AttentionKind.QUESTION,
+            title="Describe it",
+            options=(AttentionOption("best", "Best default", "1", shortcut="b"),),
+            allow_custom=True,
+        )
+        waiter = Thread(target=lambda: answers.append(store.request_attention(request)))
+        waiter.start()
+        with create_pipe_input() as pipe:
+            pipe.send_text("basic\r\x11")
+            app = PersistentWorkspaceApp(
+                store,
+                on_input=lambda _item: None,
+                on_interrupt=lambda: None,
+                on_exit=store.mark_exit,
+                output=io.StringIO(),
+                app_input=pipe,
+                app_output=DummyOutput(),
+                no_color=True,
+            )
+            app.run()
+        waiter.join(1)
+        self.assertEqual(answers[0].key, "custom")
+        self.assertEqual(answers[0].text, "basic")
+
+    def test_exit_can_be_deferred_until_work_reaches_a_checkpoint(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        attempts = []
+        def on_exit():
+            attempts.append(True)
+            return len(attempts) > 1
+
+        with create_pipe_input() as pipe:
+            pipe.send_text("\x11\x11")
+            app = PersistentWorkspaceApp(
+                store,
+                on_input=lambda _item: None,
+                on_interrupt=lambda: None,
+                on_exit=on_exit,
+                output=io.StringIO(),
+                app_input=pipe,
+                app_output=DummyOutput(),
+                no_color=True,
+            )
+            app.run()
+        self.assertEqual(len(attempts), 2)
+
     def test_default_selection_prefers_enabled_but_disabled_rows_explain_themselves(self):
         state = ChoiceListState.create(_items())
         self.assertEqual(state.current.key, "normal")

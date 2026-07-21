@@ -70,7 +70,7 @@ from .ui_state import (
     is_recommended_defaults_utterance,
     question_session,
 )
-from .action_policy import plan_review_reasons, should_surface_question
+from .action_policy import plan_review_reasons
 from .ui import (
     ApprovalPromptRequested,
     COMMAND_GROUPS,
@@ -133,7 +133,7 @@ def choose_workspace(
     output: TextIO = sys.stdout,
     rich: bool | None = None,
     initial: str | os.PathLike[str] | None = None,
-    step_label: str = "Setup 1 of 4",
+    step_label: str = "Setup 1 of 5",
     no_color: bool = False,
     reduced_motion: bool = False,
 ) -> Path:
@@ -272,7 +272,7 @@ def choose_model(
     output: TextIO = sys.stdout,
     rich: bool | None = None,
     initial: str | None = None,
-    step_label: str = "Setup 3 of 4",
+    step_label: str = "Setup 3 of 5",
     no_color: bool = False,
     reduced_motion: bool = False,
 ) -> ModelDescriptor:
@@ -328,7 +328,11 @@ def choose_model(
             )
             location = descriptor.execution_class.value.upper()
             provider_note = (
-                "Network inference; independent agents can run in parallel."
+                (
+                    "Credentials configured; connectivity and model access are verified on first use."
+                    if descriptor.source == "environment"
+                    else "Network inference; independent agents can run in parallel."
+                )
                 if descriptor.execution_class is ExecutionClass.CLOUD
                 else "Runs locally; one agent works at a time."
             )
@@ -350,7 +354,7 @@ def choose_model(
         selected = select_choice(
             choices,
             title="Choose a model",
-            subtitle="Only available tool-capable models are shown.",
+            subtitle="Ollama models are probed now; configured cloud models are verified on first use.",
             initial_key=initial_key,
             filterable=True,
             step_label=step_label,
@@ -393,7 +397,7 @@ def choose_access_level(
     sandbox: DockerSandbox | None = None,
     rich: bool | None = None,
     initial: str | AccessLevel = AccessLevel.NORMAL,
-    step_label: str = "Setup 4 of 4",
+    step_label: str = "Setup 4 of 5",
     no_color: bool = False,
     reduced_motion: bool = False,
 ) -> AccessLevel:
@@ -493,7 +497,7 @@ def choose_project_protection(
     input_func: Callable[[str], str] = input,
     output: TextIO = sys.stdout,
     rich: bool | None = None,
-    step_label: str = "Setup 2 of 4",
+    step_label: str = "Setup 2 of 5",
     no_color: bool = False,
     reduced_motion: bool = False,
 ) -> GitProtectionStatus:
@@ -682,7 +686,7 @@ def choose_interaction_mode(
     output: TextIO = sys.stdout,
     rich: bool | None = None,
     initial: str | InteractionMode = InteractionMode.NORMAL,
-    step_label: str = "Session · Mode",
+    step_label: str = "Setup 5 of 5",
     no_color: bool = False,
     reduced_motion: bool = False,
     ultra_disabled_reason: str = "",
@@ -703,7 +707,7 @@ def choose_interaction_mode(
                         "Intent intake, one durable goal, planning, review, and automatic execution. "
                         "Complex requests are promoted to Ultra automatically."
                     ),
-                    meta="Current" if selected_mode is InteractionMode.NORMAL else "Recommended",
+                    meta="Current" if selected_mode is InteractionMode.NORMAL else "Basic",
                     value=InteractionMode.NORMAL,
                 ),
                 ChoiceItem(
@@ -720,7 +724,7 @@ def choose_interaction_mode(
                 ),
             ),
             title="Choose how GA3BAD should work",
-            subtitle="You can switch at any time with F2 or /mode.",
+            subtitle="You can switch workflow mode at a safe checkpoint with /mode.",
             initial_key=(
                 InteractionMode.NORMAL.value
                 if selected_mode is InteractionMode.ULTRA and ultra_disabled_reason
@@ -834,7 +838,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--auto",
         action="store_true",
-        help="Retry/self-prompt without limit until completion or real user input.",
+        help="Persist through no-progress attempts; pause on repeated provider failures or real user input.",
     )
     parser.add_argument("--interactive", action="store_true", help="Enter the REPL after --command actions.")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors.")
@@ -1198,7 +1202,8 @@ def _execute_model(runtime: AgentRuntime, console: ConsoleUI, value: str | None,
 
 def _run_auto(runtime: AgentRuntime, console: ConsoleUI) -> None:
     console.write(
-        "Unbounded goal mode is active. Attempts self-reprompt until completion or real user input; "
+        "Durable goal mode is active. No-progress attempts self-reprompt until completion or real user input; "
+        "repeated provider failures pause for repair; "
         "press Ctrl-C to checkpoint."
     )
     while True:
@@ -1218,7 +1223,7 @@ def _run_auto(runtime: AgentRuntime, console: ConsoleUI) -> None:
                 ):
                     raise
                 console.write(
-                    "Planning attempt failed transiently; the durable unbounded retry loop will try again."
+                    "Planning failed transiently; the durable retry policy will try again within its provider-failure limit."
                 )
             _show_runtime_state(runtime, console)
             continue
@@ -1293,9 +1298,10 @@ def _answer_pending_question_with_picker(
         for index, option in enumerate(question.get("options", ()), 1)
         if isinstance(option, Mapping)
     ]
+    custom_key = str(len(options) + 1)
     options.append(
         ChoiceItem(
-            key="4",
+            key=custom_key,
             label="Write your answer",
             description="Enter a custom decision in your own words.",
             value=None,
@@ -1336,7 +1342,7 @@ def _answer_pending_question_with_picker(
         answer_recommended_remaining(runtime)
         console.write("Recommended answers saved.")
         return True
-    if selected.key == "4":
+    if selected.value is None:
         answer = prompt_text(
             title="Write your answer",
             subtitle=str(question.get("question") or ""),
@@ -1486,7 +1492,8 @@ def _open_swarm_inspector(
     initial_tab: str,
 ) -> bool:
     if not (
-        rich_terminal_available(input_func=console.input_func, output=console.stream)
+        not console.workspace_active
+        and rich_terminal_available(input_func=console.input_func, output=console.stream)
         and not console.plain
         and console.stream is sys.stdout
     ):
@@ -1720,7 +1727,8 @@ def _show_thinking(console: ConsoleUI) -> None:
         console.write("Thinking\n  (no model thoughts captured in this session)")
         return
     if (
-        rich_terminal_available(input_func=console.input_func, output=console.stream)
+        not console.workspace_active
+        and rich_terminal_available(input_func=console.input_func, output=console.stream)
         and not console.plain
         and console.stream is sys.stdout
     ):
@@ -2181,8 +2189,9 @@ def execute_command(
         return True
     if command.kind == CommandKind.KEYMAP:
         console.write(
-            "Keymap: F2 mode, F3 model, F4 permissions, Ctrl+K commands, "
-            "Ctrl+Q exit. Type /vim to toggle Vim composer keys."
+            "Keymap: F2 Simple/Advanced display, F3 model, F4 permissions, "
+            "Ctrl+K actions, Ctrl+C safe checkpoint while running, Ctrl+Q exit "
+            "at a checkpoint. Type /vim to toggle Vim composer keys."
         )
         return True
     if command.kind == CommandKind.VIM:
@@ -2427,15 +2436,17 @@ def _question_attention(question: Mapping[str, Any], *, source: str) -> Attentio
                 primary=bool(raw.get("recommended")) or index == 1,
             )
         )
-    options.append(
-        AttentionOption(
-            key="best",
-            label="Use best choice",
-            value="1",
-            shortcut="b",
-            primary=not any(item.primary for item in options),
+    if not options:
+        options.append(
+            AttentionOption(
+                key="continue",
+                label="Continue with the suggested default",
+                value="1",
+                description="Use the planner's recommended answer for this decision.",
+                shortcut="1",
+                primary=True,
+            )
         )
-    )
     return AttentionRequest(
         id=f"question:{source}:{question_id}:{time.monotonic_ns()}",
         kind=AttentionKind.QUESTION,
@@ -2460,28 +2471,44 @@ def _plan_attention(view: Any, reasons: tuple[str, ...]) -> AttentionRequest:
         title="Review this plan",
         message=message,
         options=(
-            AttentionOption("start", "Start", "start", shortcut="s", primary=True),
-            AttentionOption("change", "Change", "change", shortcut="c"),
-            AttentionOption("cancel", "Cancel", "cancel", shortcut="n"),
+            AttentionOption(
+                "start", "Approve and start", "start",
+                description="Approve exactly this revision and begin execution.",
+                shortcut="s", primary=True,
+            ),
+            AttentionOption(
+                "change", "Request changes", "change",
+                description="Describe what the plan should change before any work starts.",
+                shortcut="c",
+            ),
+            AttentionOption(
+                "cancel", "Keep paused", "cancel",
+                description="Leave this revision unapproved.", shortcut="n",
+            ),
         ),
-        details="\n".join(reasons),
+        details="\n".join(reasons) or "Every implementation plan requires explicit approval.",
     )
 
 
 def _action_attention(store: WorkspaceUIStore) -> AttentionRequest:
-    running = store.snapshot().running
+    snapshot = store.snapshot()
+    running = snapshot.running
+    ar = snapshot.locale == "ar"
+    def copy(en: str, arabic: str) -> str:
+        return arabic if ar else en
     values = [
-        AttentionOption("new", "New task", "new", shortcut="n", primary=not running),
-        AttentionOption("stop", "Stop safely", "stop", shortcut="s"),
-        AttentionOption("changes", "Review changes", "changes", shortcut="r"),
-        AttentionOption("result", "Open result", "result", shortcut="o"),
-        AttentionOption("permissions", "Permissions", "permissions", shortcut="p"),
-        AttentionOption("advanced", "Advanced", "advanced", shortcut="a"),
+        AttentionOption("new", copy("New task", "مهمة جديدة"), "new", description=copy("Start a separate goal.", "ابدأ هدفًا منفصلًا."), shortcut="n", primary=not running),
+        AttentionOption("stop", copy("Stop safely", "إيقاف آمن"), "stop", description=copy("Save a checkpoint after the current action.", "احفظ نقطة استعادة بعد الإجراء الحالي."), shortcut="s"),
+        AttentionOption("status", copy("Task status", "حالة المهمة"), "status", description=copy("Show the durable goal and plan state.", "اعرض حالة الهدف والخطة المحفوظة."), shortcut="t"),
+        AttentionOption("changes", copy("Review changes", "مراجعة التغييرات"), "changes", description=copy("Show the current Git diff.", "اعرض تغييرات Git الحالية."), shortcut="r"),
+        AttentionOption("result", copy("Managed previews", "المعاينات المُدارة"), "result", description=copy("List running previews and processes.", "اعرض المعاينات والعمليات الجارية."), shortcut="o"),
+        AttentionOption("permissions", copy("Permissions", "الصلاحيات"), "permissions", description=copy("Choose normal or ready Docker access.", "اختر الوصول العادي أو Docker الجاهز."), shortcut="p"),
+        AttentionOption("advanced", copy("Advanced details", "تفاصيل متقدمة"), "advanced", description=copy("Show technical activity in the workspace.", "اعرض النشاط التقني في مساحة العمل."), shortcut="a"),
     ]
     return AttentionRequest(
         id=f"actions:{time.monotonic_ns()}",
         kind=AttentionKind.QUESTION,
-        title="What would you like to do?",
+        title=copy("What would you like to do?", "ماذا تريد أن تفعل؟"),
         options=tuple(values),
     )
 
@@ -2502,6 +2529,7 @@ def _persistent_interactive_loop(
     console.bind_workspace_store(store)
     inbox: Queue[WorkspaceInput] = Queue()
     stop = Event()
+    work_running = Event()
 
     def submit(item: WorkspaceInput) -> None:
         inbox.put(item)
@@ -2509,13 +2537,28 @@ def _persistent_interactive_loop(
     def interrupt() -> None:
         try:
             runtime.checkpoint_interrupt()
-            store.set_activity(ActivityStage.PAUSED, "Stopped safely", running=False)
+            if work_running.is_set():
+                store.set_activity(
+                    ActivityStage.PAUSED,
+                    "Checkpoint saved; waiting for the current action to return",
+                    running=True,
+                )
+            else:
+                store.set_activity(ActivityStage.PAUSED, "Checkpoint saved", running=False)
         except Exception as exc:
             store.append_log(f"interrupt: {exc}")
 
-    def exit_session() -> None:
+    def exit_session() -> bool:
+        if work_running.is_set():
+            interrupt()
+            store.append_transcript(
+                "assistant",
+                "Exit will be available after the current action reaches its saved checkpoint.",
+            )
+            return False
         stop.set()
         store.mark_exit()
+        return True
 
     app = PersistentWorkspaceApp(
         store,
@@ -2530,19 +2573,23 @@ def _persistent_interactive_loop(
         active_work: Thread | None = None
         work_done = Event()
         work_errors: list[BaseException] = []
+        work_results: list[bool] = []
         last_command: UserCommand | None = None
         shown_questions: set[str] = set()
         reviewed_plans: set[str] = set()
         completed_goals: set[str] = set()
         queued: list[str] = []
+        pending_new_task: list[str] = []
         slow_prompted = False
+        slow_request_id: str | None = None
 
         def work(command: UserCommand) -> None:
             try:
-                execute_command(runtime, console, command, preferences)
+                work_results.append(execute_command(runtime, console, command, preferences))
             except BaseException as exc:
                 work_errors.append(exc)
             finally:
+                work_running.clear()
                 work_done.set()
 
         def start(command: UserCommand) -> None:
@@ -2557,6 +2604,7 @@ def _persistent_interactive_loop(
                 daemon=False,
             )
             console.set_background_working(True)
+            work_running.set()
             store.set_activity(ActivityStage.UNDERSTANDING, "Understanding your request", running=True)
             active_work.start()
 
@@ -2573,6 +2621,142 @@ def _persistent_interactive_loop(
             )
             return resolution.text.strip() if resolution.key == "custom" else ""
 
+        def handle_permissions() -> None:
+            sandbox = (
+                runtime.permission_adapter.sandbox
+                if runtime.permission_adapter is not None
+                else DockerSandbox()
+            )
+            status = sandbox.status()
+            options = [
+                AttentionOption(
+                    "normal", "Normal", "normal",
+                    description="Ask before risky actions on this computer.",
+                    shortcut="n", primary=runtime.access_level == "normal",
+                )
+            ]
+            if status.ready:
+                options.append(
+                    AttentionOption(
+                        "full", "Full Docker", "full",
+                        description="Run build and test actions in the ready Docker sandbox.",
+                        shortcut="f", primary=runtime.access_level == "full",
+                    )
+                )
+            options.append(AttentionOption("cancel", "Cancel", "", shortcut="c"))
+            choice = store.request_attention(
+                AttentionRequest(
+                    id=f"permissions:{time.monotonic_ns()}",
+                    kind=AttentionKind.APPROVAL,
+                    title="Choose permissions",
+                    message=(
+                        "Full Docker is unavailable until /setup completes successfully."
+                        if not status.ready
+                        else "Choose where project commands may run."
+                    ),
+                    options=tuple(options),
+                )
+            )
+            if choice.value:
+                start(parse_command(f"/permissions {choice.value}"))
+
+        def handle_model() -> None:
+            goal = runtime.active_goal()
+            if goal is not None and goal.status in {
+                GoalStatus.RUNNING, GoalStatus.VERIFYING, GoalStatus.REVIEWING, GoalStatus.RECOVERING,
+            }:
+                store.append_transcript(
+                    "assistant",
+                    "Pause at a safe checkpoint before changing models.",
+                )
+                return
+            store.set_activity(ActivityStage.UNDERSTANDING, "Checking available models", running=True)
+            catalog = ModelCatalog()
+            models = catalog.discover()
+            if not models:
+                detail = "; ".join(f"{item.source}: {item.message}" for item in catalog.diagnostics)
+                store.set_activity(ActivityStage.PROBLEM, "No model is currently available", running=False)
+                store.append_transcript(
+                    "assistant",
+                    "No tool-capable model is available." + (f" {detail}" if detail else ""),
+                )
+                return
+            by_key = {f"model-{index}": descriptor for index, descriptor in enumerate(models, 1)}
+            options = tuple(
+                AttentionOption(
+                    key,
+                    descriptor.display_name,
+                    key,
+                    description=(
+                        f"{descriptor.provider} · {descriptor.execution_class.value} · "
+                        + ("configured; connection is verified on first use" if descriptor.source == "environment" else "tool calling verified")
+                    ),
+                    shortcut=str(index) if index < 10 else "",
+                    primary=descriptor.model == runtime.model_name,
+                )
+                for index, (key, descriptor) in enumerate(by_key.items(), 1)
+            )
+            resolution = store.request_attention(
+                AttentionRequest(
+                    id=f"model:{time.monotonic_ns()}",
+                    kind=AttentionKind.QUESTION,
+                    title="Choose a model",
+                    message="Cloud credentials are configuration evidence; connectivity is checked on first use.",
+                    options=options,
+                )
+            )
+            descriptor = by_key.get(resolution.value)
+            if descriptor is None:
+                store.set_activity(ActivityStage.PAUSED, "Model selection cancelled", running=False)
+                return
+            provider = descriptor.create_provider()
+            setattr(provider, "reasoning_effort", runtime.reasoning_effort)
+            runtime.replace_provider(provider, descriptor)
+            console.set_runtime_identity(
+                access_level=runtime.access_level,
+                execution_class=runtime.execution_class,
+                model=runtime.model_name,
+                reasoning_effort=runtime.reasoning_effort,
+                workspace=str(runtime.workspace),
+            )
+            store.set_activity(ActivityStage.IDLE, "Ready", running=False)
+            store.append_transcript(
+                "assistant",
+                f"Model changed to {descriptor.provider}/{descriptor.model} ({descriptor.execution_class.value}).",
+            )
+
+        def handle_workflow_mode() -> None:
+            issue = runtime.ultra_readiness_issue()
+            options = [
+                AttentionOption(
+                    "normal", "Normal", "normal",
+                    description="One durable goal with plan, review, and automatic execution.",
+                    shortcut="n", primary=preferences.mode is InteractionMode.NORMAL,
+                )
+            ]
+            if not issue:
+                options.append(
+                    AttentionOption(
+                        "ultra", "Ultra", "ultra",
+                        description="Recursive specialists and deeper integration gates.",
+                        shortcut="u", primary=preferences.mode is InteractionMode.ULTRA,
+                    )
+                )
+            options.append(AttentionOption("cancel", "Cancel", "", shortcut="c"))
+            resolution = store.request_attention(
+                AttentionRequest(
+                    id=f"mode:{time.monotonic_ns()}",
+                    kind=AttentionKind.QUESTION,
+                    title="Choose workflow mode",
+                    message=(f"Ultra is unavailable: {issue}" if issue else "This changes orchestration, not the Simple/Advanced display."),
+                    options=tuple(options),
+                )
+            )
+            if resolution.value:
+                _set_interaction_mode(
+                    runtime, console, preferences, resolution.value, detailed=False
+                )
+
         def handle_actions() -> None:
             resolution = store.request_attention(_action_attention(store))
             action = resolution.value
@@ -2584,25 +2768,18 @@ def _persistent_interactive_loop(
                 start(parse_command("/diff"))
             elif action == "result":
                 start(parse_command("/processes"))
+            elif action == "status":
+                start(parse_command("/status"))
             elif action == "permissions":
-                choice = store.request_attention(
-                    AttentionRequest(
-                        id=f"permissions:{time.monotonic_ns()}",
-                        kind=AttentionKind.APPROVAL,
-                        title="Choose protection",
-                        message="Normal asks only for risky computer actions. Full isolates build and test in Docker.",
-                        options=(
-                            AttentionOption("normal", "Normal", "normal", shortcut="n", primary=True),
-                            AttentionOption("full", "Full Docker", "full", shortcut="f"),
-                            AttentionOption("cancel", "Cancel", "", shortcut="c"),
-                        ),
-                    )
-                )
-                if choice.value:
-                    start(parse_command(f"/permissions {choice.value}"))
+                handle_permissions()
             elif action == "new":
                 objective = ask_custom("Start a new task", "Describe what you want to build or change.")
                 if objective:
+                    current_goal = runtime.active_goal()
+                    if current_goal is not None and current_goal.status not in {
+                        GoalStatus.COMPLETED, GoalStatus.CANCELLED,
+                    }:
+                        runtime.cancel("CANCEL")
                     store.observe_user_text(objective)
                     store.append_transcript("user", objective)
                     start(parse_command(objective))
@@ -2615,6 +2792,30 @@ def _persistent_interactive_loop(
                     active_work = None
                     console.set_background_working(False)
                     work_done.clear()
+                    if slow_request_id is not None:
+                        active_attention = store.active_attention()
+                        if active_attention is not None and active_attention.id == slow_request_id:
+                            store.resolve_attention("keep")
+                        store.take_attention_result(slow_request_id)
+                        slow_request_id = None
+                    if pending_new_task:
+                        objective = pending_new_task.pop(0)
+                        pending_new_task.clear()
+                        queued.clear()
+                        store.set_queued_count(0)
+                        current_goal = runtime.active_goal()
+                        if current_goal is not None and current_goal.status not in {
+                            GoalStatus.COMPLETED, GoalStatus.CANCELLED,
+                        }:
+                            runtime.cancel("CANCEL")
+                        work_errors.clear()
+                        work_results.clear()
+                        store.append_transcript(
+                            "assistant",
+                            "The previous task reached a checkpoint. Starting your new task now.",
+                        )
+                        start(parse_command(objective))
+                        continue
                     for guidance in tuple(queued):
                         try:
                             runtime.add_guidance(guidance)
@@ -2641,9 +2842,32 @@ def _persistent_interactive_loop(
                         )
                         if resolution.value == "retry" and last_command is not None:
                             start(last_command)
+                        elif resolution.value == "change":
+                            feedback = ask_custom(
+                                "Change the request",
+                                "Describe what should change before I try again.",
+                            )
+                            if feedback:
+                                goal = runtime.active_goal()
+                                if goal is not None and goal.active_plan_revision is not None:
+                                    start(parse_command(f"/replan {feedback}"))
+                                elif last_command is not None:
+                                    runtime.add_guidance(feedback)
+                                    start(last_command)
                         elif resolution.value == "details":
                             store.set_mode(ExperienceMode.ADVANCED)
                         continue
+                    if work_results and work_results.pop(0) is False:
+                        stop.set()
+                        store.mark_exit()
+                        break
+
+                if slow_request_id is not None:
+                    resolution = store.take_attention_result(slow_request_id)
+                    if resolution is not None:
+                        slow_request_id = None
+                        if resolution.value == "stop":
+                            interrupt()
 
                 if active_work is not None and not slow_prompted:
                     snapshot = store.snapshot()
@@ -2655,9 +2879,10 @@ def _persistent_interactive_loop(
                     )
                     if quiet >= 60 and snapshot.attention is None:
                         slow_prompted = True
-                        resolution = store.request_attention(
+                        slow_request_id = f"slow:{time.monotonic_ns()}"
+                        store.present_attention(
                             AttentionRequest(
-                                id=f"slow:{time.monotonic_ns()}",
+                                id=slow_request_id,
                                 kind=AttentionKind.RECOVERY,
                                 title="This is taking longer than usual",
                                 message="Work is still active. Nothing has been rejected or lost.",
@@ -2667,16 +2892,13 @@ def _persistent_interactive_loop(
                                 ),
                             )
                         )
-                        if resolution.value == "stop":
-                            interrupt()
-                        continue
 
                 if active_work is None:
                     session = question_session(runtime)
                     if session is not None and session.current is not None:
                         question = session.current
                         key = f"{session.source}:{question.get('id')}"
-                        if key not in shown_questions and should_surface_question(question):
+                        if key not in shown_questions:
                             shown_questions.add(key)
                             store.set_activity(ActivityStage.PAUSED, "One choice is needed", running=False)
                             resolution = store.request_attention(
@@ -2684,11 +2906,8 @@ def _persistent_interactive_loop(
                             )
                             answer = resolution.text if resolution.key == "custom" else resolution.value
                             answer_question(runtime, session, str(question.get("id", "")), answer or "1")
-                            answer_recommended_remaining(runtime)
                             _show_runtime_state(runtime, console, force=True)
                             continue
-                        answer_recommended_remaining(runtime)
-                        _show_runtime_state(runtime, console, force=True)
                         continue
 
                     goal = runtime.active_goal()
@@ -2699,33 +2918,53 @@ def _persistent_interactive_loop(
                         if plan_key not in reviewed_plans:
                             reviewed_plans.add(plan_key)
                             reasons = plan_review_reasons(view)
-                            if reasons:
-                                store.set_activity(ActivityStage.PAUSED, "Review the plan", running=False)
-                                resolution = store.request_attention(_plan_attention(view, reasons))
-                                if resolution.value == "start":
-                                    start(parse_command(f"/approve {view.plan_revision}"))
-                                elif resolution.value == "change":
-                                    feedback = ask_custom("Change the plan", "What should I change?")
-                                    if feedback:
-                                        start(parse_command(f"/replan {feedback}"))
-                                else:
-                                    store.append_transcript("assistant", "The plan is paused. Nothing has started.")
-                                continue
-                            store.append_transcript(
-                                "assistant",
-                                f"I understand. I’ll {str(view.plan_summary or view.objective).rstrip('.')}.",
-                            )
-                            start(parse_command(f"/approve {view.plan_revision}"))
+                            store.set_activity(ActivityStage.PAUSED, "Review the plan", running=False)
+                            resolution = store.request_attention(_plan_attention(view, reasons))
+                            if resolution.value == "start":
+                                start(parse_command(f"/approve {view.plan_revision}"))
+                            elif resolution.value == "change":
+                                feedback = ask_custom("Change the plan", "What should I change?")
+                                if feedback:
+                                    start(parse_command(f"/replan {feedback}"))
+                            else:
+                                store.append_transcript("assistant", "The plan is paused. Nothing has started.")
                             continue
 
                     if goal is not None and str(goal.status.value) == "completed" and goal_id not in completed_goals:
                         completed_goals.add(goal_id)
                         view = runtime.dashboard()
                         completed = sum(task.status in {"done", "skipped"} for task in view.tasks)
+                        actual_files = tuple(dict.fromkeys(
+                            str(path)
+                            for change_set in tuple(getattr(goal, "metadata", {}).get("goal_change_sets", ()) or ())
+                            if isinstance(change_set, Mapping)
+                            for path in tuple(change_set.get("changed_files", ()) or ())
+                            if str(path).strip()
+                        ))
+                        verified = tuple(
+                            item.summary
+                            for item in runtime.store.list_evidence(goal_id)
+                            if getattr(item, "verified", False)
+                        )
+                        files_receipt = (
+                            " Changed files: " + ", ".join(actual_files[:8]) + ("…" if len(actual_files) > 8 else "") + "."
+                            if actual_files
+                            else " No workspace file changes were recorded."
+                        )
+                        verification_receipt = (
+                            " Verification: " + " | ".join(" ".join(item.split())[:180] for item in verified[-3:]) + "."
+                            if verified
+                            else " Verification: no verified evidence receipt was recorded."
+                        )
                         store.set_activity(ActivityStage.DONE, "Done", completed=completed, total=len(view.tasks), running=False)
                         store.append_transcript(
                             "assistant",
-                            f"Done. {completed}/{len(view.tasks)} planned steps completed. Use / to review changes or open the result.",
+                            (
+                                f"Done. {completed}/{len(view.tasks)} planned steps completed. "
+                                + files_receipt
+                                + verification_receipt
+                                + " Press Ctrl+K for status, changes, and managed previews."
+                            ),
                         )
 
                 try:
@@ -2734,8 +2973,17 @@ def _persistent_interactive_loop(
                     continue
                 text = item.text.strip()
                 if not text:
+                    if item.kind == "actions":
+                        if active_work is None:
+                            handle_actions()
+                    elif item.kind == "model":
+                        if active_work is None:
+                            handle_model()
+                    elif item.kind == "permissions":
+                        if active_work is None:
+                            handle_permissions()
                     continue
-                if text == "/":
+                if text == "/" or item.kind == "actions":
                     if active_work is None:
                         handle_actions()
                     else:
@@ -2745,17 +2993,115 @@ def _persistent_interactive_loop(
                 store.append_transcript("user", text)
                 if active_work is not None:
                     try:
-                        runtime.add_guidance(text)
-                        store.append_transcript("assistant", "Got it — I’ll apply that at the next safe point.")
-                    except Exception:
-                        queued.append(text)
-                        store.set_queued_count(len(queued))
+                        active_command = parse_command(text)
+                    except CommandParseError as exc:
+                        store.append_transcript("assistant", f"I couldn’t understand that: {exc}")
+                        continue
+                    observer_kinds = {
+                        CommandKind.STATUS, CommandKind.PLAN, CommandKind.DIFF,
+                        CommandKind.PROCESSES, CommandKind.THINKING, CommandKind.AGENTS,
+                        CommandKind.AGENT, CommandKind.TREE, CommandKind.METRICS,
+                        CommandKind.MEMORY, CommandKind.TRACE, CommandKind.INSIGHTS,
+                        CommandKind.HISTORY, CommandKind.VERSIONS, CommandKind.HELP,
+                        CommandKind.KEYMAP,
+                    }
+                    if active_command.kind in observer_kinds:
+                        execute_command(runtime, console, active_command, preferences)
+                        continue
+                    if active_command.kind is CommandKind.PAUSE:
+                        interrupt()
+                        continue
+                    if active_command.kind is CommandKind.QUIT:
+                        exit_session()
+                        continue
+                    if active_command.kind is not CommandKind.TEXT:
+                        store.append_transcript(
+                            "assistant",
+                            "That command needs the current action to reach a checkpoint first. Use Ctrl+C to request one.",
+                        )
+                        continue
+                    goal = runtime.active_goal()
+                    resolution = store.request_attention(
+                        AttentionRequest(
+                            id=f"active-intent:{time.monotonic_ns()}",
+                            kind=AttentionKind.QUESTION,
+                            title="How should this message be used?",
+                            message=f"Current task: {str(getattr(goal, 'objective', 'active task'))[:180]}",
+                            options=(
+                                AttentionOption(
+                                    "update", "Update current task", "update",
+                                    description="Save this as guidance at the next safe point.",
+                                    shortcut="u", primary=True,
+                                ),
+                                AttentionOption(
+                                    "new", "Start a new task", "new",
+                                    description="Checkpoint and cancel the current goal, then plan this separately.",
+                                    shortcut="n",
+                                ),
+                                AttentionOption("cancel", "Cancel", "cancel", shortcut="c"),
+                            ),
+                        )
+                    )
+                    if resolution.value == "new":
+                        pending_new_task.append(text)
+                        interrupt()
+                        store.append_transcript(
+                            "assistant",
+                            "New task queued. I’ll switch after the current action reaches its checkpoint.",
+                        )
+                    elif resolution.value == "update":
+                        try:
+                            runtime.add_guidance(text)
+                            store.append_transcript("assistant", "Guidance saved for the current task.")
+                        except Exception:
+                            queued.append(text)
+                            store.set_queued_count(len(queued))
                     continue
                 try:
                     command = parse_command(text)
                 except CommandParseError as exc:
                     store.append_transcript("assistant", f"I couldn’t understand that: {exc}")
                     continue
+                if command.kind is CommandKind.MODEL and not command.args.get("model") and not command.args.get("effort"):
+                    handle_model()
+                    continue
+                if command.kind is CommandKind.PERMISSIONS and not command.args.get("level"):
+                    handle_permissions()
+                    continue
+                if command.kind is CommandKind.MODE and not command.args.get("mode"):
+                    handle_workflow_mode()
+                    continue
+                goal = runtime.active_goal()
+                if (
+                    command.kind is CommandKind.TEXT
+                    and goal is not None
+                    and goal.status not in {GoalStatus.COMPLETED, GoalStatus.CANCELLED}
+                ):
+                    resolution = store.request_attention(
+                        AttentionRequest(
+                            id=f"intent:{time.monotonic_ns()}",
+                            kind=AttentionKind.QUESTION,
+                            title="How should this affect the current task?",
+                            message=f"Current task: {str(getattr(goal, 'objective', 'active task'))[:180]}",
+                            options=(
+                                AttentionOption(
+                                    "update", "Update current task", "update",
+                                    description="Treat this message as guidance for the active goal.",
+                                    shortcut="u", primary=True,
+                                ),
+                                AttentionOption(
+                                    "replace", "Start a new task", "replace",
+                                    description="Cancel the current goal and plan this request separately.",
+                                    shortcut="n",
+                                ),
+                                AttentionOption("cancel", "Cancel", "cancel", shortcut="c"),
+                            ),
+                        )
+                    )
+                    if resolution.value == "cancel":
+                        continue
+                    if resolution.value == "replace":
+                        runtime.cancel("CANCEL")
                 start(command)
         finally:
             stop.set()

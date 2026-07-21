@@ -82,12 +82,13 @@ The coordinator receives a stable system prefix plus a late, dynamic state
 envelope. The stable prefix preserves provider prompt-cache value. The envelope
 is rebuilt from SQLite every step, so context compaction cannot erase the goal.
 
-Each work slice is bounded, but the durable retry count is not. Reaching a limit
-creates a checkpoint and leaves the goal `RUNNING`. `/auto` applies bounded
-exponential backoff and keeps retrying until verified completion or a genuine
-input/approval boundary. Every failed attempt injects a self-reflection prompt;
-repeated stalls escalate to a different decomposition/role/plan, while repeated
-identical actions still trip a circuit breaker.
+Each work slice is bounded. No-progress work attempts may continue with bounded
+exponential backoff and a changed hypothesis, decomposition, role, or plan.
+Provider-access failures are different: after `provider_failure_limit` consecutive
+failed cycles, the runtime persists an actionable `PAUSED` checkpoint with
+`auto_retryable=false`. This prevents bad credentials, an unavailable model, or a
+misconfigured local service from becoming an infinite countdown. Repeated identical
+actions still trip their separate circuit breaker.
 
 Before every workspace tool:
 

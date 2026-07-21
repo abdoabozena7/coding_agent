@@ -271,6 +271,8 @@ class WorkspaceUIStore:
         clean = str(text or "").strip()
         if not clean:
             return
+        if len(clean) > 20_000:
+            clean = clean[:19_920].rstrip() + "\n… output truncated; use the focused command again for the latest full view."
         with self._lock:
             self._sequence += 1
             self._transcript.append(
@@ -341,6 +343,15 @@ class WorkspaceUIStore:
         *,
         timeout: float | None = None,
     ) -> AttentionResolution:
+        event = self.present_attention(request)
+        if not event.wait(timeout):
+            raise TimeoutError(f"attention request {request.id} timed out")
+        result = self.take_attention_result(request.id)
+        return result or AttentionResolution("ui_error", "ui_error")
+
+    def present_attention(self, request: AttentionRequest) -> Event:
+        """Present attention without blocking the controller that owns work state."""
+
         event = Event()
         with self._lock:
             if request.id in self._attention_events:
@@ -352,13 +363,13 @@ class WorkspaceUIStore:
             else:
                 self._attention_queue.append(request)
         self._notify()
-        if not event.wait(timeout):
-            raise TimeoutError(f"attention request {request.id} timed out")
+        return event
+
+    def take_attention_result(self, request_id: str) -> AttentionResolution | None:
+        """Return and consume a completed non-blocking attention result."""
+
         with self._lock:
-            return self._attention_results.pop(
-                request.id,
-                AttentionResolution("ui_error", "ui_error"),
-            )
+            return self._attention_results.pop(str(request_id), None)
 
     @staticmethod
     def _default_option_index(request: AttentionRequest) -> int:
@@ -463,7 +474,13 @@ class WorkspaceUIStore:
         if normalized == "tool_result":
             failed = str(message).lstrip().lower().startswith(("error:", "permission denied"))
             if failed:
-                self.set_activity(ActivityStage.PROBLEM, self.text("problem"), running=False)
+                # Tool failures are often handled by the coordinator. Preserve
+                # truthful running state until the durable goal actually pauses.
+                self.set_activity(
+                    self._activity.stage if self._running else ActivityStage.PROBLEM,
+                    "A step failed; checking another approach" if self._running else self.text("problem"),
+                    running=self._running,
+                )
             else:
                 tool = str(data.get("tool") or "step")
                 self.set_activity(
@@ -490,15 +507,76 @@ class WorkspaceUIStore:
         if normalized == "plan":
             self.set_activity(ActivityStage.PLANNING, "The plan is ready")
             return
-        if normalized in {"questions", "checkpoint"}:
+        if normalized == "retry_wait":
+            self.set_activity(ActivityStage.CHECKING, message or "Waiting before retry", running=True)
+            return
+        if normalized == "questions":
             self.set_activity(ActivityStage.PAUSED, message or "Your input is needed", running=False)
             self._commit_stream()
             return
-        if normalized in {"error", "warning"}:
-            self.set_activity(ActivityStage.PROBLEM, self.text("problem"), running=False)
+        if normalized == "checkpoint":
+            status = str(data.get("status") or "").casefold()
+            paused = bool(data.get("paused") or data.get("retry_exhausted")) or status == "paused"
+            if status in {"completed", "complete", "done"}:
+                self.set_activity(ActivityStage.DONE, message or "Done", running=False)
+                self._commit_stream()
+            elif paused:
+                self.set_activity(ActivityStage.PAUSED, message or "Your input is needed", running=False)
+                self._commit_stream()
+            else:
+                self.set_activity(
+                    self._activity.stage if self._running else ActivityStage.CHECKING,
+                    message or "Checkpoint saved; work continues",
+                    running=bool(data.get("continues")) or self._running,
+                )
+            return
+        if normalized == "warning":
+            self.set_activity(
+                self._activity.stage if self._running else ActivityStage.PROBLEM,
+                message or ("Still working after a warning" if self._running else self.text("problem")),
+                running=self._running,
+            )
+            return
+        if normalized == "error":
+            self.set_activity(
+                self._activity.stage if self._running else ActivityStage.PROBLEM,
+                message or self.text("problem"),
+                running=self._running,
+            )
             return
         if normalized.startswith("ultra."):
-            self.set_activity(ActivityStage.BUILDING, "Specialists are working on the project")
+            lower = normalized.casefold()
+            if any(token in lower for token in ("review", "verify", "test")):
+                stage = ActivityStage.CHECKING
+            elif any(token in lower for token in ("graph", "plan", "foundation")):
+                stage = ActivityStage.PLANNING
+            elif any(token in lower for token in ("completed", "cancelled")):
+                stage = ActivityStage.DONE if "completed" in lower else ActivityStage.PAUSED
+            else:
+                stage = ActivityStage.BUILDING
+            label = " ".join(str(message or normalized.removeprefix("ultra.")).split())
+            def integer(*keys: str) -> int | None:
+                for key in keys:
+                    value = data.get(key)
+                    try:
+                        if value is not None:
+                            return max(0, int(value))
+                    except (TypeError, ValueError):
+                        continue
+                return None
+            total = integer("total_nodes", "total")
+            completed = integer("completed_nodes", "completed")
+            last_success = None
+            if str(data.get("status", "")).casefold() == "completed":
+                last_success = str(data.get("node_title") or message or "Specialist step completed")
+            self.set_activity(
+                stage,
+                label.replace("_", " ").strip().capitalize(),
+                completed=completed,
+                total=total,
+                last_success=last_success,
+                running=stage not in {ActivityStage.DONE, ActivityStage.PAUSED},
+            )
 
     def _commit_stream(self) -> None:
         with self._lock:

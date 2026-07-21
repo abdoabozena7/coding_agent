@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 import socket
 from dataclasses import replace
@@ -48,7 +49,7 @@ class OllamaProvider:
         native_replay=True,
     )
 
-    def __init__(self, model: str | None = None, host: str | None = None, capability_profile: ModelCapabilityProfile | None = None, reasoning_effort: str = "medium", context_size: int | None = None, num_gpu: int | None = None, max_output_tokens: int | None = None, force_json: bool = False, temperature: float | None = None, request_timeout: float | None = None):
+    def __init__(self, model: str | None = None, host: str | None = None, capability_profile: ModelCapabilityProfile | None = None, reasoning_effort: str = "medium", context_size: int | None = None, num_gpu: int | None = None, max_output_tokens: int | None = None, force_json: bool = False, temperature: float | None = None, request_timeout: float | None = None, require_gpu: bool | None = None):
         self.model = model or os.getenv("OLLAMA_MODEL") or MODEL_NAME
         self.host = (host or os.getenv("OLLAMA_HOST", DEFAULT_HOST)).rstrip("/")
         self.capability_profile = capability_profile or ModelCapabilityProfile(
@@ -69,9 +70,20 @@ class OllamaProvider:
             self.num_gpu = None if raw_num_gpu in {None, ""} else max(0, int(raw_num_gpu))
         except (TypeError, ValueError):
             self.num_gpu = None
-        self.require_gpu = str(
+        hostname = (urllib.parse.urlsplit(self.host).hostname or "").casefold()
+        remote_model = self.model.casefold().endswith((":cloud", "-cloud"))
+        remote_host = hostname == "ollama.com" or hostname.endswith(".ollama.com")
+        configured_gpu_requirement = str(
             os.getenv("AGENT_REQUIRE_LOCAL_GPU", "")
         ).strip().casefold() in {"1", "true", "yes", "on"}
+        # AGENT_REQUIRE_LOCAL_GPU protects local inference only. Hosted Ollama
+        # models have no local runner entry in /api/ps, so applying the guard to
+        # them creates a deterministic failure that can never recover.
+        self.require_gpu = bool(
+            (configured_gpu_requirement if require_gpu is None else require_gpu)
+            and not remote_model
+            and not remote_host
+        )
         if self.require_gpu and self.num_gpu is None:
             # Ask Ollama to offload every layer. The post-call residency check
             # below fails closed if the runner silently falls back to CPU.

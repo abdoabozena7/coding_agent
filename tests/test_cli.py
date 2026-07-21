@@ -403,6 +403,20 @@ class CLITests(unittest.TestCase):
         self.assertTrue(console.confirm_action("write_file", {"path": "app.py"}, "risky"))
         self.assertIsNone(store.active_attention())
 
+    def test_persistent_simple_workspace_keeps_multiline_results_and_errors_visible(self):
+        console = ConsoleUI(stream=io.StringIO(), color=False)
+        store = WorkspaceUIStore()
+        console.bind_workspace_store(store)
+
+        console.write("PLAN\n  1. Build UI\n  2. Run tests")
+        console.write("error: provider is unavailable")
+
+        transcript = store.snapshot().transcript
+        self.assertEqual(len(transcript), 2)
+        self.assertTrue(all(not item.technical for item in transcript))
+        self.assertIn("Run tests", transcript[0].text)
+        self.assertIn("provider is unavailable", transcript[1].text)
+
     def test_persistent_project_checks_ask_once_per_session(self):
         console = ConsoleUI(stream=io.StringIO(), color=False)
         store = WorkspaceUIStore()
@@ -430,6 +444,30 @@ class CLITests(unittest.TestCase):
             )
         )
         self.assertIsNone(store.active_attention())
+
+    def test_persistent_approval_shows_target_and_defaults_to_deny(self):
+        console = ConsoleUI(stream=io.StringIO(), color=False)
+        store = WorkspaceUIStore()
+        console.bind_workspace_store(store)
+        results = []
+        worker = Thread(
+            target=lambda: results.append(
+                console.confirm_action("run_bash", {"command": "npm install package-x"}, "risky")
+            )
+        )
+        worker.start()
+        for _ in range(100):
+            if store.active_attention() is not None:
+                break
+            Event().wait(0.01)
+        request = store.active_attention()
+        self.assertIsNotNone(request)
+        self.assertIn("npm install package-x", request.message)
+        primary = [item.key for item in request.options if item.primary]
+        self.assertEqual(primary, ["deny"])
+        store.resolve_selected_attention()
+        worker.join(1)
+        self.assertEqual(results, [False])
 
     def test_background_approval_is_handed_to_the_main_ui_thread(self):
         console = ConsoleUI(stream=io.StringIO(), color=False)

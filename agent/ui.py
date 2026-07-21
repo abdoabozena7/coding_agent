@@ -575,7 +575,7 @@ def render_tree(nodes: Iterable[Any], *, root_id: str | None = None) -> str:
 
     values = list(nodes)
     if not values:
-        return "Project tree\n  (no ULTRA work nodes yet)"
+        return "Project tree\n  (no work nodes yet)"
 
     def field(item: Any, name: str, default: Any = "") -> Any:
         if isinstance(item, Mapping):
@@ -927,7 +927,7 @@ def render_dashboard(view: DashboardView, width: int | None = None) -> str:
 
     lines = [top, "|" + _fit(meta, inner) + "|"]
     if view.goal_attempt:
-        attempt = f" ATTEMPT {view.goal_attempt} | unbounded goal retries active"
+        attempt = f" ATTEMPT {view.goal_attempt} | durable retry history"
         if view.retry_reason:
             attempt += f" | {view.retry_reason}"
         lines.append("|" + _fit(attempt, inner) + "|")
@@ -1148,7 +1148,7 @@ def render_plan(view: DashboardView, width: int | None = None) -> str:
         render_tasks(view.tasks)
     lines.append("-" * width)
     lines.append(
-        "A Approve  /  R Request changes  /  E Edit tasks  /  Esc Back"
+        "Use /approve REV to start, /replan FEEDBACK to revise, or /plan to reread"
         if not execution_started
         else "Use /status for the live workspace or /diff for current changes"
     )
@@ -1758,6 +1758,10 @@ class ConsoleUI:
                 status=self._current_status,
             )
 
+    @property
+    def workspace_active(self) -> bool:
+        return self._workspace_store is not None
+
     def _modal_available(self) -> bool:
         # prompt_toolkit's patch_stdout() temporarily replaces sys.stdout while
         # the composer is open.  The ConsoleUI stream still points at the real
@@ -1938,12 +1942,11 @@ class ConsoleUI:
             if clean:
                 self._workspace_store.append_log(clean)
                 lower = clean.casefold()
+                # Multiline command results, plans, diffs, help, and errors are
+                # user-facing output. Only internal trace-like rows belong
+                # exclusively in Advanced details.
                 technical = (
-                    "\n" in clean
-                    or lower.startswith((
-                        "error:", "fatal:", "normal mode:", "ultra", "permissions =",
-                        "goal.", "plan.", "coordinator", "saved ", "ready ·",
-                    ))
+                    lower.startswith(("coordinator trace:", "goal.event:", "plan.event:"))
                     or "details in /thinking" in lower
                     or "fingerprint" in lower
                 )
@@ -2600,26 +2603,33 @@ class ConsoleUI:
         options = [
             AttentionOption(
                 "allow_once", "Allow once", ApprovalDecision.ALLOW_ONCE.value,
-                shortcut="y", primary=True,
+                description=f"Run only this {str(name).replace('_', ' ')} action.",
+                shortcut="y",
             )
         ]
         if policy.requirement is ApprovalRequirement.SESSION:
             options.append(
                 AttentionOption(
                     "allow_session", "Allow this session",
-                    ApprovalDecision.ALLOW_SESSION.value, shortcut="s",
+                    ApprovalDecision.ALLOW_SESSION.value,
+                    description=f"Allow later actions in the {policy.group.replace('_', ' ')} group.",
+                    shortcut="s",
                 )
             )
         options.append(
             AttentionOption(
-                "deny", "Deny", ApprovalDecision.DENY.value, shortcut="n"
+                "deny", "Deny", ApprovalDecision.DENY.value,
+                description="Do not run this action.", shortcut="n", primary=True,
             )
         )
         request = AttentionRequest(
             id=f"approval:{digest}:{time.monotonic_ns()}",
             kind=AttentionKind.APPROVAL,
             title=f"Allow {str(name).replace('_', ' ')}?",
-            message=f"{policy.reason}. Scope: {policy.scope}.",
+            message=(
+                f"{policy.reason}. Scope: {policy.scope}. "
+                f"Target: {canonical[:360]}{'…' if len(canonical) > 360 else ''}"
+            ),
             options=tuple(options),
             details=canonical,
             source=policy.group,

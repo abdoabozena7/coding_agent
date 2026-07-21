@@ -30,10 +30,10 @@ keeps that readable core while adding a deterministic control plane around it.
   contexts, retry/backoff, repeated-action circuit breakers, automatic reprompts,
   independent plan/final critique, and deterministic verification gates do not
   depend on the model remembering instructions.
-- **Goal retries are unbounded.** `/auto` keeps making durable attempts until the
-  completion gate passes or real user input/approval is required. Each failed
-  attempt injects a self-reflection prompt, changes the required approach, and
-  uses bounded exponential backoff; Ctrl-C still checkpoints immediately.
+- **Goal work persists without hiding broken providers.** `/auto` keeps making
+  durable, approach-changing attempts until completion or a real input/approval
+  boundary. Repeated provider-access failures stop after a configurable limit and
+  show an actionable model/network checkpoint instead of retrying forever.
 - **Workspace security is enforced in code.** Canonical path containment,
   sensitive-file denial, atomic edits, strict schemas, bounded output, explicit
   shell approval, a scrubbed child environment, and crash-window journaling are
@@ -94,10 +94,11 @@ You can also launch the workspace chooser:
 python -m agent
 ```
 
-The interactive terminal opens on the existing full-screen `GA3BAD` welcome. Press
-Enter and choose only the project. GA3BAD then chooses the best available model,
-local project protection, Normal mode, and safe access automatically; all of those
-choices remain available later when you actually need them.
+The interactive terminal opens on the original animated full-screen `GA3BAD` welcome. Press
+Enter, then review the five explicit setup decisions: workspace, project protection,
+model, permissions, and workflow mode. Back returns to the previous decision. Ollama
+models are probed during discovery; configured cloud credentials are clearly labeled
+as unverified until their first request.
 
 After setup, there is one calm, persistent workspace rather than a sequence of
 screens. It always shows the conversation, one current-work cell, and a composer
@@ -114,11 +115,13 @@ silent denial.
 
 While work runs, type guidance and press Enter; it is saved for the next safe point.
 After a quiet 10 seconds the status says it is still working; after 60 seconds it
-offers **Keep waiting** or **Stop safely**. `/` opens only six contextual actions in
-Simple: New task, Stop safely, Review changes, Open result, Permissions, and
-Advanced. Direct slash commands and legacy `:command` syntax remain available for
-scripts and power users. `Ctrl+Q` exits safely. Use `--plain` for the line-oriented
-SSH UI or `--reduced-motion` for static, accessible motion.
+offers **Keep waiting** or **Stop safely** without blocking a completion event. `/`
+or `Ctrl+K` opens contextual actions: New task, Stop safely, Task status, Review
+changes, Managed previews, Permissions, and Advanced details. `F3` opens model
+selection and `F4` opens permissions. `Ctrl+Q` exits only at a saved checkpoint;
+while work is active it requests a checkpoint and keeps the session open. Use
+`--plain` to skip the animated intro and use the line-oriented SSH/screen-reader
+UI, or `--reduced-motion` for lower-motion setup and progress surfaces.
 
 ## ULTRA mode
 
@@ -259,7 +262,7 @@ opens the redacted, session-only blocks again. Use `/trace`, `/history`, or
 | `/done ID NOTE` | Complete a task with user-supplied evidence |
 | `/todo ID`, `/block ID NOTE`, `/skip ID NOTE` | Reopen or change task state |
 | `/run [STEPS]` | Run one bounded work slice; the goal itself has no slice deadline |
-| `/auto` | Retry and self-prompt without an attempt limit until verified completion or real input/approval |
+| `/auto` | Persist through no-progress attempts; pause after repeated provider failures or at real input/approval boundaries |
 | `/pause`, `/resume` | Cooperatively checkpoint and continue |
 | `/history` | Show durable events and generated worker roles/results |
 | `/versions` | List protected baseline/accepted checkpoints and their file-change summaries |
@@ -381,13 +384,14 @@ All limits apply to one recoverable slice, not the lifetime of the goal:
 | `AGENT_SUBAGENT_STEPS` | 16 | Steps per focused worker |
 | `AGENT_MAX_DELEGATION_DEPTH` | 4 | Recursive delegation safety bound |
 | `AGENT_MAX_DELEGATIONS_PER_SLICE` | 12 | Worker fan-out bound |
-| `AGENT_PROVIDER_RETRIES` | 3 | Transient provider retries |
+| `AGENT_PROVIDER_RETRIES` | 3 | Transport retries inside one provider call |
+| `AGENT_PROVIDER_FAILURE_LIMIT` | 3 | Consecutive failed provider cycles before an actionable pause |
 | `AGENT_REPEAT_LIMIT` | 2 | Identical-action no-progress circuit breaker |
 | `AGENT_NO_ACTION_LIMIT` | 3 | Prose-only reprompt limit |
 | `AGENT_STALLED_SLICE_LIMIT` | 3 | No-progress attempts between stronger decomposition/escalation prompts |
 | `AGENT_CONTEXT_CHARS` | 120000 | Conversation compaction threshold |
-| `AGENT_GOAL_RETRY_BASE_MS` | 1000 | Initial backoff between unbounded goal attempts |
-| `AGENT_GOAL_RETRY_MAX_MS` | 30000 | Maximum per-attempt backoff; retry count remains unlimited |
+| `AGENT_GOAL_RETRY_BASE_MS` | 1000 | Initial backoff between durable attempts |
+| `AGENT_GOAL_RETRY_MAX_MS` | 30000 | Maximum per-attempt backoff |
 
 ## Architecture
 
@@ -421,7 +425,7 @@ python -m unittest discover -s tests -v
 ```
 
 It covers inspected/applicable plan approval and fingerprint staleness, editable
-revisions, unbounded self-retry recovery, false completion, dynamic worker
+revisions, durable self-retry recovery, provider-failure pause boundaries, false completion, dynamic worker
 isolation, failed reviews and repair plans, crash recovery, provider replay
 formats, malformed tool calls, path/symlink/secret attacks, atomic-write failure,
 shell environment/cwd/output bounds, conversation pairing, and ASCII snapshots.

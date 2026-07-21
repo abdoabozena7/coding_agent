@@ -31,7 +31,13 @@ __all__ = [
 _PROVIDERS = ("openai", "gemini", "ollama")
 
 
-def get_provider(name: str, *, model: str | None = None, host: str | None = None):
+def get_provider(
+    name: str,
+    *,
+    model: str | None = None,
+    host: str | None = None,
+    require_gpu: bool | None = None,
+):
     """Create an independent adapter instance.
 
     The optional arguments preserve the original environment-driven behavior
@@ -49,7 +55,7 @@ def get_provider(name: str, *, model: str | None = None, host: str | None = None
         return GeminiProvider(model=model)
     if name == "ollama":
         from .ollama_provider import OllamaProvider
-        return OllamaProvider(model=model, host=host)
+        return OllamaProvider(model=model, host=host, require_gpu=require_gpu)
     raise ValueError(f"Unknown LLM_PROVIDER '{name}'. Options: {', '.join(_PROVIDERS)}")
 
 
@@ -61,7 +67,13 @@ def create_provider(descriptor):
         model = descriptor.model
     except AttributeError as exc:
         raise TypeError("descriptor must expose provider and model attributes") from exc
-    return get_provider(name, model=model, host=getattr(descriptor, "host", None))
+    execution = str(getattr(getattr(descriptor, "execution_class", ""), "value", getattr(descriptor, "execution_class", "")))
+    return get_provider(
+        name,
+        model=model,
+        host=getattr(descriptor, "host", None),
+        require_gpu=False if execution == "cloud" else None,
+    )
 
 
 def get_provider_capabilities(name: str) -> ProviderCapabilities:
