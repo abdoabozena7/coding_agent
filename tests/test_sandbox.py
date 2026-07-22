@@ -141,6 +141,36 @@ class DockerSandboxTests(unittest.TestCase):
         self.assertTrue(adapter.requires_approval(True))
         self.assertEqual(self.docker.calls, [])
 
+    def test_bounded_requires_approval_for_every_mutation_or_process_launch(self):
+        adapter = PermissionAdapter(AccessLevel.BOUNDED, self.sandbox)
+
+        self.assertFalse(adapter.requires_approval(False, bounded_operation=False))
+        self.assertTrue(adapter.requires_approval(False, bounded_operation=True))
+        self.assertTrue(adapter.requires_approval(True, bounded_operation=True))
+        self.assertEqual(self.docker.calls, [])
+
+    def test_host_full_bypasses_repeated_approval_but_keeps_destructive_guards(self):
+        adapter = PermissionAdapter(AccessLevel.HOST, self.sandbox)
+        calls = []
+        result = adapter.run_shell(
+            "echo safe", self.workspace,
+            normal_runner=lambda command: calls.append(command) or "host-safe",
+        )
+
+        self.assertEqual(result, "host-safe")
+        self.assertFalse(adapter.requires_approval(True, bounded_operation=True))
+        with self.assertRaisesRegex(SandboxError, "blocked"):
+            adapter.run_shell(
+                "Remove-Item -Recurse C:\\Windows", self.workspace,
+                normal_runner=lambda _command: "must not run",
+            )
+        with self.assertRaisesRegex(SandboxError, "sensitive"):
+            adapter.run_shell(
+                "Get-Content C:\\Users\\me\\.ssh\\id_rsa", self.workspace,
+                normal_runner=lambda _command: "must not run",
+            )
+        self.assertEqual(calls, ["echo safe"])
+
     def test_full_unavailable_downgrades_and_never_builds_or_starts_docker(self):
         self.docker.available = False
 

@@ -138,14 +138,13 @@ def parse_command(line: str) -> UserCommand:
             "auto": "normal",
             "agent": "normal",
             "chat": "normal",
-            "plan": "normal",
             "goal": "normal",
             "deep": "ultra",
             "max": "ultra",
         }
         mode = mode_aliases.get(mode, mode)
-        if mode not in {"normal", "ultra"}:
-            raise CommandParseError(f"Usage: {usage('mode', 'normal|ultra')}")
+        if mode not in {"plan", "normal", "ultra"}:
+            raise CommandParseError(f"Usage: {usage('mode', 'plan|normal|ultra')}")
         return UserCommand(CommandKind.MODE, {"mode": mode}, raw)
     if name == "settings":
         if not rest:
@@ -168,8 +167,10 @@ def parse_command(line: str) -> UserCommand:
         return UserCommand(CommandKind.MODEL, {"model": " ".join(parts) or None, "effort": effort}, raw)
     if name in {"permissions", "permission", "access"}:
         level = rest.lower() or None
-        if level not in {None, "normal", "full"}:
-            raise CommandParseError(f"Usage: {usage('permissions', 'normal|full')}")
+        aliases = {"default": "normal", "docker": "full", "docker_full": "full", "host_full": "host"}
+        level = aliases.get(level, level)
+        if level not in {None, "normal", "bounded", "full", "host"}:
+            raise CommandParseError(f"Usage: {usage('permissions', 'normal|bounded|full|host')}")
         return UserCommand(CommandKind.PERMISSIONS, {"level": level}, raw)
     if name == "ide":
         if rest:

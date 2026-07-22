@@ -7925,7 +7925,23 @@ class UltraSession:
                 )
         risk = _TOOL_RISK.get(call.name, "unknown")
         normal_requirement = tools.requires_approval(call.name, args)
-        needs_approval = self.permission_adapter.requires_approval(normal_requirement)
+        spec = tools.get_spec(call.name)
+        bounded_operation = bool(
+            spec is not None
+            and (
+                spec.mutates_workspace
+                or spec.category in {"command", "install", "open"}
+                or (spec.category in {"process", "preview"} and spec.risk != "low")
+            )
+        )
+        try:
+            needs_approval = self.permission_adapter.requires_approval(
+                normal_requirement, bounded_operation=bounded_operation
+            )
+        except TypeError as exc:
+            if "bounded_operation" not in str(exc):
+                raise
+            needs_approval = self.permission_adapter.requires_approval(normal_requirement)
         self.events.publish(
             "tool_call",
             call.name,

@@ -94,6 +94,100 @@ You can also launch the workspace chooser:
 python -m agent
 ```
 
+## Local web application
+
+GA3BAD also includes a React + TypeScript workspace with a FastAPI control plane.
+It uses the same runtime, providers, tools, safety policy, approval semantics, and
+workspace SQLite journal as the terminal client. Projects and durable task metadata
+live in a small private application registry; opening an existing workspace imports
+its legacy `workspace-session` as a task without rewriting history.
+
+Build the bundled interface once, then start the entire application with one Python
+command:
+
+```powershell
+Set-Location web
+npm install
+npm run build
+Set-Location ..
+.venv\Scripts\python -m agent.web
+```
+
+The launcher binds one Uvicorn worker to `127.0.0.1`, prints and opens a one-time
+token URL, exchanges that token for an HTTP-only SameSite session cookie, and serves
+the production Vite build. Work remains owned by the backend when the browser is
+reloaded or closed. A single global FIFO slot preserves deterministic execution
+across projects; queued tasks can be canceled and running tasks accept durable
+guidance at safe checkpoints.
+
+While one message is running, the same task accepts up to ten durable FIFO
+follow-ups. The composer keeps a separate **Guide current** action for the next safe
+checkpoint, shows the queued order, and lets a message be canceled before it starts.
+Other tasks keep their drafts but cannot consume the global execution slot. Questions,
+approvals, failures, pauses, and recovery stop the queue instead of skipping ahead.
+
+**Visualize** switches the active task between the transcript and a live durable map
+of the goal, plan steps, agents, tools, approvals, retries, checkpoints, and evidence.
+It is a view preference only; it never changes workflow execution or exposes hidden
+chain-of-thought. The workspace Files panel has bounded read-only previews, and the
+project terminal starts in the workspace with persistent history. Default/Bounded
+terminal commands are limited to inspection and verification with chaining and
+redirects disabled; Docker Full and task-scoped Host Full retain their explicit
+permission boundaries.
+
+Pause is cooperative: the current action reaches a safe checkpoint before stopping.
+A browser reload never stops backend work. After an abnormal backend/device stop,
+the task is restored as `recovery_required`, uncertain actions remain blocked, the
+queue and drafts stay intact, and only an explicit **Resume task** can continue.
+
+For frontend development, run the API and Vite server separately:
+
+```powershell
+# Terminal 1
+$env:GA3BAD_WEB_DEV_ORIGIN = "http://127.0.0.1:5173"
+.venv\Scripts\python -m agent.web --dev --no-browser
+
+# Terminal 2
+Set-Location web
+npm run dev
+```
+
+The desktop shell uses a warm near-black workshop palette, a focused orange safety
+accent, responsive side panels, persisted dark/light/system themes, and
+keyboard-visible focus. Direction is an `Auto / RTL` preference on each assistant
+output only: it never translates text or reverses the composer, user messages,
+plans, activity, or project rail. Every terminal slash command is accepted by the
+web composer, while plans, changes, agents, history, evidence, memory, traces,
+metrics, and managed resources are available in the inspector.
+
+The `Mode` menu exposes **Plan**, **Normal**, and **Ultra**. Plan is strictly
+read-only and produces fingerprinted revisions with **Implement plan** and
+**Keep planning** actions. Feedback revises the current plan instead of silently
+starting a different one. Normal uses semantic request completeness—not message
+length—to decide whether an approval-bound planning pass is needed; a concise,
+actionable request can start directly, while vague or consequentially incomplete
+work stops for planning or clarification. Ultra always starts with its master-plan
+phase and never auto-executes that plan.
+
+Long local runs include a milestone flow with the current step, completion percent,
+an estimated remaining-time range, an expected finish time, and an explicit
+confidence/basis. The estimate begins with a user-calibrated local step duration and
+switches to observed milestone velocity as evidence becomes available. A compact
+resource strip reports RAM, NVIDIA VRAM when detectable, and remaining provider
+context. CPU/RAM/GPU/VRAM values that are unavailable or zero are omitted; Context
+always remains visible and uses `—` when no truthful usage is available. **Settings →
+Advanced** controls supported local Ollama inference parameters (CPU/GPU, GPU
+layers, threads, context, output tokens, temperature, Top-P, and Top-K), plus
+validated harness budgets for planning, Normal work quanta, review, retries, and
+Ultra concurrency/depth. Changes reload only idle sessions; active work must first
+reach a safe checkpoint.
+
+Permissions are independent of Mode. **Bounded** approval-gates workspace mutations
+and process launches. **Full Access** always opens a warning and requires an explicit
+choice between isolated Docker Full and task-scoped Host Full. Host Full expires on
+restart or a new task and cannot disable broad-destructive-target, sensitive-path,
+redaction, or workspace-containment guards.
+
 The interactive terminal opens on the original animated full-screen `GA3BAD` welcome. Press
 Enter, then review the five explicit setup decisions: workspace, project protection,
 model, permissions, and workflow mode. Back returns to the previous decision. Ollama

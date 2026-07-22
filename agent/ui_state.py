@@ -201,6 +201,8 @@ class WorkspaceUIStore:
         self._attention_queue: deque[AttentionRequest] = deque()
         self._attention_events: dict[str, Event] = {}
         self._attention_results: dict[str, AttentionResolution] = {}
+        self._attention_wait_started: Callable[[AttentionRequest], None] | None = None
+        self._attention_wait_finished: Callable[[AttentionRequest], None] | None = None
         self._subscribers: list[Callable[[], None]] = []
         self._sequence = 0
         self._workspace = ""
@@ -344,10 +346,35 @@ class WorkspaceUIStore:
         timeout: float | None = None,
     ) -> AttentionResolution:
         event = self.present_attention(request)
-        if not event.wait(timeout):
-            raise TimeoutError(f"attention request {request.id} timed out")
+        with self._lock:
+            started = self._attention_wait_started
+            finished = self._attention_wait_finished
+        if started is not None:
+            started(request)
+        try:
+            if not event.wait(timeout):
+                raise TimeoutError(f"attention request {request.id} timed out")
+        finally:
+            if finished is not None:
+                finished(request)
         result = self.take_attention_result(request.id)
         return result or AttentionResolution("ui_error", "ui_error")
+
+    def set_attention_wait_hooks(
+        self,
+        started: Callable[[AttentionRequest], None] | None,
+        finished: Callable[[AttentionRequest], None] | None,
+    ) -> None:
+        """Connect blocking attention to an external execution-slot owner.
+
+        Terminal adapters leave these hooks unset. The web scheduler uses them
+        to release its global slot while a person is answering, then reacquire
+        it before controller work continues.
+        """
+
+        with self._lock:
+            self._attention_wait_started = started
+            self._attention_wait_finished = finished
 
     def present_attention(self, request: AttentionRequest) -> Event:
         """Present attention without blocking the controller that owns work state."""
@@ -438,9 +465,22 @@ class WorkspaceUIStore:
         """Reduce a runtime event into calm Simple state and complete Advanced logs."""
 
         data = dict(data or {})
-        self.append_log(f"{kind}: {message}" if message else kind)
         normalized = str(kind)
+        if normalized in {"model_text", "model_thought"}:
+            # Never put provider scratch text or hidden reasoning in the web
+            # transcript/log. User-facing chat output is the only model stream
+            # that may become an assistant message.
+            self.append_log(f"{normalized}: activity received")
+        else:
+            self.append_log(f"{kind}: {message}" if message else kind)
         if normalized == "model_text":
+            actor = str(data.get("actor") or "").casefold()
+            if actor not in {"chat", "assistant", "response"}:
+                self.set_activity(
+                    ActivityStage.UNDERSTANDING,
+                    "Drafting the next structured step" if actor == "planner" else "Working with the selected model",
+                )
+                return
             with self._lock:
                 self._stream_text = (self._stream_text + str(message))[-20_000:]
             self._notify()
@@ -449,7 +489,13 @@ class WorkspaceUIStore:
             self.set_activity(ActivityStage.UNDERSTANDING, "Thinking through the next step")
             return
         if normalized == "step":
-            self.set_activity(ActivityStage.BUILDING, "Working on the next step")
+            actor = str(data.get("actor") or "agent").casefold()
+            if actor == "planner":
+                self.set_activity(ActivityStage.PLANNING, "Drafting the project plan")
+            elif "review" in actor or "verif" in actor or "critic" in actor:
+                self.set_activity(ActivityStage.CHECKING, "Reviewing the current result")
+            else:
+                self.set_activity(ActivityStage.BUILDING, "Implementing the next project step")
             return
         if normalized == "tool_call":
             tool = str(message or data.get("tool") or "")
@@ -687,6 +733,69 @@ def question_session(runtime: Any) -> QuestionSessionView | None:
     return None
 
 
+def question_attention(session: QuestionSessionView) -> AttentionRequest:
+    """Build one transport-neutral choice surface for the active interview.
+
+    Terminal key hints belong to the terminal adapter.  Web and other rich
+    clients consume this structured request and render native controls instead
+    of receiving a pre-rendered numbered menu as assistant text.
+    """
+
+    question = session.current
+    if question is None:
+        raise ValueError("the question session has no pending decision")
+    options: list[AttentionOption] = []
+    raw_options = question.get("options") or ()
+    for index, raw in enumerate(
+        raw_options[:3] if isinstance(raw_options, (list, tuple)) else (), 1
+    ):
+        if not isinstance(raw, Mapping):
+            continue
+        options.append(
+            AttentionOption(
+                key=f"option-{index}",
+                label=str(raw.get("label") or f"Option {index}"),
+                value=str(index),
+                description=str(raw.get("description") or ""),
+                shortcut=str(index),
+                primary=bool(raw.get("recommended")) or index == 1,
+            )
+        )
+    if not options:
+        options.append(
+            AttentionOption(
+                key="continue",
+                label="Continue with the suggested default",
+                value="1",
+                description="Use the planner's recommended answer for this decision.",
+                shortcut="1",
+                primary=True,
+            )
+        )
+    if len(session.pending) > 1:
+        options.append(
+            AttentionOption(
+                key="recommended-all",
+                label="Use recommended for the rest",
+                value="__recommended_all__",
+                description="Accept the recommended choice for every remaining decision and continue.",
+            )
+        )
+    return AttentionRequest(
+        id=(
+            f"question:{session.source}:{question.get('id') or 'question'}:"
+            f"{time.monotonic_ns()}"
+        ),
+        kind=AttentionKind.QUESTION,
+        title=str(question.get("header") or "One choice needed"),
+        message=str(question.get("question") or "Choose how you want this to work."),
+        options=tuple(options),
+        details=f"Decision {session.completed + 1} of {session.total}",
+        allow_custom=True,
+        source=session.source,
+    )
+
+
 def answer_question(
     runtime: Any,
     session: QuestionSessionView,
@@ -741,5 +850,6 @@ __all__ = [
     "answer_question",
     "answer_recommended_remaining",
     "is_recommended_defaults_utterance",
+    "question_attention",
     "question_session",
 ]

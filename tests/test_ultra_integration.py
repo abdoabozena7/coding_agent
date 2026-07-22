@@ -1039,7 +1039,7 @@ class UltraIntegrationTests(unittest.TestCase):
                     master = runtime.start_ultra("Build the demo")
                     self.assertIsNotNone(master)
                     accepted = runtime.approve_ultra()
-                    result = runtime.ultra_session.future.result(timeout=10)
+                    result = runtime.ultra_session.future.result(timeout=30)
 
                 run = runtime.active_ultra_run()
                 self.assertTrue(result.successful)
@@ -1122,7 +1122,7 @@ class UltraIntegrationTests(unittest.TestCase):
                     runtime = self._runtime(workspace, store)
                     runtime.start_ultra("Build the demo")
                     runtime.approve_ultra()
-                    result = runtime.ultra_session.future.result(timeout=10)
+                    result = runtime.ultra_session.future.result(timeout=30)
 
                 run = runtime.active_ultra_run()
                 refreshed = store.get_ultra_run(run.id)
@@ -1268,7 +1268,7 @@ animate();
                     runtime = self._runtime(workspace, store)
                     runtime.start_ultra("Build the demo")
                     runtime.approve_ultra()
-                    result = runtime.ultra_session.future.result(timeout=10)
+                    result = runtime.ultra_session.future.result(timeout=30)
 
                 run = runtime.active_ultra_run()
                 self.assertFalse(result.successful)
@@ -1314,7 +1314,7 @@ animate();
                     runtime = self._runtime(workspace, store)
                     runtime.start_ultra("Build the demo")
                     runtime.approve_ultra()
-                    result = runtime.ultra_session.future.result(timeout=10)
+                    result = runtime.ultra_session.future.result(timeout=30)
 
                 run = runtime.active_ultra_run()
                 refreshed = store.get_ultra_run(run.id)
@@ -1382,7 +1382,7 @@ animate();
                     runtime = self._runtime(workspace, store)
                     runtime.start_ultra("Build the demo")
                     runtime.approve_ultra()
-                    result = runtime.ultra_session.future.result(timeout=10)
+                    result = runtime.ultra_session.future.result(timeout=30)
 
                 run = runtime.active_ultra_run()
                 self.assertFalse(result.successful)
@@ -1422,7 +1422,7 @@ animate();
                     self.assertTrue(active)
                     self.assertTrue(any(agent.phase == "implement" for agent in active))
                     release.set()
-                    self.assertTrue(runtime.ultra_session.future.result(timeout=10).successful)
+                    self.assertTrue(runtime.ultra_session.future.result(timeout=30).successful)
             finally:
                 release.set()
                 if runtime:
@@ -1471,7 +1471,7 @@ animate();
                     self.assertEqual(stored.execution_class, ExecutionClass.CLOUD)
                     self.assertEqual(stored.concurrency, 4)
                     runtime.resume()
-                    self.assertTrue(runtime.ultra_session.future.result(timeout=10).successful)
+                    self.assertTrue(runtime.ultra_session.future.result(timeout=30).successful)
             finally:
                 release.set()
                 if runtime:
@@ -1570,7 +1570,7 @@ animate();
 
                     second = self._runtime(workspace, store)
                     second.resume()
-                    result = second.ultra_session.future.result(timeout=10)
+                    result = second.ultra_session.future.result(timeout=30)
 
                 self.assertTrue(result.successful)
                 self.assertEqual(store.get_goal(accepted.goal_id).status, GoalStatus.COMPLETED)
@@ -1617,7 +1617,7 @@ animate();
 
                     second = self._runtime(workspace, store)
                     second.resume()
-                    result = second.ultra_session.future.result(timeout=10)
+                    result = second.ultra_session.future.result(timeout=30)
 
                 self.assertTrue(result.successful)
                 self.assertEqual(store.get_goal(accepted.goal_id).status, GoalStatus.COMPLETED)

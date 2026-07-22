@@ -242,6 +242,68 @@ class RuntimeTestCase(unittest.TestCase):
 
 
 class PlanningAndCompletionTests(RuntimeTestCase):
+    def test_empty_threejs_project_gets_greenfield_plan_when_local_planner_stalls(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([inspect_call(), "I should keep thinking about the plan."]),
+            self.store,
+            self.workspace,
+            config=replace(self.config, planning_steps=2),
+            sleeper=lambda _seconds: None,
+            approval=lambda *_args: True,
+        )
+
+        plan = runtime.start_goal(
+            "Create a Crossy Road game with Three.js\n\nCANONICAL EXECUTION BRIEF:\n"
+            + ("Detailed durable planning context. " * 80)
+        )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.assertEqual(plan.expected_changes[0]["path"], "index.html")
+        self.assertEqual(plan.proposed_by, "harness-weak-model-fallback")
+
+    def test_clear_normal_brief_auto_approves_its_internal_plan(self):
+        turns = [inspect_call(), plan_call(), plan_pass()]
+        direct = AgentRuntime(
+            ScriptedProvider(turns), self.store, self.workspace,
+            config=self.config, sleeper=lambda _seconds: None,
+            approval=lambda *_args: True,
+            workflow_mode="normal", direct_normal_execution=True,
+        )
+        plan = direct.submit_intent(
+            "Fix the parser bug in agent/intake.py and run its focused unit tests."
+        )
+        self.assertEqual(plan.status, PlanStatus.ACCEPTED)
+        self.assertEqual(direct.active_goal().status, GoalStatus.RUNNING)
+
+    def test_vague_normal_brief_stops_at_visible_plan_approval(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([inspect_call(), plan_call(), plan_pass()]),
+            self.store, self.workspace,
+            config=self.config, sleeper=lambda _seconds: None,
+            approval=lambda *_args: True,
+            workflow_mode="normal", direct_normal_execution=True,
+        )
+        plan = runtime.submit_intent("Fix the parser")
+
+        self.assertEqual(plan.status, PlanStatus.PENDING_APPROVAL)
+        self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
+
+    def test_explicit_plan_mode_never_auto_approves_a_clear_brief(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([inspect_call(), plan_call(), plan_pass()]),
+            self.store, self.workspace,
+            config=self.config, sleeper=lambda _seconds: None,
+            approval=lambda *_args: True,
+            workflow_mode="plan", direct_normal_execution=True,
+        )
+        plan = runtime.submit_intent(
+            "Fix the parser bug in agent/intake.py and run its focused unit tests."
+        )
+
+        self.assertEqual(plan.status, PlanStatus.PENDING_APPROVAL)
+        self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
+
     def test_windows_gpu_probe_accepts_amd_display_adapter(self):
         def which(name):
             if name == "nvidia-smi":

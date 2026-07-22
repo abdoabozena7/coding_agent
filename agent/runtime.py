@@ -192,12 +192,17 @@ class AgentRuntime:
         store: StateStore,
         workspace: str | Path,
         *,
+        session_id: str = "workspace-session",
         events: EventBus | None = None,
         approval: ApprovalCallback | None = None,
         config: RuntimeConfig | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         model_descriptor: ModelDescriptor | None = None,
         permission_adapter: PermissionAdapter | None = None,
+        auto_promote_ultra: bool = True,
+        role_providers: Mapping[str, Any] | None = None,
+        workflow_mode: str = "normal",
+        direct_normal_execution: bool = False,
     ) -> None:
         self.provider = provider
         self.store = store
@@ -209,6 +214,11 @@ class AgentRuntime:
         self.sleeper = sleeper
         self.model_descriptor = model_descriptor
         self.permission_adapter = permission_adapter
+        self.auto_promote_ultra = bool(auto_promote_ultra)
+        self.role_providers = dict(role_providers or {})
+        self.workflow_mode = "normal"
+        self.direct_normal_execution = bool(direct_normal_execution)
+        self.set_workflow_mode(workflow_mode)
         self.ultra_session: Any | None = None
         self._closed = False
         self._lock = RLock()
@@ -219,7 +229,10 @@ class AgentRuntime:
         self._provider_output_tokens = 0
         self.retry_ledger = RetryLedger()
         self._chat_conversation: list[dict[str, Any]] = []
-        self.session_id = "workspace-session"
+        normalized_session_id = str(session_id).strip()
+        if not normalized_session_id or len(normalized_session_id) > 200:
+            raise ValueError("session_id must be a non-empty identifier of at most 200 characters")
+        self.session_id = normalized_session_id
         self.sleep_controller = SleepController()
         self.weak_model_policy = WeakModelPolicy()
         self.intent_architect = IntentArchitect()
@@ -447,6 +460,16 @@ class AgentRuntime:
         if self.permission_adapter is not None:
             return self.permission_adapter.access_level.value
         return "normal"
+
+    def set_workflow_mode(self, mode: str) -> str:
+        """Set the UI/controller workflow policy without weakening runtime gates."""
+
+        normalized = str(getattr(mode, "value", mode)).strip().casefold()
+        normalized = {"chat": "normal", "goal": "normal", "deep": "ultra"}.get(normalized, normalized)
+        if normalized not in {"plan", "normal", "ultra"}:
+            raise ValueError("workflow mode must be plan, normal, or ultra")
+        self.workflow_mode = normalized
+        return normalized
 
     def replace_provider(
         self,
@@ -705,7 +728,70 @@ class AgentRuntime:
             execution_brief=brief.to_dict(),
         )
         canonical = brief.canonical_prompt()
-        return self.start_ultra(canonical) if routed is RunMode.ULTRA else self.start_goal(canonical)
+        if routed is RunMode.ULTRA:
+            # Ultra always stops at its durable master-plan approval boundary.
+            return self.start_ultra(canonical)
+        plan = self.start_goal(canonical)
+        if (
+            plan is not None
+            and self.direct_normal_execution
+            and self.workflow_mode == "normal"
+            and str(getattr(brief, "planning_policy", "review")) == "direct"
+        ):
+            self.events.publish(
+                "plan.direct_execution",
+                "The Normal request was concrete enough to approve its internal durable plan and start directly.",
+                revision=plan.revision,
+                fingerprint=plan.fingerprint,
+            )
+            return self.approve_plan(plan.revision, approved_by="normal-direct-policy")
+        return plan
+
+    def _router_enrichment(self, text: str, repository_facts: Sequence[str]) -> str:
+        """Collect an optional bounded routing note without delegating the decision."""
+
+        if self.role_providers.get("router") is None:
+            return ""
+        prompt = state_envelope(
+            {
+                "request": redact_text(text, 20_000),
+                "repository_facts": list(repository_facts)[:8],
+                "required_output": {
+                    "shape": "one concise factual routing note",
+                    "rules": [
+                        "identify concrete target, outcome, and consequential unknowns only",
+                        "do not choose Normal or Ultra",
+                        "do not include hidden reasoning or chain-of-thought",
+                    ],
+                },
+            },
+            "INTAKE_ROUTER_INPUT",
+            max_chars=32_000,
+        )
+        try:
+            turn = self._call_provider(
+                [{"role": "user", "content": prompt}],
+                (),
+                "Return only a concise routing note. The deterministic Intent Architect owns every final decision.",
+                actor="intent-router",
+                step=1,
+                stream_text=False,
+            )
+            note = redact_text(str(turn.text or ""), 2_000).strip()
+        except Exception as exc:
+            self.events.publish(
+                "intake.router_unavailable",
+                "Optional Router enrichment failed; deterministic intake continues.",
+                error=redact_text(exc, 300),
+            )
+            return ""
+        if note:
+            self.events.publish(
+                "intake.router_enriched",
+                "Optional Router added a bounded intake note; Intent Architect remains authoritative.",
+                note=note,
+            )
+        return note
 
     def submit_intent(
         self,
@@ -729,11 +815,19 @@ class AgentRuntime:
             return self.answer_intake_question(str(unanswered[0]["id"]), value)
         if self.active_goal() is not None:
             return self.add_guidance(value)
+        repository_facts = self._intake_repository_facts(value)
         decision = self.intent_architect.analyze(
             value,
             requested_mode=requested_mode,
-            repository_facts=self._intake_repository_facts(value),
+            repository_facts=repository_facts,
+            auto_promote=self.auto_promote_ultra,
         )
+        router_enrichment = self._router_enrichment(value, repository_facts)
+        if router_enrichment:
+            decision = replace(
+                decision,
+                brief=replace(decision.brief, router_enrichment=router_enrichment),
+            )
         intake = self.store.create_intake_session(
             self.session_id,
             original_input=value,
@@ -813,12 +907,23 @@ class AgentRuntime:
             str(item["id"]): str(item.get("answer") or "")
             for item in updated.get("questions", ())
         }
+        repository_facts = self._intake_repository_facts(str(updated["original_input"]))
         decision = self.intent_architect.analyze(
             str(updated["original_input"]),
             requested_mode=str(updated["requested_mode"]),
             answers=answers,
-            repository_facts=self._intake_repository_facts(str(updated["original_input"])),
+            repository_facts=repository_facts,
+            auto_promote=self.auto_promote_ultra,
         )
+        prior_brief = dict(updated.get("brief") or {})
+        router_enrichment = str(prior_brief.get("router_enrichment") or "")
+        if not router_enrichment:
+            router_enrichment = self._router_enrichment(str(updated["original_input"]), repository_facts)
+        if router_enrichment:
+            decision = replace(
+                decision,
+                brief=replace(decision.brief, router_enrichment=router_enrichment),
+            )
         self.store.save_prompt_completeness(
             str(updated["id"]),
             decision.completeness.to_dict(),
@@ -1199,6 +1304,13 @@ class AgentRuntime:
         stream_text: bool = True,
     ) -> AssistantTurn:
         self.events.publish("step", actor=actor, step=step)
+        actor_key = str(actor).casefold()
+        selected_provider = None
+        if any(token in actor_key for token in ("intent-router", "intake-router")):
+            selected_provider = self.role_providers.get("router")
+        elif any(token in actor_key for token in ("critic", "review", "verifier", "evaluation")):
+            selected_provider = self.role_providers.get("verifier")
+        selected_provider = selected_provider or self.provider
         current_goal = self.active_goal()
         if current_goal is not None:
             contract_data = current_goal.metadata.get("goal_contract")
@@ -1221,10 +1333,10 @@ class AgentRuntime:
                         "rules": self.weak_model_policy.applied_rules("provider_call"),
                     },
                 )
-        ensure_capabilities = getattr(self.provider, "_ensure_capabilities", None)
+        ensure_capabilities = getattr(selected_provider, "_ensure_capabilities", None)
         if callable(ensure_capabilities):
             ensure_capabilities()
-        capability_profile = getattr(self.provider, "capability_profile", None)
+        capability_profile = getattr(selected_provider, "capability_profile", None)
         native_tools = bool(getattr(capability_profile, "tool_call_support", True))
         if current_goal is not None and capability_profile is not None:
             self.store.append_event(
@@ -1257,7 +1369,7 @@ class AgentRuntime:
         last_error: Exception | None = None
         for attempt in range(self.config.max_provider_retries + 1):
             try:
-                turn = self.provider.call(
+                turn = selected_provider.call(
                     conversation,
                     list(schemas),
                     system,
@@ -1572,25 +1684,75 @@ class AgentRuntime:
         """Create a narrow approval-bound plan when a weak planner stalls.
 
         This fallback is deliberately limited to short objectives naming one
-        concrete artifact. It never executes or approves the plan.
+        concrete artifact, or an inspected empty greenfield workspace with an
+        explicit implementation platform. A generic ``build`` request must
+        still go through the normal repair/checkpoint path. It never executes
+        or approves the plan.
         """
 
         objective = str(goal.objective).strip()
-        if not inspection_records or len(objective) > 1_200:
+        # Intake appends a canonical execution brief to the durable objective.
+        # Fallback eligibility and target inference must use the user's actual
+        # request, otherwise even "Build a game" looks thousands of characters
+        # long and an empty project is incorrectly paused.
+        user_objective = objective.split("\n\nCANONICAL EXECUTION BRIEF:", 1)[0].strip()
+        if not inspection_records or not user_objective or len(user_objective) > 1_200:
             return None
         paths = re.findall(
             r"(?<![\w./-])([A-Za-z0-9_.-]+\.(?:html?|py|js|ts|tsx|jsx|css|json|md|txt|ya?ml|toml))\b",
-            objective,
+            user_objective,
             flags=re.IGNORECASE,
         )
+        # Framework/product names are not workspace paths. Treating
+        # ``Three.js`` as the requested output file made empty browser-game
+        # projects fail into a nonsensical plan target.
+        paths = [
+            path for path in paths
+            if path.casefold() not in {"three.js", "node.js", "react.js", "vue.js"}
+        ]
         unique_paths = tuple(dict.fromkeys(path.replace("\\", "/") for path in paths))
-        if len(unique_paths) != 1:
-            return None
-        target = unique_paths[0]
+        empty_workspace = all(
+            "(no files under" in str(record.get("result") or "").casefold()
+            or "no project files" in str(record.get("result") or "").casefold()
+            for record in inspection_records.values()
+        )
+        if len(unique_paths) == 1:
+            target = unique_paths[0]
+        else:
+            lowered = user_objective.casefold()
+            has_build_intent = any(
+                token in lowered
+                for token in ("create", "build", "make", "implement", "scaffold")
+            )
+            has_explicit_platform = any(
+                token in lowered
+                for token in (
+                    "three.js",
+                    "three js",
+                    "browser game",
+                    "html",
+                    "react",
+                    "python",
+                )
+            )
+            if not (empty_workspace and has_build_intent and has_explicit_platform):
+                return None
+            if any(token in lowered for token in ("three.js", "three js", "browser game", "html")):
+                target = "index.html"
+            elif "react" in lowered:
+                target = "src/App.tsx"
+            elif "python" in lowered:
+                target = "main.py"
+            else:  # Kept defensive if platform markers are extended above.
+                return None
         is_html = target.casefold().endswith((".html", ".htm"))
         reference, record = next(iter(inspection_records.items()))
         raw = {
-            "summary": f"Implement and verify {target} from the user's explicit objective.",
+            "summary": (
+                f"Create and verify the greenfield project for: {user_objective}"
+                if target == "."
+                else f"Implement and verify {target} from the user's explicit objective."
+            ),
             "applicability_evidence": [
                 {
                     "fact": (
@@ -1610,14 +1772,26 @@ class AgentRuntime:
             ],
             "tasks": [
                 {
-                    "title": f"Implement and verify {target}",
+                    "title": (
+                        "Create and verify the greenfield project"
+                        if target == "."
+                        else f"Implement and verify {target}"
+                    ),
                     "description": objective,
                     "acceptance_criteria": [
-                        f"{target} exists and implements every behavior explicitly requested in the objective.",
+                        (
+                            "The project has a runnable entry point and implements every behavior explicitly requested in the objective."
+                            if target == "."
+                            else f"{target} exists and implements every behavior explicitly requested in the objective."
+                        ),
                         "The saved artifact is re-read and contains no placeholder-only implementation.",
                     ],
                     "verification": [
-                        f"Read {target} after writing and compare it with the objective.",
+                        (
+                            "Inspect the created project files and compare the runnable result with the objective."
+                            if target == "."
+                            else f"Read {target} after writing and compare it with the objective."
+                        ),
                         (
                             f"Open {target} with the browser preview and confirm HTTP success with no console, page, or network errors."
                             if is_html
@@ -3477,11 +3651,26 @@ class AgentRuntime:
             return f"Error: {decision.reason}"
         risk = TOOL_RISK.get(call.name, "unknown")
         normal_requirement = tools.requires_approval(call.name, args)
-        needs_approval = (
-            self.permission_adapter.requires_approval(normal_requirement)
-            if self.permission_adapter is not None
-            else normal_requirement
+        spec = tools.get_spec(call.name)
+        bounded_operation = bool(
+            spec is not None
+            and (
+                spec.mutates_workspace
+                or spec.category in {"command", "install", "open"}
+                or (spec.category in {"process", "preview"} and spec.risk != "low")
+            )
         )
+        if self.permission_adapter is None:
+            needs_approval = normal_requirement
+        else:
+            try:
+                needs_approval = self.permission_adapter.requires_approval(
+                    normal_requirement, bounded_operation=bounded_operation
+                )
+            except TypeError as exc:
+                if "bounded_operation" not in str(exc):
+                    raise
+                needs_approval = self.permission_adapter.requires_approval(normal_requirement)
         if call.name == "open_path" or (call.name == "preview_html" and bool(args.get("open_browser", True))):
             # Full only relaxes sandboxed workspace actions. Host GUI launch
             # still needs direct user intent/approval.
@@ -4794,10 +4983,28 @@ class AgentRuntime:
             if item.status in {DelegationStatus.PENDING, DelegationStatus.IN_PROGRESS}
         ]
         events = self.store.list_recent_events(goal.id, limit=100)
-        activity = [
-            f"{event.event_type}: {str(event.payload.get('reason') or event.payload.get('summary') or event.entity_id or '')[:120]}"
-            for event in events[-4:]
-        ]
+        durable_activity_labels = {
+            "planning.inspection_recorded": "Workspace inspection recorded",
+            "goal_contract.projected": "Execution brief prepared",
+            "provider.capability_selected": "Model capabilities verified",
+            "provider.request_adapter_selected": "Model adapter selected",
+            "planning.harness_fallback": "Greenfield plan recovered by the harness",
+            "plan.critic_passed": "Plan review passed",
+            "workflow.retry": "A bounded retry was scheduled",
+        }
+        activity = []
+        for event in events[-4:]:
+            label = durable_activity_labels.get(event.event_type)
+            if label is None:
+                if event.event_type.startswith("action."):
+                    label = "Safe action checkpoint updated"
+                elif event.event_type.startswith("task."):
+                    label = "Task milestone updated"
+                elif event.event_type.startswith("plan."):
+                    label = "Plan milestone updated"
+                else:
+                    label = event.event_type.replace(".", " ").replace("_", " ").capitalize()
+            activity.append(label)
         return DashboardView(
             objective=goal.objective,
             status=goal.status.value,
@@ -5017,13 +5224,32 @@ class AgentRuntime:
             return tools.ToolExecutionResult(False, f"Error: unknown chat tool {call.name!r}"), ()
         risk = spec.risk
         normal_requirement = tools.requires_approval(call.name, args)
-        needs_approval = (
-            self.permission_adapter.requires_approval(normal_requirement)
-            if self.permission_adapter is not None else normal_requirement
+        bounded_operation = bool(
+            spec.mutates_workspace
+            or spec.category in {"command", "install", "open"}
+            or (spec.category in {"process", "preview"} and spec.risk != "low")
         )
+        if self.permission_adapter is None:
+            needs_approval = normal_requirement
+        else:
+            try:
+                needs_approval = self.permission_adapter.requires_approval(
+                    normal_requirement, bounded_operation=bounded_operation
+                )
+            except TypeError as exc:
+                # Third-party/legacy adapters implement the original one-arg
+                # protocol. Preserve that extension boundary while the built-in
+                # adapter enforces the stronger Bounded contract.
+                if "bounded_operation" not in str(exc):
+                    raise
+                needs_approval = self.permission_adapter.requires_approval(normal_requirement)
         if call.name == "open_path" or (call.name == "preview_html" and bool(args.get("open_browser", True))):
             needs_approval = True
-        if intent.authorizes(call.name):
+        if intent.authorizes(call.name) and not (
+            self.permission_adapter is not None
+            and self.permission_adapter.access_level is AccessLevel.BOUNDED
+            and bounded_operation
+        ):
             needs_approval = False
         action_id = self.store.begin_session_action(
             self.session_id, call.name, redact_data(args), risk=risk,

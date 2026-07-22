@@ -20,3 +20,11 @@ Pillow>=12.3,<13
 # Multi-language AST parsing and approximate semantic retrieval.
 tree-sitter-language-pack>=0.13,<1
 hnswlib>=0.8,<1
+
+# Local React application API, WebSocket transport, and single-process server.
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+httpx>=0.28,<1
+
+# Cross-platform RAM/CPU telemetry for long-running local web tasks.
+psutil>=6,<8

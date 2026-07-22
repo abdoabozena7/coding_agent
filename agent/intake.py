@@ -180,7 +180,15 @@ class ExecutionBriefV1:
     routed_mode: RunMode
     route_reason: str
     answers: Mapping[str, str] = field(default_factory=dict)
+    planning_policy: str = "review"
+    router_enrichment: str = ""
     version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.planning_policy not in {"review", "direct", "master_plan"}:
+            raise ValueError("planning_policy must be review, direct, or master_plan")
+        if len(self.router_enrichment) > 2_000:
+            raise ValueError("router_enrichment exceeds the typed brief limit")
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -199,12 +207,15 @@ class ExecutionBriefV1:
             "Assumptions:\n- " + "\n- ".join(self.assumptions),
             "Risks:\n- " + "\n- ".join(self.risks),
             f"Harness route: {self.routed_mode.value} ({self.route_reason})",
+            f"Planning policy: {self.planning_policy}",
         ]
         if self.answers:
             sections.append(
                 "User decisions:\n- "
                 + "\n- ".join(f"{key}: {value}" for key, value in sorted(self.answers.items()))
             )
+        if self.router_enrichment:
+            sections.append("Optional Router enrichment (non-authoritative):\n" + self.router_enrichment)
         return "\n".join(section for section in sections if section.strip())
 
 
@@ -534,6 +545,69 @@ class IntentArchitect:
         return PromptCompletenessV1(tuple(slots))
 
     @staticmethod
+    def normal_planning_policy(
+        prompt: str,
+        *,
+        completeness: PromptCompletenessV1,
+        questions: Sequence[ClarificationQuestionV1] = (),
+        complexity: TaskComplexityAssessmentV1 | None = None,
+        answers: Mapping[str, str] | None = None,
+        repository_facts: Sequence[str] = (),
+    ) -> str:
+        """Choose whether Normal needs a visible plan approval.
+
+        This is deliberately semantic rather than a character-count shortcut.
+        A concise request can execute directly when it identifies a concrete
+        target and outcome; a longer but vague request still stops for planning.
+        The runtime always creates an internal durable plan either way.
+        """
+
+        if questions or not completeness.complete:
+            return "review"
+        if complexity is not None and complexity.hard_triggers:
+            return "review"
+        text = " ".join(str(prompt).split())
+        lowered = text.casefold()
+        facts = "\n".join(str(item) for item in repository_facts).casefold()
+        concrete_target = bool(
+            re.search(
+                r"(?:[\w.-]+[\\/])+[\w.-]+|\b[\w.-]+\.(?:py|js|ts|tsx|jsx|css|html?|json|md|ya?ml|toml)\b|"
+                r"\b(?:class|function|method|endpoint|route|test|error|exception|stack trace|selector|component)\s+[\w.:'\"/-]+",
+                text,
+                re.I,
+            )
+        )
+        exact_change = bool(
+            re.search(
+                r"\b(?:rename|replace|change|move|remove|add|implement|fix)\b.+\b(?:to|with|when|so that|and)\b|"
+                r"(?:غي[ّ]?ر|استبدل|انقل|احذف|أضف|اصلح|صلح).+(?:إلى|بـ|لما|بحيث|و)",
+                text,
+                re.I,
+            )
+        )
+        observable_result = any(
+            term in lowered
+            for term in (
+                "must ", "should ", "verify", "test", "without ", "preserve ",
+                "when ", "so that", "acceptance", "expected", "pass", "fail",
+                "لازم", "اختبر", "تحقق", "من غير", "حافظ", "لما", "بحيث",
+            )
+        )
+        structured_requirements = bool(
+            re.search(r"(?:^|\n)\s*(?:[-*]|\d+[.)])\s+", str(prompt), re.M)
+            or len(re.findall(r"[;؛]", text)) >= 1
+            or len(re.findall(r"\b(?:and|then|also)\b|(?:وكمان|ثم|أيضاً)", lowered)) >= 2
+        )
+        answered = bool(dict(answers or {}))
+        discovered_target = bool(repository_facts) and any(
+            marker in facts for marker in ("repository context", " -> ", "provenance=")
+        )
+        clarity_signals = sum(
+            (concrete_target, exact_change, observable_result, structured_requirements, answered, discovered_target)
+        )
+        return "direct" if clarity_signals >= 2 else "review"
+
+    @staticmethod
     def _needs_questions(completeness: PromptCompletenessV1) -> bool:
         return not completeness.complete
 
@@ -620,13 +694,14 @@ class IntentArchitect:
         requested_mode: str | RunMode = RunMode.NORMAL,
         answers: Mapping[str, str] | None = None,
         repository_facts: Sequence[str] = (),
+        auto_promote: bool = True,
     ) -> IntakeDecisionV1:
         original = str(prompt).strip()
         if not original:
             raise ValueError("intent input must not be empty")
         requested = RunMode.parse(requested_mode)
         complexity = self.assess_complexity(original)
-        routed = RunMode.ULTRA if requested is RunMode.ULTRA or complexity.ultra_required else RunMode.NORMAL
+        routed = RunMode.ULTRA if requested is RunMode.ULTRA or (auto_promote and complexity.ultra_required) else RunMode.NORMAL
         route_reason = (
             "explicit Ultra request"
             if requested is RunMode.ULTRA
@@ -724,6 +799,18 @@ class IntentArchitect:
                     "Overall quality is at least 0.95 and every critical visual category is at least 0.90",
                 )
             )
+        planning_policy = (
+            "master_plan"
+            if routed is RunMode.ULTRA
+            else self.normal_planning_policy(
+                original,
+                completeness=completeness,
+                questions=questions,
+                complexity=complexity,
+                answers=resolved_answers,
+                repository_facts=repository_facts,
+            )
+        )
         brief = ExecutionBriefV1(
             original_input=original,
             objective=original,
@@ -749,6 +836,7 @@ class IntentArchitect:
             routed_mode=routed,
             route_reason=route_reason,
             answers=resolved_answers,
+            planning_policy=planning_policy,
         )
         return IntakeDecisionV1(
             brief=brief,

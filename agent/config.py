@@ -14,20 +14,23 @@ class InteractionMode(str, Enum):
     """Public run policy; intake/planning are internal lifecycle phases."""
 
     NORMAL = "normal"
+    PLAN = "plan"
     ULTRA = "ultra"
     CHAT = "normal"
-    PLAN = "normal"
     GOAL = "normal"
 
     @classmethod
     def parse(cls, value: str | "InteractionMode") -> "InteractionMode":
         if isinstance(value, cls):
             return value
-        normalized = RunMode.parse(str(getattr(value, "value", value))).value
+        raw = str(getattr(value, "value", value)).strip().lower()
+        if raw == "plan":
+            return cls.PLAN
+        normalized = RunMode.parse(raw).value
         try:
             return cls(normalized)
         except ValueError as exc:
-            raise ValueError("mode must be 'normal' or 'ultra'") from exc
+            raise ValueError("mode must be 'plan', 'normal', or 'ultra'") from exc
 
 
 class ReasoningEffort(str, Enum):

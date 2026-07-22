@@ -32,6 +32,22 @@ class IntentArchitectTests(unittest.TestCase):
 
         self.assertEqual(decision.questions, ())
         self.assertIs(decision.brief.routed_mode, RunMode.NORMAL)
+        self.assertEqual(decision.brief.planning_policy, "direct")
+
+    def test_short_vague_normal_request_requires_visible_plan_review(self) -> None:
+        decision = IntentArchitect().analyze("Fix the parser")
+
+        self.assertIs(decision.brief.routed_mode, RunMode.NORMAL)
+        self.assertEqual(decision.brief.planning_policy, "review")
+
+    def test_ultra_always_requires_master_plan_even_when_the_brief_is_detailed(self) -> None:
+        decision = IntentArchitect().analyze(
+            "Replace parse_mode in agent/config.py, preserve aliases, and run tests/test_cli.py.",
+            requested_mode="ultra",
+        )
+
+        self.assertIs(decision.brief.routed_mode, RunMode.ULTRA)
+        self.assertEqual(decision.brief.planning_policy, "master_plan")
 
     def test_ambiguous_threejs_game_promotes_to_ultra(self) -> None:
         decision = IntentArchitect().analyze(

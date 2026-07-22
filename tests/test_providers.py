@@ -339,7 +339,7 @@ class OllamaProviderTests(unittest.TestCase):
             provider._assert_gpu_residency()
 
     def test_local_context_is_bounded_in_every_chat_request(self):
-        provider = OllamaProvider(model="offline", context_size=16_384, num_gpu=0, max_output_tokens=2048, force_json=True, temperature=0.25)
+        provider = OllamaProvider(model="offline", context_size=16_384, num_gpu=0, max_output_tokens=2048, force_json=True, temperature=0.25, top_p=0.8, top_k=32, num_thread=6, num_batch=512)
         provider.capability_profile = __import__("agent.local_provider", fromlist=["ModelCapabilityProfile"]).ModelCapabilityProfile(
             "offline", tool_call_support=True, thinking_support=True, health_status="reachable"
         )
@@ -352,6 +352,10 @@ class OllamaProviderTests(unittest.TestCase):
         self.assertEqual(payload["options"]["num_gpu"], 0)
         self.assertEqual(payload["options"]["num_predict"], 2048)
         self.assertEqual(payload["options"]["temperature"], 0.25)
+        self.assertEqual(payload["options"]["top_p"], 0.8)
+        self.assertEqual(payload["options"]["top_k"], 32)
+        self.assertEqual(payload["options"]["num_thread"], 6)
+        self.assertEqual(payload["options"]["num_batch"], 512)
         self.assertEqual(payload["think"], "medium")
         self.assertEqual(payload["format"], "json")
 

@@ -879,7 +879,7 @@ class TerminalUITests(unittest.TestCase):
 
         console.set_mode("plan")
         self.assertEqual(console.prompt(), "/status")
-        self.assertEqual(prompts[-1], "GA3BAD [NORMAL]> ")
+        self.assertEqual(prompts[-1], "GA3BAD [PLAN]> ")
 
     def test_ultra_status_is_sparse_and_active_events_are_gold(self):
         view = DashboardView(

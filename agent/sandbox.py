@@ -36,18 +36,24 @@ class AccessLevel(str, Enum):
     """Workspace mutation policy selected for this process."""
 
     NORMAL = "normal"
+    BOUNDED = "bounded"
     FULL = "full"
+    HOST = "host"
 
     @classmethod
     def parse(cls, value: str | "AccessLevel") -> "AccessLevel":
         if isinstance(value, cls):
             return value
         normalized = str(value or "normal").strip().lower()
-        aliases = {"default": "normal", "safe": "normal", "sandbox": "full"}
+        aliases = {
+            "default": "normal", "safe": "normal", "strict": "bounded",
+            "sandbox": "full", "docker": "full", "docker_full": "full",
+            "host_full": "host",
+        }
         try:
             return cls(aliases.get(normalized, normalized))
         except ValueError as exc:
-            raise ValueError("access level must be 'normal' or 'full'") from exc
+            raise ValueError("access level must be normal, bounded, full, or host") from exc
 
 
 class SandboxError(RuntimeError):
@@ -530,8 +536,8 @@ def select_access_level(
     """Resolve Full fail-closed, explicitly downgrading to Normal if unready."""
 
     requested_level = AccessLevel.parse(requested)
-    if requested_level is AccessLevel.NORMAL:
-        return AccessSelection(requested_level, AccessLevel.NORMAL)
+    if requested_level in {AccessLevel.NORMAL, AccessLevel.BOUNDED, AccessLevel.HOST}:
+        return AccessSelection(requested_level, requested_level)
     status = sandbox.status()
     if status.ready:
         return AccessSelection(requested_level, AccessLevel.FULL)
@@ -554,8 +560,17 @@ class PermissionAdapter:
     def access_level(self) -> AccessLevel:
         return self.selection.effective
 
-    def requires_approval(self, normal_requirement: bool = True) -> bool:
-        return bool(normal_requirement) if self.access_level is AccessLevel.NORMAL else False
+    def requires_approval(
+        self,
+        normal_requirement: bool = True,
+        *,
+        bounded_operation: bool = False,
+    ) -> bool:
+        if self.access_level in {AccessLevel.FULL, AccessLevel.HOST}:
+            return False
+        if self.access_level is AccessLevel.BOUNDED and bounded_operation:
+            return True
+        return bool(normal_requirement)
 
     def run_shell(
         self,
@@ -564,9 +579,29 @@ class PermissionAdapter:
         *,
         normal_runner: Callable[[str], str],
     ) -> str:
-        if self.access_level is AccessLevel.NORMAL:
+        if self.access_level in {AccessLevel.NORMAL, AccessLevel.BOUNDED, AccessLevel.HOST}:
+            if self.access_level is AccessLevel.HOST:
+                _guard_host_full_command(command)
             return normal_runner(command)
         return self.sandbox.run(command, workspace).render()
+
+
+def _guard_host_full_command(command: str) -> None:
+    """Keep non-negotiable broad destructive targets blocked in Host Full."""
+    import re
+
+    value = " ".join(str(command).strip().casefold().split())
+    forbidden = (
+        r"\brm\s+-[^\n]*r[^\n]*f[^\n]*(?:\s+/\s*$|\s+~(?:/|\s|$))",
+        r"\bremove-item\b[^\n]*(?:-recurse|-r\b)[^\n]*(?:\\windows\b|[a-z]:\\\s*$|\\users\\[^\\]+\\?\s*$)",
+        r"\b(?:format|diskpart|bcdedit|cipher\s+/w|shutdown)\b",
+        r"\bdel\s+/[a-z]*s[a-z]*\b[^\n]*(?:[a-z]:\\|\\windows\\)",
+        r"(?:^|[\s'\"])(?:[a-z]:\\|/)(?:users|home)\\?/?[^\s\\/]+[\\/](?:\.ssh|\.aws|\.azure|\.gnupg|\.kube)(?:[\\/\s'\"]|$)",
+        r"(?:^|[\s'\"\\/])\.env(?:[\s'\"]|$)",
+        r"(?:credentials|id_rsa|id_ed25519|application_default_credentials\.json)(?:[\s'\"]|$)",
+    )
+    if any(re.search(pattern, value, re.IGNORECASE) for pattern in forbidden):
+        raise SandboxError("Host Full blocked a destructive or sensitive system target")
 
 
 @dataclass

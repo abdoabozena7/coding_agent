@@ -49,7 +49,7 @@ class OllamaProvider:
         native_replay=True,
     )
 
-    def __init__(self, model: str | None = None, host: str | None = None, capability_profile: ModelCapabilityProfile | None = None, reasoning_effort: str = "medium", context_size: int | None = None, num_gpu: int | None = None, max_output_tokens: int | None = None, force_json: bool = False, temperature: float | None = None, request_timeout: float | None = None, require_gpu: bool | None = None):
+    def __init__(self, model: str | None = None, host: str | None = None, capability_profile: ModelCapabilityProfile | None = None, reasoning_effort: str = "medium", context_size: int | None = None, num_gpu: int | None = None, max_output_tokens: int | None = None, force_json: bool = False, temperature: float | None = None, top_p: float | None = None, top_k: int | None = None, num_thread: int | None = None, num_batch: int | None = None, request_timeout: float | None = None, require_gpu: bool | None = None):
         self.model = model or os.getenv("OLLAMA_MODEL") or MODEL_NAME
         self.host = (host or os.getenv("OLLAMA_HOST", DEFAULT_HOST)).rstrip("/")
         self.capability_profile = capability_profile or ModelCapabilityProfile(
@@ -123,6 +123,10 @@ class OllamaProvider:
             )
         except (TypeError, ValueError):
             self.temperature = None
+        self.top_p = None if top_p is None else max(0.0, min(1.0, float(top_p)))
+        self.top_k = None if top_k is None else max(0, min(1_000, int(top_k)))
+        self.num_thread = None if num_thread is None else max(1, min(256, int(num_thread)))
+        self.num_batch = None if num_batch is None else max(1, min(2_048, int(num_batch)))
         self.force_json = bool(force_json)
 
     def _ensure_capabilities(self) -> None:
@@ -368,6 +372,14 @@ class OllamaProvider:
             payload["options"]["num_predict"] = self.max_output_tokens
         if self.temperature is not None:
             payload["options"]["temperature"] = self.temperature
+        if self.top_p is not None:
+            payload["options"]["top_p"] = self.top_p
+        if self.top_k is not None:
+            payload["options"]["top_k"] = self.top_k
+        if self.num_thread is not None:
+            payload["options"]["num_thread"] = self.num_thread
+        if self.num_batch is not None:
+            payload["options"]["num_batch"] = self.num_batch
 
         text_parts: list[str] = []
         thought_parts: list[str] = []

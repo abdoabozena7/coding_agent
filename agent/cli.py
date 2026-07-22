@@ -68,6 +68,7 @@ from .ui_state import (
     answer_question,
     answer_recommended_remaining,
     is_recommended_defaults_utterance,
+    question_attention,
     question_session,
 )
 from .action_policy import plan_review_reasons
@@ -188,6 +189,13 @@ def choose_workspace(
         ]
         choices.extend(
             (
+                ChoiceItem(
+                    key=InteractionMode.PLAN.value,
+                    label="Plan",
+                    description="Create and revise the approval-bound plan without executing tools.",
+                    meta="Current" if selected_mode is InteractionMode.PLAN else "Read-only",
+                    value=InteractionMode.PLAN,
+                ),
                 ChoiceItem(
                     key="__create__",
                     label=f"Create {next_name}",
@@ -742,9 +750,10 @@ def choose_interaction_mode(
             raise PickerBack()
         return selected.value
     print("Mode", file=output)
-    print("  1. normal  intent intake, durable goal, plan, review, and automatic execution", file=output)
+    print("  1. plan    planning and revision only; approval switches to Normal", file=output)
+    print("  2. normal  intent intake, durable goal, plan, review, and automatic execution", file=output)
     print(
-        "  2. ultra   "
+        "  3. ultra   "
         + (
             f"unavailable: {ultra_disabled_reason}"
             if ultra_disabled_reason
@@ -754,14 +763,14 @@ def choose_interaction_mode(
     )
     while True:
         choice = input_func("mode> ").strip().lower()
-        aliases = {"1": "normal", "2": "ultra"}
+        aliases = {"1": "plan", "2": "normal", "3": "ultra"}
         choice = aliases.get(choice, choice)
         if choice == "ultra" and ultra_disabled_reason:
             print(f"Ultra is unavailable: {ultra_disabled_reason}", file=output)
             continue
         if choice in {"normal", "ultra", "chat", "plan", "goal"}:
             return InteractionMode.parse(choice)
-        print("Choose normal or ultra.", file=output)
+        print("Choose plan, normal, or ultra.", file=output)
 
 
 def _descriptor_for_explicit_model(
@@ -815,13 +824,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         type=lambda value: InteractionMode.parse(value).value,
-        choices=(InteractionMode.NORMAL.value, InteractionMode.ULTRA.value),
-        help="Run mode: normal (default) or recursive-specialist ultra. Legacy chat/plan/goal map to normal.",
+        choices=(InteractionMode.PLAN.value, InteractionMode.NORMAL.value, InteractionMode.ULTRA.value),
+        help="Run mode: planning-only plan, durable normal, or recursive-specialist ultra.",
     )
     parser.add_argument(
         "--permissions",
-        choices=(AccessLevel.NORMAL.value, AccessLevel.FULL.value),
-        help="Workspace permission profile. Full is accepted only in the ready Docker sandbox.",
+        choices=(AccessLevel.NORMAL.value, AccessLevel.BOUNDED.value, AccessLevel.FULL.value, AccessLevel.HOST.value),
+        help="Workspace permission profile. Full uses Docker; host is direct and task-scoped in the web app.",
     )
     parser.add_argument(
         "--setup-sandbox",
@@ -991,7 +1000,8 @@ def _set_interaction_mode(
         issue = runtime.ultra_readiness_issue()
         if issue:
             raise ValueError(f"Ultra is unavailable: {issue}")
-    runtime.transition_mode(selected.value)
+    runtime.set_workflow_mode(selected.value)
+    runtime.transition_mode("normal" if selected is InteractionMode.PLAN else selected.value)
     preferences.mode = selected
     console.set_mode(selected)
     if not detailed:
@@ -1001,6 +1011,12 @@ def _set_interaction_mode(
         console.write(
             "ULTRA mode active: GoalSpec → architecture → one master approval → "
             "nested module waves → independent review/test/fix/integration → final evidence."
+        )
+        return
+    if selected == InteractionMode.PLAN:
+        console.write(
+            "PLAN mode active: build and revise an approval-bound plan without executing. "
+            "Approving the latest revision switches to NORMAL and begins implementation."
         )
         return
     goal = runtime.active_goal()
@@ -2109,6 +2125,8 @@ def execute_command(
     console: ConsoleUI,
     command: UserCommand,
     preferences: SessionPreferences,
+    *,
+    structured_attention: bool = False,
 ) -> bool:
     """Execute one parsed command. Return False when the session should exit."""
     if command.kind == CommandKind.QUIT:
@@ -2133,6 +2151,7 @@ def execute_command(
             console,
             parse_command(selected_command),
             preferences,
+            structured_attention=structured_attention,
         )
     if command.kind == CommandKind.HELP:
         console.write(HELP_TEXT.rstrip())
@@ -2369,12 +2388,15 @@ def execute_command(
         result = None
     else:
         result = runtime.apply_command(command)
-    if isinstance(result, SliceResult):
+    if isinstance(result, SliceResult) and not (
+        structured_attention and result.needs_user
+    ):
         console.write(result.message)
     if (
         result is not None
         and runtime.active_goal() is not None
         and runtime.active_goal().status == GoalStatus.AWAITING_PLAN_APPROVAL
+        and not structured_attention
     ):
         # Rich terminals open the focused plan-review surface from the main
         # loop. Plain/redirected sessions retain the complete textual plan.
@@ -2390,15 +2412,28 @@ def execute_command(
         actual_mode = InteractionMode.parse(
             runtime.store.get_workflow_session(runtime.session_id)["session_mode"]
         )
-        if actual_mode is not preferences.mode:
+        keep_plan_policy = (
+            preferences.mode is InteractionMode.PLAN
+            and runtime.active_goal() is not None
+            and runtime.active_goal().status == GoalStatus.AWAITING_PLAN_APPROVAL
+        )
+        if actual_mode is not preferences.mode and not keep_plan_policy:
             preferences.mode = actual_mode
             console.set_mode(actual_mode)
     except (StateStoreError, ValueError, TypeError, KeyError, AttributeError):
         pass
     pending_intake = runtime.intake_questions()
     if isinstance(pending_intake, (tuple, list)) and pending_intake:
-        _show_questions(runtime, console)
-    _show_runtime_state(runtime, console)
+        if not structured_attention:
+            _show_questions(runtime, console)
+    if not structured_attention:
+        _show_runtime_state(runtime, console)
+    if command.kind == CommandKind.APPROVE and preferences.mode is InteractionMode.PLAN:
+        preferences.mode = InteractionMode.NORMAL
+        console.set_mode(InteractionMode.NORMAL)
+        runtime.set_workflow_mode("normal")
+        runtime.transition_mode("normal")
+        console.write("Plan approved; switching to NORMAL implementation.")
     goal_mode_triggers = {CommandKind.APPROVE, CommandKind.RESUME, CommandKind.TEXT}
     nonempty_guidance = command.kind != CommandKind.TEXT or bool(command.args.get("text", "").strip())
     if (
@@ -2416,46 +2451,6 @@ def execute_command(
             console.write(f"NORMAL mode: {reason}; continuing automatically.")
             _run_auto(runtime, console)
     return True
-
-
-def _question_attention(question: Mapping[str, Any], *, source: str) -> AttentionRequest:
-    question_id = str(question.get("id") or "question")
-    raw_options = question.get("options") or ()
-    options: list[AttentionOption] = []
-    for index, raw in enumerate(raw_options[:3] if isinstance(raw_options, (list, tuple)) else (), 1):
-        if not isinstance(raw, Mapping):
-            continue
-        label = str(raw.get("label") or f"Option {index}")
-        options.append(
-            AttentionOption(
-                key=f"option-{index}",
-                label=label,
-                value=str(index),
-                description=str(raw.get("description") or ""),
-                shortcut=str(index),
-                primary=bool(raw.get("recommended")) or index == 1,
-            )
-        )
-    if not options:
-        options.append(
-            AttentionOption(
-                key="continue",
-                label="Continue with the suggested default",
-                value="1",
-                description="Use the planner's recommended answer for this decision.",
-                shortcut="1",
-                primary=True,
-            )
-        )
-    return AttentionRequest(
-        id=f"question:{source}:{question_id}:{time.monotonic_ns()}",
-        kind=AttentionKind.QUESTION,
-        title=str(question.get("header") or "One choice needed"),
-        message=str(question.get("question") or "Choose how you want this to work."),
-        options=tuple(options),
-        allow_custom=True,
-        source=source,
-    )
 
 
 def _plan_attention(view: Any, reasons: tuple[str, ...]) -> AttentionRequest:
@@ -2729,6 +2724,11 @@ def _persistent_interactive_loop(
             issue = runtime.ultra_readiness_issue()
             options = [
                 AttentionOption(
+                    "plan", "Plan", "plan",
+                    description="Create and revise a plan without executing tools.",
+                    shortcut="p", primary=preferences.mode is InteractionMode.PLAN,
+                ),
+                AttentionOption(
                     "normal", "Normal", "normal",
                     description="One durable goal with plan, review, and automatic execution.",
                     shortcut="n", primary=preferences.mode is InteractionMode.NORMAL,
@@ -2901,9 +2901,7 @@ def _persistent_interactive_loop(
                         if key not in shown_questions:
                             shown_questions.add(key)
                             store.set_activity(ActivityStage.PAUSED, "One choice is needed", running=False)
-                            resolution = store.request_attention(
-                                _question_attention(question, source=session.source)
-                            )
+                            resolution = store.request_attention(question_attention(session))
                             answer = resolution.text if resolution.key == "custom" else resolution.value
                             answer_question(runtime, session, str(question.get("id", "")), answer or "1")
                             _show_runtime_state(runtime, console, force=True)
@@ -3584,6 +3582,9 @@ def main(argv: Iterable[str] | None = None) -> int:
             approval=console.confirm_action_decision,
             model_descriptor=descriptor,
             permission_adapter=permission_adapter,
+            auto_promote_ultra=False,
+            workflow_mode=preferences.mode.value,
+            direct_normal_execution=True,
         )
         if not interactive_launch:
             console.write(

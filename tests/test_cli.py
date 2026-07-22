@@ -69,7 +69,7 @@ class CLITests(unittest.TestCase):
         self.assertIn("Full access is unavailable", output.getvalue())
 
     def test_mode_picker_cannot_select_ultra_when_runtime_prerequisite_is_missing(self):
-        answers = iter(("2", "1"))
+        answers = iter(("3", "2"))
         output = io.StringIO()
 
         selected = choose_interaction_mode(
@@ -80,7 +80,7 @@ class CLITests(unittest.TestCase):
         )
 
         self.assertEqual(selected, InteractionMode.NORMAL)
-        self.assertIn("Ultra is unavailable", output.getvalue())
+        self.assertIn("ultra   unavailable", output.getvalue().lower())
         self.assertIn("usable local GPU", output.getvalue())
 
     def test_status_command_is_offline_import_safe_and_creates_durable_state(self):
@@ -140,7 +140,7 @@ class CLITests(unittest.TestCase):
         self.assertIsNone(mode_query.args["mode"])
         self.assertEqual(parse_command("/mode GOAL").args["mode"], "normal")
         self.assertEqual(parse_command("/mode\tgoal").args["mode"], "normal")
-        self.assertEqual(parse_command(":mode plan").args["mode"], "normal")
+        self.assertEqual(parse_command(":mode plan").args["mode"], "plan")
 
         settings_query = parse_command("/settings")
         self.assertEqual(settings_query.kind, CommandKind.SETTINGS)

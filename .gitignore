@@ -10,6 +10,11 @@ __pycache__/
 .venv/
 venv/
 
+# React/Vite development outputs (the production web/dist bundle is shipped)
+web/node_modules/
+web/*.tsbuildinfo
+web/coverage/
+
 # Workspace-local persistent harness state
 .coding-agent/
 **/run-artifacts/.ultra-staging/
@@ -18,6 +23,7 @@ run-artifacts/*.log
 # Local browser automation state and disposable captures
 .playwright-cli/
 output/playwright/
+output/verification/
 
 # Per-run diagnostics (published evidence already tracked stays tracked)
 projects/*/run-artifacts/
