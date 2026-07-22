@@ -74,6 +74,7 @@ from .prompts import (
     subagent_system_prompt,
 )
 from .providers.base import AssistantTurn, ToolCall
+from .plan_document import parse_plan_document, render_plan_document
 from .safety import ProgressWatchdog, redact_data, redact_text
 from .store import NotFoundError, StateStore, StateStoreError
 from .ui import DashboardView, TaskView, WorkerView
@@ -607,6 +608,39 @@ class AgentRuntime:
         self.ultra_session = self._make_ultra_session()
         return self.ultra_session.start(redact_text(objective, 20_000))
 
+    def retry_ultra_foundation(self) -> Any:
+        """Retry a failed pre-approval ULTRA foundation without duplicating intake.
+
+        Intake routing creates the durable goal before model-backed foundation
+        generation.  A provider failure must therefore resume that goal rather
+        than submit the final intake answer a second time.
+        """
+
+        goal = self.active_goal()
+        if goal is None:
+            raise RuntimeStateError("there is no unfinished ULTRA foundation to retry")
+        if goal.active_plan_revision is not None:
+            raise RuntimeStateError("the ULTRA foundation already has a durable plan")
+        if goal.status not in {GoalStatus.DISCOVERING, GoalStatus.PAUSED}:
+            raise RuntimeStateError(
+                f"cannot retry the ULTRA foundation while goal is {goal.status.value}"
+            )
+        if self.ultra_session is not None and self.ultra_session.running:
+            raise RuntimeStateError("pause ULTRA before retrying its foundation")
+        if goal.status is GoalStatus.PAUSED:
+            self.store.transition_goal(
+                goal.id,
+                GoalStatus.DISCOVERING,
+                reason="retrying failed ULTRA foundation",
+            )
+        self.ultra_session = self._make_ultra_session()
+        self.events.publish(
+            "ultra.foundation_retry",
+            "Retrying the saved ULTRA foundation with a clean model request.",
+            goal_id=goal.id,
+        )
+        return self.ultra_session.restart_foundation(goal.id, goal.objective)
+
     def intake_questions(self) -> tuple[Mapping[str, Any], ...]:
         pending = self.store.get_pending_intake(self.session_id)
         if pending is None:
@@ -705,7 +739,9 @@ class AgentRuntime:
             execution_brief=brief.to_dict(),
         )
         canonical = brief.canonical_prompt()
-        return self.start_ultra(canonical) if routed is RunMode.ULTRA else self.start_goal(canonical)
+        if routed is RunMode.ULTRA:
+            return self.start_ultra(canonical)
+        return self.start_goal(canonical, planning_only=routed is RunMode.PLAN)
 
     def submit_intent(
         self,
@@ -803,6 +839,29 @@ class AgentRuntime:
             question_id=question_id,
             answer_source=source,
         )
+        if question_id == "execution_mode" and answer.casefold().startswith("edit request"):
+            self.store.cancel_intake_session(
+                str(pending["id"]),
+                reason="user chose to edit the request before planning",
+            )
+            self.store.save_workflow_session(
+                self.session_id,
+                goal_id=None,
+                session_mode=str(updated["requested_mode"]),
+                plan_state=PlanState.INSPECTING.value,
+                run_state=RunState.IDLE.value,
+                state={"intake_id": pending["id"], "intake_status": IntakeStatus.CANCELLED.value},
+            )
+            self.events.publish(
+                "intake.edit_requested",
+                "Request editing is active; update the objective in the composer when ready.",
+                intake_id=pending["id"],
+            )
+            return SliceResult(
+                "intake_edit_requested",
+                "Planning is paused. Edit the request in the composer and send it when ready.",
+                needs_user=True,
+            )
         if unanswered:
             return SliceResult(
                 "awaiting_answers",
@@ -1351,7 +1410,7 @@ class AgentRuntime:
             f"provider unavailable after retries: {type(last_error).__name__}: {redact_text(last_error, 500)}"
         ) from last_error
 
-    def start_goal(self, objective: str) -> Plan | None:
+    def start_goal(self, objective: str, *, planning_only: bool = False) -> Plan | None:
         with self._lock:
             safe_objective = redact_text(objective, 20_000)
             prior_session = self.store.get_workflow_session(self.session_id)
@@ -1396,7 +1455,7 @@ class AgentRuntime:
             self.store.save_workflow_session(
                 self.session_id,
                 goal_id=goal.id,
-                session_mode=SessionMode.PLAN.value,
+                session_mode=(SessionMode.PLAN if planning_only else SessionMode.NORMAL).value,
                 plan_state=PlanState.INSPECTING.value,
                 run_state=RunState.PLANNING.value,
             )
@@ -1673,7 +1732,9 @@ class AgentRuntime:
         self.store.save_workflow_session(
             self.session_id,
             goal_id=goal.id,
-            session_mode=SessionMode.PLAN.value,
+                session_mode=SessionMode.parse(
+                    self.store.get_workflow_session(self.session_id)["session_mode"]
+                ).value,
             plan_state=PlanState.AWAITING_APPROVAL.value,
             run_state=RunState.PLANNING.value,
             state={"plan_revision": plan.revision, "plan_fingerprint": plan.fingerprint, "fallback": True},
@@ -2287,7 +2348,9 @@ class AgentRuntime:
                     self.store.save_workflow_session(
                         self.session_id,
                         goal_id=goal.id,
-                        session_mode=SessionMode.PLAN.value,
+                        session_mode=SessionMode.parse(
+                            self.store.get_workflow_session(self.session_id)["session_mode"]
+                        ).value,
                         plan_state=PlanState.AWAITING_APPROVAL.value,
                         run_state=RunState.PLANNING.value,
                         state={"plan_revision": plan.revision, "plan_fingerprint": plan.fingerprint},
@@ -2371,6 +2434,17 @@ class AgentRuntime:
         plan = self.latest_plan()
         if goal is None or plan is None:
             raise RuntimeStateError("there is no plan to approve")
+        session_mode = SessionMode.parse(
+            self.store.get_workflow_session(self.session_id)["session_mode"]
+        )
+        if session_mode is SessionMode.PLAN:
+            raise RuntimeStateError(
+                "Plan Mode never executes. Switch to /mode normal or /mode ultra, review the final plan, then approve explicitly."
+            )
+        if session_mode is SessionMode.ULTRA and not goal.metadata.get("ultra_run_id"):
+            raise RuntimeStateError(
+                "This plan was prepared by the Normal planner. Ultra requires a new foundation review; request /replan after switching rather than executing this revision silently."
+            )
         if goal.metadata.get("ultra_run_id"):
             return self.approve_ultra(revision)
         requested = plan.revision if revision is None else revision
@@ -2494,7 +2568,7 @@ class AgentRuntime:
         self.store.save_workflow_session(
             self.session_id,
             goal_id=goal.id,
-            session_mode=SessionMode.GOAL.value,
+            session_mode=SessionMode.NORMAL.value,
             plan_state=PlanState.APPROVED.value,
             run_state=RunState.EXECUTING.value,
             state={"plan_revision": accepted.revision, "plan_fingerprint": accepted.fingerprint},
@@ -2758,6 +2832,86 @@ class AgentRuntime:
             reason=f"plan revision r{plan.revision} requires user approval",
         )
         self.events.publish("plan", f"Plan r{plan.revision} is pending approval: {reason}")
+        return plan
+
+    def plan_document(self) -> str:
+        plan = self.latest_plan()
+        if plan is None:
+            raise RuntimeStateError("there is no plan to review")
+        saved = self.store.get_plan_document(plan.id)
+        return str(saved["content"]) if saved is not None else render_plan_document(plan)
+
+    def replace_plan_document(
+        self,
+        document: str,
+        *,
+        reason: str = "manual full-plan edit",
+        edited_by: str = "user",
+    ) -> Plan:
+        parsed = parse_plan_document(document)
+        goal, old_plan = self._revision_context()
+        prior_by_id = {task.id: task for task in old_plan.tasks}
+        task_values: list[dict[str, Any]] = []
+        for index, value in enumerate(parsed.tasks):
+            prior = prior_by_id.get(str(value["id"]).upper())
+            task_values.append(
+                {
+                    **dict(value),
+                    "status": TaskStatus.PENDING.value,
+                    "role": (prior.role.to_dict() if prior is not None else RoleProfile().to_dict()),
+                    "mode": prior.mode if prior is not None else "auto",
+                    "priority": prior.priority if prior is not None else index,
+                    "origin": "user-editor",
+                    "metadata": dict(prior.metadata) if prior is not None else {},
+                }
+            )
+        original_status = goal.status
+        if original_status is not GoalStatus.REVISING:
+            self.store.transition_goal(goal.id, GoalStatus.REVISING, reason=reason)
+        try:
+            plan = self.store.create_plan(
+                goal.id,
+                parsed.summary,
+                task_values,
+                applicability_evidence=parsed.applicability_evidence,
+                execution_strategy=parsed.execution_strategy,
+                expected_changes=parsed.expected_changes,
+                proposed_by="user-editor",
+                submit=True,
+                source_document=document,
+                source_format_version=1,
+                edited_by=edited_by,
+            )
+        except Exception:
+            if original_status is not GoalStatus.REVISING:
+                self.store.transition_goal(
+                    goal.id,
+                    original_status,
+                    reason="invalid manual plan edit rolled back",
+                )
+            raise
+        self.store.transition_goal(
+            goal.id,
+            GoalStatus.AWAITING_PLAN_APPROVAL,
+            reason=f"manual plan document saved as r{plan.revision}",
+        )
+        session = self.store.get_workflow_session(self.session_id)
+        self.store.save_workflow_session(
+            self.session_id,
+            goal_id=goal.id,
+            session_mode=str(session["session_mode"]),
+            plan_state=PlanState.AWAITING_APPROVAL.value,
+            run_state=RunState.PLANNING.value,
+            ultra_profile=str(session.get("ultra_profile", "standard")),
+            sleep_state=str(session.get("sleep_state", "off")),
+            state={"plan_revision": plan.revision, "plan_fingerprint": plan.fingerprint},
+        )
+        self.events.publish(
+            "plan",
+            f"Manual plan edit saved as revision r{plan.revision}.",
+            revision=plan.revision,
+            source="user-editor",
+        )
         return plan
 
     def add_user_task(self, text: str, acceptance_criteria: str = "") -> Plan:
@@ -3067,6 +3221,58 @@ class AgentRuntime:
         )
         result = self.store.transition_goal(goal.id, GoalStatus.PAUSED, reason=reason)
         self.events.publish("phase", "Goal paused safely; state is durable.")
+        return result
+
+    def request_pause(self, reason: str = "pause requested by user") -> Goal:
+        """Persist a cooperative pause request without misreporting completion."""
+
+        goal = self.active_goal()
+        if goal is None:
+            raise RuntimeStateError("no active goal")
+        if goal.status is GoalStatus.PAUSED:
+            return goal
+        if self.ultra_session is not None and self.ultra_session.running:
+            self.ultra_session.pause()
+        self.store.update_goal_metadata(
+            goal.id,
+            pause_requested=True,
+            pause_requested_at=time.time(),
+            pause_reason=str(reason),
+            resume_status=goal.status.value,
+            auto_retryable=False,
+            retry_after_ms=0,
+        )
+        self.events.publish(
+            "phase",
+            "Pause requested; finishing the current operation before the saved checkpoint.",
+            pause_requested=True,
+        )
+        return self.store.get_goal(goal.id)
+
+    def complete_requested_pause(self) -> Goal | None:
+        """Commit PAUSED only once active work has actually drained."""
+
+        goal = self.active_goal()
+        if goal is None or not bool(goal.metadata.get("pause_requested")):
+            return goal
+        if (
+            self.ultra_session is not None
+            and self.ultra_session.running
+            and not self.ultra_session.safe_for_reconfiguration
+        ):
+            return goal
+        self.store.update_goal_metadata(
+            goal.id,
+            pause_requested=False,
+            pause_completed_at=time.time(),
+        )
+        result = self.pause(str(goal.metadata.get("pause_reason") or "paused by user"))
+        self.events.publish(
+            "checkpoint",
+            "Paused at a saved checkpoint. Use /resume or /continue when ready.",
+            paused=True,
+            status="paused",
+        )
         return result
 
     def resume(self) -> Goal:

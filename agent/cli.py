@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import subprocess
 import sys
 import textwrap
 import time
+import traceback
 import unicodedata
 from collections import Counter
 from pathlib import Path
@@ -40,12 +42,15 @@ from .diagnostics import (
 from .evaluation import learn_from_benchmark_trend, record_benchmark_trend
 from .events import EventBus
 from .model_catalog import ExecutionClass, ModelCatalog, ModelDescriptor
+from .local_provider import ProviderRequestError
 from .models import DomainError, GoalStatus
 from .providers import get_provider
 from .runtime import AgentRuntime, RuntimeErrorBase, SliceResult
+from .safety import redact_text
 from .rock_coding_agent_intro import play_intro
 from .sandbox import AccessLevel, DockerSandbox, PermissionAdapter, SandboxError
 from .store import StateCorruptionError, StateStore, StateStoreError
+from .workspace_registry import list_recent_workspaces, record_workspace
 from .tui import (
     ChoiceItem,
     PersistentWorkspaceApp,
@@ -58,6 +63,7 @@ from .tui import (
     select_choice,
     select_horizontal_action,
 )
+from .tui_telemetry import TelemetrySampler
 from .ui_state import (
     ActivityStage,
     AttentionKind,
@@ -153,6 +159,12 @@ def choose_workspace(
         except (OSError, RuntimeError):
             continue
     contained.sort(key=lambda item: item.name.casefold())
+    contained_keys = {os.path.normcase(str(item)) for item in contained}
+    recent_entries = list_recent_workspaces()
+    external_entries = [
+        item for item in recent_entries
+        if os.path.normcase(str(Path(item["path"]))) not in contained_keys
+    ]
 
     use_rich = (
         rich_terminal_available(input_func=input_func, output=output)
@@ -185,6 +197,21 @@ def choose_workspace(
                 value=workspace,
             )
             for workspace in contained
+        ]
+        choices[0:0] = [
+            ChoiceItem(
+                key=str(item["path"]),
+                label=str(item["name"]),
+                description=(
+                    f"{item['path']}\n"
+                    + ("Recent external workspace." if item["available"] else "Folder is currently unavailable.")
+                ),
+                meta="Recent" if item["available"] else "Missing",
+                value=Path(str(item["path"])),
+                disabled=not bool(item["available"]),
+                disabled_reason="The recorded folder no longer exists.",
+            )
+            for item in external_entries
         ]
         choices.extend(
             (
@@ -233,8 +260,9 @@ def choose_workspace(
             return _resolve_workspace(raw_path)
         return Path(selected.value)
 
+    plain_workspaces = contained
     print("Workspaces", file=output)
-    for index, workspace in enumerate(contained, start=1):
+    for index, workspace in enumerate(plain_workspaces, start=1):
         print(f"  {index:>2}. {workspace.name}", file=output)
     print("Enter a number, a project name, or an existing directory path.", file=output)
     print("Press Enter to create the next project-NNN workspace.", file=output)
@@ -246,8 +274,8 @@ def choose_workspace(
             return _resolve_workspace(created, create=True)
         if choice.isdigit():
             index = int(choice)
-            if 1 <= index <= len(contained):
-                return contained[index - 1]
+            if 1 <= index <= len(plain_workspaces):
+                return plain_workspaces[index - 1]
             print("That workspace number is not listed.", file=output)
             continue
 
@@ -701,11 +729,21 @@ def choose_interaction_mode(
         selected = select_choice(
             (
                 ChoiceItem(
+                    key=InteractionMode.PLAN.value,
+                    label="Plan",
+                    description=(
+                        "Inspect the project and prepare a durable editable plan only. "
+                        "Execution always requires switching mode and approving explicitly."
+                    ),
+                    meta="Current" if selected_mode is InteractionMode.PLAN else "Read-only planning",
+                    value=InteractionMode.PLAN,
+                ),
+                ChoiceItem(
                     key=InteractionMode.NORMAL.value,
                     label="Normal",
                     description=(
                         "Intent intake, one durable goal, planning, review, and automatic execution. "
-                        "Complex requests are promoted to Ultra automatically."
+                        "Large requests ask before switching to Ultra."
                     ),
                     meta="Current" if selected_mode is InteractionMode.NORMAL else "Basic",
                     value=InteractionMode.NORMAL,
@@ -815,8 +853,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         type=lambda value: InteractionMode.parse(value).value,
-        choices=(InteractionMode.NORMAL.value, InteractionMode.ULTRA.value),
-        help="Run mode: normal (default) or recursive-specialist ultra. Legacy chat/plan/goal map to normal.",
+        choices=(InteractionMode.PLAN.value, InteractionMode.NORMAL.value, InteractionMode.ULTRA.value),
+        help="Run mode: plan-only, normal (default), or recursive-specialist ultra.",
     )
     parser.add_argument(
         "--permissions",
@@ -960,6 +998,7 @@ def _show_runtime_state(
         active_agents = 0
     access = getattr(runtime, "access_level", "normal")
     execution = getattr(runtime, "execution_class", "local")
+    console.set_context_window(getattr(runtime.provider, "context_size", None))
     console.set_runtime_identity(
         access_level=access if isinstance(access, str) else "normal",
         execution_class=execution if isinstance(execution, str) else "local",
@@ -969,13 +1008,8 @@ def _show_runtime_state(
         workspace=str(runtime.workspace),
     )
     console.show_status(view, force=force)
-    if view.status == GoalStatus.AWAITING_PLAN_APPROVAL.value and (
-        force or not console.live_activity_enabled
-    ):
-        console.write(
-            f"Plan r{view.plan_revision} is ready · {len(view.tasks)} task(s) · "
-            "use /plan to expand, /approve to continue, or /reject with feedback."
-        )
+    # The durable plan event and review attention own plan readiness. A status
+    # refresh must not create another transcript receipt.
 
 
 def _set_interaction_mode(
@@ -997,6 +1031,12 @@ def _set_interaction_mode(
     if not detailed:
         console.write(f"Mode switched to {selected.value.upper()}.")
         return
+    if selected == InteractionMode.PLAN:
+        console.write(
+            "PLAN mode active: inspect and prepare a durable plan only. Switch to /mode normal "
+            "or /mode ultra and approve explicitly before execution."
+        )
+        return
     if selected == InteractionMode.ULTRA:
         console.write(
             "ULTRA mode active: GoalSpec → architecture → one master approval → "
@@ -1011,7 +1051,7 @@ def _set_interaction_mode(
     )
     console.write(
         "NORMAL mode active: every request passes through Intent Architect, then uses a durable "
-        f"goal, plan, review, and automatic execution. Complex work auto-promotes to ULTRA.{suffix}"
+        f"goal, plan, review, and automatic execution. Large work asks before ULTRA escalation.{suffix}"
     )
 
 
@@ -2167,7 +2207,7 @@ def execute_command(
                 )
             else:
                 console.write(
-                    f"mode = {preferences.mode.value}; choose /mode normal or /mode ultra"
+                    f"mode = {preferences.mode.value}; choose /mode plan, /mode normal, or /mode ultra"
                 )
         else:
             _set_interaction_mode(runtime, console, preferences, selected)
@@ -2181,44 +2221,11 @@ def execute_command(
     if command.kind == CommandKind.PERMISSIONS:
         _execute_permissions(runtime, console, command.args.get("level"))
         return True
-    if command.kind == CommandKind.IDE:
-        console.write(
-            "IDE context bridge is not connected in this local agent yet. "
-            f"Workspace context is active: {runtime.workspace}"
-        )
-        return True
     if command.kind == CommandKind.KEYMAP:
         console.write(
             "Keymap: F2 Simple/Advanced display, F3 model, F4 permissions, "
-            "Ctrl+K actions, Ctrl+C safe checkpoint while running, Ctrl+Q exit "
-            "at a checkpoint. Type /vim to toggle Vim composer keys."
-        )
-        return True
-    if command.kind == CommandKind.VIM:
-        requested = command.args.get("state")
-        enabled = console.set_vim_mode(
-            None if requested is None else requested == "on"
-        )
-        console.write(f"Vim composer mode {'on' if enabled else 'off'}.")
-        return True
-    if command.kind == CommandKind.SANDBOX_ADD_READ_DIR:
-        path = Path(str(command.args.get("path") or "")).expanduser()
-        if not path.is_absolute():
-            console.write("error: /sandbox-add-read-dir needs an absolute path.")
-            return True
-        if not path.is_dir():
-            console.write(f"error: read directory does not exist: {path}")
-            return True
-        console.write(
-            "Sandbox read-dir UI command accepted. This agent's current Docker "
-            "sandbox still mounts the active workspace only, so use --workspace "
-            f"or /settings workspace when you need execution inside {path}."
-        )
-        return True
-    if command.kind == CommandKind.EXPERIMENTAL:
-        console.write(
-            "Experimental features are controlled through /settings in this agent. "
-            f"Requested state: {command.args.get('state')}."
+            "F6 Sleep, F7 diff, F8 project folder, Ctrl+K actions, Ctrl+C "
+            "cooperative pause, Ctrl+Q checkpoint-safe exit."
         )
         return True
     if command.kind == CommandKind.SKILLS:
@@ -2267,8 +2274,34 @@ def execute_command(
         _setup_sandbox(runtime, console)
         return True
     if command.kind == CommandKind.SLEEP:
-        status = runtime.sleep_profile(command.args["action"], preferences.mode)
-        console.write(f"Sleep profile {status['profile']} · state {status['state']}")
+        action = str(command.args["action"]).strip().lower()
+        if action == "status":
+            console.write(
+                f"Sleep Mode {'on' if console.sleep_enabled else 'off'} · "
+                "safe recommended choices only; unsafe decisions stay manual"
+            )
+            if preferences.mode is InteractionMode.ULTRA:
+                status = runtime.sleep_profile("status", preferences.mode)
+                console.write(
+                    f"Ultra Sleep profile {status['profile']} · state {status['state']}"
+                )
+            return True
+
+        enabled = action == "on"
+        console.set_sleep_mode(enabled)
+        if action == "off":
+            runtime.sleep_profile("off", preferences.mode)
+        elif preferences.mode is InteractionMode.ULTRA:
+            try:
+                status = runtime.sleep_profile("on", preferences.mode)
+                console.write(
+                    f"Ultra Sleep profile {status['profile']} · state {status['state']}"
+                )
+            except RuntimeError as exc:
+                console.write(
+                    "General Sleep Mode remains on, but deeper Ultra Sleep was not armed: "
+                    f"{exc}"
+                )
         return True
     if command.kind == CommandKind.TREE:
         _show_tree(runtime, console, command.args.get("target"))
@@ -2288,6 +2321,12 @@ def execute_command(
     if command.kind == CommandKind.THINKING:
         _show_thinking(console)
         return True
+    if command.kind == CommandKind.DETAILS:
+        console.write(
+            "Details\n  The persistent workspace opens collapsed messages and diagnostics here. "
+            "In plain mode use /thinking, /trace, /status, or /history for the corresponding detail."
+        )
+        return True
     if command.kind == CommandKind.INSIGHTS:
         _show_insights(runtime, console, command.args.get("target"))
         return True
@@ -2298,7 +2337,37 @@ def execute_command(
         _show_metrics(runtime, console)
         return True
     if command.kind == CommandKind.PLAN:
-        console.write(render_plan(runtime.dashboard()))
+        try:
+            console.write(runtime.plan_document())
+        except Exception:
+            _set_interaction_mode(
+                runtime, console, preferences, InteractionMode.PLAN, detailed=False
+            )
+            console.write("Plan Mode is active. Describe the project to prepare a plan without execution.")
+        return True
+    if command.kind == CommandKind.CHAT:
+        entries = runtime.store.list_timeline_entries(runtime.session_id, limit=500)
+        if not entries:
+            console.write("No durable conversation has been recorded yet.")
+        for entry in entries:
+            if str(entry.get("visibility")) != "transcript":
+                continue
+            message = entry.get("message") or {}
+            if isinstance(message, Mapping):
+                console.write(
+                    f"{str(message.get('role') or 'assistant').upper()} · {entry.get('created_at', '')}\n"
+                    f"{message.get('content', '')}"
+                )
+        return True
+    if command.kind == CommandKind.EXPLORER:
+        path = str(Path(runtime.workspace).resolve(strict=True))
+        if os.name == "nt":
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+        console.write(f"Opened project folder: {path}")
         return True
     if command.kind == CommandKind.STATUS:
         _show_runtime_state(runtime, console, force=True)
@@ -2421,11 +2490,21 @@ def execute_command(
 def _question_attention(question: Mapping[str, Any], *, source: str) -> AttentionRequest:
     question_id = str(question.get("id") or "question")
     raw_options = question.get("options") or ()
+    raw_sequence = tuple(raw_options[:3]) if isinstance(raw_options, (list, tuple)) else ()
+    recommended_index = next(
+        (
+            index
+            for index, raw in enumerate(raw_sequence, 1)
+            if isinstance(raw, Mapping) and bool(raw.get("recommended"))
+        ),
+        1,
+    )
     options: list[AttentionOption] = []
-    for index, raw in enumerate(raw_options[:3] if isinstance(raw_options, (list, tuple)) else (), 1):
+    for index, raw in enumerate(raw_sequence, 1):
         if not isinstance(raw, Mapping):
             continue
         label = str(raw.get("label") or f"Option {index}")
+        recommended = index == recommended_index
         options.append(
             AttentionOption(
                 key=f"option-{index}",
@@ -2433,7 +2512,9 @@ def _question_attention(question: Mapping[str, Any], *, source: str) -> Attentio
                 value=str(index),
                 description=str(raw.get("description") or ""),
                 shortcut=str(index),
-                primary=bool(raw.get("recommended")) or index == 1,
+                primary=recommended,
+                recommended=recommended,
+                auto_safe=recommended and question_id != "execution_mode",
             )
         )
     if not options:
@@ -2445,8 +2526,15 @@ def _question_attention(question: Mapping[str, Any], *, source: str) -> Attentio
                 description="Use the planner's recommended answer for this decision.",
                 shortcut="1",
                 primary=True,
+                recommended=True,
+                auto_safe=True,
             )
         )
+    default_key = (
+        "option-2"
+        if question_id == "execution_mode" and len(options) >= 2
+        else next((option.key for option in options if option.recommended), options[0].key)
+    )
     return AttentionRequest(
         id=f"question:{source}:{question_id}:{time.monotonic_ns()}",
         kind=AttentionKind.QUESTION,
@@ -2455,6 +2543,8 @@ def _question_attention(question: Mapping[str, Any], *, source: str) -> Attentio
         options=tuple(options),
         allow_custom=True,
         source=source,
+        default_key=default_key,
+        auto_resolve_safe=question_id != "execution_mode",
     )
 
 
@@ -2472,9 +2562,14 @@ def _plan_attention(view: Any, reasons: tuple[str, ...]) -> AttentionRequest:
         message=message,
         options=(
             AttentionOption(
+                "open", "Open and review", "open",
+                description="Open the complete plan before deciding whether it should run.",
+                shortcut="o", recommended=True,
+            ),
+            AttentionOption(
                 "start", "Approve and start", "start",
                 description="Approve exactly this revision and begin execution.",
-                shortcut="s", primary=True,
+                shortcut="s",
             ),
             AttentionOption(
                 "change", "Request changes", "change",
@@ -2487,6 +2582,9 @@ def _plan_attention(view: Any, reasons: tuple[str, ...]) -> AttentionRequest:
             ),
         ),
         details="\n".join(reasons) or "Every implementation plan requires explicit approval.",
+        default_key="cancel",
+        cancel_key="cancel",
+        auto_resolve_safe=False,
     )
 
 
@@ -2505,11 +2603,25 @@ def _action_attention(store: WorkspaceUIStore) -> AttentionRequest:
         AttentionOption("permissions", copy("Permissions", "الصلاحيات"), "permissions", description=copy("Choose normal or ready Docker access.", "اختر الوصول العادي أو Docker الجاهز."), shortcut="p"),
         AttentionOption("advanced", copy("Advanced details", "تفاصيل متقدمة"), "advanced", description=copy("Show technical activity in the workspace.", "اعرض النشاط التقني في مساحة العمل."), shortcut="a"),
     ]
+    values.append(
+        AttentionOption(
+            "cancel",
+            copy("Back", "رجوع"),
+            "cancel",
+            description=copy(
+                "Close this menu without changing anything.",
+                "أغلق هذه القائمة بدون تغيير.",
+            ),
+            shortcut="esc",
+        )
+    )
     return AttentionRequest(
         id=f"actions:{time.monotonic_ns()}",
         kind=AttentionKind.QUESTION,
         title=copy("What would you like to do?", "ماذا تريد أن تفعل؟"),
         options=tuple(values),
+        default_key="cancel",
+        cancel_key="cancel",
     )
 
 
@@ -2526,6 +2638,38 @@ def _persistent_interactive_loop(
         model=str(runtime.model_name),
         status=str(runtime.dashboard().status),
     )
+    last_loaded: tuple[str, str] | None = None
+    try:
+        timeline_entries = runtime.store.list_timeline_entries(runtime.session_id, limit=500)
+        if not isinstance(timeline_entries, (tuple, list)):
+            timeline_entries = ()
+    except (AttributeError, StateStoreError, TypeError):
+        timeline_entries = ()
+    for timeline_item in timeline_entries:
+        if str(timeline_item.get("visibility")) != "transcript":
+            continue
+        message = timeline_item.get("message") or {}
+        if not isinstance(message, Mapping):
+            continue
+        role = str(message.get("role") or "assistant")
+        content = str(message.get("content") or "").strip()
+        if not content or last_loaded == (role, content):
+            continue
+        store.append_transcript(
+            role,
+            content,
+            event_key=f"timeline:{timeline_item.get('sequence')}",
+        )
+        last_loaded = (role, content)
+    if isinstance(getattr(runtime, "session_id", None), str):
+        store.bind_timeline_sink(
+            lambda role, content, key: runtime.store.append_chat_message(
+                runtime.session_id,
+                {"role": role, "content": content},
+                event_key=key,
+                visibility="transcript",
+            )
+        )
     console.bind_workspace_store(store)
     inbox: Queue[WorkspaceInput] = Queue()
     stop = Event()
@@ -2536,15 +2680,12 @@ def _persistent_interactive_loop(
 
     def interrupt() -> None:
         try:
-            runtime.checkpoint_interrupt()
-            if work_running.is_set():
-                store.set_activity(
-                    ActivityStage.PAUSED,
-                    "Checkpoint saved; waiting for the current action to return",
-                    running=True,
-                )
-            else:
-                store.set_activity(ActivityStage.PAUSED, "Checkpoint saved", running=False)
+            runtime.request_pause()
+            store.set_activity(
+                ActivityStage.CHECKING,
+                "Pause requested · waiting for the current operation to reach a saved checkpoint",
+                running=True,
+            )
         except Exception as exc:
             store.append_log(f"interrupt: {exc}")
 
@@ -2568,6 +2709,34 @@ def _persistent_interactive_loop(
         output=console.stream,
         no_color=not console.color,
     )
+    if timeline_entries:
+        restored_lines: list[str] = []
+        for entry in timeline_entries:
+            if str(entry.get("visibility")) != "transcript":
+                continue
+            message = entry.get("message") or {}
+            if not isinstance(message, Mapping):
+                continue
+            content = str(message.get("content") or "").strip()
+            if not content:
+                continue
+            restored_lines.extend(
+                (
+                    f"{str(message.get('role') or 'assistant').upper()} | {entry.get('created_at', '')}",
+                    content,
+                    "",
+                )
+            )
+        if restored_lines:
+            app.open_details(
+                "Workspace chat",
+                "\n".join(restored_lines).rstrip(),
+                kind="chat",
+            )
+    telemetry = TelemetrySampler(
+        lambda sample: store.update_resources(**sample.as_update())
+    )
+    telemetry.start()
 
     def controller() -> None:
         active_work: Thread | None = None
@@ -2575,37 +2744,54 @@ def _persistent_interactive_loop(
         work_errors: list[BaseException] = []
         work_results: list[bool] = []
         last_command: UserCommand | None = None
+        last_action: UserCommand | Callable[[], None] | None = None
         shown_questions: set[str] = set()
         reviewed_plans: set[str] = set()
         completed_goals: set[str] = set()
         queued: list[str] = []
+        deferred_observers: list[UserCommand] = []
+        pending_controls: list[UserCommand] = []
         pending_new_task: list[str] = []
-        slow_prompted = False
         slow_request_id: str | None = None
+        next_slow_notice = 60.0
+        work_transcript_count = 0
+        last_swarm_refresh = 0.0
+        cached_swarm_snapshot: Mapping[str, Any] = {}
 
-        def work(command: UserCommand) -> None:
+        def work(action: UserCommand | Callable[[], None]) -> None:
             try:
-                work_results.append(execute_command(runtime, console, command, preferences))
+                if isinstance(action, UserCommand):
+                    work_results.append(execute_command(runtime, console, action, preferences))
+                else:
+                    action()
             except BaseException as exc:
                 work_errors.append(exc)
             finally:
                 work_running.clear()
                 work_done.set()
 
-        def start(command: UserCommand) -> None:
-            nonlocal active_work, last_command, slow_prompted
-            last_command = command
-            slow_prompted = False
+        def start(
+            action: UserCommand | Callable[[], None],
+            *,
+            summary: str = "Understanding your request",
+        ) -> None:
+            nonlocal active_work, last_command, last_action, next_slow_notice, work_transcript_count
+            last_action = action
+            if isinstance(action, UserCommand):
+                last_command = action
+            next_slow_notice = 60.0
+            work_transcript_count = len(store.snapshot().transcript)
+            store.reset_request_context()
             work_done.clear()
             active_work = Thread(
                 target=work,
-                args=(command,),
+                args=(action,),
                 name="ga3bad-persistent-work",
                 daemon=False,
             )
             console.set_background_working(True)
             work_running.set()
-            store.set_activity(ActivityStage.UNDERSTANDING, "Understanding your request", running=True)
+            store.set_activity(ActivityStage.UNDERSTANDING, summary, running=True)
             active_work.start()
 
         def ask_custom(title: str, message: str) -> str:
@@ -2617,6 +2803,8 @@ def _persistent_interactive_loop(
                     message=message,
                     options=(AttentionOption("cancel", "Cancel", "", shortcut="c"),),
                     allow_custom=True,
+                    default_key="cancel",
+                    cancel_key="cancel",
                 )
             )
             return resolution.text.strip() if resolution.key == "custom" else ""
@@ -2655,6 +2843,9 @@ def _persistent_interactive_loop(
                         else "Choose where project commands may run."
                     ),
                     options=tuple(options),
+                    default_key="cancel",
+                    cancel_key="cancel",
+                    auto_resolve_safe=False,
                 )
             )
             if choice.value:
@@ -2702,7 +2893,9 @@ def _persistent_interactive_loop(
                     kind=AttentionKind.QUESTION,
                     title="Choose a model",
                     message="Cloud credentials are configuration evidence; connectivity is checked on first use.",
-                    options=options,
+                    options=options + (AttentionOption("cancel", "Cancel", "", shortcut="c"),),
+                    default_key="cancel",
+                    cancel_key="cancel",
                 )
             )
             descriptor = by_key.get(resolution.value)
@@ -2712,6 +2905,7 @@ def _persistent_interactive_loop(
             provider = descriptor.create_provider()
             setattr(provider, "reasoning_effort", runtime.reasoning_effort)
             runtime.replace_provider(provider, descriptor)
+            console.set_context_window(getattr(provider, "context_size", None))
             console.set_runtime_identity(
                 access_level=runtime.access_level,
                 execution_class=runtime.execution_class,
@@ -2728,6 +2922,11 @@ def _persistent_interactive_loop(
         def handle_workflow_mode() -> None:
             issue = runtime.ultra_readiness_issue()
             options = [
+                AttentionOption(
+                    "plan", "Plan only", "plan",
+                    description="Inspect and prepare an editable plan without executing.",
+                    shortcut="p", primary=preferences.mode is InteractionMode.PLAN,
+                ),
                 AttentionOption(
                     "normal", "Normal", "normal",
                     description="One durable goal with plan, review, and automatic execution.",
@@ -2750,6 +2949,8 @@ def _persistent_interactive_loop(
                     title="Choose workflow mode",
                     message=(f"Ultra is unavailable: {issue}" if issue else "This changes orchestration, not the Simple/Advanced display."),
                     options=tuple(options),
+                    default_key="cancel",
+                    cancel_key="cancel",
                 )
             )
             if resolution.value:
@@ -2784,24 +2985,248 @@ def _persistent_interactive_loop(
                     store.append_transcript("user", objective)
                     start(parse_command(objective))
 
+        def publish_change_summary(value: str) -> None:
+            files = {
+                line.split(" b/", 1)[1]
+                for line in value.splitlines()
+                if line.startswith("diff --git ") and " b/" in line
+            }
+            additions = sum(
+                1 for line in value.splitlines()
+                if line.startswith("+") and not line.startswith("+++")
+            )
+            deletions = sum(
+                1 for line in value.splitlines()
+                if line.startswith("-") and not line.startswith("---")
+            )
+            try:
+                undo_available = (
+                    runtime.active_goal() is None
+                    and bool(runtime.version_control.undo_candidates(1))
+                )
+            except Exception:
+                undo_available = False
+            store.update_changes(
+                files=len(files),
+                additions=additions,
+                deletions=deletions,
+                undo_available=undo_available,
+            )
+
+        def refresh_change_summary() -> None:
+            try:
+                publish_change_summary(runtime.version_control.diff(None))
+            except Exception as exc:
+                store.append_log(f"change summary: {exc}")
+
+        def open_live_observer(command: UserCommand) -> bool:
+            """Open read-only workspace overlays without touching live engine objects."""
+
+            nonlocal cached_swarm_snapshot, last_swarm_refresh
+            if command.kind in {CommandKind.AGENTS, CommandKind.AGENT, CommandKind.TREE}:
+                run = _current_ultra_run(runtime)
+                if run is None:
+                    app.open_details(
+                        "Specialists",
+                        "No ULTRA specialists have been materialized yet.",
+                    )
+                    return True
+                cached_swarm_snapshot = _swarm_inspector_snapshot(runtime, run)
+                last_swarm_refresh = time.monotonic()
+                store.update_swarm_summary(cached_swarm_snapshot)
+                app.open_swarm(
+                    cached_swarm_snapshot,
+                    tab="tree" if command.kind is CommandKind.TREE else "agents",
+                    target=command.args.get("target"),
+                )
+                return True
+            if command.kind is CommandKind.PLAN:
+                try:
+                    document = runtime.plan_document()
+                    plan = runtime.latest_plan()
+                    title = f"Plan r{getattr(plan, 'revision', '?')}"
+                    if str(command.args.get("action") or "show") == "edit":
+                        app.open_plan_editor(title, document)
+                    else:
+                        app.open_details(title, document, kind="plan")
+                except Exception as exc:
+                    if runtime.latest_plan() is None:
+                        _set_interaction_mode(
+                            runtime,
+                            console,
+                            preferences,
+                            InteractionMode.PLAN,
+                            detailed=False,
+                        )
+                        app.open_details(
+                            "Plan Mode",
+                            "Plan Mode is active. Close this view and describe the project; no execution will start without a later mode switch and explicit approval.",
+                        )
+                    else:
+                        app.open_details("Plan", f"The plan could not be opened.\n\n{exc}")
+                return True
+            if command.kind is CommandKind.CHAT:
+                entries = runtime.store.list_timeline_entries(runtime.session_id, limit=500)
+                lines: list[str] = []
+                for entry in entries:
+                    if str(entry.get("visibility")) != "transcript":
+                        continue
+                    message = entry.get("message") or {}
+                    if not isinstance(message, Mapping):
+                        continue
+                    role = str(message.get("role") or "assistant").upper()
+                    content = str(message.get("content") or "").strip()
+                    if content:
+                        lines.extend((f"{role} · {entry.get('created_at', '')}", content, ""))
+                app.open_details(
+                    "Workspace chat",
+                    "\n".join(lines) if lines else "No durable conversation has been recorded yet.",
+                    kind="chat",
+                )
+                return True
+            if command.kind is CommandKind.EXPLORER:
+                try:
+                    path = str(Path(runtime.workspace).resolve(strict=True))
+                    if os.name == "nt":
+                        os.startfile(path)  # type: ignore[attr-defined]
+                    elif sys.platform == "darwin":
+                        subprocess.Popen(["open", path])
+                    else:
+                        subprocess.Popen(["xdg-open", path])
+                    store.append_transcript(
+                        "assistant", f"Opened project folder: {path}", event_key=f"explorer:{time.monotonic_ns()}"
+                    )
+                except Exception as exc:
+                    store.append_transcript("assistant", f"Could not open the project folder: {exc}")
+                return True
+            if command.kind is CommandKind.DIFF:
+                target = command.args.get("target")
+                app.open_details("Changes", "Loading the project diff…", kind="diff")
+
+                def load_diff() -> None:
+                    try:
+                        value = runtime.version_control.diff(target)
+                    except Exception as exc:
+                        value = f"Diff unavailable: {exc}"
+                    publish_change_summary(value)
+                    app.open_details("Project changes", value, kind="diff")
+
+                Thread(target=load_diff, name="ga3bad-diff-observer", daemon=True).start()
+                return True
+            if command.kind is CommandKind.THINKING:
+                action = str(command.args.get("action") or "show")
+                if action == "hide":
+                    if app.overlay_kind == "thinking":
+                        app.close_overlay()
+                    store.append_transcript("assistant", "Reasoning summaries are hidden.")
+                    return True
+                blocks = console.thought_blocks()
+                if action == "status":
+                    store.append_transcript(
+                        "assistant",
+                        f"Reasoning summaries are collapsed by default · {len(blocks)} captured.",
+                    )
+                    return True
+                lines = [
+                    "Redacted model summaries · session only · raw chain-of-thought is never shown",
+                    "",
+                ]
+                for block in blocks:
+                    lines.extend(
+                        (
+                            f"Thought {block.get('id', '?')} · {block.get('actor', 'agent')} "
+                            f"· step {block.get('step', '?')} · {block.get('duration_seconds', 0)}s",
+                            textwrap.indent(str(block.get("text") or "(empty)"), "  "),
+                            "",
+                        )
+                    )
+                app.open_details(
+                    "Thinking summaries",
+                    "\n".join(lines) if blocks else "No model summaries have been captured yet.",
+                    kind="thinking",
+                )
+                return True
+            if command.kind is CommandKind.DETAILS:
+                snapshot = store.snapshot()
+                target = str(command.args.get("target") or "").strip()
+                entry = None
+                if target.isdigit():
+                    entry = next(
+                        (item for item in snapshot.transcript if item.id == int(target)),
+                        None,
+                    )
+                if entry is None:
+                    entry = next(
+                        (
+                            item
+                            for item in reversed(snapshot.transcript)
+                            if len(item.text) > 2_000 or item.text.count("\n") >= 12
+                        ),
+                        None,
+                    )
+                if entry is not None:
+                    app.open_details(
+                        f"Message {entry.id} · {entry.role}",
+                        store.transcript_details(entry.id) or entry.text,
+                    )
+                elif snapshot.advanced_log:
+                    app.open_details("Latest diagnostic", snapshot.advanced_log[-1])
+                else:
+                    app.open_details("Details", "No collapsed message or diagnostic is available.")
+                return True
+            return False
+
         try:
+            Thread(
+                target=refresh_change_summary,
+                name="ga3bad-initial-change-summary",
+                daemon=True,
+            ).start()
             _show_runtime_state(runtime, console, force=True)
             while not stop.is_set():
+                now = time.monotonic()
+                if now - last_swarm_refresh >= 1.0:
+                    run = _current_ultra_run(runtime)
+                    if run is not None:
+                        try:
+                            cached_swarm_snapshot = _swarm_inspector_snapshot(runtime, run)
+                            store.update_swarm_summary(cached_swarm_snapshot)
+                            if app.overlay_kind == "swarm":
+                                app.update_swarm(cached_swarm_snapshot)
+                        except Exception as exc:
+                            store.append_log(f"swarm snapshot: {exc}")
+                    last_swarm_refresh = now
                 if active_work is not None and work_done.is_set():
                     active_work.join()
                     active_work = None
                     console.set_background_working(False)
                     work_done.clear()
+                    try:
+                        runtime.complete_requested_pause()
+                    except Exception as exc:
+                        store.append_log(f"pause finalizer: {exc}")
+                    store.finalize_stream(commit=not work_errors)
+                    try:
+                        _show_runtime_state(runtime, console, force=True)
+                    except Exception as exc:
+                        store.append_log(f"finalizer dashboard refresh: {exc}")
                     if slow_request_id is not None:
                         active_attention = store.active_attention()
                         if active_attention is not None and active_attention.id == slow_request_id:
                             store.resolve_attention("keep")
                         store.take_attention_result(slow_request_id)
                         slow_request_id = None
+                    store.append_log("work.finalized: stream flushed; dashboard refreshed")
+                    Thread(
+                        target=refresh_change_summary,
+                        name="ga3bad-change-summary",
+                        daemon=True,
+                    ).start()
                     if pending_new_task:
                         objective = pending_new_task.pop(0)
                         pending_new_task.clear()
                         queued.clear()
+                        deferred_observers.clear()
                         store.set_queued_count(0)
                         current_goal = runtime.active_goal()
                         if current_goal is not None and current_goal.status not in {
@@ -2825,35 +3250,71 @@ def _persistent_interactive_loop(
                     store.set_queued_count(0)
                     if work_errors:
                         exc = work_errors.pop(0)
-                        store.append_log(f"error: {exc}")
-                        store.set_activity(ActivityStage.PROBLEM, "I could not finish that step", running=False)
+                        diagnostic = redact_text(
+                            "".join(traceback.format_exception(exc)),
+                            6_000,
+                        )
+                        store.append_log(f"error: {diagnostic}")
+                        provider_failure = isinstance(exc, ProviderRequestError)
+                        provider_message = (
+                            "The local model runner could not complete its structured response."
+                            if provider_failure
+                            else redact_text(str(exc), 800)
+                        )
+                        title = (
+                            "Local model stopped unexpectedly"
+                            if provider_failure
+                            else "That step did not finish"
+                        )
+                        message = (
+                            "Ollama stopped while preparing the current step. "
+                            "Saved intake and project state are still intact."
+                            if provider_failure
+                            else "The project state is saved. You can inspect the error or retry safely."
+                        )
+                        retry_action: UserCommand | Callable[[], None] | None = last_action
+                        goal = runtime.active_goal()
+                        if (
+                            provider_failure
+                            and goal is not None
+                            and goal.active_plan_revision is None
+                        ):
+                            try:
+                                runtime.pause("local model failed while starting the saved goal")
+                            except Exception as pause_error:
+                                store.append_log(f"provider recovery pause: {pause_error}")
+                            retry_action = (
+                                runtime.retry_ultra_foundation
+                                if getattr(runtime, "ultra_session", None) is not None
+                                else parse_command("/resume")
+                            )
+                        store.set_activity(ActivityStage.PROBLEM, title, running=False)
+                        store.append_transcript(
+                            "assistant",
+                            f"{title}. {message} Cause: {provider_message}",
+                        )
                         resolution = store.request_attention(
                             AttentionRequest(
                                 id=f"recovery:{time.monotonic_ns()}",
                                 kind=AttentionKind.RECOVERY,
-                                title="That step did not finish",
-                                message="You can retry, change your request, or inspect the technical details.",
+                                title=title,
+                                message=message,
+                                details=diagnostic,
                                 options=(
-                                    AttentionOption("retry", "Retry", "retry", shortcut="r", primary=True),
-                                    AttentionOption("change", "Change", "change", shortcut="c"),
+                                    AttentionOption("keep", "Keep paused", "keep", shortcut="k"),
+                                    AttentionOption("retry", "Retry cleanly", "retry", shortcut="r", recommended=True),
+                                    AttentionOption("model", "Change model", "model", shortcut="m"),
                                     AttentionOption("details", "Details", "details", shortcut="d"),
                                 ),
+                                default_key="keep",
+                                cancel_key="keep",
+                                auto_resolve_safe=False,
                             )
                         )
-                        if resolution.value == "retry" and last_command is not None:
-                            start(last_command)
-                        elif resolution.value == "change":
-                            feedback = ask_custom(
-                                "Change the request",
-                                "Describe what should change before I try again.",
-                            )
-                            if feedback:
-                                goal = runtime.active_goal()
-                                if goal is not None and goal.active_plan_revision is not None:
-                                    start(parse_command(f"/replan {feedback}"))
-                                elif last_command is not None:
-                                    runtime.add_guidance(feedback)
-                                    start(last_command)
+                        if resolution.value == "retry" and retry_action is not None:
+                            start(retry_action, summary="Retrying the saved step")
+                        elif resolution.value == "model":
+                            start(handle_model, summary="Checking available models")
                         elif resolution.value == "details":
                             store.set_mode(ExperienceMode.ADVANCED)
                         continue
@@ -2861,6 +3322,23 @@ def _persistent_interactive_loop(
                         stop.set()
                         store.mark_exit()
                         break
+                    if pending_controls:
+                        control = pending_controls.pop(0)
+                        if control.kind is CommandKind.MODEL and not control.args.get("model") and not control.args.get("effort"):
+                            start(handle_model, summary="Checking available models")
+                        elif control.kind is CommandKind.PERMISSIONS and not control.args.get("level"):
+                            handle_permissions()
+                        else:
+                            start(control, summary="Applying the queued session change")
+                        continue
+                    if deferred_observers:
+                        observer = deferred_observers.pop(0)
+                        store.append_transcript(
+                            "assistant",
+                            "The worker reached a checkpoint; opening the requested details now.",
+                        )
+                        start(observer, summary="Loading requested details")
+                        continue
 
                 if slow_request_id is not None:
                     resolution = store.take_attention_result(slow_request_id)
@@ -2869,7 +3347,7 @@ def _persistent_interactive_loop(
                         if resolution.value == "stop":
                             interrupt()
 
-                if active_work is not None and not slow_prompted:
+                if active_work is not None and slow_request_id is None:
                     snapshot = store.snapshot()
                     last_signal = snapshot.activity.last_signal_at
                     quiet = (
@@ -2877,19 +3355,31 @@ def _persistent_interactive_loop(
                         if last_signal is None
                         else time.monotonic() - last_signal
                     )
-                    if quiet >= 60 and snapshot.attention is None:
-                        slow_prompted = True
+                    if quiet >= next_slow_notice and snapshot.attention is None:
+                        next_slow_notice = max(next_slow_notice * 2.0, quiet + 60.0)
                         slow_request_id = f"slow:{time.monotonic_ns()}"
+                        model_activity = snapshot.resources.model_activity
+                        waiting_on = (
+                            "A model call is still open."
+                            if model_activity in {"calling model", "thinking", "streaming"}
+                            else f"The worker is still active ({model_activity})."
+                        )
                         store.present_attention(
                             AttentionRequest(
                                 id=slow_request_id,
                                 kind=AttentionKind.RECOVERY,
                                 title="This is taking longer than usual",
-                                message="Work is still active. Nothing has been rejected or lost.",
+                                message=f"{waiting_on} Nothing has been rejected or lost.",
                                 options=(
-                                    AttentionOption("keep", "Keep waiting", "keep", shortcut="k", primary=True),
+                                    AttentionOption(
+                                        "keep", "Keep waiting", "keep", shortcut="k", primary=True,
+                                        recommended=True, auto_safe=True,
+                                    ),
                                     AttentionOption("stop", "Stop safely", "stop", shortcut="s"),
                                 ),
+                                default_key="keep",
+                                cancel_key="keep",
+                                auto_resolve_safe=True,
                             )
                         )
 
@@ -2905,8 +3395,32 @@ def _persistent_interactive_loop(
                                 _question_attention(question, source=session.source)
                             )
                             answer = resolution.text if resolution.key == "custom" else resolution.value
-                            answer_question(runtime, session, str(question.get("id", "")), answer or "1")
-                            _show_runtime_state(runtime, console, force=True)
+                            question_id = str(question.get("id", ""))
+
+                            def apply_answer(
+                                session_view: Any = session,
+                                selected_question_id: str = question_id,
+                                selected_answer: str = answer or "1",
+                                presentation_key: str = key,
+                            ) -> None:
+                                try:
+                                    answer_question(
+                                        runtime,
+                                        session_view,
+                                        selected_question_id,
+                                        selected_answer,
+                                    )
+                                    _show_runtime_state(runtime, console, force=True)
+                                except BaseException:
+                                    # If persistence failed before routing, the
+                                    # durable question remains pending and must
+                                    # be allowed to render again. If routing
+                                    # succeeded, question_session() is empty and
+                                    # recovery resumes the saved goal instead.
+                                    shown_questions.discard(presentation_key)
+                                    raise
+
+                            start(apply_answer, summary="Applying your choice")
                             continue
                         continue
 
@@ -2920,7 +3434,13 @@ def _persistent_interactive_loop(
                             reasons = plan_review_reasons(view)
                             store.set_activity(ActivityStage.PAUSED, "Review the plan", running=False)
                             resolution = store.request_attention(_plan_attention(view, reasons))
-                            if resolution.value == "start":
+                            if resolution.value == "open":
+                                app.open_details(
+                                    f"Plan r{view.plan_revision}",
+                                    render_plan(view),
+                                    kind="plan",
+                                )
+                            elif resolution.value == "start":
                                 start(parse_command(f"/approve {view.plan_revision}"))
                             elif resolution.value == "change":
                                 feedback = ask_custom("Change the plan", "What should I change?")
@@ -2972,16 +3492,51 @@ def _persistent_interactive_loop(
                 except Empty:
                     continue
                 text = item.text.strip()
+                if item.kind == "plan_save" and text:
+                    if active_work is None:
+                        app.close_overlay()
+                        start(
+                            lambda value=item.text: runtime.replace_plan_document(value),
+                            summary="Saving the edited plan as a new revision",
+                        )
+                    else:
+                        store.append_transcript(
+                            "assistant",
+                            "The edited plan is still in the editor; wait for the current action to reach a checkpoint before saving.",
+                        )
+                    continue
                 if not text:
                     if item.kind == "actions":
                         if active_work is None:
                             handle_actions()
+                    elif item.kind == "overlay_refresh" and app.overlay_kind == "swarm":
+                        run = _current_ultra_run(runtime)
+                        if run is not None:
+                            cached_swarm_snapshot = _swarm_inspector_snapshot(runtime, run)
+                            store.update_swarm_summary(cached_swarm_snapshot)
+                            app.update_swarm(cached_swarm_snapshot)
                     elif item.kind == "model":
                         if active_work is None:
-                            handle_model()
+                            start(handle_model, summary="Checking available models")
+                        else:
+                            pending_controls[:] = [parse_command("/model")]
+                            interrupt()
+                            store.append_transcript(
+                                "assistant",
+                                "Model selection is queued for the next saved checkpoint.",
+                            )
                     elif item.kind == "permissions":
                         if active_work is None:
                             handle_permissions()
+                        else:
+                            pending_controls[:] = [parse_command("/permissions")]
+                            interrupt()
+                            store.append_transcript(
+                                "assistant",
+                                "Permission selection is queued for the next saved checkpoint.",
+                            )
+                    elif item.kind == "sleep_toggle":
+                        console.toggle_sleep_mode()
                     continue
                 if text == "/" or item.kind == "actions":
                     if active_work is None:
@@ -2999,14 +3554,48 @@ def _persistent_interactive_loop(
                         continue
                     observer_kinds = {
                         CommandKind.STATUS, CommandKind.PLAN, CommandKind.DIFF,
+                        CommandKind.CHAT, CommandKind.EXPLORER,
                         CommandKind.PROCESSES, CommandKind.THINKING, CommandKind.AGENTS,
                         CommandKind.AGENT, CommandKind.TREE, CommandKind.METRICS,
                         CommandKind.MEMORY, CommandKind.TRACE, CommandKind.INSIGHTS,
                         CommandKind.HISTORY, CommandKind.VERSIONS, CommandKind.HELP,
-                        CommandKind.KEYMAP,
+                        CommandKind.KEYMAP, CommandKind.SLEEP, CommandKind.DETAILS,
                     }
+                    if active_command.kind in {CommandKind.MODEL, CommandKind.PERMISSIONS}:
+                        pending_controls[:] = [active_command]
+                        interrupt()
+                        store.append_transcript(
+                            "assistant",
+                            "That session change is queued for the next saved checkpoint.",
+                        )
+                        continue
                     if active_command.kind in observer_kinds:
-                        execute_command(runtime, console, active_command, preferences)
+                        if open_live_observer(active_command):
+                            pass
+                        elif active_command.kind is CommandKind.STATUS:
+                            current = store.snapshot()
+                            progress = current.progress
+                            count = (
+                                f"{progress.completed}/{progress.total} complete"
+                                if progress.total
+                                else "task total unknown"
+                            )
+                            store.append_transcript(
+                                "assistant",
+                                f"{progress.phase or current.activity.stage.value}: "
+                                f"{progress.current_task or current.activity.summary} · {count}. "
+                                "This is the latest presentation snapshot; work is still active.",
+                            )
+                        elif active_command.kind in {
+                            CommandKind.HELP, CommandKind.KEYMAP, CommandKind.SLEEP,
+                        }:
+                            execute_command(runtime, console, active_command, preferences)
+                        else:
+                            deferred_observers.append(active_command)
+                            store.append_transcript(
+                                "assistant",
+                                "That detail view is queued for the next safe checkpoint so it cannot race the active worker.",
+                            )
                         continue
                     if active_command.kind is CommandKind.PAUSE:
                         interrupt()
@@ -3031,7 +3620,7 @@ def _persistent_interactive_loop(
                                 AttentionOption(
                                     "update", "Update current task", "update",
                                     description="Save this as guidance at the next safe point.",
-                                    shortcut="u", primary=True,
+                                    shortcut="u", recommended=True,
                                 ),
                                 AttentionOption(
                                     "new", "Start a new task", "new",
@@ -3040,6 +3629,8 @@ def _persistent_interactive_loop(
                                 ),
                                 AttentionOption("cancel", "Cancel", "cancel", shortcut="c"),
                             ),
+                            default_key="cancel",
+                            cancel_key="cancel",
                         )
                     )
                     if resolution.value == "new":
@@ -3062,8 +3653,10 @@ def _persistent_interactive_loop(
                 except CommandParseError as exc:
                     store.append_transcript("assistant", f"I couldn’t understand that: {exc}")
                     continue
+                if open_live_observer(command):
+                    continue
                 if command.kind is CommandKind.MODEL and not command.args.get("model") and not command.args.get("effort"):
-                    handle_model()
+                    start(handle_model, summary="Checking available models")
                     continue
                 if command.kind is CommandKind.PERMISSIONS and not command.args.get("level"):
                     handle_permissions()
@@ -3087,7 +3680,7 @@ def _persistent_interactive_loop(
                                 AttentionOption(
                                     "update", "Update current task", "update",
                                     description="Treat this message as guidance for the active goal.",
-                                    shortcut="u", primary=True,
+                                    shortcut="u", recommended=True,
                                 ),
                                 AttentionOption(
                                     "replace", "Start a new task", "replace",
@@ -3096,6 +3689,8 @@ def _persistent_interactive_loop(
                                 ),
                                 AttentionOption("cancel", "Cancel", "cancel", shortcut="c"),
                             ),
+                            default_key="cancel",
+                            cancel_key="cancel",
                         )
                     )
                     if resolution.value == "cancel":
@@ -3103,6 +3698,63 @@ def _persistent_interactive_loop(
                     if resolution.value == "replace":
                         runtime.cancel("CANCEL")
                 start(command)
+        except Exception as exc:
+            # A presentation/controller defect must never escape a background
+            # thread as an unhandled traceback. Keep the workspace alive so
+            # the user can inspect diagnostics or leave through Ctrl+Q.
+            diagnostic = redact_text(
+                "".join(traceback.format_exception(exc)),
+                6_000,
+            )
+            store.append_log(f"controller failure: {diagnostic}")
+            store.set_activity(
+                ActivityStage.PROBLEM,
+                "The terminal controller hit an internal error",
+                running=False,
+            )
+            request_id = f"controller-failure:{time.monotonic_ns()}"
+            store.present_attention(
+                AttentionRequest(
+                    id=request_id,
+                    kind=AttentionKind.RECOVERY,
+                    title="Terminal controller recovered from an internal error",
+                    message="Project state is still saved. Open details or exit safely.",
+                    details=diagnostic,
+                    options=(
+                        AttentionOption("details", "Details", "details", shortcut="d"),
+                        AttentionOption("exit", "Exit safely", "exit", shortcut="q"),
+                    ),
+                    default_key="details",
+                    cancel_key="details",
+                )
+            )
+            while not stop.is_set():
+                resolution = store.take_attention_result(request_id)
+                if resolution is not None:
+                    if resolution.value == "details":
+                        store.set_mode(ExperienceMode.ADVANCED)
+                    elif resolution.value == "exit":
+                        stop.set()
+                        break
+                try:
+                    item = inbox.get(timeout=0.1)
+                except Empty:
+                    try:
+                        goal = runtime.active_goal()
+                        if (
+                            goal is not None
+                            and bool(goal.metadata.get("pause_requested"))
+                            and active_work is None
+                        ):
+                            runtime.complete_requested_pause()
+                    except Exception as exc:
+                        store.append_log(f"pause watchdog: {exc}")
+                    continue
+                if item.kind == "sleep_toggle":
+                    store.toggle_sleep_mode()
+                elif item.text.strip() in {"/quit", ":quit"}:
+                    stop.set()
+                    break
         finally:
             stop.set()
             store.mark_exit()
@@ -3120,6 +3772,7 @@ def _persistent_interactive_loop(
         stop.set()
         store.mark_exit()
         controller_thread.join(timeout=5)
+        telemetry.stop()
         console.bind_workspace_store(None)
 
 
@@ -3156,6 +3809,7 @@ def _legacy_interactive_loop(
     active_observer_kinds = {
         CommandKind.STATUS,
         CommandKind.THINKING,
+        CommandKind.DETAILS,
         CommandKind.AGENTS,
         CommandKind.AGENT,
         CommandKind.TREE,
@@ -3172,6 +3826,7 @@ def _legacy_interactive_loop(
         CommandKind.HELP,
         CommandKind.KEYMAP,
         CommandKind.PAUSE,
+        CommandKind.SLEEP,
     }
     while True:
         if console.has_pending_approval() is True:
@@ -3567,6 +4222,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             console.write(permission_adapter.selection.reason)
 
         console.set_mode(preferences.mode)
+        console.set_context_window(getattr(provider, "context_size", None))
         console.set_runtime_identity(
             access_level=permission_adapter.access_level.value,
             execution_class=descriptor.execution_class.value,
@@ -3575,6 +4231,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
         bus = EventBus()
         bus.subscribe(console.on_event)
+        try:
+            record_workspace(workspace)
+        except (OSError, RuntimeError, ValueError):
+            pass
         store = StateStore(workspace)
         runtime = AgentRuntime(
             provider,

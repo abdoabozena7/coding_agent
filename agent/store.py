@@ -100,7 +100,7 @@ from .durable_memory import (
 )
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 DEFAULT_TRACE_MAX_BYTES = 256_000
 MAX_TRACE_MAX_BYTES = 2_000_000
@@ -420,6 +420,9 @@ class StateStore:
                     existing = 10
                 if existing < 11:
                     self._migrate_v11()
+                    existing = 11
+                if existing < 12:
+                    self._migrate_v12()
                 self._connection.execute(
                     "UPDATE managed_resources SET status='stale',updated_at=? WHERE status IN ('running','ready')",
                     (_iso(utc_now()),),
@@ -1424,6 +1427,38 @@ class StateStore:
         """
         self._connection.executescript(schema)
 
+    def _migrate_v12(self) -> None:
+        """Persist editable plan documents and idempotent timeline metadata."""
+
+        columns = {
+            str(row[1])
+            for row in self._connection.execute("PRAGMA table_info(chat_messages)").fetchall()
+        }
+        alters = []
+        if "event_key" not in columns:
+            alters.append("ALTER TABLE chat_messages ADD COLUMN event_key TEXT")
+        if "run_id" not in columns:
+            alters.append("ALTER TABLE chat_messages ADD COLUMN run_id TEXT NOT NULL DEFAULT ''")
+        if "visibility" not in columns:
+            alters.append("ALTER TABLE chat_messages ADD COLUMN visibility TEXT NOT NULL DEFAULT 'transcript'")
+        schema = "\n".join(alters)
+        with self.transaction() as connection:
+            for statement in alters:
+                connection.execute(statement)
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_messages_event_key "
+                "ON chat_messages(session_id,event_key) WHERE event_key IS NOT NULL"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS plan_documents ("
+                "plan_id TEXT PRIMARY KEY REFERENCES plans(id) ON DELETE CASCADE,"
+                "goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,"
+                "revision INTEGER NOT NULL,format_version INTEGER NOT NULL,"
+                "content TEXT NOT NULL,content_hash TEXT NOT NULL,edited_by TEXT NOT NULL,"
+                "created_at TEXT NOT NULL,UNIQUE(goal_id,revision))"
+            )
+            connection.execute("PRAGMA user_version=12")
+
     def _ensure_brain_fts(self) -> bool:
         """Enable FTS5 when SQLite provides it; LIKE search remains portable."""
         try:
@@ -1699,6 +1734,9 @@ class StateStore:
         expected_changes: Iterable[Mapping[str, Any]],
         proposed_by: str = "agent",
         submit: bool = True,
+        source_document: str | None = None,
+        source_format_version: int = 1,
+        edited_by: str = "",
     ) -> Plan:
         summary = str(summary).strip()
         if not summary:
@@ -1766,6 +1804,22 @@ class StateStore:
                         _iso(task.updated_at),
                     ),
                 )
+            if source_document is not None:
+                document = str(source_document)
+                connection.execute(
+                    "INSERT INTO plan_documents(plan_id,goal_id,revision,format_version,content,content_hash,edited_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        plan.id,
+                        goal_id,
+                        revision,
+                        max(1, int(source_format_version)),
+                        document,
+                        hashlib.sha256(document.encode("utf-8")).hexdigest(),
+                        str(edited_by or proposed_by),
+                        _iso(now),
+                    ),
+                )
             self._event(
                 connection,
                 "plan.submitted" if submit else "plan.created",
@@ -1775,6 +1829,13 @@ class StateStore:
                 payload={"revision": revision, "fingerprint": plan.fingerprint, "proposed_by": proposed_by},
             )
             return plan
+
+    def get_plan_document(self, plan_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM plan_documents WHERE plan_id=?", (str(plan_id),)
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     revise_plan = create_plan
 
@@ -5070,6 +5131,22 @@ class StateStore:
             )
         return self.get_intake_session(intake_id)
 
+    def cancel_intake_session(self, intake_id: str, *, reason: str = "") -> dict[str, Any]:
+        """Close an intake without routing it into a goal.
+
+        The original request and answered choices remain durable for the chat
+        timeline/recovery view; only the pending-decision status is cleared.
+        """
+
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE intake_sessions SET status='cancelled',route_reason=?,updated_at=? WHERE id=?",
+                (str(reason), _iso(utc_now()), intake_id),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError(f"intake session not found: {intake_id}")
+        return self.get_intake_session(intake_id)
+
     def save_specialist_profile(self, item: Mapping[str, Any]) -> dict[str, Any]:
         profile_id = str(item.get("id") or new_id("specialist"))
         now = _iso(utc_now())
@@ -6022,14 +6099,56 @@ class StateStore:
             raise NotFoundError(f"workflow session not found: {session_id}")
         return {**dict(row), "state": _loads(row["state_json"], {})}
 
-    def append_chat_message(self, session_id: str, message: Mapping[str, Any]) -> int:
+    def append_chat_message(
+        self,
+        session_id: str,
+        message: Mapping[str, Any],
+        *,
+        event_key: str | None = None,
+        run_id: str = "",
+        visibility: str = "transcript",
+    ) -> int:
         encoded = _json(dict(message))
         with self.transaction() as connection:
+            if event_key:
+                existing = connection.execute(
+                    "SELECT sequence FROM chat_messages WHERE session_id=? AND event_key=?",
+                    (session_id, str(event_key)),
+                ).fetchone()
+                if existing is not None:
+                    return int(existing[0])
             cursor = connection.execute(
-                "INSERT INTO chat_messages(session_id,message_json,created_at) VALUES(?,?,?)",
-                (session_id, encoded, _iso(utc_now())),
+                "INSERT INTO chat_messages(session_id,message_json,created_at,event_key,run_id,visibility) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    session_id,
+                    encoded,
+                    _iso(utc_now()),
+                    str(event_key) if event_key else None,
+                    str(run_id),
+                    str(visibility),
+                ),
             )
             return int(cursor.lastrowid)
+
+    def list_timeline_entries(self, session_id: str, *, limit: int = 500) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            rows = list(reversed(self._connection.execute(
+                "SELECT sequence,message_json,created_at,event_key,run_id,visibility "
+                "FROM chat_messages WHERE session_id=? ORDER BY sequence DESC LIMIT ?",
+                (session_id, max(1, min(int(limit), 2_000))),
+            ).fetchall()))
+        return tuple(
+            {
+                "sequence": int(row["sequence"]),
+                "message": _loads(row["message_json"], {}),
+                "created_at": row["created_at"],
+                "event_key": row["event_key"],
+                "run_id": row["run_id"],
+                "visibility": row["visibility"],
+            }
+            for row in rows
+        )
 
     def list_chat_messages(self, session_id: str, *, limit: int = 200) -> tuple[dict[str, Any], ...]:
         with self._lock:

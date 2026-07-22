@@ -4,6 +4,7 @@ import unittest
 import time
 from threading import Thread
 from types import SimpleNamespace
+from unittest import mock
 
 from agent.ui_state import (
     ActivityStage,
@@ -11,6 +12,8 @@ from agent.ui_state import (
     AttentionOption,
     AttentionRequest,
     ExperienceMode,
+    PresentationEvent,
+    PresentationLifecycle,
     WorkspaceUIStore,
     answer_question,
     answer_recommended_remaining,
@@ -208,6 +211,153 @@ class WorkspaceStoreTests(unittest.TestCase):
         store.mark_exit()
         worker.join(1)
         self.assertEqual(answers[0].value, "ui_error")
+
+    def test_dashboard_progress_learns_an_approximate_eta_only_after_observed_work(self):
+        store = WorkspaceUIStore()
+        pending = SimpleNamespace(id="a", title="Inspect", status="in_progress")
+        later = SimpleNamespace(id="b", title="Build", status="pending")
+        view = SimpleNamespace(
+            objective="Upgrade TUI", plan_revision=1, status="running",
+            goal_attempt=0, retry_reason="", tasks=(pending, later),
+        )
+        with mock.patch("agent.ui_state.time.monotonic", side_effect=(10.0, 20.0, 20.0)):
+            store.sync_dashboard(view)
+            learning = store.snapshot().progress
+            self.assertIsNone(learning.eta_low_seconds)
+            pending.status = "done"
+            store.sync_dashboard(view)
+        learned = store.snapshot().progress
+        self.assertEqual((learned.completed, learned.remaining), (1, 1))
+        self.assertIsNotNone(learned.eta_low_seconds)
+        self.assertGreater(learned.eta_high_seconds, learned.eta_low_seconds)
+
+    def test_sleep_auto_resolves_only_explicit_safe_recommended_questions(self):
+        store = WorkspaceUIStore()
+        store.set_sleep_mode(True)
+        safe = AttentionRequest(
+            id="safe",
+            kind=AttentionKind.QUESTION,
+            title="Continue waiting?",
+            options=(
+                AttentionOption(
+                    "keep", "Keep waiting", "keep", recommended=True, auto_safe=True
+                ),
+                AttentionOption("stop", "Stop", "stop"),
+            ),
+            auto_resolve_safe=True,
+        )
+        event = store.present_attention(safe)
+        self.assertTrue(event.is_set())
+        answer = store.take_attention_result("safe")
+        self.assertEqual(answer.origin, "sleep")
+        self.assertIn("Keep waiting", store.snapshot().sleep_log[-1])
+        self.assertFalse(
+            any("Keep waiting" in item.text for item in store.snapshot().transcript)
+        )
+
+        unsafe = AttentionRequest(
+            id="unsafe",
+            kind=AttentionKind.APPROVAL,
+            title="Delete files?",
+            options=(
+                AttentionOption(
+                    "yes", "Delete", "yes", recommended=True, auto_safe=True
+                ),
+                AttentionOption("no", "Deny", "no", primary=True),
+            ),
+            default_key="no",
+            cancel_key="no",
+            auto_resolve_safe=True,
+        )
+        event = store.present_attention(unsafe)
+        self.assertFalse(event.is_set())
+        self.assertEqual(store.active_attention(), unsafe)
+        store.cancel_attention()
+        self.assertEqual(store.take_attention_result("unsafe").value, "no")
+
+    def test_invalid_choice_preserves_decision_and_escape_uses_safe_cancel(self):
+        store = WorkspaceUIStore()
+        request = AttentionRequest(
+            id="strict",
+            kind=AttentionKind.PLAN_REVIEW,
+            title="Start?",
+            options=(
+                AttentionOption("start", "Start", "start", recommended=True),
+                AttentionOption("pause", "Keep paused", "pause"),
+            ),
+            default_key="pause",
+            cancel_key="pause",
+        )
+        store.present_attention(request)
+        self.assertFalse(store.resolve_attention("missing"))
+        self.assertEqual(store.active_attention(), request)
+        self.assertIn("Invalid choice", store.snapshot().attention_feedback)
+        self.assertTrue(store.cancel_attention())
+        self.assertEqual(store.take_attention_result("strict").value, "pause")
+
+    def test_context_capacity_and_log_coalescing_remain_truthful(self):
+        store = WorkspaceUIStore()
+        store.handle_event("usage", data={"input_tokens": 1_200})
+        self.assertIsNone(store.snapshot().resources.context_remaining_tokens)
+        store.set_context_window(4_000)
+        self.assertEqual(store.snapshot().resources.context_remaining_tokens, 2_800)
+        store.append_log("polling worker")
+        store.append_log("polling worker")
+        self.assertEqual(store.snapshot().log_entries[-1].count, 2)
+        store.append_log("error: first")
+        store.append_log("error: first")
+        self.assertEqual(store.snapshot().log_entries[-2].category, "error")
+        self.assertEqual(store.snapshot().log_entries[-1].count, 1)
+
+    def test_stream_finalization_is_idempotent(self):
+        store = WorkspaceUIStore()
+        store.handle_event("model_text", "Final result")
+        store.finalize_stream()
+        store.finalize_stream()
+        messages = [item.text for item in store.snapshot().transcript]
+        self.assertEqual(messages.count("Final result"), 1)
+
+    def test_failed_stream_attempt_is_discarded_before_manual_retry(self):
+        store = WorkspaceUIStore()
+        store.handle_event("model_text", "partial answer")
+        store.finalize_stream(commit=False)
+        store.finalize_stream(commit=False)
+
+        self.assertFalse(store.snapshot().transcript)
+        self.assertEqual(store.snapshot().resources.model_activity, "idle")
+
+    def test_internal_actor_stream_stays_out_of_the_user_transcript(self):
+        store = WorkspaceUIStore()
+
+        store.handle_event(
+            "model_text",
+            "private planner protocol and a very large draft",
+            {"actor": "architect"},
+        )
+
+        snapshot = store.snapshot()
+        self.assertFalse(snapshot.transcript)
+        self.assertIn("architect", snapshot.resources.model_activity)
+        self.assertTrue(any("reasoning.architect" in item for item in snapshot.advanced_log))
+
+    def test_presentation_receipts_are_idempotent_and_active_events_are_transient(self):
+        store = WorkspaceUIStore()
+        store.publish(
+            PresentationEvent(
+                "plan:1:active",
+                "plan",
+                "Architect · reviewing the plan",
+                PresentationLifecycle.ACTIVE,
+                actor="architect",
+            )
+        )
+        self.assertFalse(store.snapshot().transcript)
+        store.publish(PresentationEvent("plan:1:settled", "plan", "Plan revision 1 is ready."))
+        store.publish(PresentationEvent("plan:1:settled", "plan", "Plan revision 1 is ready."))
+        self.assertEqual(
+            [item.text for item in store.snapshot().transcript],
+            ["Plan revision 1 is ready."],
+        )
 
 
 if __name__ == "__main__":

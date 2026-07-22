@@ -86,6 +86,48 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(restored.status, GoalStatus.RUNNING)
         self.assertEqual(restored.active_plan_revision, 2)
 
+    def test_plan_document_and_timeline_events_are_durable_and_idempotent(self):
+        goal = self._pending_goal()
+        document = "# Project Plan\n\n## Summary\nA manually edited plan.\n"
+        plan = self.store.create_plan(
+            goal.id,
+            "manual plan",
+            [task("T001")],
+            source_document=document,
+            source_format_version=1,
+            edited_by="user",
+            **plan_basis("T001"),
+        )
+        stored = self.store.get_plan_document(plan.id)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored["content"], document)
+        self.assertEqual(stored["edited_by"], "user")
+
+        self.store.save_workflow_session(
+            "session-test",
+            goal_id=goal.id,
+            session_mode="normal",
+            plan_state="awaiting_approval",
+            run_state="idle",
+        )
+        first = self.store.append_chat_message(
+            "session-test",
+            {"role": "assistant", "content": "Plan revision is ready."},
+            event_key="plan:1:settled",
+            run_id="run-1",
+            visibility="timeline",
+        )
+        second = self.store.append_chat_message(
+            "session-test",
+            {"role": "assistant", "content": "Plan revision is ready."},
+            event_key="plan:1:settled",
+            run_id="run-1",
+            visibility="timeline",
+        )
+        self.assertEqual(first, second)
+        timeline = self.store.list_timeline_entries("session-test")
+        self.assertEqual(len(timeline), 1)
+
     def test_applicability_evidence_is_persisted_and_fingerprint_bound(self):
         goal = self._pending_goal()
         first_basis = plan_basis("T001")
@@ -165,7 +207,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get_plan(goal.id, plan.revision).fingerprint, plan.fingerprint)
         migrated = sqlite3.connect(path)
         try:
-            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 11)
+            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 12)
             self.assertIsNotNone(
                 migrated.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='ultra_runs'"

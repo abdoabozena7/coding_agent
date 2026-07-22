@@ -33,25 +33,28 @@ class IntentArchitectTests(unittest.TestCase):
         self.assertEqual(decision.questions, ())
         self.assertIs(decision.brief.routed_mode, RunMode.NORMAL)
 
-    def test_ambiguous_threejs_game_promotes_to_ultra(self) -> None:
+    def test_ambiguous_threejs_game_recommends_ultra_without_silent_promotion(self) -> None:
         decision = IntentArchitect().analyze(
             "اعمل لعبة عربيات 3D في ملف HTML بـThree.js"
         )
 
-        self.assertIs(decision.brief.routed_mode, RunMode.ULTRA)
+        self.assertIs(decision.brief.routed_mode, RunMode.NORMAL)
+        self.assertEqual(decision.questions[0].id, "execution_mode")
+        self.assertTrue(decision.questions[0].options[0].recommended)
         self.assertIn("visual_interactive_showcase", decision.complexity.hard_triggers)
         self.assertEqual(len(decision.questions), 3)
         self.assertEqual(answer_from_value(decision.questions[0], "1")[1], "suggested")
         self.assertEqual(answer_from_value(decision.questions[0], "4 Web kiosk"), ("Web kiosk", "freeform"))
 
-    def test_explicit_normal_still_promotes_on_hard_trigger_and_keeps_discovery(self) -> None:
+    def test_explicit_normal_keeps_safe_default_and_discovery_on_hard_trigger(self) -> None:
         decision = IntentArchitect().analyze(
             "Build a visual WebGL game with vehicle road character and logic specialists.",
             requested_mode="normal",
             repository_facts=("Discovered repository context: src/game.js",),
         )
 
-        self.assertIs(decision.brief.routed_mode, RunMode.ULTRA)
+        self.assertIs(decision.brief.routed_mode, RunMode.NORMAL)
+        self.assertEqual(decision.questions[0].id, "execution_mode")
         self.assertIn("Discovered repository context: src/game.js", decision.brief.assumptions)
 
     def test_short_existing_game_refinement_preserves_baseline_without_reasking_project_shape(self) -> None:

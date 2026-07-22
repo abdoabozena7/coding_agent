@@ -18,7 +18,7 @@ from agent.cli import (
     interactive_loop,
     main,
 )
-from agent.commands import CommandKind, parse_command
+from agent.commands import CommandKind, CommandParseError, parse_command
 from agent.config import InteractionMode, RuntimeConfig, SessionPreferences
 from agent.models import GoalStatus
 from agent.store import StateStore
@@ -34,6 +34,133 @@ class _TTY(io.StringIO):
 
 
 class CLITests(unittest.TestCase):
+    def test_persistent_controller_contains_last_intake_provider_failure(self):
+        import time
+
+        from agent.cli import _persistent_interactive_loop
+        from agent.local_provider import (
+            ProviderDiagnostic,
+            ProviderFailureKind,
+            ProviderRequestError,
+        )
+
+        session = SimpleNamespace(
+            source="intake",
+            current={
+                "id": "q-last",
+                "question": "Use the recommended architecture?",
+                "options": (
+                    {"label": "Yes", "description": "Continue", "recommended": True},
+                ),
+            },
+        )
+        failure = ProviderRequestError(
+            ProviderDiagnostic(
+                True,
+                ProviderFailureKind.MODEL_LOAD_FAILED,
+                "parse_stream",
+                provider_message="CUDA error: illegal memory access",
+                endpoint="http://localhost:11434/api/chat",
+            )
+        )
+        captured = {}
+
+        class FakeApp:
+            def __init__(self, store, *, on_input, on_interrupt, on_exit, **_kwargs):
+                self.store = store
+                self.on_exit = on_exit
+                self.overlay_kind = ""
+                captured["store"] = store
+
+            def run(self):
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    request = self.store.active_attention()
+                    if request is None:
+                        time.sleep(0.01)
+                        continue
+                    if request.kind.value == "recovery":
+                        self.store.resolve_attention("keep")
+                        self.on_exit()
+                        return
+                    self.store.resolve_selected_attention()
+                    time.sleep(0.01)
+                self.on_exit()
+
+            def stop(self):
+                return None
+
+            def open_details(self, *_args, **_kwargs):
+                return None
+
+            def open_swarm(self, *_args, **_kwargs):
+                return None
+
+            def update_swarm(self, *_args, **_kwargs):
+                return None
+
+        runtime = mock.Mock()
+        runtime.workspace = Path("workspace")
+        runtime.model_name = "ollama/test"
+        runtime.dashboard.return_value = SimpleNamespace(
+            status="idle", tasks=(), objective="", goal_id="", plan_revision=0
+        )
+        runtime.active_goal.return_value = None
+        console = mock.Mock()
+        console.stream = io.StringIO()
+        console.color = False
+        answer = mock.Mock(side_effect=failure)
+
+        with mock.patch("agent.cli.PersistentWorkspaceApp", FakeApp), mock.patch(
+            "agent.cli.TelemetrySampler"
+        ) as telemetry, mock.patch(
+            "agent.cli.question_session", return_value=session
+        ), mock.patch(
+            "agent.cli.answer_question", answer
+        ), mock.patch(
+            "agent.cli._show_runtime_state"
+        ), mock.patch(
+            "agent.cli._current_ultra_run", return_value=None
+        ):
+            telemetry.return_value.start.return_value = None
+            telemetry.return_value.stop.return_value = None
+            _persistent_interactive_loop(runtime, console, SessionPreferences())
+
+        answer.assert_called_once()
+        transcript = captured["store"].snapshot().transcript
+        self.assertTrue(
+            any("Local model stopped unexpectedly" in item.text for item in transcript)
+        )
+
+    def test_general_sleep_mode_is_available_outside_ultra(self):
+        output = io.StringIO()
+        console = ConsoleUI(stream=output, color=False)
+        runtime = mock.Mock()
+        preferences = SessionPreferences(mode=InteractionMode.NORMAL)
+
+        self.assertTrue(
+            execute_command(runtime, console, parse_command("/sleep on"), preferences)
+        )
+        self.assertTrue(console.sleep_enabled)
+        runtime.sleep_profile.assert_not_called()
+        self.assertTrue(
+            execute_command(runtime, console, parse_command("/sleep status"), preferences)
+        )
+        self.assertIn("safe recommended choices only", output.getvalue())
+
+    def test_ultra_sleep_gate_failure_does_not_disable_safe_ui_sleep(self):
+        output = io.StringIO()
+        console = ConsoleUI(stream=output, color=False)
+        runtime = mock.Mock()
+        runtime.sleep_profile.side_effect = RuntimeError("Docker is not ready")
+        preferences = SessionPreferences(mode=InteractionMode.ULTRA)
+
+        self.assertTrue(
+            execute_command(runtime, console, parse_command("/sleep on"), preferences)
+        )
+        self.assertTrue(console.sleep_enabled)
+        self.assertIn("deeper Ultra Sleep was not armed", output.getvalue())
+
     def test_plain_project_protection_defaults_to_local_git_when_gh_is_missing(self):
         with tempfile.TemporaryDirectory() as directory:
             output = io.StringIO()
@@ -109,6 +236,9 @@ class CLITests(unittest.TestCase):
         self.assertEqual(parse_command("/").kind, CommandKind.MENU)
         self.assertEqual(parse_command("/   ").kind, CommandKind.MENU)
         self.assertEqual(parse_command("/thinking").kind, CommandKind.THINKING)
+        self.assertEqual(parse_command("/reasoning hide").args["action"], "hide")
+        self.assertEqual(parse_command("/details 42").kind, CommandKind.DETAILS)
+        self.assertEqual(parse_command("/details 42").args["target"], "42")
         self.assertEqual(parse_command("/doctor").kind, CommandKind.DOCTOR)
         self.assertEqual(parse_command("/readiness").kind, CommandKind.DOCTOR)
         self.assertEqual(parse_command("/doctor --live").args, {"live": True})
@@ -126,21 +256,23 @@ class CLITests(unittest.TestCase):
         self.assertEqual(stopped.args["resource_id"], "preview-123")
         self.assertEqual(parse_command("/model gemma4:e4b high").args, {"model": "gemma4:e4b", "effort": "high"})
         self.assertEqual(parse_command("/model xhigh").args, {"model": None, "effort": "xhigh"})
-        self.assertEqual(parse_command("/ide").kind, CommandKind.IDE)
         self.assertEqual(parse_command("/keymap").kind, CommandKind.KEYMAP)
-        self.assertEqual(parse_command("/vim on").args, {"state": "on"})
-        self.assertEqual(
-            parse_command("/sandbox-add-read-dir C:\\Users").args,
-            {"path": "C:\\Users"},
-        )
-        self.assertEqual(parse_command("/experimental").args, {"state": "status"})
+        for unsupported in (
+            "/ide", "/vim on", "/sandbox-add-read-dir C:\\Users", "/experimental"
+        ):
+            with self.assertRaises(CommandParseError):
+                parse_command(unsupported)
+        self.assertEqual(parse_command("/chat").kind, CommandKind.CHAT)
+        self.assertEqual(parse_command("/explorer").kind, CommandKind.EXPLORER)
+        self.assertEqual(parse_command("/continue").kind, CommandKind.RESUME)
+        self.assertEqual(parse_command("/plan edit").args["action"], "edit")
 
         mode_query = parse_command("/mode")
         self.assertEqual(mode_query.kind, CommandKind.MODE)
         self.assertIsNone(mode_query.args["mode"])
         self.assertEqual(parse_command("/mode GOAL").args["mode"], "normal")
         self.assertEqual(parse_command("/mode\tgoal").args["mode"], "normal")
-        self.assertEqual(parse_command(":mode plan").args["mode"], "normal")
+        self.assertEqual(parse_command(":mode plan").args["mode"], "plan")
 
         settings_query = parse_command("/settings")
         self.assertEqual(settings_query.kind, CommandKind.SETTINGS)

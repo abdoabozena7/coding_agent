@@ -11,6 +11,9 @@ python-dotenv>=1.2,<2
 prompt-toolkit>=3.0,<4
 colorama>=0.4.6,<1
 
+# Cross-platform CPU/RAM/process telemetry for the non-blocking TUI sampler.
+psutil>=7.2,<8
+
 # Real local HTML preview verification (uses installed Chrome/Edge first).
 playwright>=1.61,<2
 

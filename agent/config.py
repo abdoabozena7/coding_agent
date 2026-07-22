@@ -14,9 +14,9 @@ class InteractionMode(str, Enum):
     """Public run policy; intake/planning are internal lifecycle phases."""
 
     NORMAL = "normal"
+    PLAN = "plan"
     ULTRA = "ultra"
     CHAT = "normal"
-    PLAN = "normal"
     GOAL = "normal"
 
     @classmethod
@@ -27,7 +27,7 @@ class InteractionMode(str, Enum):
         try:
             return cls(normalized)
         except ValueError as exc:
-            raise ValueError("mode must be 'normal' or 'ultra'") from exc
+            raise ValueError("mode must be 'plan', 'normal', or 'ultra'") from exc
 
 
 class ReasoningEffort(str, Enum):

@@ -1372,6 +1372,26 @@ class DelegationAndReviewTests(RuntimeTestCase):
 
 
 class RecoveryRuntimeTests(RuntimeTestCase):
+    def test_failed_ultra_foundation_retry_reuses_saved_goal(self):
+        goal = self.store.create_goal("Saved canonical objective")
+        self.store.transition_goal(goal.id, GoalStatus.DISCOVERING)
+        runtime = AgentRuntime(
+            ScriptedProvider([]), self.store, self.workspace, config=self.config
+        )
+        session = mock.Mock()
+        session.running = False
+        session.restart_foundation.return_value = "master-plan"
+
+        with mock.patch.object(runtime, "_make_ultra_session", return_value=session):
+            result = runtime.retry_ultra_foundation()
+
+        self.assertEqual(result, "master-plan")
+        session.restart_foundation.assert_called_once_with(
+            goal.id, "Saved canonical objective"
+        )
+        self.assertEqual(self.store.get_goal(goal.id).status, GoalStatus.DISCOVERING)
+        self.assertEqual(self.store.get_latest_goal().id, goal.id)
+
     def test_interrupted_planning_resumes_planner_not_invalid_running_state(self):
         goal = self.store.create_goal("Resume an interrupted plan")
         self.store.transition_goal(goal.id, GoalStatus.DISCOVERING)

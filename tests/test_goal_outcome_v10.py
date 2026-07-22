@@ -216,7 +216,7 @@ class GoalOutcomePersistenceTests(unittest.TestCase):
 
             connection = sqlite3.connect(Path(directory) / ".coding-agent" / "state.db")
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 11)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 12)
                 tables = {
                     row[0]
                     for row in connection.execute(

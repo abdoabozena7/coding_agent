@@ -225,7 +225,7 @@ class PromptCompletenessV9Tests(unittest.TestCase):
         )
         self.assertEqual(
             [item.id for item in decision.questions],
-            ["platform", "packaging", "visual_direction"],
+            ["execution_mode", "platform", "packaging"],
         )
 
     def test_existing_game_refinement_targets_discovered_nested_artifact(self) -> None:
@@ -1693,7 +1693,7 @@ class PersistenceAndPickerV9Tests(unittest.TestCase):
             store.close()
             connection = sqlite3.connect(Path(directory) / ".coding-agent" / "state.db")
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 11)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 12)
                 tables = {
                     row[0]
                     for row in connection.execute(

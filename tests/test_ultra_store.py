@@ -147,7 +147,7 @@ class UltraStoreTests(unittest.TestCase):
         self.assertIs(AccessLevel, SandboxAccessLevel)
         connection = sqlite3.connect(self.store.path)
         try:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 11)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 12)
             tables = {
                 row[0]
                 for row in connection.execute(

@@ -447,6 +447,53 @@ class OllamaProviderTests(unittest.TestCase):
         self.assertEqual(retry_payload["options"]["num_gpu"], 999)
         self.assertEqual(retry_payload["options"]["num_ctx"], 4096)
 
+    def test_streamed_grammar_cuda_failure_is_typed_and_replayed_once(self):
+        provider = OllamaProvider(model="offline", context_size=4096, num_gpu=999)
+        provider.capability_profile = __import__(
+            "agent.local_provider", fromlist=["ModelCapabilityProfile"]
+        ).ModelCapabilityProfile("offline", health_status="reachable")
+        failed = io.BytesIO(
+            json.dumps(
+                {
+                    "error": (
+                        "Unexpected empty grammar stack after accepting piece: <unused50>; "
+                        "CUDA error: an illegal memory access was encountered"
+                    )
+                }
+            ).encode()
+            + b"\n"
+        )
+        unloaded = io.BytesIO(b'{"done":true}\n')
+        recovered = io.BytesIO(
+            b'{"message":{"content":"recovered"},"done":true}\n'
+        )
+        provider._post_json = Mock(side_effect=[failed, unloaded, recovered])
+
+        turn = provider.call([], [], "system")
+
+        self.assertEqual(turn.text, "recovered")
+        self.assertEqual(provider._post_json.call_count, 3)
+        self.assertEqual(
+            provider._post_json.call_args_list[2].args[1]["options"]["num_gpu"],
+            999,
+        )
+
+    def test_streamed_runner_failure_after_visible_text_does_not_duplicate_retry(self):
+        provider = OllamaProvider(model="offline")
+        response = io.BytesIO(
+            b'{"message":{"content":"partial"}}\n'
+            + b'{"error":"CUDA error: illegal memory access"}\n'
+        )
+        provider._post_json = Mock(return_value=response)
+        fragments = []
+
+        with self.assertRaises(ProviderRequestError) as raised:
+            provider.call([], [], "system", on_text=fragments.append)
+
+        self.assertEqual(raised.exception.diagnostic.kind, ProviderFailureKind.MODEL_LOAD_FAILED)
+        self.assertEqual(fragments, ["partial"])
+        self.assertEqual(provider._post_json.call_count, 1)
+
     def test_completely_malformed_stream_is_classified_not_silently_accepted(self):
         provider = OllamaProvider(model="offline")
         provider._post_json = Mock(return_value=io.BytesIO(b"not-json\n{broken\n"))

@@ -237,6 +237,51 @@ class OllamaProvider:
         with response:
             response.read()
 
+    def _stream_error(self, message: Any) -> ProviderRequestError:
+        """Normalize an Ollama NDJSON error into the provider error contract."""
+
+        safe = redact_provider_message(str(message or "Ollama stream failed"))
+        lowered = safe.casefold()
+        if any(token in lowered for token in ("cuda error", "illegal memory access", "runner process")):
+            kind = ProviderFailureKind.MODEL_LOAD_FAILED
+        elif any(
+            token in lowered
+            for token in (
+                "unexpected empty grammar stack",
+                "grammar stack",
+                "accepting piece",
+                "structured output",
+            )
+        ):
+            kind = ProviderFailureKind.INVALID_TYPED_OUTPUT
+        else:
+            kind = ProviderFailureKind.MALFORMED_STREAM
+        return ProviderRequestError(
+            ProviderDiagnostic(
+                reachable=True,
+                kind=kind,
+                operation="parse_stream",
+                provider_message=safe,
+                endpoint=f"{self.host}/api/chat",
+            )
+        )
+
+    @staticmethod
+    def _runner_recovery_allowed(error: ProviderRequestError) -> bool:
+        message = str(error.diagnostic.provider_message or "").casefold()
+        return error.diagnostic.kind in {
+            ProviderFailureKind.MODEL_LOAD_FAILED,
+            ProviderFailureKind.INVALID_TYPED_OUTPUT,
+        } or any(
+            token in message
+            for token in (
+                "cuda error",
+                "illegal memory access",
+                "unexpected empty grammar stack",
+                "accepting piece",
+            )
+        )
+
     def _assert_gpu_residency(self) -> None:
         """Fail closed unless the active model is fully resident on the GPU."""
 
@@ -376,16 +421,17 @@ class OllamaProvider:
         malformed_chunks = 0
         valid_chunks = 0
 
+        runner_replayed = False
         try:
             response = self._post_json("/api/chat", payload)
         except ProviderRequestError as error:
-            provider_message = str(error.diagnostic.provider_message or "")
-            if "cuda error" in provider_message.casefold():
+            if self._runner_recovery_allowed(error):
                 # Keep the execution class GPU-only: unload the corrupted
                 # runner/KV cache, then replay the exact governed request once
                 # so Ollama reloads it with num_gpu unchanged.
                 self.reset_model_cache()
                 response = self._post_json("/api/chat", payload)
+                runner_replayed = True
             else:
                 field = error.diagnostic.incompatible_field
                 adaptable = field in {"think", "tools", "format"} and field in payload
@@ -403,52 +449,75 @@ class OllamaProvider:
                 adapted_payload.pop(field, None)
                 response = self._post_json("/api/chat", adapted_payload)
 
-        with response:
-            for raw_line in response:
-                if not raw_line or not raw_line.strip():
-                    continue
-                try:
-                    chunk = json.loads(raw_line)
-                except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
-                    # A truncated NDJSON line should not take down a long run;
-                    # later chunks may still contain a complete answer/call.
-                    malformed_chunks += 1
-                    continue
-                if not isinstance(chunk, Mapping):
-                    malformed_chunks += 1
-                    continue
-                valid_chunks += 1
-                if chunk.get("error"):
-                    raise RuntimeError(f"Ollama error: {chunk['error']}")
-                message = chunk.get("message")
-                if not isinstance(message, Mapping):
-                    message = {}
+        def consume(stream: Any) -> None:
+            nonlocal malformed_chunks, valid_chunks, usage
+            with stream:
+                for raw_line in stream:
+                    if not raw_line or not raw_line.strip():
+                        continue
+                    try:
+                        chunk = json.loads(raw_line)
+                    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+                        # A truncated NDJSON line should not take down a long run;
+                        # later chunks may still contain a complete answer/call.
+                        malformed_chunks += 1
+                        continue
+                    if not isinstance(chunk, Mapping):
+                        malformed_chunks += 1
+                        continue
+                    valid_chunks += 1
+                    if chunk.get("error"):
+                        raise self._stream_error(chunk["error"])
+                    message = chunk.get("message")
+                    if not isinstance(message, Mapping):
+                        message = {}
 
-                thought = message.get("thinking") or chunk.get("thinking")
-                if thought:
-                    fragment = thought if isinstance(thought, str) else str(thought)
-                    thought_parts.append(fragment)
-                    if on_thought:
-                        on_thought(fragment)
+                    thought = message.get("thinking") or chunk.get("thinking")
+                    if thought:
+                        fragment = thought if isinstance(thought, str) else str(thought)
+                        thought_parts.append(fragment)
+                        if on_thought:
+                            on_thought(fragment)
 
-                content = message.get("content")
-                if content:
-                    fragment = content if isinstance(content, str) else str(content)
-                    text_parts.append(fragment)
-                    if on_text:
-                        on_text(fragment)
+                    content = message.get("content")
+                    if content:
+                        fragment = content if isinstance(content, str) else str(content)
+                        text_parts.append(fragment)
+                        if on_text:
+                            on_text(fragment)
 
-                calls = message.get("tool_calls")
-                if isinstance(calls, (list, tuple)):
-                    raw_tool_calls.extend(
-                        call for call in calls if isinstance(call, Mapping)
-                    )
+                    calls = message.get("tool_calls")
+                    if isinstance(calls, (list, tuple)):
+                        raw_tool_calls.extend(
+                            call for call in calls if isinstance(call, Mapping)
+                        )
 
-                if chunk.get("done"):
-                    usage = Usage(
-                        input_tokens=chunk.get("prompt_eval_count", 0) or 0,
-                        output_tokens=chunk.get("eval_count", 0) or 0,
-                    )
+                    if chunk.get("done"):
+                        usage = Usage(
+                            input_tokens=chunk.get("prompt_eval_count", 0) or 0,
+                            output_tokens=chunk.get("eval_count", 0) or 0,
+                        )
+
+        try:
+            consume(response)
+        except ProviderRequestError as error:
+            # Replaying after user-visible fragments would duplicate streamed
+            # content because the neutral callback contract has no rollback.
+            # Fail cleanly in that rare case; the workspace finalizer discards
+            # the uncommitted attempt and offers an explicit retry.
+            if (
+                runner_replayed
+                or not self._runner_recovery_allowed(error)
+                or text_parts
+                or thought_parts
+                or raw_tool_calls
+            ):
+                raise
+            self.reset_model_cache()
+            runner_replayed = True
+            malformed_chunks = 0
+            valid_chunks = 0
+            consume(self._post_json("/api/chat", payload))
 
         if malformed_chunks and not valid_chunks:
             raise ProviderRequestError(ProviderDiagnostic(

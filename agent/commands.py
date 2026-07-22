@@ -19,11 +19,7 @@ class CommandKind(str, Enum):
     SETTINGS = "settings"
     MODEL = "model"
     PERMISSIONS = "permissions"
-    IDE = "ide"
     KEYMAP = "keymap"
-    VIM = "vim"
-    SANDBOX_ADD_READ_DIR = "sandbox_add_read_dir"
-    EXPERIMENTAL = "experimental"
     DOCTOR = "doctor"
     SKILLS = "skills"
     PROCESSES = "processes"
@@ -34,6 +30,7 @@ class CommandKind(str, Enum):
     MEMORY = "memory"
     TRACE = "trace"
     THINKING = "thinking"
+    DETAILS = "details"
     INSIGHTS = "insights"
     QUESTIONS = "questions"
     ANSWER = "answer"
@@ -45,6 +42,8 @@ class CommandKind(str, Enum):
     REJECT = "reject"
     REPLAN = "replan"
     PLAN = "plan"
+    CHAT = "chat"
+    EXPLORER = "explorer"
     ADD = "add"
     EDIT = "edit"
     REMOVE = "remove"
@@ -119,9 +118,10 @@ def parse_command(line: str) -> UserCommand:
         "q": "quit",
         "ls": "plan",
         "list": "plan",
-        "continue": "run",
+        "continue": "resume",
         "go": "run",
         "yes": "approve",
+        "reasoning": "thinking",
     }
     name = aliases.get(name, name)
 
@@ -138,14 +138,13 @@ def parse_command(line: str) -> UserCommand:
             "auto": "normal",
             "agent": "normal",
             "chat": "normal",
-            "plan": "normal",
             "goal": "normal",
             "deep": "ultra",
             "max": "ultra",
         }
         mode = mode_aliases.get(mode, mode)
-        if mode not in {"normal", "ultra"}:
-            raise CommandParseError(f"Usage: {usage('mode', 'normal|ultra')}")
+        if mode not in {"plan", "normal", "ultra"}:
+            raise CommandParseError(f"Usage: {usage('mode', 'plan|normal|ultra')}")
         return UserCommand(CommandKind.MODE, {"mode": mode}, raw)
     if name == "settings":
         if not rest:
@@ -171,24 +170,10 @@ def parse_command(line: str) -> UserCommand:
         if level not in {None, "normal", "full"}:
             raise CommandParseError(f"Usage: {usage('permissions', 'normal|full')}")
         return UserCommand(CommandKind.PERMISSIONS, {"level": level}, raw)
-    if name == "ide":
-        if rest:
-            raise CommandParseError(f"{prefix}ide does not take arguments.")
-        return UserCommand(CommandKind.IDE, raw=raw)
     if name == "keymap":
         if rest:
             raise CommandParseError(f"{prefix}keymap does not take arguments.")
         return UserCommand(CommandKind.KEYMAP, raw=raw)
-    if name == "vim":
-        if rest and rest.lower() not in {"on", "off"}:
-            raise CommandParseError(f"Usage: {usage('vim', '[on|off]')}")
-        return UserCommand(CommandKind.VIM, {"state": rest.lower() or None}, raw=raw)
-    if name == "sandbox-add-read-dir":
-        return UserCommand(CommandKind.SANDBOX_ADD_READ_DIR, {"path": _required(rest, usage("sandbox-add-read-dir", "ABSOLUTE_PATH"))}, raw=raw)
-    if name == "experimental":
-        if rest and rest.lower() not in {"on", "off", "status"}:
-            raise CommandParseError(f"Usage: {usage('experimental', '[on|off|status]')}")
-        return UserCommand(CommandKind.EXPERIMENTAL, {"state": rest.lower() or "status"}, raw=raw)
     if name in {"doctor", "readiness"}:
         args: dict[str, Any] = {}
         for token in rest.lower().split():
@@ -222,9 +207,12 @@ def parse_command(line: str) -> UserCommand:
         }[name]
         return UserCommand(kind, {"target": rest or None}, raw)
     if name == "thinking":
-        if rest:
-            raise CommandParseError(f"{prefix}thinking does not take arguments.")
-        return UserCommand(CommandKind.THINKING, raw=raw)
+        action = rest.lower() or "show"
+        if action not in {"show", "hide", "status"}:
+            raise CommandParseError(f"Usage: {usage('thinking', '[show|hide|status]')}")
+        return UserCommand(CommandKind.THINKING, {"action": action}, raw=raw)
+    if name == "details":
+        return UserCommand(CommandKind.DETAILS, {"target": rest or None}, raw=raw)
     if name == "agents":
         if rest in {"", "--all", "all"}:
             return UserCommand(CommandKind.AGENTS, {"all": bool(rest), "target": None}, raw)
@@ -274,7 +262,20 @@ def parse_command(line: str) -> UserCommand:
         return UserCommand(kind, {"feedback": feedback}, raw)
     if name == "help":
         return UserCommand(CommandKind.HELP, {"topic": rest.lower() or None}, raw)
-    if name in {"plan", "status", "history", "versions", "auto", "pause", "resume", "quit"}:
+    if name == "plan":
+        action = rest.lower() or "show"
+        if action not in {"show", "edit"}:
+            raise CommandParseError(f"Usage: {usage('plan', '[edit]')}")
+        return UserCommand(CommandKind.PLAN, {"action": action}, raw=raw)
+    if name == "chat":
+        if rest:
+            raise CommandParseError(f"{prefix}chat does not take arguments.")
+        return UserCommand(CommandKind.CHAT, raw=raw)
+    if name in {"explorer", "open-folder"}:
+        if rest:
+            raise CommandParseError(f"{prefix}{name} does not take arguments.")
+        return UserCommand(CommandKind.EXPLORER, raw=raw)
+    if name in {"status", "history", "versions", "auto", "pause", "resume", "quit"}:
         if rest:
             raise CommandParseError(f"{prefix}{name} does not take arguments.")
         return UserCommand(CommandKind(name), raw=raw)

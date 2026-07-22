@@ -101,27 +101,77 @@ models are probed during discovery; configured cloud credentials are clearly lab
 as unverified until their first request.
 
 After setup, there is one calm, persistent workspace rather than a sequence of
-screens. It always shows the conversation, one current-work cell, and a composer
-you can type in. `F2` switches between **Simple** (the default) and **Advanced**.
+screens. It always shows the conversation, a fixed project-progress area, one
+responsive telemetry row, and a composer you can type in. Progress is derived
+from durable tasks: phase, current task/operation, completed and remaining counts,
+retries or blockers, elapsed time, and an explicitly approximate ETA range. ETA
+starts as `learning`, pauses while input is required, and is never shown when the
+total is unknown. CPU and RAM are sampled asynchronously; GPU is shown only when
+a bounded NVIDIA/ROCm probe succeeds. Context remaining is numeric only when the
+provider exposes a capacity, otherwise it remains `?`. `F2` switches between
+**Simple** (the default) and **Advanced**.
 Simple hides tool calls, JSON, coordinator steps, and stack traces. Advanced keeps
-the full diagnostic transcript without interrupting the work.
+the coalesced diagnostic transcript without interrupting the work. Errors,
+warnings, blockers, file-change receipts, test results, and required decisions are
+kept visible in both modes.
 
 Questions, plan reviews, errors, and permissions appear in one small area directly
 above the composer. Use arrows, number keys, shortcut letters, the mouse, or type a
-custom answer. Ordinary project edits and isolated checks continue automatically;
+custom answer. One option may be marked **Recommended**, while **Enter default**
+identifies the separate safe default. Escape goes back or chooses the declared safe
+cancel option; invalid input leaves the decision open with inline guidance.
+Ordinary project edits and isolated checks continue automatically;
 dependency installs, network/host actions, deletes, secrets, and out-of-project
 work stay visibly paused until an explicit choice. Closing a prompt never becomes a
 silent denial.
 
 While work runs, type guidance and press Enter; it is saved for the next safe point.
-After a quiet 10 seconds the status says it is still working; after 60 seconds it
-offers **Keep waiting** or **Stop safely** without blocking a completion event. `/`
-or `Ctrl+K` opens contextual actions: New task, Stop safely, Task status, Review
-changes, Managed previews, Permissions, and Advanced details. `F3` opens model
+After 60 quiet seconds the compact activity strip identifies whether a model call
+or worker is still open and offers **Keep waiting** or **Stop safely** without
+blocking completion. Typing `/` or pressing `Ctrl+K` opens the same filterable
+command palette; Up/Down selects, Tab completes, Enter runs, and Escape closes it.
+Read-only `/status`, `/agents`, `/tree`, `/agent`, `/thinking`, and `/details`
+remain available while work continues. `F3` opens model
 selection and `F4` opens permissions. `Ctrl+Q` exits only at a saved checkpoint;
 while work is active it requests a checkpoint and keeps the session open. Use
 `--plain` to skip the animated intro and use the line-oriented SSH/screen-reader
 UI, or `--reduced-motion` for lower-motion setup and progress surfaces.
+
+`F6` toggles process-local **Sleep Mode** at any time. `/sleep on|off|status`
+provides the same control. Sleep chooses only an explicitly recommended option
+that the producer has also marked safe and reversible, and logs the question,
+choice, reason, and time. It never auto-approves actions or plans, destructive or
+security-sensitive work, permission/model changes, costly retries, or other unsafe
+decisions. In eligible Ultra/Full-Docker sessions `/sleep on` also tries to arm the
+existing deeper Ultra Sleep profile; failure of that stricter gate does not weaken
+it and does not disable the safe UI mode.
+
+`F7` opens the current project diff and `F8` (or `/explorer`) opens the exact
+selected project workspace in the operating-system file explorer. The fixed
+footer changes by execution class: local models prioritize CPU/GPU/RAM, while
+cloud models prioritize provider/model activity, input/output/cached tokens,
+known context remaining, and only provider limits actually reported by the
+provider. Unknown quotas and limits are shown as unavailable, never estimated.
+
+## Plan mode and durable conversation
+
+`/mode plan` is a real planning-only mode. It may inspect and prepare a durable
+plan, but it cannot approve or execute tools or file changes. `/plan` reviews the
+latest revision and `/plan edit` opens the full-screen Markdown editor; `Ctrl+E`
+starts editing, `Ctrl+S` validates and saves a new revision, and Escape protects
+unsaved edits. Switching to Normal or Ultra still requires explicit approval
+before any execution begins.
+
+`/chat` opens the read-only durable workspace timeline. Restoring a workspace
+with conversation history opens that view first; Escape returns to the working
+surface, and typing a new request transfers it to the composer. Failed partial
+model streams and raw reasoning are never promoted into durable chat.
+
+`/pause` records a cooperative pause request and stops new scheduling. The UI
+shows `Pause pending` while the current model/tool/agent drains, and changes the
+goal to PAUSED only after a saved checkpoint. `/resume` and `/continue` appear
+only after that durable state exists. An API call is not presented as a
+server-side job and does not claim to keep running after the computer shuts down.
 
 ## ULTRA mode
 
@@ -137,7 +187,7 @@ context → mini-plan → decompose → research → implement
 
 Dynamic child nodes inherit their parent's forbidden changes and write scope.
 New interfaces, dependencies, or out-of-scope paths stop at a new master-plan
-approval. SQLite schema v10 stores prompt completeness, intake briefs/questions,
+approval. SQLite schema v12 stores prompt completeness, intake briefs/questions,
 AST and graph metadata, the hierarchical specialist task graph, staged component
 files, materialized package revisions, interface contracts, package-consumption
 evidence, independent visual verdicts/pairwise comparisons, typed messages,
@@ -158,22 +208,24 @@ created only when the approved plan has not already divided the responsibility.
 `/tree`, `/agents`, `/agent`, `/memory`,
 `/trace`, `/insights`, and `/metrics` keep the default scrollback uncluttered.
 
-During a long ULTRA run, the interactive terminal keeps a five-line live region
-on screen with the current phase and specialist, completed/total nodes, queued
-work, elapsed time, an evidence-based ETA range, the latest completed component,
-the next scheduled component, and time since the last runtime signal. A quiet
-local-model request is labeled `model call open`; a prolonged quiet period is
-labeled `long model call` rather than being mistaken for completion. `/agents`
-opens the read-only detail view, while Esc/Ctrl+C requests a safe checkpoint.
+During a long ULTRA run, the main body keeps a two-line activity strip with the
+human-readable phase, active operation, completed/remaining nodes, elapsed time,
+and an approximate ETA only after enough work has been observed. Blockers add one
+temporary third line. CPU, GPU, RAM, context, model activity, and Sleep state stay
+in the fixed footer rather than interrupting the transcript.
 
-`/agents` now opens a live full-screen Swarm Inspector on interactive terminals.
+`/agents` opens a live in-workspace Swarm Inspector without starting a nested
+terminal application.
 Every materialized specialist receives a short path-derived name and a read-only
 workspace showing its status, role/phase, capabilities, owned concerns and
 interfaces, assignment, deliverable, and latest redacted prompt. Up/Down switches
 specialists without affecting execution; Tab or Left/Right switches between the
 agent workspace and a status-aware hierarchy map. The view refreshes from durable
 SQLite state while the local model continues running. `/tree` opens the same
-inspector directly on the hierarchy tab, and plain/redirected terminals retain
+inspector directly on the hierarchy tab. `/thinking show|hide|status` (or
+`/reasoning`) controls redacted session summaries; raw chain-of-thought is never
+shown. `/details [ID]` expands a collapsed long message or the latest diagnostic.
+Plain/redirected terminals retain
 the compact text fallback.
 
 `/permissions full` is fail-closed: it works only after `/setup` builds the
@@ -192,9 +244,9 @@ python agent/main.py --workspace /path/to/project
    discoverable repository context, creates a canonical execution brief, and asks
    only consequential missing product decisions. Each question has exactly three
    suggestions (the first Recommended) plus a free-form fourth answer.
-2. Normal is the default durable goal workflow. Ultra is selected automatically
-   at complexity `>= 0.65` or for hard triggers such as multi-component systems,
-   high-risk changes, and high-quality visual/interactive work. The read-only planner then inspects
+2. Normal is the default durable goal workflow. For Ultra-scale complexity, the
+   intake recommends Ultra while keeping Normal as the safe Enter default; it
+   never escalates orchestration or cost silently. The read-only planner then inspects
    the repository and submits a
    structured plan containing factual applicability evidence, an execution
    strategy, expected workspace changes, and task-bound verification.
@@ -240,13 +292,13 @@ opens the redacted, session-only blocks again. Use `/trace`, `/history`, or
 | Command | Effect |
 |---|---|
 | `/` | Open the interactive slash-command palette |
-| `/mode normal`, `/mode ultra` | Select the durable Normal workflow or recursive specialist Ultra; legacy `chat|plan|goal` aliases map to Normal |
+| `/mode plan`, `/mode normal`, `/mode ultra` | Select planning-only, durable Normal, or recursive specialist Ultra orchestration |
 | `/settings [NAME [VALUE]]` | Inspect safe session settings or change color/runtime limits; secrets are never displayed |
 | `/model [NAME]` | Reopen the picker or switch models at a safe checkpoint |
 | `/permissions normal\|full`, `/setup` | Select approvals or initialize the fail-closed Docker Full sandbox |
 | `/skills` | Show the real local tool registry, availability, risk, and approval policy |
 | `/processes`, `/stop-process ID` | Inspect or stop agent-owned processes and HTML previews |
-| `/sleep on\|off\|status` | Control the session-scoped Sleep profile; requires Ultra and ready Full Docker access |
+| `/sleep on\|off\|status` | Control safe process-local Sleep Mode; eligible Ultra/Full-Docker sessions also arm the stricter Ultra Sleep profile |
 | `/tree [NODE]`, `/agents [--all\|AGENT]` | Open the lightweight read-only live swarm topology |
 | `/agent NUMBER\|NODE_ID\|AGENT_ID` | Switch to one specialist's mission, interfaces, activity, and redacted live prompt |
 | `/memory [SECTION]`, `/trace [latest\|RUN_ID]` | Inspect Project Brain and redacted prompts/context/summaries |
@@ -254,7 +306,9 @@ opens the redacted, session-only blocks again. Use `/trace`, `/history`, or
 | `/insights [NODE]`, `/metrics` | Inspect durable findings and execution metrics |
 | `/questions`, `/answer ID VALUE` | Advanced fallback for decisions; reply normally, use `/answer 1` for the current question, or `/answer q1 1` for an explicit ID (`/ans` is an alias) |
 | plain text / `/goal TEXT` | Enter the same Intent Architect gate when idle; otherwise add durable user guidance |
-| `/plan`, `/status` | Render the cardless complete plan or refresh the responsive working surface |
+| `/plan`, `/plan edit`, `/status` | Review/edit the durable plan or refresh the responsive working surface |
+| `/chat` | Open the durable read-only workspace conversation; typing returns to the composer |
+| `/explorer`, `/open-folder` | Open the exact selected project workspace in the file explorer |
 | `/approve [REV]` | Approve the exact latest plan revision |
 | `/reject FEEDBACK`, `/replan FEEDBACK` | Reject and regenerate with feedback |
 | `/add TEXT :: CRITERIA` | Add a checklist item as a new plan revision |
@@ -263,7 +317,7 @@ opens the redacted, session-only blocks again. Use `/trace`, `/history`, or
 | `/todo ID`, `/block ID NOTE`, `/skip ID NOTE` | Reopen or change task state |
 | `/run [STEPS]` | Run one bounded work slice; the goal itself has no slice deadline |
 | `/auto` | Persist through no-progress attempts; pause after repeated provider failures or at real input/approval boundaries |
-| `/pause`, `/resume` | Cooperatively checkpoint and continue |
+| `/pause`, `/resume`, `/continue` | Request a cooperative checkpoint, then continue only after PAUSED is durable |
 | `/history` | Show durable events and generated worker roles/results |
 | `/versions` | List protected baseline/accepted checkpoints and their file-change summaries |
 | `/diff [NUMBER\|COMMIT]` | Show redacted current staged/unstaged/untracked changes, or a checkpoint patch |

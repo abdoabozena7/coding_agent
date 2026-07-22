@@ -123,6 +123,56 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         self.assertIn("اعمل آلة حاسبة", rendered)
         self.assertNotIn("technical", rendered)
 
+    def test_compact_and_wide_snapshots_keep_progress_failure_and_telemetry(self):
+        store = WorkspaceUIStore()
+        tasks = (
+            mock.Mock(id="a", title="Responsive loop", status="done"),
+            mock.Mock(id="b", title="Failure recovery", status="blocked"),
+        )
+        store.sync_dashboard(
+            mock.Mock(
+                goal_id="goal-1", objective="TUI upgrade", plan_revision=1,
+                status="running", goal_attempt=1, retry_reason="provider silence",
+                tasks=tasks,
+            )
+        )
+        store.set_activity(ActivityStage.PROBLEM, "Provider stopped", running=False)
+        store.update_resources(
+            cpu_percent=24.0, memory_percent=51.0, process_memory_mib=180.0,
+            gpu_available=True, gpu_percent=12.0,
+        )
+        store.set_context_window(8_000)
+        store.handle_event("usage", data={"input_tokens": 3_000})
+        for width in (72, 120):
+            rendered = render_persistent_workspace(store.snapshot(), width=width, height=24)
+            with self.subTest(width=width):
+                self.assertIn("FAILURE RECOVERY", rendered.upper())
+                self.assertIn("CPU 24%", rendered)
+                self.assertIn("left 5.0k", rendered)
+                self.assertIn("Sleep off", rendered)
+
+    def test_cloud_footer_prioritizes_limits_and_tokens_over_host_resources(self):
+        store = WorkspaceUIStore()
+        store.update_identity(workspace="cloud-project", model="gpt-cloud", status="running")
+        store.update_resources(
+            execution_class="cloud",
+            cpu_percent=88.0,
+            memory_percent=77.0,
+            output_tokens=1_250,
+            cached_tokens=800,
+            provider_limits="limits unavailable",
+        )
+        store.set_context_window(10_000)
+        store.handle_event("usage", data={"input_tokens": 4_000})
+
+        rendered = render_persistent_workspace(store.snapshot(), width=120, height=24)
+
+        self.assertIn("cloud gpt-cloud", rendered)
+        self.assertIn("remaining 6.0k", rendered)
+        self.assertIn("limits unavailable", rendered)
+        self.assertNotIn("CPU 88%", rendered)
+        self.assertNotIn("RAM 77%", rendered)
+
     def test_one_application_owns_composer_and_mode_shortcut(self):
         from prompt_toolkit.input.defaults import create_pipe_input
         from prompt_toolkit.output import DummyOutput
@@ -144,6 +194,71 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
             app.run()
         self.assertEqual(submitted[0].text, "Build it")
         self.assertEqual(store.snapshot().mode, ExperienceMode.ADVANCED)
+
+    def test_slash_palette_filters_and_executes_inside_persistent_workspace(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        submitted = []
+        with create_pipe_input() as pipe:
+            pipe.send_text("/agents\r\x11")
+            app = PersistentWorkspaceApp(
+                store,
+                on_input=submitted.append,
+                on_interrupt=lambda: None,
+                on_exit=lambda: True,
+                output=io.StringIO(),
+                app_input=pipe,
+                app_output=DummyOutput(),
+                no_color=True,
+            )
+            app.run()
+
+        self.assertEqual([item.text for item in submitted], ["/agents"])
+
+    def test_ctrl_k_opens_same_palette_and_tab_completes(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        submitted = []
+        with create_pipe_input() as pipe:
+            pipe.send_text("\x0bsta\t\r\x11")
+            app = PersistentWorkspaceApp(
+                store,
+                on_input=submitted.append,
+                on_interrupt=lambda: None,
+                on_exit=lambda: True,
+                output=io.StringIO(),
+                app_input=pipe,
+                app_output=DummyOutput(),
+                no_color=True,
+            )
+            app.run()
+
+        self.assertEqual([item.text for item in submitted], ["/status"])
+
+    def test_long_prompt_is_collapsed_visually_but_retained_in_store(self):
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        original = "first line\nsecond line\n" + ("detail\n" * 500)
+        store.append_transcript("user", original)
+        app = PersistentWorkspaceApp(
+            store,
+            on_input=lambda _item: None,
+            on_interrupt=lambda: None,
+            on_exit=lambda: True,
+            output=io.StringIO(),
+            app_output=DummyOutput(),
+            no_color=True,
+        )
+        rendered = "".join(fragment[1] for fragment in app._transcript_fragments())
+
+        self.assertIn("collapsed", rendered)
+        self.assertNotIn("detail\ndetail\ndetail", rendered)
+        self.assertEqual(store.snapshot().transcript[0].text, original.strip())
 
     def test_attention_accepts_direct_keyboard_choice_without_text_entry(self):
         from threading import Thread
@@ -236,6 +351,159 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
             )
             app.run()
         self.assertEqual(len(attempts), 2)
+
+    def test_enter_uses_declared_safe_default_not_visual_recommendation(self):
+        from threading import Thread
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        answers = []
+        request = AttentionRequest(
+            id="safe-enter",
+            kind=AttentionKind.PLAN_REVIEW,
+            title="Start the plan?",
+            options=(
+                AttentionOption("start", "Start", "start", recommended=True),
+                AttentionOption("pause", "Keep paused", "pause"),
+            ),
+            default_key="pause",
+            cancel_key="pause",
+        )
+        waiter = Thread(target=lambda: answers.append(store.request_attention(request)))
+        waiter.start()
+        with create_pipe_input() as pipe:
+            pipe.send_text("\r\x11")
+            app = PersistentWorkspaceApp(
+                store,
+                on_input=lambda _item: None,
+                on_interrupt=lambda: None,
+                on_exit=store.mark_exit,
+                output=io.StringIO(),
+                app_input=pipe,
+                app_output=DummyOutput(),
+                no_color=True,
+            )
+            app.run()
+        waiter.join(1)
+        self.assertEqual(answers[0].value, "pause")
+
+    def test_escape_cancels_to_declared_safe_option(self):
+        from threading import Thread
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        answers = []
+        request = AttentionRequest(
+            id="safe-escape",
+            kind=AttentionKind.APPROVAL,
+            title="Allow?",
+            options=(
+                AttentionOption("yes", "Allow", "yes"),
+                AttentionOption("no", "Deny", "no"),
+            ),
+            default_key="no",
+            cancel_key="no",
+        )
+        waiter = Thread(target=lambda: answers.append(store.request_attention(request)))
+        waiter.start()
+        with create_pipe_input() as pipe:
+            pipe.send_text("\x1b\x11")
+            app = PersistentWorkspaceApp(
+                store,
+                on_input=lambda _item: None,
+                on_interrupt=lambda: None,
+                on_exit=store.mark_exit,
+                output=io.StringIO(),
+                app_input=pipe,
+                app_output=DummyOutput(),
+                no_color=True,
+            )
+            app.run()
+        waiter.join(1)
+        self.assertEqual(answers[0].value, "no")
+
+    def test_f6_toggles_sleep_while_a_decision_is_open(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        store.present_attention(
+            AttentionRequest(
+                id="manual",
+                kind=AttentionKind.APPROVAL,
+                title="Manual decision",
+                options=(AttentionOption("deny", "Deny", "deny"),),
+                cancel_key="deny",
+            )
+        )
+        with create_pipe_input() as pipe:
+            pipe.send_text("\x1b[17~\x11")
+            app = PersistentWorkspaceApp(
+                store,
+                on_input=lambda _item: None,
+                on_interrupt=lambda: None,
+                on_exit=store.mark_exit,
+                output=io.StringIO(),
+                app_input=pipe,
+                app_output=DummyOutput(),
+                no_color=True,
+            )
+            app.run()
+        self.assertTrue(store.snapshot().sleep_enabled)
+
+    def test_page_up_follow_state_survives_mode_switch(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        for index in range(30):
+            store.append_transcript("assistant", f"line {index}")
+        with create_pipe_input() as pipe:
+            pipe.send_text("\x1b[5~\x1bOQ\x11")
+            app = PersistentWorkspaceApp(
+                store,
+                on_input=lambda _item: None,
+                on_interrupt=lambda: None,
+                on_exit=store.mark_exit,
+                output=io.StringIO(),
+                app_input=pipe,
+                app_output=DummyOutput(),
+                no_color=True,
+            )
+            app.run()
+        self.assertFalse(app._follow_transcript)
+        self.assertEqual(store.snapshot().mode, ExperienceMode.ADVANCED)
+
+    def test_input_and_pause_remain_live_while_external_work_is_blocked(self):
+        from threading import Event, Thread
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        store.set_activity(ActivityStage.BUILDING, "Blocked fake model", running=True)
+        release = Event()
+        worker = Thread(target=lambda: release.wait(1.0))
+        worker.start()
+        pauses = []
+        with create_pipe_input() as pipe:
+            pipe.send_text("\x1b[17~\x03\x11")
+            app = PersistentWorkspaceApp(
+                store,
+                on_input=lambda _item: None,
+                on_interrupt=lambda: pauses.append(True),
+                on_exit=lambda: True,
+                output=io.StringIO(),
+                app_input=pipe,
+                app_output=DummyOutput(),
+                no_color=True,
+            )
+            app.run()
+        release.set()
+        worker.join(1)
+        self.assertTrue(store.snapshot().sleep_enabled)
+        self.assertEqual(pauses, [True])
 
     def test_default_selection_prefers_enabled_but_disabled_rows_explain_themselves(self):
         state = ChoiceListState.create(_items())

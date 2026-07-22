@@ -21,6 +21,13 @@ try:
     from .events import UIEvent
     from .safety import redact_text
     from .tui import ChoiceItem, select_horizontal_action, terminal_supports_unicode
+    from .tui_commands import (
+        ALL_SLASH_COMMANDS,
+        CODEX_SLASH_COMMANDS,
+        COMMAND_GROUPS,
+        SLASH_COMMANDS,
+        contextual_commands,
+    )
     from .ui_state import (
         ApprovalDecision,
         AttentionKind,
@@ -34,6 +41,13 @@ except ImportError:  # direct ``python agent/main.py`` compatibility
     from events import UIEvent  # type: ignore
     from safety import redact_text  # type: ignore
     from tui import ChoiceItem, select_horizontal_action, terminal_supports_unicode  # type: ignore
+    from tui_commands import (  # type: ignore
+        ALL_SLASH_COMMANDS,
+        CODEX_SLASH_COMMANDS,
+        COMMAND_GROUPS,
+        SLASH_COMMANDS,
+        contextual_commands,
+    )
     from ui_state import (  # type: ignore
         ApprovalDecision,
         AttentionKind,
@@ -72,126 +86,6 @@ class ApprovalPromptRequested(Exception):
 
 class WorkspaceRefreshRequested(Exception):
     """Internal wake-up: background state changed while the composer was open."""
-
-CODEX_SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
-    ("/model", "choose what model and reasoning effort to use"),
-    ("/ide", "include current selection, open files, and other context from your IDE"),
-    ("/permissions", "choose what Codex is allowed to do"),
-    ("/keymap", "remap TUI shortcuts"),
-    ("/vim", "toggle Vim mode for the composer"),
-    ("/sandbox-add-read-dir", "let sandbox read a directory: /sandbox-add-read-dir <absolute_path>"),
-    ("/experimental", "toggle experimental features"),
-    ("/approve", "approve one retry of a recent auto-review denial"),
-)
-
-SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
-    ("/mode", "switch NORMAL / ULTRA mode"),
-    ("/model", "choose a model and reasoning effort"),
-    ("/permissions", "switch NORMAL / FULL access"),
-    ("/tree", "show the hierarchical project tree"),
-    ("/agents", "open the read-only live specialist observer"),
-    ("/agent", "view one specialist's assignment and redacted prompt"),
-    ("/memory", "inspect the Project Brain"),
-    ("/trace", "inspect redacted prompts and run trace"),
-    ("/thinking", "expand redacted thoughts captured in this session"),
-    ("/insights", "show durable findings and decisions"),
-    ("/questions", "show pending intake or plan questions"),
-    ("/answer", "answer with 1/2/3 or free-form text"),
-    ("/metrics", "show quality, usage, and timing metrics"),
-    ("/doctor", "audit weak-model agent readiness; add --live/--record for probes/history"),
-    ("/settings", "inspect or change session settings"),
-    ("/skills", "show real local tools, availability, risk, and approval policy"),
-    ("/processes", "list active managed processes and HTML previews"),
-    ("/stop-process", "stop a managed process or preview by ID"),
-    ("/goal", "start a durable goal"),
-    ("/plan", "show the complete plan and checklist"),
-    ("/approve", "approve the displayed plan revision"),
-    ("/reject", "reject the draft plan with feedback"),
-    ("/replan", "request a revised plan with feedback"),
-    ("/add", "add a checklist task"),
-    ("/edit", "edit a checklist task"),
-    ("/remove", "remove a checklist task"),
-    ("/done", "mark a task done with evidence"),
-    ("/todo", "reopen a checklist task"),
-    ("/block", "mark a checklist task blocked"),
-    ("/skip", "skip a checklist task"),
-    ("/run", "run one bounded work slice"),
-    ("/auto", "continue the approved goal until a checkpoint"),
-    ("/status", "show the dashboard"),
-    ("/history", "show durable activity"),
-    ("/diff", "show current changes or one checkpoint diff"),
-    ("/versions", "show accepted project checkpoints"),
-    ("/undo", "safely revert accepted checkpoints: /undo [steps]"),
-    ("/pause", "checkpoint active work"),
-    ("/resume", "continue paused work"),
-    ("/resolve", "reconcile uncertain crash-window work"),
-    ("/cancel", "explicitly abandon the active goal"),
-    ("/setup", "validate the one-time sandbox setup"),
-    ("/sleep", "control the Ultra Sleep profile"),
-    ("/help", "show every command"),
-    ("/quit", "save state and exit"),
-)
-
-ALL_SLASH_COMMANDS: tuple[tuple[str, str], ...] = tuple(
-    dict((*CODEX_SLASH_COMMANDS, *SLASH_COMMANDS)).items()
-)
-
-# The parser remains the execution authority; this registry only controls how
-# commands are progressively disclosed in the interactive palette.
-COMMAND_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    (
-        "Workflow",
-        "Start, approve, run, pause, or resume the current goal",
-        (
-            "/goal", "/plan", "/approve", "/reject", "/replan", "/run",
-            "/auto", "/pause", "/resume", "/resolve", "/cancel",
-        ),
-    ),
-    (
-        "Tasks",
-        "Edit the accepted checklist and record task outcomes",
-        ("/add", "/edit", "/remove", "/done", "/todo", "/block", "/skip"),
-    ),
-    (
-        "Inspect",
-        "Open status, activity, agents, memory, traces, and metrics",
-        (
-            "/status", "/history", "/diff", "/versions", "/tree", "/agents", "/agent", "/memory", "/trace", "/thinking",
-            "/insights", "/questions", "/answer", "/metrics", "/doctor", "/skills", "/processes",
-        ),
-    ),
-    (
-        "Session",
-        "Change mode, model, access, and terminal settings",
-        ("/mode", "/model", "/permissions", "/settings", "/setup", "/sleep", "/stop-process", "/undo"),
-    ),
-    (
-        "Help & exit",
-        "Show guidance or checkpoint and leave the session",
-        ("/help", "/quit"),
-    ),
-)
-
-_COMMAND_DESCRIPTIONS = dict(SLASH_COMMANDS)
-_CONTEXT_COMMANDS: dict[str, tuple[str, ...]] = {
-    "idle": ("/goal", "/mode", "/model", "/settings"),
-    "new": ("/goal", "/mode", "/model", "/settings"),
-    "discovering": ("/status", "/pause", "/model", "/thinking"),
-    "revising": ("/status", "/pause", "/plan", "/thinking"),
-    "awaiting_plan_approval": ("/approve", "/reject", "/plan", "/questions"),
-    "running": ("/status", "/agents", "/pause", "/thinking", "/tree"),
-    "paused": ("/resume", "/status", "/resolve", "/trace"),
-    "recovering": ("/resolve", "/status", "/trace", "/help"),
-    "reviewing": ("/status", "/agents", "/trace", "/pause"),
-    "verifying": ("/status", "/agents", "/trace", "/pause"),
-}
-
-
-def contextual_commands(status: str) -> tuple[tuple[str, str], ...]:
-    """Return the small command set worth showing at this checkpoint."""
-
-    names = _CONTEXT_COMMANDS.get(str(status).strip().lower(), ("/status", "/help", "/quit"))
-    return tuple((name, _COMMAND_DESCRIPTIONS[name]) for name in names)
 
 
 def prompt_receipt(value: str, threshold: int = LONG_PROMPT_RECEIPT_CHARS) -> str:
@@ -442,6 +336,7 @@ def render_slash_menu() -> str:
         (
             "",
             "More GA3BAD commands remain available directly, including:",
+            "  /mode plan   create and edit a durable plan without executing it",
             "  /mode normal shared intake, durable goal, planning, review, and automatic execution",
             "  /mode ultra  recursive specialists, component packages, and deeper quality gates",
             "  /settings    inspect or change session settings",
@@ -1159,6 +1054,7 @@ HELP_TEXT = """\
 Slash palette and modes
   /                           open the slash-command palette
   /mode                      show the current interaction mode
+  /mode plan                 planning and review only; no tools or file changes
   /mode normal               intent intake + durable goal + planning/review/automatic execution
   /mode ultra                recursive specialists + Project Brain + full quality gates
   /settings                  show safe session settings (never secrets)
@@ -1169,13 +1065,23 @@ Slash palette and modes
   /skills                    show actual local tools and live capability status
   /processes                 list managed processes and HTML previews
   /stop-process ID           stop a managed process or preview
+  /sleep on|off|status       safe unattended recommended choices; unsafe decisions stay manual
+
+Persistent workspace keys
+  F2                         Simple / Advanced details
+  F3 / F4 / F6              model / permissions / Sleep Mode
+  F7 / F8                    current diff / exact project folder
+  arrows / Enter / Escape    navigate / safe default / back or safe cancel
+  Page Up / Page Down / End  inspect transcript / resume following
+  Ctrl+C / Ctrl+Q            cooperative pause / checkpoint-safe exit
 
 Goal and plan
   /goal TEXT                 start a durable goal (plain text also works when idle)
   /approve [REV]             approve exactly the displayed plan revision
   /reject FEEDBACK           reject and regenerate the draft
   /replan FEEDBACK           ask for a revised plan
-  /plan                      show the dashboard/checklist
+  /plan [edit]               review or directly edit the durable plan document
+  /chat                      open the durable read-only workspace conversation
   /questions                 show non-discoverable intake/planning decisions
   /answer ID 1|2|3|TEXT      select a suggestion or save a free-form answer
 
@@ -1189,10 +1095,11 @@ Editable checklist
 Execution
   /run [STEPS]               run a bounded work slice; goal remains durable
   /auto                      retry/self-prompt without limit until completion or real user input
-  /pause / /resume           cooperatively stop or continue
+  /pause / /resume           drain to a saved checkpoint, then continue
   /history / /status         inspect durable execution state
   /versions                  list protected accepted checkpoints and change summaries
   /diff [NUMBER|COMMIT]      show current changes or one redacted checkpoint patch
+  /explorer                  open the exact selected project folder
   /undo [STEPS]              safely revert accepted checkpoints after explicit approval
   /tree [NODE]               inspect the ULTRA module/submodule/task hierarchy
   /agents [--all|AGENT]      read-only live swarm list/topology
@@ -1702,6 +1609,8 @@ class ConsoleUI:
         self.reasoning_effort = "medium"
         self.workspace_label = ""
         self.context_tokens = 0
+        self.context_window_tokens: int | None = None
+        self._sleep_enabled = False
         self.vim_mode = False
         self.color_mode = "auto" if color is None else ("on" if color else "off")
         self.color = False
@@ -1757,6 +1666,38 @@ class ConsoleUI:
                 model=self.active_model,
                 status=self._current_status,
             )
+            store.set_context_window(self.context_window_tokens)
+            store.update_runtime_profile(execution_class=self.execution_class)
+            if self._sleep_enabled:
+                store.set_sleep_mode(True)
+
+    @property
+    def sleep_enabled(self) -> bool:
+        if self._workspace_store is not None:
+            return self._workspace_store.sleep_enabled()
+        return self._sleep_enabled
+
+    def set_sleep_mode(self, enabled: bool) -> bool:
+        self._sleep_enabled = bool(enabled)
+        if self._workspace_store is not None:
+            return self._workspace_store.set_sleep_mode(enabled)
+        self.write(
+            f"Sleep Mode {'enabled' if enabled else 'disabled'}. "
+            "Unsafe decisions still require you."
+        )
+        return self._sleep_enabled
+
+    def toggle_sleep_mode(self) -> bool:
+        return self.set_sleep_mode(not self.sleep_enabled)
+
+    def set_context_window(self, value: int | None) -> None:
+        try:
+            parsed = int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            parsed = 0
+        self.context_window_tokens = max(1, parsed) if parsed > 0 else None
+        if self._workspace_store is not None:
+            self._workspace_store.set_context_window(self.context_window_tokens)
 
     @property
     def workspace_active(self) -> bool:
@@ -1853,6 +1794,7 @@ class ConsoleUI:
         model: str | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
+        context_window: int | None = None,
     ) -> None:
         self.access_level = str(access_level).lower()
         self.execution_class = str(execution_class).lower()
@@ -1863,11 +1805,16 @@ class ConsoleUI:
             self.reasoning_effort = str(reasoning_effort)
         if workspace is not None:
             self.workspace_label = str(workspace)
+        if context_window is not None:
+            self.set_context_window(context_window)
         if self._workspace_store is not None:
             self._workspace_store.update_identity(
                 workspace=self.workspace_label,
                 model=self.active_model,
                 status=self._current_status,
+            )
+            self._workspace_store.update_runtime_profile(
+                execution_class=self.execution_class
             )
 
     def thought_blocks(self) -> tuple[dict[str, Any], ...]:
@@ -2056,6 +2003,7 @@ class ConsoleUI:
                 total=len(view.tasks),
                 running=running,
             )
+            self._workspace_store.sync_dashboard(view)
             return
         signature = (
             view.status,
@@ -2633,6 +2581,9 @@ class ConsoleUI:
             options=tuple(options),
             details=canonical,
             source=policy.group,
+            default_key="deny",
+            cancel_key="deny",
+            auto_resolve_safe=False,
         )
         try:
             resolution = self._workspace_store.request_attention(request)

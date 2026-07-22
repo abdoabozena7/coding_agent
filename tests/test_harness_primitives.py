@@ -818,14 +818,14 @@ class TerminalUITests(unittest.TestCase):
         self.assertEqual(len(lines[-1]), max(len(line) for line in lines[:5]))
         self.assertEqual(lines[-1], "coding agent".center(len(lines[-1])))
 
-    def test_slash_menu_lists_modes_settings_and_legacy_fallback(self):
+    def test_slash_menu_lists_supported_modes_and_controls(self):
         rendered = render_slash_menu()
         rendered.encode("ascii")
 
         self.assertIn("/model", rendered)
-        self.assertIn("/ide", rendered)
         self.assertIn("/keymap", rendered)
-        self.assertIn("/sandbox-add-read-dir", rendered)
+        self.assertNotIn("/ide", rendered)
+        self.assertNotIn("/sandbox-add-read-dir", rendered)
         self.assertIn("/mode normal", rendered)
         self.assertNotIn("/mode goal", rendered)
         self.assertIn("/mode ultra", rendered)
@@ -879,7 +879,7 @@ class TerminalUITests(unittest.TestCase):
 
         console.set_mode("plan")
         self.assertEqual(console.prompt(), "/status")
-        self.assertEqual(prompts[-1], "GA3BAD [NORMAL]> ")
+        self.assertEqual(prompts[-1], "GA3BAD [PLAN]> ")
 
     def test_ultra_status_is_sparse_and_active_events_are_gold(self):
         view = DashboardView(

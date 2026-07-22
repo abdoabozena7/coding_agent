@@ -82,7 +82,7 @@ class DurableMemoryV11Tests(unittest.TestCase):
                 try:
                     self.assertEqual(
                         connection.execute("PRAGMA user_version").fetchone()[0],
-                        11,
+                        12,
                     )
                 finally:
                     connection.close()

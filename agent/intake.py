@@ -15,6 +15,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 class RunMode(str, Enum):
     NORMAL = "normal"
+    PLAN = "plan"
     ULTRA = "ultra"
 
     @classmethod
@@ -24,7 +25,6 @@ class RunMode(str, Enum):
         normalized = str(getattr(value, "value", value)).strip().casefold()
         normalized = {
             "chat": "normal",
-            "plan": "normal",
             "goal": "normal",
             "manual": "normal",
             "default": "normal",
@@ -36,7 +36,7 @@ class RunMode(str, Enum):
         try:
             return cls(normalized)
         except ValueError as exc:
-            raise ValueError("mode must be 'normal' or 'ultra'") from exc
+            raise ValueError("mode must be 'plan', 'normal', or 'ultra'") from exc
 
 
 class IntakeStatus(str, Enum):
@@ -626,7 +626,15 @@ class IntentArchitect:
             raise ValueError("intent input must not be empty")
         requested = RunMode.parse(requested_mode)
         complexity = self.assess_complexity(original)
-        routed = RunMode.ULTRA if requested is RunMode.ULTRA or complexity.ultra_required else RunMode.NORMAL
+        mode_answer = str((answers or {}).get("execution_mode", "")).casefold()
+        if requested is RunMode.PLAN:
+            routed = RunMode.PLAN
+        elif requested is RunMode.ULTRA or mode_answer.startswith("ultra"):
+            routed = RunMode.ULTRA
+        else:
+            # A large goal requested in Normal stays Normal unless the user
+            # explicitly accepts the cost/orchestration escalation below.
+            routed = RunMode.NORMAL
         route_reason = (
             "explicit Ultra request"
             if requested is RunMode.ULTRA
@@ -660,6 +668,33 @@ class IntentArchitect:
             for item in self._questions(original)
             if item.id in selected_question_ids
         )[:3]
+        if (
+            requested is RunMode.NORMAL
+            and complexity.ultra_required
+            and not resolved_answers.get("execution_mode")
+        ):
+            escalation = ClarificationQuestionV1(
+                id="execution_mode",
+                header="Large project",
+                question="This goal is large enough to benefit from Ultra specialists. How should it run?",
+                options=(
+                    QuestionOptionV1(
+                        "Ultra mode",
+                        "Use recursive specialists and deeper integration checks; this may cost more.",
+                        recommended=True,
+                    ),
+                    QuestionOptionV1(
+                        "Normal mode",
+                        "Keep one durable goal and the lower-cost orchestration.",
+                    ),
+                    QuestionOptionV1(
+                        "Edit request",
+                        "Pause here so the scope can be narrowed before planning.",
+                    ),
+                ),
+                reason="Complexity crossed the Ultra recommendation threshold.",
+            )
+            questions = (escalation, *questions)[:3]
         visual_experience = bool(_contains(original, _VISUAL_TERMS))
         packaging = resolved_answers.get("packaging", "")
         single_html = (
