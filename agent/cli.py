@@ -2548,13 +2548,65 @@ def _question_attention(question: Mapping[str, Any], *, source: str) -> Attentio
     )
 
 
-def _plan_attention(view: Any, reasons: tuple[str, ...]) -> AttentionRequest:
+def _plan_attention(
+    view: Any,
+    reasons: tuple[str, ...],
+    *,
+    plan_only: bool = False,
+    ultra_available: bool = True,
+) -> AttentionRequest:
     task_lines = [
         f"{index}. {str(getattr(task, 'title', '') or 'Project step')}"
         for index, task in enumerate(tuple(getattr(view, "tasks", ()) or ())[:4], 1)
     ]
     summary = str(getattr(view, "plan_summary", "") or "I prepared a focused plan.")
     message = "\n".join([summary, *task_lines][:6])
+    if plan_only:
+        options = [
+            AttentionOption(
+                "open", "Open and review", "open",
+                description="Open the complete editable plan before choosing an execution mode.",
+                shortcut="o", recommended=True,
+            ),
+            AttentionOption(
+                "normal", "Continue with Normal", "normal",
+                description="Keep this plan, switch mode, then ask for explicit approval.",
+                shortcut="n",
+            ),
+        ]
+        if ultra_available:
+            options.append(
+                AttentionOption(
+                    "ultra", "Continue with Ultra", "ultra",
+                    description="Prepare a fresh Ultra foundation, then ask for explicit approval.",
+                    shortcut="u",
+                )
+            )
+        options.extend(
+            (
+                AttentionOption(
+                    "change", "Ask model to revise", "change",
+                    description="Revise the latest saved plan without executing it.",
+                    shortcut="r",
+                ),
+                AttentionOption(
+                    "cancel", "Keep planning", "cancel",
+                    description="Keep this revision unapproved and remain in Plan Mode.",
+                    shortcut="k",
+                ),
+            )
+        )
+        return AttentionRequest(
+            id=f"plan:{getattr(view, 'goal_id', 'goal')}:r{getattr(view, 'plan_revision', 0)}:{time.monotonic_ns()}",
+            kind=AttentionKind.PLAN_REVIEW,
+            title="Plan is ready for review",
+            message=message,
+            options=tuple(options),
+            details="\n".join(reasons) or "Plan Mode cannot execute this revision.",
+            default_key="cancel",
+            cancel_key="cancel",
+            auto_resolve_safe=False,
+        )
     return AttentionRequest(
         id=f"plan:{getattr(view, 'goal_id', 'goal')}:r{getattr(view, 'plan_revision', 0)}:{time.monotonic_ns()}",
         kind=AttentionKind.PLAN_REVIEW,
@@ -3433,7 +3485,14 @@ def _persistent_interactive_loop(
                             reviewed_plans.add(plan_key)
                             reasons = plan_review_reasons(view)
                             store.set_activity(ActivityStage.PAUSED, "Review the plan", running=False)
-                            resolution = store.request_attention(_plan_attention(view, reasons))
+                            resolution = store.request_attention(
+                                _plan_attention(
+                                    view,
+                                    reasons,
+                                    plan_only=preferences.mode is InteractionMode.PLAN,
+                                    ultra_available=not bool(runtime.ultra_readiness_issue()),
+                                )
+                            )
                             if resolution.value == "open":
                                 app.open_details(
                                     f"Plan r{view.plan_revision}",
@@ -3442,6 +3501,32 @@ def _persistent_interactive_loop(
                                 )
                             elif resolution.value == "start":
                                 start(parse_command(f"/approve {view.plan_revision}"))
+                            elif resolution.value == "normal":
+                                _set_interaction_mode(
+                                    runtime,
+                                    console,
+                                    preferences,
+                                    InteractionMode.NORMAL,
+                                    detailed=False,
+                                )
+                                reviewed_plans.discard(plan_key)
+                                store.append_transcript(
+                                    "assistant",
+                                    "Normal selected. The saved plan remains unapproved; review it once more before execution.",
+                                )
+                            elif resolution.value == "ultra":
+                                _set_interaction_mode(
+                                    runtime,
+                                    console,
+                                    preferences,
+                                    InteractionMode.ULTRA,
+                                    detailed=False,
+                                )
+                                reviewed_plans.discard(plan_key)
+                                start(
+                                    runtime.prepare_ultra_from_existing_goal,
+                                    summary="Preparing the Ultra foundation",
+                                )
                             elif resolution.value == "change":
                                 feedback = ask_custom("Change the plan", "What should I change?")
                                 if feedback:

@@ -641,6 +641,31 @@ class AgentRuntime:
         )
         return self.ultra_session.restart_foundation(goal.id, goal.objective)
 
+    def prepare_ultra_from_existing_goal(self) -> Any:
+        """Prepare Ultra for an unapproved saved goal without starting execution."""
+
+        goal = self.active_goal()
+        if goal is None:
+            raise RuntimeStateError("there is no saved goal to prepare for Ultra")
+        if goal.metadata.get("ultra_run_id"):
+            raise RuntimeStateError("this goal already has an Ultra foundation")
+        if goal.status not in {
+            GoalStatus.DISCOVERING,
+            GoalStatus.AWAITING_PLAN_APPROVAL,
+            GoalStatus.PAUSED,
+            GoalStatus.REVISING,
+        }:
+            raise RuntimeStateError(
+                f"cannot prepare an Ultra foundation while goal is {goal.status.value}"
+            )
+        self.ultra_session = self._make_ultra_session()
+        self.events.publish(
+            "ultra.foundation_transition",
+            "Preparing a fresh Ultra foundation for the saved goal; the existing plan will not execute.",
+            goal_id=goal.id,
+        )
+        return self.ultra_session.restart_foundation(goal.id, goal.objective)
+
     def intake_questions(self) -> tuple[Mapping[str, Any], ...]:
         pending = self.store.get_pending_intake(self.session_id)
         if pending is None:

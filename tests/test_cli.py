@@ -34,6 +34,24 @@ class _TTY(io.StringIO):
 
 
 class CLITests(unittest.TestCase):
+    def test_plan_mode_review_keeps_safe_default_and_never_offers_direct_start(self):
+        from agent.cli import _plan_attention
+
+        view = SimpleNamespace(
+            goal_id="goal-1",
+            plan_revision=2,
+            plan_summary="A saved plan",
+            tasks=(SimpleNamespace(title="Inspect the TUI"),),
+        )
+        request = _plan_attention(view, (), plan_only=True, ultra_available=True)
+
+        values = {item.value for item in request.options}
+        self.assertEqual(request.default_key, "cancel")
+        self.assertIn("normal", values)
+        self.assertIn("ultra", values)
+        self.assertNotIn("start", values)
+        self.assertEqual(sum(item.recommended for item in request.options), 1)
+
     def test_persistent_controller_contains_last_intake_provider_failure(self):
         import time
 
