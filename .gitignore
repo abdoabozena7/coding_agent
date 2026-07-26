@@ -19,6 +19,12 @@ run-artifacts/*.log
 .playwright-cli/
 output/playwright/
 
+# Generated experiment transcripts and replay inputs
+output/**/*.stderr.log
+output/**/*.stdout.log
+output/**/*-input.txt
+output/**/*.log.pid
+
 # Per-run diagnostics (published evidence already tracked stays tracked)
 projects/*/run-artifacts/
 run-artifacts/*.err
