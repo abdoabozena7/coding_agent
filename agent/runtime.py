@@ -20,7 +20,8 @@ import shutil
 import shlex
 from dataclasses import dataclass, replace
 from pathlib import Path
-from threading import RLock
+from queue import Empty, Queue
+from threading import Event, RLock, Thread
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import context, tools
@@ -93,6 +94,14 @@ from .workflow import (
 from .sleep_profile import SleepController
 from .quality import ChangeSetStatus
 from .run_context import GoalContractV1, is_goal_escalation_approval
+from .semantic import (
+    RequestedEffect,
+    ResourceClaimV1,
+    SemanticGoalV2,
+    StrategyAttemptV1,
+    VerificationContractV1,
+)
+from .verifiers import discover_verifier_plugins
 from .weak_model import WeakModelPolicy
 from .repository_index import OllamaEmbeddingProvider, RepositoryIndex
 from .diagnostics import ErrorSignature, FailureDomain, normalize_error_message
@@ -127,6 +136,20 @@ class RuntimeStateError(RuntimeErrorBase):
 
 class ProviderUnavailableError(RuntimeErrorBase):
     pass
+
+
+def _provider_retry_after_seconds(exc: BaseException) -> int | None:
+    value = getattr(exc, "retry_after", None)
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {}) if response is not None else {}
+    if value is None and isinstance(headers, Mapping):
+        value = headers.get("retry-after") or headers.get("Retry-After")
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        match = re.search(r"retry[- ]after[^0-9]*(\d+)", str(exc), re.IGNORECASE)
+        parsed = int(match.group(1)) if match else 0
+    return max(1, min(parsed, 86_400)) if parsed > 0 else None
 
 
 @dataclass(frozen=True)
@@ -199,6 +222,7 @@ class AgentRuntime:
         sleeper: Callable[[float], None] = time.sleep,
         model_descriptor: ModelDescriptor | None = None,
         permission_adapter: PermissionAdapter | None = None,
+        session_id: str = "workspace-session",
     ) -> None:
         self.provider = provider
         self.store = store
@@ -220,7 +244,8 @@ class AgentRuntime:
         self._provider_output_tokens = 0
         self.retry_ledger = RetryLedger()
         self._chat_conversation: list[dict[str, Any]] = []
-        self.session_id = "workspace-session"
+        self.session_id = str(session_id).strip() or "workspace-session"
+        self.local_web_server: Any | None = None
         self.sleep_controller = SleepController()
         self.weak_model_policy = WeakModelPolicy()
         self.intent_architect = IntentArchitect()
@@ -251,12 +276,15 @@ class AgentRuntime:
                 session_mode=SessionMode.NORMAL.value,
                 plan_state=PlanState.NONE.value,
                 run_state=RunState.IDLE.value,
+                state=self._session_runtime_snapshot(),
             )
+        else:
+            self._persist_runtime_snapshot()
         self._chat_conversation = [dict(item) for item in self.store.list_chat_messages(self.session_id)]
         tools.register_artifact_provider(self.workspace, self.store.get_chat_artifact)
         tools.configure_workspace(self.workspace)
 
-        active_policy_goal = self.store.load_active_goal()
+        active_policy_goal = self.store.load_active_goal(self.session_id)
         if active_policy_goal is not None:
             persisted_policy = active_policy_goal.metadata.get("weak_model_policy")
             if isinstance(persisted_policy, Mapping):
@@ -271,7 +299,7 @@ class AgentRuntime:
                 delegations=list(recovery.delegation_ids),
                 actions=list(recovery.action_ids),
             )
-            goal = self.store.load_active_goal()
+            goal = self.store.load_active_goal(self.session_id)
             if goal and goal.status == GoalStatus.RECOVERING:
                 uncertain_sets = list(goal.metadata.get("goal_change_sets", ()))
                 for action_id in recovery.action_ids:
@@ -346,7 +374,7 @@ class AgentRuntime:
 
         auto_reconciled = self._auto_reconcile_read_only_ultra_uncertainty()
         if auto_reconciled:
-            recovered_goal = self.store.load_active_goal()
+            recovered_goal = self.store.load_active_goal(self.session_id)
             if recovered_goal is not None:
                 self.store.update_goal_metadata(
                     recovered_goal.id,
@@ -365,7 +393,7 @@ class AgentRuntime:
         # Planning/review phases are model-call transients. A process can stop
         # there without an action row, so normalize them to an explicit paused
         # checkpoint instead of leaving a non-runnable goal stranded.
-        goal = self.store.load_active_goal()
+        goal = self.store.load_active_goal(self.session_id)
         if goal and goal.status in {
             GoalStatus.DISCOVERING,
             GoalStatus.REVISING,
@@ -390,13 +418,13 @@ class AgentRuntime:
         # Schema-v1 plans did not bind approval to workspace applicability.
         # Never silently grandfather an active implementation plan into the
         # stronger v2 contract; require a fresh inspected revision and approval.
-        goal = self.store.load_active_goal()
+        goal = self.store.load_active_goal(self.session_id)
         if goal and goal.status == GoalStatus.RUNNING:
             accepted = self.store.get_accepted_plan(goal.id)
             if accepted and (
                 not accepted.applicability_evidence
                 or not accepted.execution_strategy.strip()
-                or not accepted.expected_changes
+                or not goal.metadata.get("semantic_goal")
             ):
                 self.store.update_goal_metadata(
                     goal.id,
@@ -425,6 +453,53 @@ class AgentRuntime:
     def reasoning_effort(self) -> str:
         return str(getattr(self.provider, "reasoning_effort", "medium"))
 
+    def _session_runtime_snapshot(self) -> dict[str, Any]:
+        descriptor = (
+            self.model_descriptor.to_dict()
+            if self.model_descriptor is not None
+            else {
+                "provider": self.provider_name,
+                "model": self.model_name,
+                "execution_class": self.execution_class,
+            }
+        )
+        return {
+            "model_snapshot": descriptor,
+            "reasoning_effort": self.reasoning_effort,
+            "access_level": self.access_level,
+            "concurrency": int(
+                self.config.ultra_local_concurrency
+                if self.execution_class == "local"
+                else self.config.ultra_cloud_concurrency
+            ),
+            "checkpoint": "safe" if not (
+                self.ultra_session is not None and self.ultra_session.running
+            ) else "running",
+        }
+
+    def _persist_runtime_snapshot(self, **extra: Any) -> None:
+        """Merge secret-free runtime identity into the durable session row."""
+
+        session = self.store.get_workflow_session(self.session_id)
+        state = {
+            **dict(session.get("state", {})),
+            **self._session_runtime_snapshot(),
+            **extra,
+        }
+        self.store.save_workflow_session(
+            self.session_id,
+            goal_id=session.get("goal_id"),
+            session_mode=str(session["session_mode"]),
+            plan_state=str(session["plan_state"]),
+            run_state=str(session["run_state"]),
+            ultra_profile=str(session.get("ultra_profile", "standard")),
+            sleep_state=str(session.get("sleep_state", "off")),
+            state=state,
+        )
+
+    def session_snapshot(self) -> Mapping[str, Any]:
+        return dict(self.store.get_workflow_session(self.session_id).get("state", {}))
+
     def set_reasoning_effort(self, effort: str) -> str:
         from .config import ReasoningEffort
 
@@ -435,6 +510,7 @@ class AgentRuntime:
         }:
             raise RuntimeStateError("reasoning effort can change only at a safe checkpoint")
         setattr(self.provider, "reasoning_effort", selected)
+        self._persist_runtime_snapshot()
         return selected
 
     @property
@@ -489,6 +565,7 @@ class AgentRuntime:
             }:
                 self.ultra_session.close()
                 self.ultra_session = None
+        self._persist_runtime_snapshot()
 
     def replace_permission_adapter(self, adapter: PermissionAdapter) -> None:
         if (
@@ -502,6 +579,7 @@ class AgentRuntime:
         self.permission_adapter = adapter
         if self.ultra_session is not None:
             self.ultra_session.switch_permissions(adapter)
+        self._persist_runtime_snapshot()
 
     def replace_config(self, config: RuntimeConfig) -> None:
         """Apply validated slice limits at an interactive command checkpoint."""
@@ -513,6 +591,7 @@ class AgentRuntime:
             # Preserve the in-memory action history so changing an unrelated
             # display/runtime setting cannot clear the no-progress guardrail.
             self._watchdog.repeat_limit = max(1, self.config.repeated_action_limit)
+        self._persist_runtime_snapshot()
 
     def _require_ultra_setup(self) -> tuple[ModelDescriptor, PermissionAdapter]:
         if self.model_descriptor is None:
@@ -559,12 +638,8 @@ class AgentRuntime:
         return self.model_descriptor, self.permission_adapter
 
     def ultra_readiness_issue(self) -> str | None:
-        """Return the exact reason Ultra cannot start, for disabled UI choices."""
+        """Ultra is a depth policy on the unified engine, not a separate runtime."""
 
-        try:
-            self._require_ultra_setup()
-        except RuntimeStateError as exc:
-            return str(exc)
         return None
 
     def _make_ultra_session(self) -> Any:
@@ -586,13 +661,11 @@ class AgentRuntime:
                 max_nodes=self.config.ultra_max_nodes,
                 max_fix_attempts=self.config.ultra_fix_attempts,
                 cloud_concurrency=self.config.ultra_cloud_concurrency,
+                local_concurrency=self.config.ultra_local_concurrency,
                 max_concurrency=8,
                 provider_retries=self.config.max_provider_retries,
                 role_memory_ttl_hours=self.config.role_memory_ttl_hours,
-                context_chars=min(
-                    self.config.conversation_chars,
-                    120_000 if descriptor.execution_class is ExecutionClass.CLOUD else self.weak_model_policy.max_context_characters,
-                ),
+                context_chars=self._provider_conversation_budget(),
                 prompt_trace_chars=self.config.prompt_trace_chars,
             ),
             agent_steps=self.config.subagent_steps,
@@ -601,70 +674,86 @@ class AgentRuntime:
         )
 
     def start_ultra(self, objective: str) -> Any:
-        """Start the sequential foundation and checkpoint at questions/approval."""
+        """Compatibility entry point for the unified engine's Ultra policy."""
 
         if self.active_goal() is not None:
             raise RuntimeStateError("finish or cancel the active goal before starting ULTRA")
-        self.ultra_session = self._make_ultra_session()
-        return self.ultra_session.start(redact_text(objective, 20_000))
+        return self.start_goal(
+            redact_text(objective, 20_000),
+            execution_mode=RunMode.ULTRA,
+            entry_surface="ultra",
+        )
 
     def retry_ultra_foundation(self) -> Any:
-        """Retry a failed pre-approval ULTRA foundation without duplicating intake.
-
-        Intake routing creates the durable goal before model-backed foundation
-        generation.  A provider failure must therefore resume that goal rather
-        than submit the final intake answer a second time.
-        """
+        """Compatibility entry point for retrying unified Ultra planning."""
 
         goal = self.active_goal()
         if goal is None:
-            raise RuntimeStateError("there is no unfinished ULTRA foundation to retry")
+            raise RuntimeStateError("there is no unfinished Ultra planning pass to retry")
         if goal.active_plan_revision is not None:
-            raise RuntimeStateError("the ULTRA foundation already has a durable plan")
+            raise RuntimeStateError("the unified goal already has a durable plan")
         if goal.status not in {GoalStatus.DISCOVERING, GoalStatus.PAUSED}:
             raise RuntimeStateError(
-                f"cannot retry the ULTRA foundation while goal is {goal.status.value}"
+                f"cannot retry Ultra planning while goal is {goal.status.value}"
             )
-        if self.ultra_session is not None and self.ultra_session.running:
-            raise RuntimeStateError("pause ULTRA before retrying its foundation")
         if goal.status is GoalStatus.PAUSED:
             self.store.transition_goal(
                 goal.id,
                 GoalStatus.DISCOVERING,
-                reason="retrying failed ULTRA foundation",
+                reason="retrying unified Ultra planning",
             )
-        self.ultra_session = self._make_ultra_session()
         self.events.publish(
-            "ultra.foundation_retry",
-            "Retrying the saved ULTRA foundation with a clean model request.",
+            "planning.retry",
+            "Retrying the saved goal with Ultra execution depth.",
             goal_id=goal.id,
         )
-        return self.ultra_session.restart_foundation(goal.id, goal.objective)
+        return self.generate_plan(
+            "Retry the repository-grounded plan using Ultra reasoning depth."
+        )
 
     def prepare_ultra_from_existing_goal(self) -> Any:
-        """Prepare Ultra for an unapproved saved goal without starting execution."""
+        """Raise reasoning depth without replacing the durable goal or plan."""
 
         goal = self.active_goal()
         if goal is None:
             raise RuntimeStateError("there is no saved goal to prepare for Ultra")
-        if goal.metadata.get("ultra_run_id"):
-            raise RuntimeStateError("this goal already has an Ultra foundation")
         if goal.status not in {
             GoalStatus.DISCOVERING,
             GoalStatus.AWAITING_PLAN_APPROVAL,
             GoalStatus.PAUSED,
             GoalStatus.REVISING,
+            GoalStatus.RUNNING,
         }:
             raise RuntimeStateError(
-                f"cannot prepare an Ultra foundation while goal is {goal.status.value}"
+                f"cannot change execution depth while goal is {goal.status.value}"
             )
-        self.ultra_session = self._make_ultra_session()
+        self.transition_mode(SessionMode.ULTRA.value)
+        current = self.store.get_goal(goal.id)
+        policy = dict(current.metadata.get("execution_policy") or {})
+        policy.update(
+            {
+                "mode": RunMode.ULTRA.value,
+                "decomposition": "deep_when_independent",
+                "concurrency": max(
+                    1,
+                    int(
+                        self.config.ultra_local_concurrency
+                        if self.execution_class == "local"
+                        else self.config.ultra_cloud_concurrency
+                    ),
+                ),
+            }
+        )
+        current = self.store.update_goal_metadata(
+            goal.id,
+            execution_policy=policy,
+        )
         self.events.publish(
-            "ultra.foundation_transition",
-            "Preparing a fresh Ultra foundation for the saved goal; the existing plan will not execute.",
+            "mode.depth_changed",
+            "Ultra depth enabled on the existing unified goal.",
             goal_id=goal.id,
         )
-        return self.ultra_session.restart_foundation(goal.id, goal.objective)
+        return self.store.get_latest_plan(current.id)
 
     def intake_questions(self) -> tuple[Mapping[str, Any], ...]:
         pending = self.store.get_pending_intake(self.session_id)
@@ -720,33 +809,51 @@ class AgentRuntime:
             return
         for lesson_id in tuple(self._used_global_lesson_ids):
             self.global_lessons.record_outcome(lesson_id, succeeded=succeeded)
-        visual = any(
-            str(path).casefold().endswith((".html", ".htm"))
-            for path in dict(goal.metadata.get("quality_target", {})).get("artifact_ids", ())
+        if not succeeded:
+            return
+        semantic_fingerprint = str(
+            goal.metadata.get("semantic_goal_fingerprint") or goal.id
         )
-        tags = ("normal", "visual", "browser") if visual else ("normal", "implementation", "verification")
+        repository_signature = hashlib.sha256(
+            json.dumps(
+                goal.metadata.get("discovered_verifier_plugins", ()),
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        mode = str(
+            dict(goal.metadata.get("execution_policy", {})).get("mode") or "normal"
+        )
+        tags = (
+            f"repository:{repository_signature[:16]}",
+            f"task:{semantic_fingerprint[:16]}",
+            f"mode:{mode}",
+        )
         content = (
-            "Require deterministic evidence and independent review before completion; "
-            + (
-                "interactive HTML also requires browser/runtime and visual evidence."
-                if visual
-                else "preserve the durable goal, plan, and checklist across retries."
-            )
+            "This repository/task signature succeeded with fresh criterion-bound "
+            "verification and independent review. Reuse only the verified strategy "
+            "mechanics; re-inspect before applying it to different resources."
         )
-        if blocker:
-            content += f" Last blocker pattern: {redact_text(blocker, 500)}"
         self.global_lessons.put(
             LearnedLessonV1(
-                title="Normal evidence-gated execution",
+                title=f"Verified strategy {repository_signature[:8]}/{semantic_fingerprint[:8]}",
                 content=content,
                 applicability_tags=tags,
                 evidence_refs=(evidence_ref,),
+                scope="project",
                 successes=1 if succeeded else 0,
                 failures=0 if succeeded else 1,
             )
         )
 
-    def _route_intake(self, intake: Mapping[str, Any], brief: Any) -> Any:
+    def _route_intake(
+        self,
+        intake: Mapping[str, Any],
+        brief: Any,
+        *,
+        entry_surface: str = "goal",
+    ) -> Any:
         routed = RunMode.parse(brief.routed_mode)
         self.store.complete_intake_session(
             str(intake["id"]),
@@ -763,16 +870,21 @@ class AgentRuntime:
             complexity=dict(intake.get("complexity", {})),
             execution_brief=brief.to_dict(),
         )
-        canonical = brief.canonical_prompt()
-        if routed is RunMode.ULTRA:
-            return self.start_ultra(canonical)
-        return self.start_goal(canonical, planning_only=routed is RunMode.PLAN)
+        # The execution brief is audit metadata only.  The exact user request
+        # remains the semantic source of truth for every mode.
+        return self.start_goal(
+            brief.original_input,
+            planning_only=routed is RunMode.PLAN,
+            execution_mode=routed,
+            entry_surface=entry_surface,
+        )
 
     def submit_intent(
         self,
         text: str,
         *,
         requested_mode: str | RunMode = RunMode.NORMAL,
+        entry_surface: str = "goal",
     ) -> Any:
         """Run every new objective through the shared, durable intake gate."""
 
@@ -839,7 +951,11 @@ class AgentRuntime:
                 f"Intent Architect needs {len(decision.questions)} decision(s) before planning.",
                 needs_user=True,
             )
-        return self._route_intake(intake, decision.brief)
+        return self._route_intake(
+            intake,
+            decision.brief,
+            entry_surface=entry_surface,
+        )
 
     def answer_intake_question(self, question_id: str, value: str) -> Any:
         pending = self.store.get_pending_intake(self.session_id)
@@ -910,7 +1026,7 @@ class AgentRuntime:
         return self._route_intake(updated, decision.brief)
 
     def active_ultra_run(self) -> Any | None:
-        goal = self.active_goal() or self.store.get_latest_goal()
+        goal = self.active_goal() or self.store.get_latest_goal(self.session_id)
         run_id = str(goal.metadata.get("ultra_run_id", "")) if goal else ""
         if run_id:
             try:
@@ -1025,7 +1141,7 @@ class AgentRuntime:
         )
         while True:
             result = self.wait_for_ultra()
-            goal = self.active_goal() or self.store.get_latest_goal()
+            goal = self.active_goal() or self.store.get_latest_goal(self.session_id)
             if goal is None or result is None:
                 return result
             outcome = None
@@ -1146,6 +1262,9 @@ class AgentRuntime:
             self._closed = True
         if self.ultra_session is not None:
             self.ultra_session.close()
+        if self.local_web_server is not None:
+            self.local_web_server.stop()
+            self.local_web_server = None
         tools.shutdown_workspace_resources(self.workspace)
         for resource in self.store.list_managed_resources(self.session_id):
             if resource.get("status") in {"running", "ready"}:
@@ -1157,7 +1276,7 @@ class AgentRuntime:
                 )
 
     def active_goal(self) -> Goal | None:
-        return self.store.load_active_goal()
+        return self.store.load_active_goal(self.session_id)
 
     def _approval_allowed(self, name: str, args: dict[str, Any], risk: str) -> bool:
         """Normalize legacy booleans and explicit interactive decisions."""
@@ -1225,6 +1344,11 @@ class AgentRuntime:
         goal = self.active_goal()
         return self.store.get_latest_plan(goal.id) if goal else None
 
+    def mode_transition_issue(self, mode: str) -> str:
+        """Return a user-facing policy reason without changing durable state."""
+        SessionMode.parse(mode)
+        return ""
+
     def transition_mode(self, mode: str) -> str:
         """Persist a policy change without replacing the active run or its memory."""
         target = SessionMode.parse(mode)
@@ -1232,7 +1356,38 @@ class AgentRuntime:
         previous = SessionMode.parse(str(session["session_mode"]))
         state = dict(session.get("state", {}))
         goal = self.active_goal()
+        issue = self.mode_transition_issue(target.value)
+        if issue:
+            raise RuntimeStateError(issue)
+        if target is SessionMode.PLAN and previous is not SessionMode.PLAN:
+            state["plan_return_mode"] = previous.value
+        elif previous is SessionMode.PLAN and target is not SessionMode.PLAN:
+            state.pop("plan_return_mode", None)
         if goal is not None:
+            policy = dict(goal.metadata.get("execution_policy") or {})
+            policy.update(
+                {
+                    "mode": target.value,
+                    "decomposition": (
+                        "deep_when_independent"
+                        if target is SessionMode.ULTRA
+                        else "adaptive"
+                    ),
+                    "concurrency": (
+                        max(
+                            1,
+                            int(
+                                self.config.ultra_local_concurrency
+                                if self.execution_class == "local"
+                                else self.config.ultra_cloud_concurrency
+                            ),
+                        )
+                        if target is SessionMode.ULTRA
+                        else 1
+                    ),
+                }
+            )
+            self.store.update_goal_metadata(goal.id, execution_policy=policy)
             state.update({
                 "run_id": goal.metadata.get("run_id", goal.id),
                 "goal_contract_fingerprint": goal.metadata.get("goal_contract_fingerprint"),
@@ -1272,6 +1427,28 @@ class AgentRuntime:
             output_tokens=turn.usage.output_tokens,
         )
 
+    def _provider_conversation_budget(
+        self,
+        system: str = "",
+        schemas: Sequence[Mapping[str, Any]] = (),
+    ) -> int:
+        """Reserve provider space for system, tools, durable state, and output."""
+
+        configured = max(4_000, int(self.config.conversation_chars))
+        try:
+            context_tokens = int(getattr(self.provider, "context_size", None))
+        except (TypeError, ValueError):
+            return configured
+        total_chars = max(8_000, context_tokens * 3)
+        fixed_chars = len(system) + len(
+            json.dumps(list(schemas), ensure_ascii=False, default=str)
+        )
+        output_tokens = int(
+            getattr(self.provider, "max_output_tokens", 2_048) or 2_048
+        )
+        reserved = fixed_chars + max(4_000, output_tokens * 3)
+        return max(4_000, min(configured, total_chars - reserved))
+
     def _call_provider(
         self,
         conversation: list[dict[str, Any]],
@@ -1305,6 +1482,32 @@ class AgentRuntime:
                         "rules": self.weak_model_policy.applied_rules("provider_call"),
                     },
                 )
+        checkpoint = (
+            state_envelope(
+                {
+                    "goal_id": current_goal.id,
+                    "status": current_goal.status.value,
+                    "semantic_goal": current_goal.metadata.get("semantic_goal", {}),
+                    "active_plan_revision": current_goal.active_plan_revision,
+                },
+                "PROVIDER_CONTEXT_CHECKPOINT",
+                max_chars=12_000,
+            )
+            if current_goal is not None
+            else "No durable goal exists yet; preserve the latest exact user turn."
+        )
+        provider_budget = self._provider_conversation_budget(system, schemas)
+        conversation = context.suspend_and_revive(
+            conversation,
+            checkpoint,
+            getattr(self.provider, "summarize", None),
+            max_chars=provider_budget,
+            on_suspend=lambda count: self.events.publish(
+                "checkpoint",
+                f"Provider-aware context rotation suspended {count} transient messages.",
+                continues=True,
+            ),
+        )
         ensure_capabilities = getattr(self.provider, "_ensure_capabilities", None)
         if callable(ensure_capabilities):
             ensure_capabilities()
@@ -1341,15 +1544,12 @@ class AgentRuntime:
         last_error: Exception | None = None
         for attempt in range(self.config.max_provider_retries + 1):
             try:
-                turn = self.provider.call(
+                turn = self._provider_call_with_watchdog(
                     conversation,
-                    list(schemas),
+                    schemas,
                     system,
-                    on_text=(
-                        (lambda fragment: self.events.publish("model_text", str(fragment), actor=actor))
-                        if stream_text else None
-                    ),
-                    on_thought=lambda fragment: self.events.publish("model_thought", str(fragment), actor=actor),
+                    actor=actor,
+                    stream_text=stream_text,
                 )
                 if not isinstance(turn, AssistantTurn):
                     raise TypeError(f"provider returned {type(turn).__name__}, expected AssistantTurn")
@@ -1420,7 +1620,15 @@ class AgentRuntime:
                             "next_action": retry_record.next_action,
                         },
                     )
-                if isinstance(exc, (AssertionError, TypeError, ValueError)) or attempt >= self.config.max_provider_retries:
+                fatal_provider_state = any(
+                    marker in message.casefold()
+                    for marker in ("429", "quota", "authentication", "unauthorized", "forbidden")
+                )
+                if (
+                    isinstance(exc, (AssertionError, TypeError, ValueError))
+                    or fatal_provider_state
+                    or attempt >= self.config.max_provider_retries
+                ):
                     break
                 delay = self.config.retry_base_ms * (2**attempt) / 1_000
                 self.events.publish(
@@ -1431,13 +1639,121 @@ class AgentRuntime:
                 if delay:
                     self.sleeper(delay)
         assert last_error is not None
-        raise ProviderUnavailableError(
+        unavailable = ProviderUnavailableError(
             f"provider unavailable after retries: {type(last_error).__name__}: {redact_text(last_error, 500)}"
-        ) from last_error
+        )
+        retry_after = _provider_retry_after_seconds(last_error)
+        if retry_after is not None:
+            setattr(unavailable, "retry_after_seconds", retry_after)
+        raise unavailable from last_error
 
-    def start_goal(self, objective: str, *, planning_only: bool = False) -> Plan | None:
+    def _provider_call_with_watchdog(
+        self,
+        conversation: Sequence[Mapping[str, Any]],
+        schemas: Sequence[Mapping[str, Any]],
+        system: str,
+        *,
+        actor: str,
+        stream_text: bool,
+    ) -> AssistantTurn:
+        """Bound a provider call and report liveness without replaying tools."""
+
+        results: Queue[tuple[str, Any]] = Queue(maxsize=1)
+        abandoned = Event()
+        started_at = time.monotonic()
+        signal_at = [started_at]
+
+        def signal(kind: str, fragment: Any) -> None:
+            signal_at[0] = time.monotonic()
+            if abandoned.is_set():
+                return
+            self.events.publish(kind, str(fragment), actor=actor)
+
+        def invoke() -> None:
+            try:
+                value = self.provider.call(
+                    list(conversation),
+                    list(schemas),
+                    system,
+                    on_text=(
+                        (lambda fragment: signal("model_text", fragment))
+                        if stream_text else None
+                    ),
+                    on_thought=lambda fragment: signal("model_thought", fragment),
+                )
+            except BaseException as exc:
+                results.put(("error", exc))
+            else:
+                signal_at[0] = time.monotonic()
+                results.put(("result", value))
+
+        worker = Thread(
+            target=invoke,
+            name=f"ga3bad-provider-{actor[:24]}",
+            daemon=True,
+        )
+        worker.start()
+        heartbeat = max(1, int(self.config.activity_heartbeat_seconds))
+        next_heartbeat = started_at + heartbeat
+        cloud = self.execution_class == "cloud"
+        slow_warning_sent = False
+        while True:
+            try:
+                kind, value = results.get(timeout=min(1.0, float(heartbeat)))
+            except Empty:
+                now = time.monotonic()
+                total = now - started_at
+                quiet = now - signal_at[0]
+                if now >= next_heartbeat:
+                    self.events.publish(
+                        "heartbeat",
+                        f"{actor} provider request is active",
+                        actor=actor,
+                        elapsed_seconds=int(total),
+                        quiet_seconds=int(quiet),
+                    )
+                    next_heartbeat = now + heartbeat
+                if quiet >= 60 and not slow_warning_sent:
+                    slow_warning_sent = True
+                    self.events.publish(
+                        "warning",
+                        f"{actor} provider stream has been quiet for {int(quiet)} seconds; "
+                        "the saved task remains active.",
+                        actor=actor,
+                        non_blocking=True,
+                    )
+                timed_out = total >= self.config.provider_call_timeout_seconds
+                silent = cloud and quiet >= self.config.cloud_idle_timeout_seconds
+                if timed_out or silent:
+                    abandoned.set()
+                    cancel = getattr(self.provider, "cancel", None)
+                    if callable(cancel):
+                        try:
+                            cancel()
+                        except Exception:
+                            pass
+                    reason = (
+                        f"cloud stream was silent for {int(quiet)} seconds"
+                        if silent
+                        else f"provider call exceeded {self.config.provider_call_timeout_seconds} seconds"
+                    )
+                    raise TimeoutError(reason)
+                continue
+            if kind == "error":
+                raise value
+            return value
+
+    def start_goal(
+        self,
+        objective: str,
+        *,
+        planning_only: bool = False,
+        execution_mode: str | RunMode = RunMode.NORMAL,
+        entry_surface: str = "goal",
+    ) -> Plan | None:
         with self._lock:
             safe_objective = redact_text(objective, 20_000)
+            selected_mode = RunMode.parse(execution_mode)
             prior_session = self.store.get_workflow_session(self.session_id)
             prior_state = dict(prior_session.get("state", {}))
             continuation = prior_state.get("below_target_continuation")
@@ -1460,13 +1776,35 @@ class AgentRuntime:
                 completion_conditions=("all accepted tasks complete", "required executable evidence is fresh", "independent evaluation passes", "quality target is converged"),
                 artifact_expectations=preserved_artifacts,
             )
+            semantic_goal = SemanticGoalV2.pending(safe_objective)
+            verifier_plugins = discover_verifier_plugins(self.workspace)
             goal = self.store.create_goal(
                 safe_objective,
+                session_id=self.session_id,
                 metadata={
                     "run_id": run_id,
                     "weak_model_policy": self.weak_model_policy.to_dict(),
                     "goal_contract": contract.to_dict(),
                     "goal_contract_fingerprint": contract.fingerprint,
+                    "semantic_goal": semantic_goal.to_dict(),
+                    "semantic_goal_fingerprint": semantic_goal.fingerprint,
+                    "execution_policy": {
+                        "mode": selected_mode.value,
+                        "reasoning_depth": (
+                            "direct" if entry_surface == "chat" else
+                            "deep" if selected_mode is RunMode.ULTRA else
+                            "plan_only" if planning_only else "adaptive"
+                        ),
+                        "parallelism": (
+                            "independent_tasks_only"
+                            if selected_mode is RunMode.ULTRA
+                            else "conservative"
+                        ),
+                        "entry_surface": entry_surface,
+                    },
+                    "discovered_verifier_plugins": [
+                        item.to_dict() for item in verifier_plugins
+                    ],
                     "convergence_state": "not_evaluated",
                     "mutation_sequence": 0,
                     "continued_from_chat": continuing_chat_candidate,
@@ -1480,7 +1818,9 @@ class AgentRuntime:
             self.store.save_workflow_session(
                 self.session_id,
                 goal_id=goal.id,
-                session_mode=(SessionMode.PLAN if planning_only else SessionMode.NORMAL).value,
+                session_mode=(
+                    SessionMode.PLAN.value if planning_only else selected_mode.value
+                ),
                 plan_state=PlanState.INSPECTING.value,
                 run_state=RunState.PLANNING.value,
             )
@@ -1491,6 +1831,30 @@ class AgentRuntime:
                 return self.generate_plan()
             except ProviderUnavailableError as exc:
                 self.store.append_event("planning.checkpoint", goal_id=goal.id, payload={"error": redact_text(exc, 500)})
+                retry_after = getattr(exc, "retry_after_seconds", None)
+                self.store.update_goal_metadata(
+                    goal.id,
+                    waiting_question=(
+                        "The provider retries were exhausted at a saved planning checkpoint. "
+                        "Choose retry, wait, or change model; no local fallback was applied."
+                    ),
+                    resume_status=GoalStatus.DISCOVERING.value,
+                    provider_recovery={
+                        "state": "paused",
+                        "error": redact_text(exc, 500),
+                        "automatic_fallback": False,
+                    },
+                    retry_not_before=(
+                        time.time() + int(retry_after)
+                        if retry_after is not None
+                        else None
+                    ),
+                )
+                self.store.transition_goal(
+                    goal.id,
+                    GoalStatus.PAUSED,
+                    reason="provider unavailable at planning checkpoint",
+                )
                 self.events.publish("error", str(exc))
                 return None
 
@@ -1499,12 +1863,187 @@ class AgentRuntime:
 
     @staticmethod
     def _plan_requires_critic(candidate: Mapping[str, Any]) -> bool:
-        tasks = tuple(candidate.get("tasks", ()))
-        return len(tasks) > 3 or any(
-            str(item.get("risk", "medium")).lower() in {"high", "critical"}
-            for item in tasks
-            if isinstance(item, Mapping)
+        # Semantics always require an independent model pass.  Risk controls
+        # review depth elsewhere, never whether a semantic review occurs.
+        return True
+
+    def _accepted_semantic_metadata(
+        self,
+        goal: Goal,
+        proposed: Mapping[str, Any],
+        inspection_records: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Build contracts only from critic-accepted model output and evidence."""
+
+        tasks = tuple(dict(item) for item in proposed.get("tasks", ()))
+        changes = tuple(dict(item) for item in proposed.get("expected_changes", ()))
+        interpreted = SemanticGoalV2.from_mapping(
+            dict(proposed.get("semantic_goal") or {}),
+            original_request=goal.objective,
         )
+        criteria = interpreted.acceptance_criteria
+        refs = interpreted.repository_evidence_refs
+        semantic = SemanticGoalV2(
+            original_request=interpreted.original_request,
+            interpreted_outcome=interpreted.interpreted_outcome,
+            requested_effects=interpreted.requested_effects,
+            required_outcomes=interpreted.required_outcomes,
+            constraints=interpreted.constraints,
+            exclusions=interpreted.exclusions,
+            acceptance_criteria=interpreted.acceptance_criteria,
+            unresolved_decisions=interpreted.unresolved_decisions,
+            repository_evidence_refs=interpreted.repository_evidence_refs,
+            status="critic_accepted",
+        )
+        claims = tuple(
+            ResourceClaimV1(
+                purpose=str(change.get("intent") or "").strip()
+                or f"Apply accepted task contract to {change.get('path')}",
+                kind="file",
+                supports_tasks=tuple(change.get("supports_tasks") or ()),
+                inspection_refs=tuple(change.get("evidence_refs") or refs),
+                selector=str(change.get("path") or ""),
+                resolved_paths=(str(change.get("path") or ""),),
+                state="resolved",
+            )
+            for change in changes
+        )
+        plugins = discover_verifier_plugins(self.workspace)
+        verification_items: list[VerificationContractV1] = []
+        for task in tasks:
+            methods = tuple(
+                str(item) for item in task.get("verification", ()) if str(item).strip()
+            )
+            for index, criterion in enumerate(
+                task.get("acceptance_criteria", ())
+            ):
+                method = methods[min(index, len(methods) - 1)]
+                normalized_method = method.casefold()
+                matched_plugin = next(
+                    (
+                        plugin
+                        for plugin in plugins
+                        if plugin.name.casefold() in normalized_method
+                        or " ".join(plugin.command).casefold()
+                        in normalized_method
+                    ),
+                    None,
+                )
+                authority = (
+                    f"{matched_plugin.authority} ({matched_plugin.evidence_path})"
+                    if matched_plugin is not None
+                    else "accepted task contract with fresh read-back evidence"
+                )
+                verification_items.append(
+                    VerificationContractV1(
+                        criterion=str(criterion),
+                        method=method,
+                        scope=str(task.get("id") or ""),
+                        expected_result=str(criterion),
+                        authority=authority,
+                    )
+                )
+        verification = tuple(verification_items)
+        return {
+            "semantic_goal": semantic.to_dict(),
+            "semantic_goal_fingerprint": semantic.fingerprint,
+            "resource_claims": [item.to_dict() for item in claims],
+            "verification_contracts": [item.to_dict() for item in verification],
+        }
+
+    @staticmethod
+    def _validate_semantic_candidate(
+        goal: Goal,
+        proposed: Mapping[str, Any],
+        *,
+        successful_inspection_ids: frozenset[str],
+    ) -> SemanticGoalV2:
+        semantic = SemanticGoalV2.from_mapping(
+            dict(proposed.get("semantic_goal") or {}),
+            original_request=goal.objective,
+        )
+        if semantic.status != "interpreted":
+            raise ValueError("semantic_goal.status must be interpreted before critic review")
+        if semantic.unresolved_decisions:
+            raise ValueError(
+                "semantic goal contains unresolved decisions; call request_plan_input "
+                "instead of proposing executable work"
+            )
+        cited_inspections = {
+            value[len("inspection:") :]
+            for value in semantic.repository_evidence_refs
+            if value.startswith("inspection:")
+        }
+        if not cited_inspections or not cited_inspections.issubset(
+            successful_inspection_ids
+        ):
+            raise ValueError(
+                "semantic goal must cite successful repository inspection references"
+            )
+        task_criteria = {
+            str(criterion).strip().casefold()
+            for task in proposed.get("tasks", ())
+            for criterion in task.get("acceptance_criteria", ())
+            if str(criterion).strip()
+        }
+        semantic_criteria = {
+            value.casefold() for value in semantic.acceptance_criteria
+        }
+        if task_criteria != semantic_criteria:
+            missing_from_tasks = sorted(semantic_criteria - task_criteria)
+            missing_from_semantics = sorted(task_criteria - semantic_criteria)
+            raise ValueError(
+                "semantic acceptance criteria and task criteria must map exactly; "
+                f"missing_from_tasks={missing_from_tasks!r}, "
+                f"missing_from_semantic_goal={missing_from_semantics!r}"
+            )
+        effects = set(semantic.requested_effects)
+        changes = tuple(proposed.get("expected_changes", ()))
+        if RequestedEffect.READ_WORKSPACE not in effects:
+            raise ValueError(
+                "repository-grounded semantics require requested_effects=read_workspace"
+            )
+        if changes and RequestedEffect.MUTATE_WORKSPACE not in effects:
+            raise ValueError(
+                "expected changes require requested_effects=mutate_workspace"
+            )
+        if not changes and RequestedEffect.MUTATE_WORKSPACE in effects:
+            raise ValueError(
+                "mutation semantics require evidence-backed expected change paths"
+            )
+        return semantic
+
+    @staticmethod
+    def _risk_adaptive_plan_approval(
+        proposed: Mapping[str, Any],
+        semantic: SemanticGoalV2,
+        *,
+        planning_only: bool,
+    ) -> tuple[bool, str]:
+        """Return whether a plan needs a human approval checkpoint."""
+
+        if planning_only:
+            return True, "Plan mode never executes"
+        tasks = tuple(
+            item for item in proposed.get("tasks", ()) if isinstance(item, Mapping)
+        )
+        changes = tuple(proposed.get("expected_changes", ()))
+        effects = set(semantic.requested_effects)
+        sensitive = {
+            RequestedEffect.INSTALL_DEPENDENCIES,
+            RequestedEffect.USE_NETWORK,
+            RequestedEffect.EXTERNAL_SIDE_EFFECT,
+        }
+        if effects & sensitive:
+            return True, "dependency, network, or external side effect"
+        if any(
+            str(item.get("risk") or "medium").casefold() in {"medium", "high", "critical"}
+            for item in tasks
+        ):
+            return True, "model/critic contract declares non-low risk"
+        if len(tasks) > 1 or len(changes) > 2:
+            return True, "change spans multiple task or resource contracts"
+        return False, "small reversible in-scope contract"
 
     def _review_plan_candidate(
         self,
@@ -1559,12 +2098,13 @@ class AgentRuntime:
             "issues": ["Re-evaluate coverage and submit a valid plan; keep every criterion observable."],
         }
 
-    @staticmethod
     def _validate_plan_applicability(
+        self,
         proposed: Mapping[str, Any],
         tasks: Iterable[Task],
         *,
         successful_inspection_ids: frozenset[str],
+        original_request: str,
     ) -> None:
         if not successful_inspection_ids:
             raise ValueError(
@@ -1599,9 +2139,67 @@ class AgentRuntime:
             )
         change_coverage: set[str] = set()
         for item in proposed["expected_changes"]:
-            path = str(item["path"]).strip().casefold()
-            if any(marker in path for marker in ("<", ">", "tbd", "unknown", "determine later")):
+            raw_path = str(item["path"]).strip().replace("\\", "/")
+            path = raw_path.casefold()
+            if (
+                not raw_path
+                or raw_path.startswith("/")
+                or re.match(r"^[a-zA-Z]:/", raw_path)
+                or ".." in Path(raw_path).parts
+                or raw_path in {".", "./"}
+                or any(marker in path for marker in ("<", ">", "tbd", "unknown", "determine later"))
+            ):
                 raise ValueError("expected workspace changes must name real paths, not placeholders")
+            if raw_path.endswith("/") or (
+                (self.workspace / raw_path).resolve(strict=False).is_dir()
+            ):
+                raise ValueError(
+                    "expected workspace changes must identify exact leased files, "
+                    "not broad directories"
+                )
+            basis = str(item.get("basis") or "").strip()
+            evidence_refs = {
+                str(value).strip()
+                for value in item.get("evidence_refs", ())
+                if str(value).strip()
+            }
+            candidate = (self.workspace / raw_path).resolve(strict=False)
+            exists = candidate.is_file()
+            if exists and basis not in {
+                "existing_inspected_path",
+                "repository_convention",
+            }:
+                raise ValueError(
+                    "an existing target must cite inspected-path or repository-convention basis"
+                )
+            if not exists and basis not in {
+                "repository_convention",
+                "explicit_user_requirement",
+            }:
+                raise ValueError(
+                    "a new target must cite a repository convention or explicit user requirement"
+                )
+            if basis == "explicit_user_requirement":
+                if "user:request" not in evidence_refs:
+                    raise ValueError(
+                        "explicit-user path basis requires evidence_refs=user:request"
+                    )
+                normalized_request = str(original_request).replace("\\", "/").casefold()
+                if raw_path.casefold() not in normalized_request:
+                    raise ValueError(
+                        "explicit-user path basis requires the exact workspace-relative "
+                        "path to appear in the original request"
+                    )
+            else:
+                cited = {
+                    value[len("inspection:") :]
+                    for value in evidence_refs
+                    if value.startswith("inspection:")
+                }
+                if not cited or not cited.issubset(successful_inspection_ids):
+                    raise ValueError(
+                        "path basis must cite successful repository inspection evidence"
+                    )
             supports = {str(task_id).upper() for task_id in item["supports_tasks"]}
             unknown = supports - task_ids
             if unknown:
@@ -1609,8 +2207,9 @@ class AgentRuntime:
                     f"expected changes reference unknown tasks: {', '.join(sorted(unknown))}"
                 )
             change_coverage.update(supports)
-        if not change_coverage:
-            raise ValueError("the plan must identify a concrete workspace change")
+        # An evidence-backed analysis/test-only request may legitimately have
+        # no mutations.  Empty change coverage is therefore meaningful rather
+        # than a reason for the harness to invent an output file.
 
     @staticmethod
     def _bind_plan_inspection_sources(
@@ -1647,124 +2246,6 @@ class AgentRuntime:
                 item["source"] = canonical
         bound["applicability_evidence"] = evidence
         return bound
-
-    def _harness_fallback_plan(
-        self,
-        goal: Goal,
-        inspection_records: Mapping[str, Mapping[str, Any]],
-    ) -> Plan | None:
-        """Create a narrow approval-bound plan when a weak planner stalls.
-
-        This fallback is deliberately limited to short objectives naming one
-        concrete artifact. It never executes or approves the plan.
-        """
-
-        objective = str(goal.objective).strip()
-        if not inspection_records or len(objective) > 1_200:
-            return None
-        paths = re.findall(
-            r"(?<![\w./-])([A-Za-z0-9_.-]+\.(?:html?|py|js|ts|tsx|jsx|css|json|md|txt|ya?ml|toml))\b",
-            objective,
-            flags=re.IGNORECASE,
-        )
-        unique_paths = tuple(dict.fromkeys(path.replace("\\", "/") for path in paths))
-        if len(unique_paths) != 1:
-            return None
-        target = unique_paths[0]
-        is_html = target.casefold().endswith((".html", ".htm"))
-        reference, record = next(iter(inspection_records.items()))
-        raw = {
-            "summary": f"Implement and verify {target} from the user's explicit objective.",
-            "applicability_evidence": [
-                {
-                    "fact": (
-                        "The workspace was inspected and the named artifact can be implemented in place. "
-                        + str(record.get("result") or "")[:400]
-                    ),
-                    "source": f"inspection:{reference}",
-                    "supports_tasks": ["T001"],
-                }
-            ],
-            "execution_strategy": (
-                f"Create or update {target}, read it back, then "
-                + ("run browser preview verification and inspect runtime errors." if is_html else "run the narrowest applicable verification.")
-            ),
-            "expected_changes": [
-                {"path": target, "intent": objective, "supports_tasks": ["T001"]}
-            ],
-            "tasks": [
-                {
-                    "title": f"Implement and verify {target}",
-                    "description": objective,
-                    "acceptance_criteria": [
-                        f"{target} exists and implements every behavior explicitly requested in the objective.",
-                        "The saved artifact is re-read and contains no placeholder-only implementation.",
-                    ],
-                    "verification": [
-                        f"Read {target} after writing and compare it with the objective.",
-                        (
-                            f"Open {target} with the browser preview and confirm HTTP success with no console, page, or network errors."
-                            if is_html
-                            else "Run the narrowest executable or static check applicable to the artifact."
-                        ),
-                    ],
-                    "depends_on": [],
-                    "risk": "low",
-                }
-            ],
-        }
-        proposed, actions = normalize_plan_draft(raw)
-        validate_normalized_plan(proposed)
-        for task in proposed["tasks"]:
-            task.pop("_unresolved_dependencies", None)
-        plan = self.store.create_plan(
-            goal.id,
-            proposed["summary"],
-            proposed["tasks"],
-            applicability_evidence=proposed["applicability_evidence"],
-            execution_strategy=proposed["execution_strategy"],
-            expected_changes=proposed["expected_changes"],
-            proposed_by="harness-weak-model-fallback",
-            submit=True,
-        )
-        current_goal = self.store.get_goal(goal.id)
-        if current_goal.status != GoalStatus.AWAITING_PLAN_APPROVAL:
-            self.store.transition_goal(
-                goal.id,
-                GoalStatus.AWAITING_PLAN_APPROVAL,
-                reason="narrow harness fallback plan awaits user approval",
-            )
-        self.store.append_event(
-            "planning.harness_fallback",
-            goal_id=goal.id,
-            entity_type="plan",
-            entity_id=plan.id,
-            payload={"target": target, "normalization_actions": list(actions)},
-        )
-        self.events.publish(
-            "plan",
-            f"Plan r{plan.revision} was recovered from the explicit single-artifact objective. Review it, then use /approve {plan.revision}.",
-        )
-        self.store.update_goal_metadata(
-            goal.id,
-            consecutive_retries=0,
-            retry_reason="",
-            retry_after_ms=0,
-            auto_retryable=False,
-            plan_questions=[],
-            waiting_question="",
-        )
-        self.store.save_workflow_session(
-            self.session_id,
-            goal_id=goal.id,
-                session_mode=SessionMode.parse(
-                    self.store.get_workflow_session(self.session_id)["session_mode"]
-                ).value,
-            plan_state=PlanState.AWAITING_APPROVAL.value,
-            run_state=RunState.PLANNING.value,
-            state={"plan_revision": plan.revision, "plan_fingerprint": plan.fingerprint, "fallback": True},
-        )
-        return plan
 
     def _pause_planning(self, goal: Goal, question: str, reason: str) -> None:
         """Checkpoint a bounded/failed planning pass as an explicit user-visible pause."""
@@ -2038,6 +2519,12 @@ class AgentRuntime:
                     {
                         "objective": goal.objective,
                         "workspace": str(self.workspace),
+                        "execution_policy": goal.metadata.get(
+                            "execution_policy", {}
+                        ),
+                        "discovered_verifier_plugins": goal.metadata.get(
+                            "discovered_verifier_plugins", ()
+                        ),
                         "user_feedback": feedback,
                         "planning_questions": list(planning_questions),
                         "planning_answers": planning_answers,
@@ -2128,7 +2615,7 @@ class AgentRuntime:
                             "Error: plan validation failed at exact field(s); submit one targeted "
                             f"repair using the same simplified contract: {last_plan_format_error}"
                         )
-                        if invalid_plan_calls >= (4 if gross_format_failure else 2):
+                        if invalid_plan_calls >= 3:
                             plan_format_exhausted = True
                 elif call.name == "request_plan_input":
                     try:
@@ -2213,7 +2700,7 @@ class AgentRuntime:
                 if plan_format_exhausted:
                     # A single model turn may contain several proposals.  The
                     # retry budget is global to this planning run, so stop at
-                    # the fourth rejected proposal instead of processing an
+                    # the third rejected proposal instead of processing an
                     # arbitrary remainder from the same response.
                     break
 
@@ -2226,53 +2713,8 @@ class AgentRuntime:
 
             if proposed is None and requested_questions is None and inspection_records:
                 unproductive_turns_after_inspection += 1
-                if unproductive_turns_after_inspection >= 2:
-                    fallback_plan = self._harness_fallback_plan(goal, inspection_records)
-                    if fallback_plan is not None:
-                        return fallback_plan
 
             if proposed is not None:
-                # Inspection provenance and persistence-only cross references
-                # are harness data, not fields the model must manufacture.
-                task_ids = [str(item["id"]) for item in proposed["tasks"]]
-                if not proposed.get("applicability_evidence"):
-                    proposed["applicability_evidence"] = [
-                        {
-                            "fact": (
-                                "Repository exists; no project files were found; the project will be created from scratch."
-                                if not str(record.get("result", "")).strip()
-                                or "No files" in str(record.get("result", ""))
-                                else f"Workspace inspection completed with {record.get('tool', 'read-only tool')}."
-                            ),
-                            "source": str(record["reference"]),
-                            "supports_tasks": task_ids,
-                        }
-                        for record in inspection_records.values()
-                    ]
-                if not proposed.get("expected_changes"):
-                    proposed["expected_changes"] = [
-                        {
-                            "path": (
-                                re.search(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+", str(item["description"])).group(0)
-                                if re.search(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+", str(item["description"]))
-                                else "."
-                            ),
-                            "intent": str(item["description"]),
-                            "supports_tasks": [str(item["id"])],
-                        }
-                        for item in proposed["tasks"]
-                    ]
-                for change in proposed.get("expected_changes", ()):
-                    if str(change.get("path", "")).startswith("<"):
-                        match = re.search(
-                            r"[A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+",
-                            str(change.get("intent", "")),
-                        )
-                        change["path"] = match.group(0) if match else "."
-                if not str(proposed.get("execution_strategy", "")).strip():
-                    proposed["execution_strategy"] = (
-                        "Execute ready tasks in dependency order and run each task's required verification."
-                    )
                 if planning_answers:
                     proposed = dict(proposed)
                     proposed["execution_strategy"] = (
@@ -2300,10 +2742,16 @@ class AgentRuntime:
                         for item in proposed["tasks"]
                     )
                     validate_task_dag(preview)
+                    self._validate_semantic_candidate(
+                        goal,
+                        proposed,
+                        successful_inspection_ids=inspections_before_turn,
+                    )
                     self._validate_plan_applicability(
                         proposed,
                         preview,
                         successful_inspection_ids=inspections_before_turn,
+                        original_request=goal.objective,
                     )
                 except (ValueError, DomainError) as exc:
                     invalid_plan_calls += 1
@@ -2319,20 +2767,36 @@ class AgentRuntime:
                         }
                     )
                     proposed = None
-                    if invalid_plan_calls >= 4:
+                    if invalid_plan_calls >= 3:
                         plan_format_exhausted = True
                         break
                     continue
-                critique = (
-                    self._review_plan_candidate(goal, proposed, inspection_records)
-                    if self._plan_requires_critic(proposed)
-                    else {
-                        "verdict": "pass",
-                        "summary": "Deterministic validation passed; independent criticism is not required for this low-complexity plan.",
-                        "issues": [],
-                    }
+                critique = self._review_plan_candidate(
+                    goal, proposed, inspection_records
                 )
                 if critique["verdict"] == "pass" and not critique["issues"]:
+                    semantic_metadata = self._accepted_semantic_metadata(
+                        goal, proposed, inspection_records
+                    )
+                    accepted_semantic = SemanticGoalV2.from_mapping(
+                        semantic_metadata["semantic_goal"],
+                        original_request=goal.objective,
+                    )
+                    current_session = self.store.get_workflow_session(
+                        self.session_id
+                    )
+                    manual_approval, approval_reason = (
+                        self._risk_adaptive_plan_approval(
+                            proposed,
+                            accepted_semantic,
+                            planning_only=(
+                                SessionMode.parse(
+                                    current_session["session_mode"]
+                                )
+                                is SessionMode.PLAN
+                            ),
+                        )
+                    )
                     plan = self.store.create_plan(
                         goal.id,
                         proposed["summary"],
@@ -2359,16 +2823,24 @@ class AgentRuntime:
                     )
                     self.events.publish(
                         "plan",
-                        f"Plan r{plan.revision} is ready. Review it, edit if needed, then use /approve {plan.revision}.",
+                        f"Plan r{plan.revision} is ready. Review, edit, and apply it in Plan Studio.",
                     )
                     self.store.update_goal_metadata(
                         goal.id,
+                        **semantic_metadata,
+                        plan_approval_policy={
+                            "requires_user": manual_approval,
+                            "reason": approval_reason,
+                            "risk_adaptive": True,
+                        },
                         consecutive_retries=0,
                         retry_reason="",
                         retry_after_ms=0,
                         auto_retryable=False,
                         plan_questions=[],
                         waiting_question="",
+                        strategy_attempts=[],
+                        failed_attempts=[],
                     )
                     self.store.save_workflow_session(
                         self.session_id,
@@ -2380,6 +2852,11 @@ class AgentRuntime:
                         run_state=RunState.PLANNING.value,
                         state={"plan_revision": plan.revision, "plan_fingerprint": plan.fingerprint},
                     )
+                    if not manual_approval:
+                        return self.approve_plan(
+                            plan.revision,
+                            approved_by="risk-adaptive-policy",
+                        )
                     return plan
                 revisions += 1
                 conversation.append(
@@ -2404,15 +2881,11 @@ class AgentRuntime:
                     }
                 )
 
-        fallback_plan = self._harness_fallback_plan(goal, inspection_records)
-        if fallback_plan is not None:
-            return fallback_plan
-
         checkpoint_reason = (
             (
-                "planner repeatedly returned an invalid structured plan; exact field validation is recorded"
-                if invalid_plan_calls >= 4
-                else "plan validation and its single targeted repair failed"
+                "model_capability_exhausted: planner returned three invalid structured plans"
+                if invalid_plan_calls >= 3
+                else "model_capability_exhausted: plan validation repairs did not converge"
             )
             if plan_format_exhausted
             else "planner did not produce a critic-approved structured plan"
@@ -2424,13 +2897,15 @@ class AgentRuntime:
                 "reason": checkpoint_reason,
                 "format_attempts": invalid_plan_calls,
                 "technical_detail": last_plan_format_error,
+                "checkpoint_type": "model_capability_exhausted",
+                "resumable": True,
             },
         )
         if plan_format_exhausted:
             self.events.publish(
                 "error",
                 (
-                    "Plan could not be prepared after one targeted repair. "
+                    "Plan could not be prepared after three exact-field repairs. "
                     f"Stage/field detail: {last_plan_format_error}. Edit the request or use /replan."
                 ),
                 technical_detail=last_plan_format_error,
@@ -2446,7 +2921,7 @@ class AgentRuntime:
         self._pause_planning(
             goal,
             (
-                f"Plan validation failed after one targeted repair: {last_plan_format_error}. Add guidance, then use /replan."
+                f"Model capability exhausted after three exact-field repairs: {last_plan_format_error}. Change or upgrade the model, then use /replan."
                 if plan_format_exhausted
                 else "The planner did not produce a critic-approved structured plan in its bounded pass. Add guidance, then use /resume or /replan."
             ),
@@ -2465,10 +2940,6 @@ class AgentRuntime:
         if session_mode is SessionMode.PLAN:
             raise RuntimeStateError(
                 "Plan Mode never executes. Switch to /mode normal or /mode ultra, review the final plan, then approve explicitly."
-            )
-        if session_mode is SessionMode.ULTRA and not goal.metadata.get("ultra_run_id"):
-            raise RuntimeStateError(
-                "This plan was prepared by the Normal planner. Ultra requires a new foundation review; request /replan after switching rather than executing this revision silently."
             )
         if goal.metadata.get("ultra_run_id"):
             return self.approve_ultra(revision)
@@ -2494,38 +2965,31 @@ class AgentRuntime:
                 for change in accepted.expected_changes if isinstance(change, Mapping)
             ))
             artifact_paths = tuple(dict.fromkeys((*contract.artifact_expectations, *(path for path in artifact_paths if path))))
+            declared_risks = {
+                str(task.risk or "medium").casefold() for task in accepted.tasks
+            }
             standard_dimensions = [
                 ("requirement-completeness", "Every explicit requested outcome is implemented", True, 1.0),
                 ("functional-correctness", "Required behavior works under authoritative execution", True, 1.0),
-                ("runtime-stability", "No relevant runtime, provider, browser, or console error remains", True, 1.0),
-                ("integration-correctness", "The change is integrated without breaking existing contracts", True, 1.0),
-                ("regression-safety", "Impacted focused checks and appropriate broader regression checks pass", True, 1.0),
-                ("maintainability", "The implementation is coherent, bounded, and avoids unnecessary complexity", False, 0.85),
             ]
-            objective_lower = contract.interpreted_objective.casefold()
-            castle_dimensions = []
-            artifact_dimensions = []
-            if any(path.casefold().endswith((".html", ".htm")) for path in artifact_paths):
-                artifact_dimensions = [
-                    ("visual-quality", "Visual composition, hierarchy, detail, and polish meet the requested quality", False, 0.85),
-                    ("interaction-quality", "Interactive and animated behavior is understandable, stable, and appropriately varied", False, 0.85),
-                ]
-            if "castle" in objective_lower and "siege" in objective_lower:
-                castle_dimensions = [
-                    ("castle-recognizable", "Castle is visually recognizable and more detailed than placeholder rectangles", False, 0.85),
-                    ("main-gate-visible", "Main gate is visible and not hidden by overlap", True, 1.0),
-                    ("ram-soldiers", "Soldiers visibly attempt to breach the gate with a battering ram", False, 0.85),
-                    ("ram-motion", "Battering ram has repeated understandable motion", False, 0.85),
-                    ("siege-tower", "Siege tower is clearly represented and participates in the scene", False, 0.85),
-                    ("moving-arrows", "Archers visibly release moving arrows", False, 0.85),
-                    ("catapult-projectiles", "Catapults visibly launch moving projectiles", False, 0.85),
-                    ("projectile-distinction", "Projectiles are distinguishable from static decoration", False, 0.85),
-                    ("animation-variety", "Actors do not all use identical synchronized animation", False, 0.85),
-                    ("scene-depth", "Scene has meaningful layering, depth, and a non-empty composition", False, 0.85),
-                    ("self-contained", "The requested single HTML artifact is self-contained with no unexpected network requests", True, 1.0),
-                    ("extended-stability", "Animation remains stable during an extended run without JavaScript errors", True, 1.0),
-                    ("responsive-usability", "Wide and narrow viewports remain usable without harmful overflow", True, 1.0),
-                ]
+            if declared_risks - {"low"} or len(accepted.tasks) > 1:
+                standard_dimensions.extend(
+                    [
+                        ("runtime-stability", "No relevant runtime or provider error remains", True, 1.0),
+                        ("integration-correctness", "The change is integrated without breaking observed contracts", True, 1.0),
+                        ("regression-safety", "Impacted focused and configured regression checks pass", True, 1.0),
+                    ]
+                )
+            if declared_risks & {"high", "critical"}:
+                standard_dimensions.extend(
+                    [
+                        ("security-safety", "Affected trust boundaries and sensitive operations are verified", True, 1.0),
+                        ("performance-safety", "Affected resource and performance constraints are measured", False, 0.85),
+                    ]
+                )
+            standard_dimensions.append(
+                ("maintainability", "The implementation is coherent, bounded, and avoids unnecessary complexity", False, 0.85)
+            )
             generated_dimensions = [
                 {
                     "id": dimension_id,
@@ -2534,14 +2998,13 @@ class AgentRuntime:
                     "minimum_score": minimum,
                     "required_evidence": list(verification),
                     "evaluation_method": (
-                        "vision_and_runtime" if dimension_id in {item[0] for item in (*artifact_dimensions, *castle_dimensions)} and not hard_gate
-                        else "deterministic_then_independent_review"
+                        "deterministic_then_independent_review"
                     ),
                     "confidence": "medium",
                     "latest_artifact_hash": None,
                     "latest_mutation_sequence": None,
                 }
-                for dimension_id, description, hard_gate, minimum in (*standard_dimensions, *artifact_dimensions, *castle_dimensions)
+                for dimension_id, description, hard_gate, minimum in standard_dimensions
             ]
             updated_contract = GoalContractV1(
                 **{
@@ -2593,7 +3056,7 @@ class AgentRuntime:
         self.store.save_workflow_session(
             self.session_id,
             goal_id=goal.id,
-            session_mode=SessionMode.NORMAL.value,
+            session_mode=session_mode.value,
             plan_state=PlanState.APPROVED.value,
             run_state=RunState.EXECUTING.value,
             state={"plan_revision": accepted.revision, "plan_fingerprint": accepted.fingerprint},
@@ -3036,16 +3499,9 @@ class AgentRuntime:
                 payload={"state": "converged", "source": "explicit_user_visual_acceptance", "evidence_id": item.id},
             )
             return item
-        dimensions = []
-        for dimension, words in {
-            "visual_quality": ("graphic", "visual", "detail", "empty", "color", "castle", "catapult"),
-            "interaction_quality": ("animation", "motion", "basic", "slow", "fast"),
-            "functional_correctness": ("error", "broken", "still happening", "doesn't", "does not"),
-        }.items():
-            if any(word in lowered for word in words):
-                dimensions.append(dimension)
-        if not dimensions:
-            dimensions.append("requirement_completeness")
+        # Feedback is attached to the accepted semantic contract without
+        # guessing a product dimension from keywords.
+        dimensions = ["requirement_completeness"]
 
         contract_data = latest.metadata.get("goal_contract")
         components: list[dict[str, Any]] = []
@@ -3057,10 +3513,6 @@ class AgentRuntime:
                 if candidate.is_file() and candidate.is_relative_to(self.workspace):
                     self.repository_index.update(candidate.relative_to(self.workspace).as_posix())
             retrieval_query = feedback
-            if "visual_quality" in dimensions:
-                retrieval_query += " style css color lighting scene castle component"
-            if "interaction_quality" in dimensions:
-                retrieval_query += " keyframe animation event movement timing"
             context_slice = self.repository_index.context_slice(
                 retrieval_query,
                 max_entries=30,
@@ -3169,7 +3621,7 @@ class AgentRuntime:
 
         from .ultra_models import AgentRunStatus, WorkNodeStatus
 
-        goal = self.store.load_active_goal()
+        goal = self.store.load_active_goal(self.session_id)
         if goal is None:
             return ()
         run_id = str(goal.metadata.get("ultra_run_id", ""))
@@ -3314,6 +3766,15 @@ class AgentRuntime:
             goal.status != GoalStatus.PAUSED and not resumable_failed_ultra
         ):
             raise RuntimeStateError("goal is not paused")
+        retry_not_before = goal.metadata.get("retry_not_before")
+        if (
+            retry_not_before is not None
+            and float(retry_not_before) > time.time()
+        ):
+            remaining = max(1, int(float(retry_not_before) - time.time()))
+            raise RuntimeStateError(
+                f"saved provider retry is waiting for {remaining} more second(s)"
+            )
         unresolved = self._unresolved_recovery_entities(goal.id)
         if unresolved:
             preview = ", ".join(unresolved[:5])
@@ -3338,7 +3799,13 @@ class AgentRuntime:
             desired = GoalStatus.RUNNING if goal.active_plan_revision else GoalStatus.DISCOVERING
         self.store.update_goal_metadata(goal.id, waiting_question="")
         self.store.update_goal_metadata(goal.id, no_progress_slices=0)
-        self.store.update_goal_metadata(goal.id, retry_after_ms=0, auto_retryable=False)
+        self.store.update_goal_metadata(
+            goal.id,
+            retry_after_ms=0,
+            retry_not_before=None,
+            auto_retryable=False,
+            provider_recovery={"state": "retrying", "automatic_fallback": False},
+        )
         result = self.store.transition_goal(
             goal.id,
             desired,
@@ -3383,7 +3850,11 @@ class AgentRuntime:
             raise RuntimeStateError("no active goal")
         if self.ultra_session is not None:
             self.ultra_session.cancel()
-        result = self.store.transition_goal(goal.id, GoalStatus.CANCELLED, reason="explicitly cancelled by user")
+        result = self.store.cancel_goal_and_session(
+            goal.id,
+            self.session_id,
+            reason="explicitly cancelled by user",
+        )
         self.events.publish("phase", "Goal cancelled by explicit user request.")
         return result
 
@@ -3676,6 +4147,48 @@ class AgentRuntime:
             json.dumps({"tool": call.name, "args": redact_data(args)}, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
         persisted_failures = tuple(goal.metadata.get("failed_attempts", ()))
+        recent_non_improving = [
+            item
+            for item in goal.metadata.get("strategy_attempts", ())
+            if isinstance(item, Mapping)
+            and item.get("outcome") in {"unchanged", "regressed"}
+        ][-3:]
+        if (
+            len(recent_non_improving) == 3
+            and len(
+                {
+                    str(item.get("fingerprint") or item.get("strategy_fingerprint"))
+                    for item in recent_non_improving
+                }
+            )
+            == 3
+        ):
+            self.store.update_goal_metadata(
+                goal.id,
+                strategy_reinspection_required=True,
+                convergence_state="replanning",
+            )
+            if goal.status is GoalStatus.RUNNING:
+                self.store.transition_goal(
+                    goal.id,
+                    GoalStatus.REVISING,
+                    reason=(
+                        "three materially different strategies produced no "
+                        "improvement; fresh inspection and planning are required"
+                    ),
+                )
+            self.store.append_event(
+                "strategy.replan_required",
+                goal_id=goal.id,
+                payload={
+                    "reason": "three materially different strategies did not improve evidence",
+                    "task_id": task_id,
+                },
+            )
+            return (
+                "Error: three non-improving strategies require fresh repository "
+                "inspection and a revised plan before further execution."
+            )
         equivalent_count = sum(
             1 for attempt in persisted_failures
             if isinstance(attempt, Mapping) and attempt.get("approach_fingerprint") == approach_fingerprint
@@ -3740,6 +4253,45 @@ class AgentRuntime:
             risk=risk,
             mutating=call.name in MUTATING_TOOLS,
         )
+        leased_paths: tuple[str, ...] = ()
+        mutation_journal_ids: tuple[str, ...] = ()
+        if call.name in MUTATING_TOOLS:
+            leased_paths = self.store.lease_resource_claims(goal.id, task_id)
+            mutation_journal_ids = self.store.prepare_mutation_journal(
+                goal.id,
+                task_id,
+                leased_paths,
+            )
+            direct_path = (
+                str(args.get("path") or "").strip().replace("\\", "/")
+                if call.name in {"write_file", "edit_file", "materialize_artifact"}
+                else ""
+            )
+            requested_paths = {direct_path} if direct_path else set()
+            if call.name == "apply_patch":
+                base_path = str(args.get("base_path") or ".").strip()
+                prefix = "" if base_path in {"", "."} else base_path.rstrip("/\\") + "/"
+                for match in re.finditer(
+                    r"(?m)^(?:---|\+\+\+)\s+(?:[ab]/)?([^\t\r\n]+)",
+                    str(args.get("patch") or ""),
+                ):
+                    value = match.group(1).strip()
+                    if value != "/dev/null":
+                        requested_paths.add(
+                            (prefix + value).replace("\\", "/").removeprefix("./")
+                        )
+            if requested_paths - set(leased_paths):
+                result = (
+                    "Error: mutation target(s) are not covered by accepted, "
+                    "repository-evidenced resource claims: "
+                    + ", ".join(sorted(requested_paths - set(leased_paths)))
+                )
+                self.store.complete_action(action_id, result, status="denied")
+                self.store.finish_mutation_journal(
+                    mutation_journal_ids, applied=False
+                )
+                self.store.release_resource_claims(goal.id, task_id)
+                return result
         pre_path = str(args.get("path", "")).strip() if call.name in {"write_file", "edit_file", "materialize_artifact"} else ""
         pre_bytes: bytes | None = None
         pre_hash: str | None = None
@@ -3747,13 +4299,19 @@ class AgentRuntime:
             self._chat_workspace_hashes(self.workspace)
             if call.name in MUTATING_TOOLS else {}
         )
+        mutation_observed = False
         if pre_path:
             pre_candidate = (self.workspace / pre_path).resolve(strict=False)
             if pre_candidate.is_file() and pre_candidate.is_relative_to(self.workspace):
                 pre_bytes = pre_candidate.read_bytes()
                 pre_hash = hashlib.sha256(pre_bytes).hexdigest()
         try:
-            with tools.workspace_context(self.workspace):
+            with tools.workspace_context(
+                self.workspace,
+                session_id=self.session_id,
+                goal_id=goal.id,
+                task_id=task_id or "unassigned",
+            ):
                 if call.name in {"run_bash", "run_command"} and self.permission_adapter is not None:
                     shell_command = str(args.get("command", ""))
                     if (
@@ -3786,6 +4344,49 @@ class AgentRuntime:
                 path for path in sorted(set(mutation_before) | set(mutation_after))
                 if mutation_before.get(path) != mutation_after.get(path)
             ]
+            mutation_observed = bool(actual_changed_files)
+            unleased_changes = [
+                path
+                for path in actual_changed_files
+                if path not in set(leased_paths)
+            ]
+            if (
+                terminal == "completed"
+                and call.name in MUTATING_TOOLS
+                and unleased_changes
+            ):
+                result = (
+                    "Error: mutation escaped accepted resource leases; user "
+                    "inspection is required for: "
+                    + ", ".join(unleased_changes)
+                )
+                terminal = "failed"
+                self.store.mark_action_uncertain(action_id, result)
+                latest = self.store.get_goal(goal.id)
+                uncertain = list(latest.metadata.get("uncertain_actions", ()))
+                uncertain.append(
+                    {
+                        "action_id": action_id,
+                        "paths": unleased_changes,
+                        "reason": "mutation escaped accepted resource leases",
+                    }
+                )
+                self.store.update_goal_metadata(
+                    goal.id,
+                    uncertain_actions=uncertain[-50:],
+                    waiting_question=(
+                        "A mutating action changed paths outside its accepted "
+                        "leases. Inspect and resolve the uncertain action before resuming."
+                    ),
+                    resume_status=GoalStatus.RUNNING.value,
+                )
+                current_goal = self.store.get_goal(goal.id)
+                if current_goal.status is GoalStatus.RUNNING:
+                    self.store.transition_goal(
+                        goal.id,
+                        GoalStatus.PAUSED,
+                        reason="mutation escaped accepted resource leases",
+                    )
             if terminal == "completed" and call.name in MUTATING_TOOLS and actual_changed_files:
                 refreshed = self.store.get_goal(goal.id)
                 sequence = int(refreshed.metadata.get("mutation_sequence", 0)) + 1
@@ -3843,7 +4444,27 @@ class AgentRuntime:
                     "mutation_sequence": sequence,
                 }
                 changes.append(change_set)
-                self.store.update_goal_metadata(goal.id, goal_change_sets=changes)
+                successful_strategy = StrategyAttemptV1(
+                    task_id=task_id or "unassigned",
+                    hypothesis="The accepted task contract predicts this mutation advances its criteria.",
+                    approach=json.dumps(
+                        {"tool": call.name, "arguments": redact_data(args)},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    ),
+                    evidence_refs=(f"action:{action_id}", change_set["id"]),
+                    outcome="improved",
+                )
+                prior_strategies = list(
+                    latest_for_change.metadata.get("strategy_attempts", ())
+                )
+                prior_strategies.append(successful_strategy.to_dict())
+                self.store.update_goal_metadata(
+                    goal.id,
+                    goal_change_sets=changes,
+                    strategy_attempts=prior_strategies[-100:],
+                )
                 self.store.append_event(
                     "change_set.created", goal_id=goal.id,
                     entity_type="change_set", entity_id=change_set["id"],
@@ -3906,6 +4527,12 @@ class AgentRuntime:
         except Exception as exc:
             result = f"Error: tool harness failure: {type(exc).__name__}: {redact_text(exc, 500)}"
             self.store.complete_action(action_id, result, status="failed")
+        if call.name in MUTATING_TOOLS:
+            self.store.finish_mutation_journal(
+                mutation_journal_ids,
+                applied=mutation_observed or not result.startswith("Error:"),
+            )
+            self.store.release_resource_claims(goal.id, task_id)
         if result.startswith("Error:"):
             domain = (
                 FailureDomain.PERMISSION if "permission" in result.casefold()
@@ -3938,13 +4565,39 @@ class AgentRuntime:
             failures = list(latest.metadata.get("failed_hypotheses", ()))
             failures.append({"signature": signature.fingerprint, "operation": call.name, "message": signature.normalized_message})
             attempts = list(latest.metadata.get("failed_attempts", ()))
-            attempts.append({
-                "signature": signature.fingerprint,
-                "approach_fingerprint": approach_fingerprint,
-                "operation": call.name,
-            })
+            strategy_attempt = StrategyAttemptV1(
+                task_id=task_id or "unassigned",
+                hypothesis=signature.normalized_message,
+                approach=json.dumps(
+                    {"tool": call.name, "arguments": redact_data(args)},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ),
+                evidence_refs=(f"action:{action_id}",),
+                outcome="unchanged",
+                next_strategy=(
+                    "re-inspect and select a materially different mechanism"
+                    if equivalent_count >= 1
+                    else "use failure evidence to revise the hypothesis"
+                ),
+            )
+            attempts.append(
+                {
+                    **strategy_attempt.to_dict(),
+                    "signature": signature.fingerprint,
+                    "strategy_fingerprint": strategy_attempt.fingerprint,
+                    "approach_fingerprint": approach_fingerprint,
+                    "operation": call.name,
+                }
+            )
             metadata_update: dict[str, Any] = {
-                "failed_hypotheses": failures[-20:], "failed_attempts": attempts[-50:]
+                "failed_hypotheses": failures[-20:],
+                "failed_attempts": attempts[-50:],
+                "strategy_attempts": [
+                    *list(latest.metadata.get("strategy_attempts", ())),
+                    strategy_attempt.to_dict(),
+                ][-100:],
             }
             contract_data = latest.metadata.get("goal_contract")
             if isinstance(contract_data, Mapping):
@@ -4056,83 +4709,6 @@ class AgentRuntime:
         except (StateStoreError, ValueError) as exc:
             return f"Error: checklist update rejected: {redact_text(exc, 1_000)}"
         return f"Checklist {task.id} -> {task.status.value}. Durable state updated."
-
-    def _maybe_complete_harness_fallback_task(self, goal: Goal, plan: Plan) -> bool:
-        """Close a narrow fallback task from authoritative artifact evidence.
-
-        Weak models often keep re-reading a proven file instead of emitting the
-        checklist control call.  For the single-artifact fallback only, the
-        harness can evaluate the exact deterministic gates it authored.
-        """
-
-        if plan.proposed_by != "harness-weak-model-fallback" or len(plan.tasks) != 1:
-            return False
-        task = plan.tasks[0]
-        if task.status not in {TaskStatus.READY, TaskStatus.IN_PROGRESS, TaskStatus.VERIFYING}:
-            return False
-        if not plan.expected_changes:
-            return False
-        relative = str(plan.expected_changes[0].get("path") or "").strip()
-        candidate = (self.workspace / relative).resolve(strict=False)
-        if not relative or not candidate.is_file() or not candidate.is_relative_to(self.workspace):
-            return False
-        evidence = [
-            item
-            for item in self.store.list_evidence(goal.id, task_id=task.id)
-            if item.plan_revision == plan.revision and item.verified
-        ]
-        tools_seen = {str(item.data.get("tool") or "") for item in evidence}
-        if "read_file" not in tools_seen:
-            return False
-        objective = goal.objective.casefold()
-        if relative.casefold().endswith((".html", ".htm")):
-            if not tools_seen.intersection({"preview_html", "inspect_preview"}):
-                return False
-            preview_results = [
-                str(item.data.get("result") or "")
-                for item in evidence
-                if str(item.data.get("tool") or "") in {"preview_html", "inspect_preview"}
-            ]
-            if not any(
-                ('"verification": "passed"' in result or '"status": "passed"' in result)
-                and '"console_errors": []' in result
-                and '"page_errors": []' in result
-                and '"network_errors": []' in result
-                for result in preview_results
-            ):
-                return False
-            html = candidate.read_text(encoding="utf-8", errors="replace")
-            lowered = html.casefold()
-            if "<!doctype html" not in lowered or "<html" not in lowered:
-                return False
-            if "accessible" in objective and not (re.search(r"<html\b[^>]*\blang=", lowered) and "<button" in lowered):
-                return False
-            if "visible" in objective and "counter" in objective:
-                if not (
-                    re.search(r"id=[\"']counter[\"'][^>]*>\s*\d+", lowered)
-                    and "<button" in lowered
-                    and re.search(r"(?:addEventListener|onclick|increment)", html, re.IGNORECASE)
-                ):
-                    return False
-        self.store.transition_task(
-            goal.id,
-            plan.revision,
-            task.id,
-            TaskStatus.COMPLETED,
-            note="harness-authored fallback verification gates passed",
-            evidence=(
-                f"Harness verified {relative}: saved artifact read-back and required runtime/static gates passed.",
-            ),
-            actor="harness-fallback-verifier",
-        )
-        self.store.append_event(
-            "task.fallback_verified",
-            goal_id=goal.id,
-            entity_type="task",
-            entity_id=task.id,
-            payload={"path": relative, "tools": sorted(tools_seen)},
-        )
-        return True
 
     def _record_memory(self, goal: Goal, plan: Plan, args: dict[str, Any]) -> str:
         item = self.store.add_evidence(
@@ -4908,21 +5484,6 @@ class AgentRuntime:
                     if not result.startswith("Error:") and not result.startswith("Permission denied"):
                         made_progress = True
 
-                refreshed_goal = self.store.get_goal(goal.id)
-                refreshed_plan = self.store.get_latest_plan(goal.id)
-                if self._maybe_complete_harness_fallback_task(refreshed_goal, refreshed_plan):
-                    made_progress = True
-                    self._work_conversation.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "HARNESS FALLBACK VERIFICATION PASSED: the selected checklist task is now completed "
-                                "from authoritative read-back and runtime evidence. Request finish_goal with a concise "
-                                "evidence summary; do not repeat file reads."
-                            ),
-                        }
-                    )
-
                 durable_checkpoint = state_envelope(self._state_payload(
                     self.store.get_goal(goal.id),
                     self.store.get_latest_plan(goal.id),
@@ -4930,8 +5491,11 @@ class AgentRuntime:
                 self._work_conversation = context.suspend_and_revive(
                     self._work_conversation,
                     durable_checkpoint,
-                    self.provider.summarize,
-                    max_chars=self.config.conversation_chars,
+                    getattr(self.provider, "summarize", None),
+                    max_chars=self._provider_conversation_budget(
+                        COORDINATOR_SYSTEM_PROMPT,
+                        schemas,
+                    ),
                     on_suspend=lambda count: self.events.publish(
                         "checkpoint",
                         f"Suspended {count} transient messages and revived a fresh model context from durable goal memory.",
@@ -4942,6 +5506,24 @@ class AgentRuntime:
                     break
 
             current = self.store.get_goal(goal.id)
+            if (
+                current.status is GoalStatus.REVISING
+                and current.metadata.get("strategy_reinspection_required")
+            ):
+                self.store.update_goal_metadata(
+                    current.id,
+                    strategy_reinspection_required=False,
+                )
+                try:
+                    self.generate_plan(
+                        "Three materially different strategies failed to improve "
+                        "the evidence. Re-inspect the repository and produce a "
+                        "materially different plan."
+                    )
+                except ProviderUnavailableError:
+                    # generate_plan persists the resumable planning pause.
+                    pass
+                current = self.store.get_goal(goal.id)
             if current.status == GoalStatus.RUNNING:
                 stalled = 0 if made_progress else int(current.metadata.get("no_progress_slices", 0)) + 1
                 current = self.store.update_goal_metadata(
@@ -4997,7 +5579,7 @@ class AgentRuntime:
             return SliceResult(current.status.value, message, completed_steps, completed, needs_user)
 
     def dashboard(self) -> DashboardView:
-        goal = self.active_goal() or self.store.get_latest_goal()
+        goal = self.active_goal() or self.store.get_latest_goal(self.session_id)
         if goal is None:
             return DashboardView(
                 provider=self.provider_name,
@@ -5197,45 +5779,9 @@ class AgentRuntime:
         return result
 
     def _artifactize_chat_text(self, text: str) -> tuple[str, tuple[dict[str, Any], ...]]:
-        """Persist large generated code and replace provider history with stable handles."""
+        """Compatibility shim; unified execution never assigns artifact paths."""
 
-        original = str(text or "")
-        artifacts: list[dict[str, Any]] = []
-        pattern = re.compile(r"```([\w.+-]*)\s*\n([\s\S]*?)```", re.MULTILINE)
-
-        def replace(match: re.Match[str]) -> str:
-            language = (match.group(1) or "text").casefold()
-            content = match.group(2)
-            if len(content) < 2_048 and "<!doctype html" not in content.casefold():
-                return match.group(0)
-            names = {
-                "html": "index.html", "javascript": "generated.js", "js": "generated.js",
-                "python": "generated.py", "py": "generated.py", "css": "styles.css",
-            }
-            artifact = self.store.add_chat_artifact(
-                self.session_id, content, language=language,
-                suggested_name=names.get(language, "generated.txt"),
-            )
-            artifacts.append(artifact)
-            return (
-                f"<CHAT_ARTIFACT id=\"{artifact['id']}\" language=\"{language}\" "
-                f"suggested_name=\"{artifact['suggested_name']}\" sha256=\"{artifact['content_hash']}\" "
-                f"bytes=\"{artifact['byte_size']}\" />"
-            )
-
-        compact = pattern.sub(replace, original)
-        if not artifacts and len(original) >= 2_048 and "<!doctype html" in original.casefold():
-            start = original.casefold().find("<!doctype html")
-            content = original[start:]
-            artifact = self.store.add_chat_artifact(
-                self.session_id, content, language="html", suggested_name="index.html",
-            )
-            artifacts.append(artifact)
-            compact = (
-                f"<CHAT_ARTIFACT id=\"{artifact['id']}\" language=\"html\" suggested_name=\"index.html\" "
-                f"sha256=\"{artifact['content_hash']}\" bytes=\"{artifact['byte_size']}\" />"
-            )
-        return compact, tuple(artifacts)
+        return str(text or ""), ()
 
     def _execute_chat_tool(
         self,
@@ -5417,135 +5963,37 @@ class AgentRuntime:
         return "\n".join(f"- {item}" for item in evidence)
 
     def chat(self, text: str, *, steps: int = 12) -> SliceResult:
-        """Run ordinary Chat with durable artifacts and action postcondition gates."""
+        """Route Chat through the same durable semantic execution engine."""
 
         prompt = str(text).strip()
         if not prompt:
             return SliceResult("idle", "", 0)
-        user_message = {"role": "user", "content": prompt}
-        self._chat_conversation.append(user_message)
-        self.store.append_chat_message(self.session_id, user_message)
-        session = self.store.get_workflow_session(self.session_id)
-        session_state = dict(session.get("state", {}))
-        session_state.setdefault("run_id", f"run-{hashlib.sha256((prompt + str(time.time_ns())).encode()).hexdigest()[:20]}")
-        session_state.setdefault("original_objective", prompt)
-        session_state.setdefault("user_messages", [])
-        session_state["user_messages"] = [*session_state["user_messages"], prompt][-50:]
-
-        intent = ChatIntentV1.parse(prompt)
-        known_artifacts = self.store.list_chat_artifacts(self.session_id)
-        latest_html = next((item for item in reversed(known_artifacts) if item.get("language") == "html"), None)
-        if intent.requires_run and latest_html is not None:
-            suggested = str(latest_html.get("suggested_name") or "index.html")
-            if not (self.workspace / suggested).exists():
-                intent = ChatIntentV1(prompt, requires_write=True, requires_run=True, requires_install=intent.requires_install)
-
-        capability_rows = tools.capability_report()
-        capabilities = json.dumps(capability_rows, ensure_ascii=False)
-        artifact_rows = [
-            {key: item.get(key) for key in ("id", "language", "suggested_name", "content_hash", "byte_size")}
-            for item in known_artifacts[-10:]
-        ]
-        system = CHAT_SYSTEM_PROMPT + "\n\nRUNTIME CAPABILITIES:\n" + capabilities
-        if artifact_rows:
-            system += "\n\nDURABLE CHAT ARTIFACTS:\n" + json.dumps(artifact_rows, ensure_ascii=False)
-
-        executed = 0
-        changed_paths: list[str] = []
-        successful_tools: list[str] = []
-        successful_outputs: list[tuple[str, str]] = []
-        failure_outputs: list[str] = []
-        no_action_attempts = 0
-        final_text = ""
-
-        for step in range(1, max(1, steps) + 1):
-            turn = self._call_provider(
-                self._chat_conversation,
-                list(tools.TOOL_SCHEMAS),
-                system,
-                actor="chat",
-                step=step,
-                stream_text=False,
-            )
-            message = turn.to_message()
-            display_text = turn.text or ""
-            if turn.text:
-                compact_text, created = self._artifactize_chat_text(turn.text)
-                message["content"] = compact_text
-                if created:
-                    session_state["chat_artifact_ids"] = list(dict.fromkeys([
-                        *session_state.get("chat_artifact_ids", []), *(item["id"] for item in created)
-                    ]))
-            self._chat_conversation.append(message)
-            self.store.append_chat_message(self.session_id, message)
-
-            if turn.tool_calls:
-                for call in turn.tool_calls:
-                    result, changed = self._execute_chat_tool(call, intent)
-                    executed += 1
-                    tool_message = {"role": "tool", "id": call.id, "name": call.name, "content": result.output}
-                    self._chat_conversation.append(tool_message)
-                    self.store.append_chat_message(self.session_id, tool_message)
-                    self.events.publish("tool_result", result.output, tool=call.name, actor="chat", id=call.id)
-                    if result.ok:
-                        successful_tools.append(call.name)
-                        successful_outputs.append((call.name, result.output))
-                        changed_paths.extend(changed)
-                    else:
-                        failure_outputs.append(result.output)
-                continue
-
-            missing = intent.missing(successful_tools)
-            if missing:
-                if intent.requires_run and "?" in display_text and latest_html is None:
-                    candidates = [
-                        path for path in self.workspace.rglob("*.htm*")
-                        if ".coding-agent" not in path.parts
-                    ]
-                    if len(candidates) != 1:
-                        # A real target choice is allowed; capability denial is not.
-                        final_text = display_text
-                        break
-                no_action_attempts += 1
-                if no_action_attempts >= self.config.no_action_limit:
-                    detail = failure_outputs[-1] if failure_outputs else "the model repeatedly returned prose without using the available tools"
-                    final_text = f"Action could not be completed: {detail}"
-                    break
-                correction = corrective_prompt(intent, missing, capabilities)
-                correction_message = {"role": "user", "content": correction}
-                self._chat_conversation.append(correction_message)
-                self.store.append_chat_message(self.session_id, correction_message)
-                continue
-
-            final_text = display_text or "Completed the requested action."
-            break
-
-        if not final_text:
-            final_text = f"Chat turn checkpointed after {executed} tool action(s); execution can continue in the same session."
-        if successful_outputs and intent.actionable:
-            final_text = final_text.rstrip() + "\n\nEvidence:\n" + self._chat_evidence(successful_outputs)
-
-        artifacts = list(dict.fromkeys(changed_paths))
-        if artifacts:
-            session_state["below_target_continuation"] = {
-                "status": "below_target",
-                "objective": session_state["original_objective"],
-                "target": "evidence-backed convergence",
-                "weaknesses": ["candidate has not passed independent evaluation"],
-                "expected_refinement_scope": artifacts,
-                "artifacts": artifacts,
-                "recommended_action": "continue the same run in Goal mode",
-                "memory_preserved": True,
-            }
-            final_text += (
-                "\n\nQuality status: BELOW_TARGET (not independently evaluated). "
-                "The artifact and action evidence are preserved for Goal mode."
-            )
-        self.store.save_workflow_session(
-            self.session_id, goal_id=None, session_mode=SessionMode.CHAT.value,
-            plan_state=PlanState.NONE.value, run_state=RunState.IDLE.value, state=session_state,
+        result = self.submit_intent(
+            prompt,
+            requested_mode=RunMode.NORMAL,
+            entry_surface="chat",
         )
-        return SliceResult("chat", final_text, executed)
+        goal = self.active_goal()
+        if isinstance(result, Plan):
+            if result.status is PlanStatus.ACCEPTED:
+                return self.run_slice(steps=max(1, steps))
+            return SliceResult(
+                result.status.value,
+                f"Repository-grounded plan r{result.revision} is ready.",
+                0,
+                needs_user=result.status is PlanStatus.PENDING_APPROVAL,
+            )
+        if goal is not None:
+            return SliceResult(
+                goal.status.value,
+                str(goal.metadata.get("waiting_question") or "The durable task is active."),
+                0,
+                needs_user=goal.status in {
+                    GoalStatus.PAUSED,
+                    GoalStatus.AWAITING_PLAN_APPROVAL,
+                },
+            )
+        return SliceResult("idle", "No task was created.", 0)
 
     def sleep_profile(self, action: str, mode: Any) -> Mapping[str, Any]:
         """Control session-scoped Sleep without weakening Ultra/Docker gates."""
@@ -5561,7 +6009,7 @@ class AgentRuntime:
             return self.sleep_controller.status()
         selected = InteractionMode.parse(mode)
         access = self.permission_adapter.access_level if self.permission_adapter else AccessLevel.NORMAL
-        goal = self.active_goal() or self.store.get_latest_goal()
+        goal = self.active_goal() or self.store.get_latest_goal(self.session_id)
         run_id = str(goal.metadata.get("ultra_run_id", "")) if goal else ""
         uncertain = bool(
             run_id

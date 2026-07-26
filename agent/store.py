@@ -6,7 +6,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
+import stat
 import struct
 import zlib
 from contextlib import contextmanager
@@ -26,6 +28,8 @@ from .models import (
     Plan,
     PlanApproval,
     PlanStatus,
+    QueuedPrompt,
+    QueuedPromptStatus,
     RecoveryReport,
     RoleProfile,
     RuntimeEvent,
@@ -100,7 +104,9 @@ from .durable_memory import (
 )
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 14
+DEFAULT_SESSION_ID = "workspace-session"
+MAX_PENDING_PROMPTS = 10
 
 DEFAULT_TRACE_MAX_BYTES = 256_000
 MAX_TRACE_MAX_BYTES = 2_000_000
@@ -300,8 +306,8 @@ def _validate_plan_basis(
         if supports - task_ids:
             raise ValueError("expected changes reference a task outside this plan")
         change_coverage.update(supports)
-    if not change_coverage:
-        raise ValueError("a coding plan must bind at least one workspace change to a task")
+    # Analysis-only and test-only plans are valid without a mutation claim.
+    # The store must never invent a path merely to satisfy persistence.
 
 
 class StateStore:
@@ -335,6 +341,7 @@ class StateStore:
         self._connection.row_factory = sqlite3.Row
         try:
             self._initialize()
+            self._remove_legacy_recovery_baselines()
         except Exception:
             self._connection.close()
             raise
@@ -423,6 +430,22 @@ class StateStore:
                     existing = 11
                 if existing < 12:
                     self._migrate_v12()
+                    existing = 12
+                if existing < 13:
+                    self._migrate_v13()
+                    existing = 13
+                if existing < 14:
+                    self._migrate_v14()
+                journal_columns = {
+                    str(row[1])
+                    for row in self._connection.execute(
+                        "PRAGMA table_info(mutation_journal)"
+                    ).fetchall()
+                }
+                if journal_columns and "post_hash" not in journal_columns:
+                    self._connection.execute(
+                        "ALTER TABLE mutation_journal ADD COLUMN post_hash TEXT"
+                    )
                 self._connection.execute(
                     "UPDATE managed_resources SET status='stale',updated_at=? WHERE status IN ('running','ready')",
                     (_iso(utc_now()),),
@@ -430,6 +453,10 @@ class StateStore:
                 self._connection.execute(
                     "UPDATE session_actions SET status='uncertain',result_summary=?,completed_at=? WHERE status='running'",
                     ("Interrupted before the harness recorded a terminal result; inspect workspace state before retrying.", _iso(utc_now())),
+                )
+                self._connection.execute(
+                    "UPDATE queued_prompts SET status='pending',started_at=NULL "
+                    "WHERE status='running' AND goal_id IS NULL"
                 )
                 # Sleep authorization is intentionally process-scoped. Durable
                 # findings/cycles remain, but a restart always requires Full
@@ -1459,6 +1486,198 @@ class StateStore:
             )
             connection.execute("PRAGMA user_version=12")
 
+    def _migrate_v13(self) -> None:
+        """Add session-scoped goals and the immutable durable prompt queue."""
+
+        goal_columns = {
+            str(row[1])
+            for row in self._connection.execute("PRAGMA table_info(goals)").fetchall()
+        }
+        with self.transaction() as connection:
+            if "session_id" not in goal_columns:
+                connection.execute(
+                    "ALTER TABLE goals ADD COLUMN session_id TEXT "
+                    "REFERENCES workflow_sessions(id) ON DELETE SET NULL"
+                )
+            now = _iso(utc_now())
+            connection.execute(
+                "INSERT INTO workflow_sessions("
+                "id,goal_id,session_mode,plan_state,run_state,ultra_profile,"
+                "sleep_state,state_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO NOTHING",
+                (
+                    DEFAULT_SESSION_ID,
+                    None,
+                    "normal",
+                    "none",
+                    "idle",
+                    "standard",
+                    "off",
+                    "{}",
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE goals SET session_id=? WHERE session_id IS NULL OR session_id=''",
+                (DEFAULT_SESSION_ID,),
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_goals_session_status "
+                "ON goals(session_id,status,created_at)"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_goals_one_unfinished_per_session "
+                "ON goals(session_id) WHERE status NOT IN "
+                "('completed','cancelled')"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS queued_prompts ("
+                "id TEXT PRIMARY KEY,"
+                "session_id TEXT NOT NULL REFERENCES workflow_sessions(id) ON DELETE CASCADE,"
+                "sequence INTEGER NOT NULL,"
+                "prompt_text TEXT NOT NULL,"
+                "mode TEXT NOT NULL CHECK(mode IN ('plan','normal','ultra')),"
+                "status TEXT NOT NULL CHECK(status IN "
+                "('pending','running','completed','blocked','cancelled')),"
+                "goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL,"
+                "error TEXT NOT NULL DEFAULT '',"
+                "created_at TEXT NOT NULL,"
+                "started_at TEXT,"
+                "completed_at TEXT,"
+                "UNIQUE(session_id,sequence))"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_queued_prompts_ready "
+                "ON queued_prompts(session_id,status,sequence)"
+            )
+            connection.execute("PRAGMA user_version=13")
+
+    def _migrate_v14(self) -> None:
+        """Invalidate unfinished pre-semantic plans and add mutation journals."""
+
+        now = _iso(utc_now())
+        with self.transaction() as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS mutation_journal ("
+                "id TEXT PRIMARY KEY,"
+                "goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,"
+                "task_id TEXT,"
+                "path TEXT NOT NULL,"
+                "pre_hash TEXT,"
+                "post_hash TEXT,"
+                "original_bytes BLOB,"
+                "status TEXT NOT NULL CHECK(status IN "
+                "('prepared','applied','rolled_back','released')),"
+                "created_at TEXT NOT NULL,"
+                "updated_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mutation_journal_goal "
+                "ON mutation_journal(goal_id,status,created_at)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS legacy_recovery_cleanup ("
+                "run_id TEXT PRIMARY KEY,"
+                "baseline_path TEXT NOT NULL,"
+                "size_bytes INTEGER NOT NULL,"
+                "recorded_at TEXT NOT NULL,"
+                "removed_at TEXT)"
+            )
+            rows = connection.execute(
+                "SELECT id,metadata_json FROM goals WHERE status NOT IN "
+                "('completed','cancelled')"
+            ).fetchall()
+            goal_ids: list[str] = []
+            for row in rows:
+                metadata = _loads(row["metadata_json"], {})
+                metadata.update(
+                    {
+                        "legacy_semantics_invalidated": True,
+                        "semantic_checkpoint": "inspection_required",
+                        "waiting_question": (
+                            "This unfinished plan predates the repository-grounded "
+                            "semantic contract. Resume to inspect and replan."
+                        ),
+                        "resume_status": GoalStatus.DISCOVERING.value,
+                    }
+                )
+                connection.execute(
+                    "UPDATE goals SET status=?,active_plan_revision=NULL,"
+                    "metadata_json=?,updated_at=? WHERE id=?",
+                    (GoalStatus.PAUSED.value, _json(metadata), now, row["id"]),
+                )
+                connection.execute(
+                    "UPDATE plans SET status=? WHERE goal_id=? AND status IN "
+                    "('draft','pending_approval','accepted')",
+                    (PlanStatus.SUPERSEDED.value, row["id"]),
+                )
+                goal_ids.append(str(row["id"]))
+            if goal_ids:
+                placeholders = ",".join("?" for _ in goal_ids)
+                connection.execute(
+                    f"UPDATE workflow_sessions SET plan_state='none',"
+                    "run_state='blocked',updated_at=? WHERE goal_id IN "
+                    f"({placeholders})",
+                    (now, *goal_ids),
+                )
+            connection.execute("PRAGMA user_version=14")
+
+    def _remove_legacy_recovery_baselines(self) -> None:
+        """Remove only recorded full-copy baselines under agent-owned state."""
+
+        recovery_root = (self.workspace / ".coding-agent" / "recovery").resolve(strict=False)
+        if not recovery_root.is_dir():
+            return
+        try:
+            recovery_root.relative_to(self.workspace)
+        except ValueError:
+            return
+        for baseline in recovery_root.rglob("baseline"):
+            if not baseline.is_dir():
+                continue
+            resolved = baseline.resolve(strict=True)
+            try:
+                resolved.relative_to(recovery_root)
+            except ValueError:
+                continue
+            size = sum(
+                path.stat().st_size
+                for path in resolved.rglob("*")
+                if path.is_file()
+            )
+            run_id = resolved.parent.name
+            with self.transaction() as connection:
+                connection.execute(
+                    "INSERT INTO legacy_recovery_cleanup("
+                    "run_id,baseline_path,size_bytes,recorded_at,removed_at"
+                    ") VALUES(?,?,?,?,NULL) ON CONFLICT(run_id) DO NOTHING",
+                    (
+                        run_id,
+                        resolved.relative_to(self.workspace).as_posix(),
+                        size,
+                        _iso(utc_now()),
+                    ),
+                )
+            def clear_readonly_and_retry(
+                function: Any,
+                path: str,
+                _error: BaseException,
+            ) -> None:
+                os.chmod(path, stat.S_IWRITE)
+                function(path)
+
+            try:
+                shutil.rmtree(resolved, onexc=clear_readonly_and_retry)
+            except OSError:
+                # The audit row remains with removed_at=NULL, so a later open
+                # resumes this exact target without blocking all durable state.
+                continue
+            with self.transaction() as connection:
+                connection.execute(
+                    "UPDATE legacy_recovery_cleanup SET removed_at=? WHERE run_id=?",
+                    (_iso(utc_now()), run_id),
+                )
+
     def _ensure_brain_fts(self) -> bool:
         """Enable FTS5 when SQLite provides it; LIKE search remains portable."""
         try:
@@ -1556,6 +1775,7 @@ class StateStore:
         self,
         objective: str,
         *,
+        session_id: str = DEFAULT_SESSION_ID,
         success_criteria: Iterable[str] = (),
         constraints: Iterable[str] = (),
         metadata: Mapping[str, Any] | None = None,
@@ -1571,10 +1791,14 @@ class StateStore:
             terminal = tuple(status.value for status in TERMINAL_GOAL_STATUSES)
             placeholders = ",".join("?" for _ in terminal)
             active = connection.execute(
-                f"SELECT id FROM goals WHERE status NOT IN ({placeholders}) LIMIT 1", terminal
+                f"SELECT id FROM goals WHERE session_id=? "
+                f"AND status NOT IN ({placeholders}) LIMIT 1",
+                (str(session_id), *terminal),
             ).fetchone()
             if active:
-                raise ActiveGoalError(f"unfinished goal already exists: {active['id']}")
+                raise ActiveGoalError(
+                    f"unfinished goal already exists in session {session_id}: {active['id']}"
+                )
             goal = Goal(
                 id=new_id("goal"),
                 objective=objective,
@@ -1583,7 +1807,10 @@ class StateStore:
                 metadata=dict(metadata or {}),
             )
             connection.execute(
-                "INSERT INTO goals VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO goals("
+                "id,objective,success_criteria_json,constraints_json,status,"
+                "active_plan_revision,metadata_json,created_at,updated_at,session_id"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     goal.id,
                     goal.objective,
@@ -1594,6 +1821,7 @@ class StateStore:
                     _json(goal.metadata),
                     _iso(goal.created_at),
                     _iso(goal.updated_at),
+                    str(session_id),
                 ),
             )
             self._event(connection, "goal.created", goal_id=goal.id, entity_type="goal", entity_id=goal.id, payload={"objective": goal.objective})
@@ -1620,23 +1848,34 @@ class StateStore:
             raise NotFoundError(f"goal not found: {goal_id}")
         return self._goal_from_row(row)
 
-    def load_active_goal(self) -> Goal | None:
+    def load_active_goal(self, session_id: str = DEFAULT_SESSION_ID) -> Goal | None:
         terminal = tuple(status.value for status in TERMINAL_GOAL_STATUSES)
         placeholders = ",".join("?" for _ in terminal)
         with self._lock:
             rows = self._connection.execute(
-                f"SELECT * FROM goals WHERE status NOT IN ({placeholders}) ORDER BY created_at DESC", terminal
+                f"SELECT * FROM goals WHERE session_id=? "
+                f"AND status NOT IN ({placeholders}) ORDER BY created_at DESC",
+                (str(session_id), *terminal),
             ).fetchall()
         if len(rows) > 1:
-            raise StateCorruptionError("multiple unfinished goals exist")
+            raise StateCorruptionError(
+                f"multiple unfinished goals exist in session {session_id}"
+            )
         return self._goal_from_row(rows[0]) if rows else None
 
-    def get_latest_goal(self) -> Goal | None:
+    def get_latest_goal(self, session_id: str | None = None) -> Goal | None:
         """Return the most recently created goal, including terminal goals."""
         with self._lock:
-            row = self._connection.execute(
-                "SELECT * FROM goals ORDER BY created_at DESC,id DESC LIMIT 1"
-            ).fetchone()
+            if session_id is None:
+                row = self._connection.execute(
+                    "SELECT * FROM goals ORDER BY created_at DESC,id DESC LIMIT 1"
+                ).fetchone()
+            else:
+                row = self._connection.execute(
+                    "SELECT * FROM goals WHERE session_id=? "
+                    "ORDER BY created_at DESC,id DESC LIMIT 1",
+                    (str(session_id),),
+                ).fetchone()
         return self._goal_from_row(row) if row else None
 
     def transition_goal(
@@ -1671,6 +1910,68 @@ class StateStore:
             )
             return replace(current, status=target, metadata=merged, updated_at=now)
 
+    def cancel_goal_and_session(
+        self,
+        goal_id: str,
+        session_id: str,
+        *,
+        reason: str,
+    ) -> Goal:
+        """Atomically cancel the goal and make its workflow session agree."""
+
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM goals WHERE id=?", (goal_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"goal not found: {goal_id}")
+            current = self._goal_from_row(row)
+            ensure_goal_transition(current.status, GoalStatus.CANCELLED)
+            session = connection.execute(
+                "SELECT state_json FROM workflow_sessions WHERE id=?",
+                (session_id,),
+            ).fetchone()
+            state = _loads(session["state_json"], {}) if session else {}
+            state.update(
+                {
+                    "terminal_goal_id": goal_id,
+                    "terminal_goal_status": GoalStatus.CANCELLED.value,
+                    "terminal_reason": reason,
+                }
+            )
+            now = utc_now()
+            connection.execute(
+                "UPDATE goals SET status=?,updated_at=? WHERE id=?",
+                (GoalStatus.CANCELLED.value, _iso(now), goal_id),
+            )
+            connection.execute(
+                "UPDATE workflow_sessions SET goal_id=NULL,plan_state='none',"
+                "run_state='cancelled',state_json=?,updated_at=? WHERE id=?",
+                (_json(state), _iso(now), session_id),
+            )
+            connection.execute(
+                "UPDATE queued_prompts SET status='cancelled',completed_at=? "
+                "WHERE session_id=? AND goal_id=? AND status IN ('pending','running')",
+                (_iso(now), session_id, goal_id),
+            )
+            self._event(
+                connection,
+                "goal.status_changed",
+                goal_id=goal_id,
+                entity_type="goal",
+                entity_id=goal_id,
+                payload={
+                    "from": current.status.value,
+                    "to": GoalStatus.CANCELLED.value,
+                    "reason": reason,
+                },
+            )
+            return replace(
+                current,
+                status=GoalStatus.CANCELLED,
+                updated_at=now,
+            )
+
     def update_goal_metadata(self, goal_id: str, **metadata: Any) -> Goal:
         current = self.get_goal(goal_id)
         merged = dict(current.metadata)
@@ -1683,6 +1984,219 @@ class StateStore:
             )
             self._event(connection, "goal.metadata_updated", goal_id=goal_id, entity_type="goal", entity_id=goal_id, payload={"keys": sorted(metadata)})
         return replace(current, metadata=merged, updated_at=now)
+
+    def lease_resource_claims(
+        self,
+        goal_id: str,
+        task_id: str | None,
+    ) -> tuple[str, ...]:
+        """Resolve accepted resource claims into short-lived write leases."""
+
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM goals WHERE id=?", (goal_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"goal not found: {goal_id}")
+            metadata = _loads(row["metadata_json"], {})
+            claims = [
+                dict(item)
+                for item in metadata.get("resource_claims", ())
+                if isinstance(item, Mapping)
+            ]
+            leased: list[str] = []
+            for claim in claims:
+                supports = {
+                    str(value).strip().upper()
+                    for value in claim.get("supports_tasks", ())
+                }
+                if task_id and str(task_id).strip().upper() not in supports:
+                    continue
+                paths = tuple(
+                    str(value).strip().replace("\\", "/")
+                    for value in claim.get("resolved_paths", ())
+                    if str(value).strip()
+                )
+                if paths:
+                    claim["state"] = "leased"
+                    leased.extend(paths)
+            metadata["resource_claims"] = claims
+            connection.execute(
+                "UPDATE goals SET metadata_json=?,updated_at=? WHERE id=?",
+                (_json(metadata), _iso(utc_now()), goal_id),
+            )
+            return tuple(dict.fromkeys(leased))
+
+    def release_resource_claims(
+        self,
+        goal_id: str,
+        task_id: str | None,
+    ) -> None:
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM goals WHERE id=?", (goal_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"goal not found: {goal_id}")
+            metadata = _loads(row["metadata_json"], {})
+            claims = [
+                dict(item)
+                for item in metadata.get("resource_claims", ())
+                if isinstance(item, Mapping)
+            ]
+            for claim in claims:
+                supports = {
+                    str(value).strip().upper()
+                    for value in claim.get("supports_tasks", ())
+                }
+                if task_id and str(task_id).strip().upper() not in supports:
+                    continue
+                if claim.get("state") == "leased":
+                    claim["state"] = "released"
+            metadata["resource_claims"] = claims
+            connection.execute(
+                "UPDATE goals SET metadata_json=?,updated_at=? WHERE id=?",
+                (_json(metadata), _iso(utc_now()), goal_id),
+            )
+
+    @staticmethod
+    def _journal_path_allowed(path: str) -> bool:
+        normalized = str(path).strip().replace("\\", "/")
+        parts = tuple(part.casefold() for part in Path(normalized).parts)
+        name = parts[-1] if parts else ""
+        blocked_parts = {
+            ".git", ".hg", ".svn", ".coding-agent", "node_modules",
+            "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+            ".venv", "venv", "dist", "build", "coverage", ".coverage",
+        }
+        blocked_names = {
+            ".env", "credentials", "credentials.json", "secrets.json",
+            "id_rsa", "id_ed25519",
+        }
+        return bool(parts) and not any(part in blocked_parts for part in parts) and (
+            name not in blocked_names
+            and not name.startswith(".env.")
+            and not name.endswith((".pem", ".key", ".p12", ".pfx"))
+        )
+
+    def prepare_mutation_journal(
+        self,
+        goal_id: str,
+        task_id: str | None,
+        leased_paths: Iterable[str],
+    ) -> tuple[str, ...]:
+        """Capture original bytes only for safe, evidence-resolved leased files."""
+
+        journal_ids: list[str] = []
+        with self.transaction() as connection:
+            for raw_path in dict.fromkeys(str(item) for item in leased_paths):
+                normalized = raw_path.strip().replace("\\", "/")
+                if not self._journal_path_allowed(normalized):
+                    continue
+                candidate = (self.workspace / normalized).resolve(strict=False)
+                try:
+                    candidate.relative_to(self.workspace)
+                except ValueError:
+                    continue
+                original: bytes | None = None
+                pre_hash: str | None = None
+                if candidate.is_file():
+                    original = candidate.read_bytes()
+                    pre_hash = hashlib.sha256(original).hexdigest()
+                journal_id = new_id("journal")
+                connection.execute(
+                    "INSERT INTO mutation_journal("
+                    "id,goal_id,task_id,path,pre_hash,original_bytes,status,"
+                    "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        journal_id,
+                        goal_id,
+                        task_id,
+                        normalized,
+                        pre_hash,
+                        original,
+                        "prepared",
+                        _iso(utc_now()),
+                        _iso(utc_now()),
+                    ),
+                )
+                journal_ids.append(journal_id)
+        return tuple(journal_ids)
+
+    def finish_mutation_journal(
+        self,
+        journal_ids: Iterable[str],
+        *,
+        applied: bool,
+    ) -> None:
+        ids = tuple(dict.fromkeys(str(item) for item in journal_ids if str(item)))
+        if not ids:
+            return
+        with self.transaction() as connection:
+            for journal_id in ids:
+                row = connection.execute(
+                    "SELECT path FROM mutation_journal WHERE id=?",
+                    (journal_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                post_hash: str | None = None
+                if applied:
+                    candidate = (self.workspace / row["path"]).resolve(strict=False)
+                    if candidate.is_file() and candidate.is_relative_to(self.workspace):
+                        post_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                connection.execute(
+                    "UPDATE mutation_journal SET status=?,post_hash=?,updated_at=? "
+                    "WHERE id=?",
+                    (
+                        "applied" if applied else "released",
+                        post_hash,
+                        _iso(utc_now()),
+                        journal_id,
+                    ),
+                )
+
+    def rollback_mutation_journal(self, goal_id: str) -> tuple[str, ...]:
+        """Rollback only agent-owned changes whose current hash still matches."""
+
+        rows = self._connection.execute(
+            "SELECT * FROM mutation_journal WHERE goal_id=? AND status='applied' "
+            "ORDER BY created_at DESC,id DESC",
+            (goal_id,),
+        ).fetchall()
+        restored: list[str] = []
+        for row in rows:
+            candidate = (self.workspace / row["path"]).resolve(strict=False)
+            try:
+                candidate.relative_to(self.workspace)
+            except ValueError:
+                continue
+            current_hash = (
+                hashlib.sha256(candidate.read_bytes()).hexdigest()
+                if candidate.is_file()
+                else None
+            )
+            if current_hash != row["post_hash"]:
+                continue
+            original = row["original_bytes"]
+            if original is None:
+                if candidate.is_file():
+                    candidate.unlink()
+            else:
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                temporary = candidate.with_name(
+                    f".{candidate.name}.rollback-{new_id('tmp')}"
+                )
+                temporary.write_bytes(bytes(original))
+                os.replace(temporary, candidate)
+            with self.transaction() as connection:
+                connection.execute(
+                    "UPDATE mutation_journal SET status='rolled_back',updated_at=? "
+                    "WHERE id=?",
+                    (_iso(utc_now()), row["id"]),
+                )
+            restored.append(str(row["path"]))
+        return tuple(restored)
 
     @staticmethod
     def coerce_task(value: Task | Mapping[str, Any], goal_id: str, revision: int, origin: str) -> Task:
@@ -1737,6 +2251,7 @@ class StateStore:
         source_document: str | None = None,
         source_format_version: int = 1,
         edited_by: str = "",
+        expected_parent_revision: int | None = None,
     ) -> Plan:
         summary = str(summary).strip()
         if not summary:
@@ -1750,14 +2265,21 @@ class StateStore:
             raise ValueError("a plan requires inspected applicability evidence")
         if not strategy:
             raise ValueError("a plan requires an executable strategy")
-        if not changes:
-            raise ValueError("a coding plan requires at least one expected workspace change")
         with self.transaction() as connection:
             if connection.execute("SELECT 1 FROM goals WHERE id=?", (goal_id,)).fetchone() is None:
                 raise NotFoundError(f"goal not found: {goal_id}")
-            revision = connection.execute(
-                "SELECT COALESCE(MAX(revision),0)+1 FROM plans WHERE goal_id=?", (goal_id,)
-            ).fetchone()[0]
+            current_revision = int(connection.execute(
+                "SELECT COALESCE(MAX(revision),0) FROM plans WHERE goal_id=?", (goal_id,)
+            ).fetchone()[0])
+            if (
+                expected_parent_revision is not None
+                and current_revision != int(expected_parent_revision)
+            ):
+                raise StalePlanError(
+                    f"cannot create a revision from stale plan r{expected_parent_revision}; "
+                    f"latest is r{current_revision}"
+                )
+            revision = current_revision + 1
             normalized = tuple(self.coerce_task(item, goal_id, revision, proposed_by) for item in tasks)
             if not normalized:
                 raise ValueError("a plan requires at least one task")
@@ -1915,7 +2437,6 @@ class StateStore:
             if (
                 not _loads(row["applicability_json"], [])
                 or not str(row["execution_strategy"]).strip()
-                or not _loads(row["expected_changes_json"], [])
             ):
                 raise StalePlanError(
                     "plan lacks fingerprinted applicability evidence; use /replan before approval"
@@ -2157,6 +2678,34 @@ class StateStore:
             now = utc_now()
             connection.execute("UPDATE actions SET status=?,result_summary=?,completed_at=? WHERE id=?", (status, result_summary, _iso(now), action_id))
             self._event(connection, f"action.{status}", goal_id=row["goal_id"], entity_type="action", entity_id=action_id, payload={"tool": row["tool_name"], "result": result_summary})
+
+    def mark_action_uncertain(self, action_id: str, result_summary: str) -> None:
+        """Escalate a completed action when post-state exceeds its lease."""
+
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM actions WHERE id=?", (action_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"action not found: {action_id}")
+            if row["status"] not in {"running", "completed"}:
+                raise StateStoreError(
+                    f"action is already {row['status']}"
+                )
+            now = utc_now()
+            connection.execute(
+                "UPDATE actions SET status='uncertain',result_summary=?,"
+                "completed_at=? WHERE id=?",
+                (result_summary, _iso(now), action_id),
+            )
+            self._event(
+                connection,
+                "action.uncertain",
+                goal_id=row["goal_id"],
+                entity_type="action",
+                entity_id=action_id,
+                payload={"tool": row["tool_name"], "result": result_summary},
+            )
 
     def list_actions(self, goal_id: str, *, status: str | None = None) -> tuple[dict[str, Any], ...]:
         sql, params = "SELECT * FROM actions WHERE goal_id=?", [goal_id]
@@ -2587,8 +3136,6 @@ class StateStore:
         next_concurrency = int(concurrency) if concurrency is not None else current.concurrency
         if not next_provider or not next_model or not 1 <= next_concurrency <= 8:
             raise ValueError("invalid ULTRA provider/model/concurrency update")
-        if next_execution is ExecutionClass.LOCAL and next_concurrency != 1:
-            raise ValueError("local ULTRA execution must remain sequential")
         next_phase = UltraPhase(phase) if phase is not None else current.phase
         next_status = UltraRunStatus(status) if status is not None else current.status
         next_goal_spec = (
@@ -6085,12 +6632,34 @@ class StateStore:
         state: Mapping[str, Any] | None = None,
     ) -> None:
         with self.transaction() as connection:
+            if state is None:
+                existing = connection.execute(
+                    "SELECT state_json FROM workflow_sessions WHERE id=?",
+                    (session_id,),
+                ).fetchone()
+                state_value = (
+                    _loads(existing["state_json"], {})
+                    if existing is not None
+                    else {}
+                )
+            else:
+                state_value = dict(state)
             connection.execute(
                 "INSERT INTO workflow_sessions(id,goal_id,session_mode,plan_state,run_state,ultra_profile,sleep_state,state_json,updated_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET goal_id=excluded.goal_id,"
                 "session_mode=excluded.session_mode,plan_state=excluded.plan_state,run_state=excluded.run_state,"
                 "ultra_profile=excluded.ultra_profile,sleep_state=excluded.sleep_state,state_json=excluded.state_json,updated_at=excluded.updated_at",
-                (session_id, goal_id, session_mode, plan_state, run_state, ultra_profile, sleep_state, _json(state or {}), _iso(utc_now())),
+                (
+                    session_id,
+                    goal_id,
+                    session_mode,
+                    plan_state,
+                    run_state,
+                    ultra_profile,
+                    sleep_state,
+                    _json(state_value),
+                    _iso(utc_now()),
+                ),
             )
 
     def get_workflow_session(self, session_id: str) -> dict[str, Any]:
@@ -6098,6 +6667,222 @@ class StateStore:
         if row is None:
             raise NotFoundError(f"workflow session not found: {session_id}")
         return {**dict(row), "state": _loads(row["state_json"], {})}
+
+    def list_workflow_sessions(self, *, limit: int = 100) -> tuple[dict[str, Any], ...]:
+        """Return project sessions with a compact current/latest-goal summary."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT session.*,goal.objective AS goal_objective,"
+                "goal.status AS goal_status,goal.updated_at AS goal_updated_at "
+                "FROM workflow_sessions AS session "
+                "LEFT JOIN goals AS goal ON goal.id=session.goal_id "
+                "ORDER BY session.updated_at DESC,session.id LIMIT ?",
+                (max(1, min(int(limit), 1_000)),),
+            ).fetchall()
+        return tuple(
+            {
+                **dict(row),
+                "state": _loads(row["state_json"], {}),
+                "queued_count": self.count_queued_prompts(str(row["id"])),
+            }
+            for row in rows
+        )
+
+    @staticmethod
+    def _queued_prompt_from_row(row: sqlite3.Row) -> QueuedPrompt:
+        return QueuedPrompt(
+            id=str(row["id"]),
+            session_id=str(row["session_id"]),
+            sequence=int(row["sequence"]),
+            text=str(row["prompt_text"]),
+            mode=str(row["mode"]),
+            status=QueuedPromptStatus(str(row["status"])),
+            goal_id=str(row["goal_id"]) if row["goal_id"] else None,
+            error=str(row["error"] or ""),
+            created_at=_dt(row["created_at"]) or utc_now(),
+            started_at=_dt(row["started_at"]),
+            completed_at=_dt(row["completed_at"]),
+        )
+
+    def enqueue_prompt(
+        self,
+        session_id: str,
+        text: str,
+        mode: str,
+    ) -> QueuedPrompt:
+        """Append one immutable prompt, enforcing the per-session limit atomically."""
+
+        prompt_text = str(text).strip()
+        normalized_mode = str(mode).strip().casefold()
+        if not prompt_text or len(prompt_text) > 20_000 or "\x00" in prompt_text:
+            raise ValueError("queued prompt text must be 1-20,000 characters")
+        if normalized_mode not in {"plan", "normal", "ultra"}:
+            raise ValueError("queued prompt mode must be plan, normal, or ultra")
+        with self.transaction() as connection:
+            session = connection.execute(
+                "SELECT 1 FROM workflow_sessions WHERE id=?",
+                (str(session_id),),
+            ).fetchone()
+            if session is None:
+                raise NotFoundError(f"workflow session not found: {session_id}")
+            count = int(connection.execute(
+                "SELECT COUNT(*) FROM queued_prompts WHERE session_id=? "
+                "AND status IN ('pending','running','blocked')",
+                (str(session_id),),
+            ).fetchone()[0])
+            if count >= MAX_PENDING_PROMPTS:
+                raise StateStoreError(
+                    f"prompt queue is full ({MAX_PENDING_PROMPTS} pending items)"
+                )
+            sequence = int(connection.execute(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM queued_prompts WHERE session_id=?",
+                (str(session_id),),
+            ).fetchone()[0])
+            item = QueuedPrompt(
+                id=new_id("prompt"),
+                session_id=str(session_id),
+                sequence=sequence,
+                text=prompt_text,
+                mode=normalized_mode,
+            )
+            connection.execute(
+                "INSERT INTO queued_prompts("
+                "id,session_id,sequence,prompt_text,mode,status,goal_id,error,"
+                "created_at,started_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    item.id,
+                    item.session_id,
+                    item.sequence,
+                    item.text,
+                    item.mode,
+                    item.status.value,
+                    None,
+                    "",
+                    _iso(item.created_at),
+                    None,
+                    None,
+                ),
+            )
+            self._event(
+                connection,
+                "prompt.queued",
+                entity_type="queued_prompt",
+                entity_id=item.id,
+                payload={"session_id": item.session_id, "mode": item.mode, "sequence": item.sequence},
+            )
+            return item
+
+    def list_queued_prompts(
+        self,
+        session_id: str,
+        *,
+        include_terminal: bool = False,
+        limit: int = 100,
+    ) -> tuple[QueuedPrompt, ...]:
+        where = "" if include_terminal else "AND status IN ('pending','running','blocked')"
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM queued_prompts WHERE session_id=? "
+                f"{where} ORDER BY sequence LIMIT ?",
+                (str(session_id), max(1, min(int(limit), 1_000))),
+            ).fetchall()
+        return tuple(self._queued_prompt_from_row(row) for row in rows)
+
+    def count_queued_prompts(self, session_id: str) -> int:
+        with self._lock:
+            return int(self._connection.execute(
+                "SELECT COUNT(*) FROM queued_prompts WHERE session_id=? "
+                "AND status IN ('pending','running','blocked')",
+                (str(session_id),),
+            ).fetchone()[0])
+
+    def claim_next_prompt(self, session_id: str) -> QueuedPrompt | None:
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM queued_prompts WHERE session_id=? "
+                "AND status IN ('pending','running','blocked') "
+                "ORDER BY sequence LIMIT 1",
+                (str(session_id),),
+            ).fetchone()
+            if row is None or str(row["status"]) != QueuedPromptStatus.PENDING.value:
+                return None
+            started = _iso(utc_now())
+            connection.execute(
+                "UPDATE queued_prompts SET status='running',started_at=? "
+                "WHERE id=? AND status='pending'",
+                (started, str(row["id"])),
+            )
+            updated = connection.execute(
+                "SELECT * FROM queued_prompts WHERE id=?",
+                (str(row["id"]),),
+            ).fetchone()
+            assert updated is not None
+            self._event(
+                connection,
+                "prompt.started",
+                entity_type="queued_prompt",
+                entity_id=str(row["id"]),
+                payload={"session_id": str(session_id), "sequence": int(row["sequence"])},
+            )
+            return self._queued_prompt_from_row(updated)
+
+    def bind_prompt_goal(self, prompt_id: str, goal_id: str) -> QueuedPrompt:
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE queued_prompts SET goal_id=? WHERE id=? AND status='running'",
+                (str(goal_id), str(prompt_id)),
+            )
+            row = connection.execute(
+                "SELECT * FROM queued_prompts WHERE id=?",
+                (str(prompt_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"queued prompt not found: {prompt_id}")
+            self._event(
+                connection,
+                "prompt.goal_bound",
+                goal_id=str(goal_id),
+                entity_type="queued_prompt",
+                entity_id=str(prompt_id),
+                payload={"goal_id": str(goal_id)},
+            )
+            return self._queued_prompt_from_row(row)
+
+    def finish_queued_prompt(
+        self,
+        prompt_id: str,
+        *,
+        status: QueuedPromptStatus | str = QueuedPromptStatus.COMPLETED,
+        error: str = "",
+    ) -> QueuedPrompt:
+        target = QueuedPromptStatus(status)
+        if target not in {
+            QueuedPromptStatus.COMPLETED,
+            QueuedPromptStatus.BLOCKED,
+            QueuedPromptStatus.CANCELLED,
+        }:
+            raise ValueError("queued prompt terminal status is invalid")
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE queued_prompts SET status=?,error=?,completed_at=? WHERE id=?",
+                (target.value, str(error)[:2_000], _iso(utc_now()), str(prompt_id)),
+            )
+            row = connection.execute(
+                "SELECT * FROM queued_prompts WHERE id=?",
+                (str(prompt_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"queued prompt not found: {prompt_id}")
+            self._event(
+                connection,
+                f"prompt.{target.value}",
+                goal_id=str(row["goal_id"]) if row["goal_id"] else None,
+                entity_type="queued_prompt",
+                entity_id=str(prompt_id),
+                payload={"error": str(error)[:500]},
+            )
+            return self._queued_prompt_from_row(row)
 
     def append_chat_message(
         self,

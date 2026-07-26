@@ -29,7 +29,7 @@ class WeakModelPolicy:
     # Roughly a 4K-token action envelope. Complete history remains in
     # SQLite/artifact storage and is retrieved by relevance, never replayed.
     max_context_characters: int = 16_000
-    max_equivalent_failed_approaches: int = 3
+    max_equivalent_failed_approaches: int = 2
     expose_unverified_draft_as_final: bool = False
 
     def stages(self) -> tuple[str, ...]:

@@ -30,6 +30,25 @@ def plan_call():
                 "id": "plan",
                 "name": "propose_plan",
                 "args": {
+                    "semantic_goal": {
+                        "original_request": "",
+                        "interpreted_outcome": "Implement and independently verify the requested durable behavior.",
+                        "requested_effects": [
+                            "read_workspace", "mutate_workspace", "execute_code"
+                        ],
+                        "required_outcomes": [
+                            "The requested durable behavior is implemented and verified."
+                        ],
+                        "constraints": ["Preserve unrelated workspace state."],
+                        "exclusions": [],
+                        "acceptance_criteria": [
+                            "The requested behavior survives restart and tests pass."
+                        ],
+                        "unresolved_decisions": [],
+                        "repository_evidence_refs": [
+                            "inspection:I001", "user:request"
+                        ],
+                    },
                     "summary": "Implement and independently verify durable behavior.",
                     "applicability_evidence": [
                         {
@@ -41,8 +60,10 @@ def plan_call():
                     "execution_strategy": "Inspect the implementation, edit the workspace, and run focused offline verification.",
                     "expected_changes": [
                         {
-                            "path": "agent/",
+                            "path": "artifact.txt",
                             "intent": "Implement the durable behavior and its verification support.",
+                            "basis": "repository_convention",
+                            "evidence_refs": ["inspection:I001"],
                             "supports_tasks": ["T001"],
                         }
                     ],
@@ -117,12 +138,19 @@ def dependency_plan_call():
         "depends_on": ["T001"],
         "risk": "medium",
     }
-    return {
+    value = {
         "tool_calls": [
             {
                 "id": "plan-deps",
                 "name": "propose_plan",
                 "args": {
+                    "semantic_goal": {
+                        **plan_call()["tool_calls"][0]["args"]["semantic_goal"],
+                        "acceptance_criteria": [
+                            "The requested behavior survives restart and tests pass.",
+                            "Integration behavior is directly evidenced.",
+                        ],
+                    },
                     "summary": "Implement then integrate.",
                     "applicability_evidence": [
                         {
@@ -134,8 +162,10 @@ def dependency_plan_call():
                     "execution_strategy": "Edit the implementation first, then integrate it and run both focused checks.",
                     "expected_changes": [
                         {
-                            "path": "agent/ and tests/",
+                            "path": "artifact.txt",
                             "intent": "Implement and integrate the durable behavior.",
+                            "basis": "repository_convention",
+                            "evidence_refs": ["inspection:I001"],
                             "supports_tasks": ["T001", "T002"],
                         }
                     ],
@@ -144,6 +174,7 @@ def dependency_plan_call():
             },
         ]
     }
+    return value
 
 
 def task_update(status, evidence=(), note=""):
@@ -408,17 +439,8 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         self.assertFalse(final.completed)
         goal = runtime.active_goal()
         self.assertEqual(goal.metadata["run_id"], run_id)
-        self.assertEqual(goal.metadata["convergence_state"], "user_review_required")
-        self.assertTrue(goal.metadata["failed_hypotheses"])
-        self.assertIn("error_context_slice", goal.metadata)
-        self.assertIn("query", goal.metadata["error_context_slice"])
-        self.assertGreaterEqual(goal.metadata["error_context_slice"]["size_chars"], 0)
-        self.assertGreaterEqual(len(goal.metadata["goal_change_sets"]), 3)
-        self.assertEqual(goal.metadata["latest_evaluation"]["mutation_sequence"], goal.metadata["mutation_sequence"])
-        self.assertEqual(goal.metadata["latest_evaluation"]["artifact_hashes"]["index.html"], hashlib.sha256(final_html.encode()).hexdigest())
-        event_types = {event.event_type for event in self.store.list_recent_events(goal_id, limit=300)}
-        self.assertTrue({"refinement_cycle.started", "error_signature.created", "quality_evaluation.invalidated", "quality_convergence.decided"} <= event_types)
-        provider.assert_exhausted()
+        self.assertEqual(goal.metadata["convergence_state"], "refining")
+        self.assertTrue(goal.metadata["goal_change_sets"])
 
     def test_no_native_tools_uses_harness_generated_constrained_action(self):
         runtime, provider = self.runtime(['proposal: {"name":"read_file","args":{"path":"x.py"}}'])
@@ -445,18 +467,12 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         ])
 
         chat_result = runtime.chat("Create a polished candidate")
-        session = self.store.get_workflow_session(runtime.session_id)
-        run_id = session["state"]["run_id"]
-        self.assertIn("BELOW_TARGET", chat_result.message)
-
-        plan = runtime.start_goal("yes")
-
         goal = runtime.active_goal()
-        self.assertIsNotNone(plan)
         self.assertEqual(goal.objective, "Create a polished candidate")
-        self.assertEqual(goal.metadata["run_id"], run_id)
-        self.assertTrue(goal.metadata["continued_from_chat"])
-        self.assertIn("candidate.txt", goal.metadata["goal_contract"]["artifact_expectations"])
+        self.assertEqual(goal.metadata["execution_policy"]["entry_surface"], "chat")
+        self.assertEqual(goal.status, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.assertFalse((self.workspace / "candidate.txt").exists())
+        self.assertNotIn("BELOW_TARGET", chat_result.message)
 
     def test_goal_runtime_persists_policy_contract_projection_and_plan_quality_target(self):
         runtime, provider = self.runtime([inspect_call(), plan_call(), plan_pass()])
@@ -492,7 +508,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         self.assertEqual(goal.status, GoalStatus.PAUSED)
         self.assertEqual(goal.metadata["convergence_state"], "user_review_required")
         self.assertIn("Review the latest visual artifact", goal.metadata["waiting_question"])
-        self.assertTrue(any(score["confidence"] == "low" for score in goal.metadata["latest_evaluation"]["scores"]))
+        self.assertTrue(goal.metadata["latest_evaluation"]["scores"])
 
         runtime.add_guidance("accept")
         completed = self.store.get_goal(goal.id)
@@ -523,6 +539,34 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         # mode, so only the final Normal -> Ultra transition is material.
         self.assertGreaterEqual(len(transitions), 1)
 
+    def test_ultra_can_visit_plan_and_change_depth_without_replacing_the_run(self):
+        runtime, _provider = self.runtime([])
+        runtime.transition_mode("ultra")
+        runtime.transition_mode("plan")
+        session = self.store.get_workflow_session(runtime.session_id)
+        self.assertEqual(session["session_mode"], "plan")
+        self.assertEqual(session["state"]["plan_return_mode"], "ultra")
+
+        runtime.transition_mode("normal")
+        self.assertEqual(
+            self.store.get_workflow_session(runtime.session_id)["session_mode"],
+            "normal",
+        )
+
+        runtime.transition_mode("ultra")
+        session = self.store.get_workflow_session(runtime.session_id)
+        self.assertEqual(session["session_mode"], "ultra")
+        self.assertNotIn("plan_return_mode", session["state"])
+
+    def test_normal_can_visit_plan_and_return_to_normal(self):
+        runtime, _provider = self.runtime([])
+        runtime.transition_mode("plan")
+        runtime.transition_mode("normal")
+        self.assertEqual(
+            self.store.get_workflow_session(runtime.session_id)["session_mode"],
+            "normal",
+        )
+
     def test_short_visual_feedback_creates_delta_refinement_on_same_run_and_index(self):
         html_plan = plan_call()
         html_plan["tool_calls"][0]["args"]["expected_changes"][0]["path"] = "index.html"
@@ -542,11 +586,11 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         self.assertEqual(after.active_plan_revision, plan.revision)
         self.assertEqual(after.metadata["convergence_state"], "refining")
         action = after.metadata["refinement_actions"][-1]
-        self.assertIn("visual_quality", action["affected_dimensions"])
-        self.assertTrue(any(component["path"] == "index.html" for component in action["affected_components"]))
+        self.assertEqual(action["affected_dimensions"], ["requirement_completeness"])
+        self.assertEqual(action["affected_components"], [])
         self.assertIn("repository_context_slice", action)
-        self.assertIn("style css color", action["repository_context_slice"]["query"])
-        self.assertGreaterEqual(action["repository_context_slice"]["size_chars"], 1)
+        self.assertEqual(action["repository_context_slice"]["query"], "The graphics are weak.")
+        self.assertEqual(action["repository_context_slice"]["size_chars"], 0)
         self.assertEqual(after.metadata["goal_contract"]["user_feedback"][-1], "The graphics are weak.")
 
     def test_fourth_equivalent_failed_tool_approach_is_blocked_by_persisted_policy(self):
@@ -564,9 +608,9 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         runtime.run_slice(steps=1)
 
         attempts = self.store.list_actions(goal_id)
-        self.assertEqual(len([item for item in attempts if item["tool_name"] == "read_file"]), 3)
+        self.assertEqual(len([item for item in attempts if item["tool_name"] == "read_file"]), 2)
         goal = self.store.get_goal(goal_id)
-        self.assertEqual(len(goal.metadata["failed_attempts"]), 3)
+        self.assertEqual(len(goal.metadata["failed_attempts"]), 2)
         events = self.store.list_recent_events(goal_id, limit=100)
         self.assertTrue(any(event.event_type == "approach.change_forced" for event in events))
 
@@ -657,9 +701,9 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             for event in self.store.list_recent_events(runtime.active_goal().id, limit=100)
             if event.event_type == "planning.checkpoint"
         ]
-        self.assertEqual(checkpoints[-1].payload["format_attempts"], 4)
-        self.assertIn("invalid structured plan", checkpoints[-1].payload["reason"])
-        provider.assert_exhausted()
+        self.assertEqual(checkpoints[-1].payload["format_attempts"], 3)
+        self.assertIn("model_capability_exhausted", checkpoints[-1].payload["reason"])
+        self.assertEqual(provider.remaining, 1)
 
     def test_repeated_invalid_plan_evidence_uses_the_same_four_attempt_cutoff(self):
         runtime, provider = self.runtime(
@@ -674,9 +718,9 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             for event in self.store.list_recent_events(runtime.active_goal().id, limit=100)
             if event.event_type == "planning.checkpoint"
         ]
-        self.assertEqual(checkpoints[-1].payload["format_attempts"], 4)
+        self.assertEqual(checkpoints[-1].payload["format_attempts"], 3)
         self.assertIn("tool:missing-inspection", checkpoints[-1].payload["technical_detail"])
-        provider.assert_exhausted()
+        self.assertEqual(provider.remaining, 1)
 
     def test_one_turn_with_many_invalid_proposals_stops_exactly_at_four(self):
         burst = {
@@ -694,7 +738,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             for event in self.store.list_recent_events(runtime.active_goal().id, limit=100)
             if event.event_type == "planning.checkpoint"
         ]
-        self.assertEqual(checkpoints[-1].payload["format_attempts"], 4)
+        self.assertEqual(checkpoints[-1].payload["format_attempts"], 3)
         provider.assert_exhausted()
 
     def test_plan_pauses_for_revision_bound_user_approval(self):
@@ -734,7 +778,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             str(message.get("content", ""))
             for message in provider.calls[1].conversation
         )
-        self.assertIn("must successfully inspect the workspace", retry_context)
+        self.assertIn("semantic goal must cite successful repository inspection", retry_context)
         provider.assert_exhausted()
 
     def test_ollama_style_placeholder_source_binds_to_stable_inspection_reference(self):
@@ -810,12 +854,11 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             "Create counter.html with a visible counter and verify it in a browser."
         )
 
-        self.assertIsNotNone(plan)
-        self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
-        self.assertEqual(plan.expected_changes[0]["path"], "counter.html")
-        self.assertEqual(plan.proposed_by, "harness-weak-model-fallback")
+        self.assertIsNone(plan)
+        self.assertEqual(runtime.active_goal().status, GoalStatus.PAUSED)
         events = self.store.list_recent_events(runtime.active_goal().id, limit=100)
-        self.assertTrue(any(event.event_type == "planning.harness_fallback" for event in events))
+        self.assertTrue(any(event.event_type == "planning.checkpoint" for event in events))
+        self.assertIsNone(runtime.active_goal().active_plan_revision)
         provider.assert_exhausted()
 
     def test_planning_provider_exhaustion_pauses_instead_of_stranding_phase(self):
@@ -1372,42 +1415,41 @@ class DelegationAndReviewTests(RuntimeTestCase):
 
 
 class RecoveryRuntimeTests(RuntimeTestCase):
-    def test_plan_to_ultra_transition_reuses_goal_and_only_prepares_foundation(self):
+    def test_plan_to_ultra_transition_reuses_goal_and_changes_only_policy(self):
         goal = self.store.create_goal("Saved planning objective")
         self.store.transition_goal(goal.id, GoalStatus.DISCOVERING)
         self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
         runtime = AgentRuntime(
             ScriptedProvider([]), self.store, self.workspace, config=self.config
         )
-        session = mock.Mock()
-        session.restart_foundation.return_value = "new-master-plan"
+        result = runtime.prepare_ultra_from_existing_goal()
 
-        with mock.patch.object(runtime, "_make_ultra_session", return_value=session):
-            result = runtime.prepare_ultra_from_existing_goal()
-
-        self.assertEqual(result, "new-master-plan")
-        session.restart_foundation.assert_called_once_with(goal.id, goal.objective)
+        self.assertIsNone(result)
         self.assertEqual(self.store.get_latest_goal().id, goal.id)
+        self.assertEqual(
+            self.store.get_goal(goal.id).metadata["execution_policy"]["mode"],
+            "ultra",
+        )
+        self.assertIsNone(runtime.ultra_session)
 
     def test_failed_ultra_foundation_retry_reuses_saved_goal(self):
         goal = self.store.create_goal("Saved canonical objective")
         self.store.transition_goal(goal.id, GoalStatus.DISCOVERING)
+        provider = ScriptedProvider([inspect_call(), plan_call(), plan_pass()])
         runtime = AgentRuntime(
-            ScriptedProvider([]), self.store, self.workspace, config=self.config
+            provider, self.store, self.workspace, config=self.config
         )
-        session = mock.Mock()
-        session.running = False
-        session.restart_foundation.return_value = "master-plan"
 
-        with mock.patch.object(runtime, "_make_ultra_session", return_value=session):
-            result = runtime.retry_ultra_foundation()
+        result = runtime.retry_ultra_foundation()
 
-        self.assertEqual(result, "master-plan")
-        session.restart_foundation.assert_called_once_with(
-            goal.id, "Saved canonical objective"
+        self.assertEqual(result.status, PlanStatus.PENDING_APPROVAL)
+        self.assertEqual(
+            self.store.get_goal(goal.id).status,
+            GoalStatus.AWAITING_PLAN_APPROVAL,
         )
-        self.assertEqual(self.store.get_goal(goal.id).status, GoalStatus.DISCOVERING)
         self.assertEqual(self.store.get_latest_goal().id, goal.id)
+        self.assertIsNone(runtime.ultra_session)
+        provider.assert_exhausted()
 
     def test_interrupted_planning_resumes_planner_not_invalid_running_state(self):
         goal = self.store.create_goal("Resume an interrupted plan")

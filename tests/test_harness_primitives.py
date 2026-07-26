@@ -94,6 +94,19 @@ class CommandTests(unittest.TestCase):
 class ControlSchemaTests(unittest.TestCase):
     def test_plan_requires_verifiable_typed_tasks(self):
         valid = {
+            "semantic_goal": {
+                "original_request": "Implement durable state.",
+                "interpreted_outcome": "Persist goal and task state transactionally.",
+                "requested_effects": [
+                    "read_workspace", "mutate_workspace", "execute_code"
+                ],
+                "required_outcomes": ["Restart restores the same active goal."],
+                "constraints": ["Preserve unrelated state."],
+                "exclusions": [],
+                "acceptance_criteria": ["Restart restores the same active goal."],
+                "unresolved_decisions": [],
+                "repository_evidence_refs": ["inspection:I001"],
+            },
             "summary": "Implement and verify the requested behavior.",
             "applicability_evidence": [
                 {
@@ -107,6 +120,8 @@ class ControlSchemaTests(unittest.TestCase):
                 {
                     "path": "agent/store.py",
                     "intent": "Persist goal and task state transactionally.",
+                    "basis": "existing_inspected_path",
+                    "evidence_refs": ["inspection:I001"],
                     "supports_tasks": ["T001"],
                 }
             ],
@@ -126,10 +141,16 @@ class ControlSchemaTests(unittest.TestCase):
         invalid = {**valid, "surprise": True}
         with self.assertRaisesRegex(ControlValidationError, "unknown fields"):
             validate_control_call("propose_plan", invalid)
-        chat_only = dict(valid)
-        del chat_only["expected_changes"]
-        with self.assertRaisesRegex(ControlValidationError, "expected_changes is required"):
-            validate_control_call("propose_plan", chat_only)
+        analysis_only = dict(valid)
+        analysis_only["expected_changes"] = []
+        analysis_only["semantic_goal"] = {
+            **valid["semantic_goal"],
+            "requested_effects": ["read_workspace", "answer"],
+        }
+        self.assertIs(
+            validate_control_call("propose_plan", analysis_only),
+            analysis_only,
+        )
 
     def test_done_update_shape_requires_evidence_field(self):
         with self.assertRaisesRegex(ControlValidationError, "evidence is required"):

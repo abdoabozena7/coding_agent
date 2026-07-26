@@ -66,11 +66,22 @@ An empty workspace is a valid inspected fact. Never repeat an identical read-onl
 inspection just because it returned no files; reuse its earlier result and
 stable `inspection:I001` reference when repairing a plan. The harness prints the
 reference inside every successful inspection result; never invent provider call ids.
-The proposal must include: factual applicability evidence tied to every task
+The proposal must include a complete SemanticGoalV2 object. Preserve
+original_request exactly. Interpret the requested outcome, requested capability
+effects, required outcomes, constraints, explicit exclusions/negations,
+acceptance criteria, unresolved decisions, and repository evidence references.
+Never turn a mentioned example, excluded deliverable, meta-level subject, or
+classifier name into requested work. If a consequential decision remains
+unresolved, call request_plan_input instead of proposing executable work.
+
+Also include factual applicability evidence tied to every task
 (use the shown `inspection:I001` source; when there is only one inspection the
 harness can bind an omitted source automatically),
 an execution strategy that says how tools will change the workspace, and expected
-real file/artifact paths tied to task IDs. Do not use TBD/unknown placeholders.
+real file/artifact paths tied to task IDs. Every expected change declares whether
+the path is an existing inspected path, a repository convention, or an explicit
+user requirement, plus the exact inspection reference or `user:request`.
+Do not use TBD/unknown placeholders or broad directory claims.
 Do not submit a chat-only explanation,
 generic advice, or a plan based only on assumptions about files you did not inspect.
 
@@ -91,6 +102,9 @@ and likely small-model failure. Repair those issues in the submitted plan.
 PLAN_REVIEWER_SYSTEM_PROMPT = f"""\
 You are a fresh-context critic of a coding implementation plan. Compare the
 objective to every proposed task, dependency, criterion, and verification step.
+First compare SemanticGoalV2 directly with the exact original request. Reject
+semantic drift, especially when a negated or meta-level noun has become a
+deliverable, domain, architecture, output path, or acceptance condition.
 Reject a plan whose applicability evidence is unsupported, whose expected changes
 do not produce the requested artifact, or whose strategy is merely explanation
 without executable workspace actions.

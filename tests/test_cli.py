@@ -52,6 +52,41 @@ class CLITests(unittest.TestCase):
         self.assertNotIn("start", values)
         self.assertEqual(sum(item.recommended for item in request.options), 1)
 
+        ultra_plan_request = _plan_attention(
+            view,
+            (),
+            plan_only=True,
+            ultra_available=True,
+            normal_available=False,
+        )
+        ultra_values = {item.value for item in ultra_plan_request.options}
+        self.assertNotIn("normal", ultra_values)
+        self.assertIn("ultra", ultra_values)
+
+    def test_mode_command_changes_depth_without_starting_a_second_foundation(self):
+        output = io.StringIO()
+        console = ConsoleUI(stream=output, color=False)
+        preferences = SessionPreferences(mode=InteractionMode.NORMAL)
+        runtime = mock.Mock()
+        runtime.ultra_readiness_issue.return_value = ""
+        runtime.active_goal.return_value = SimpleNamespace(
+            status=GoalStatus.PAUSED,
+            metadata={},
+        )
+
+        self.assertTrue(
+            execute_command(
+                runtime,
+                console,
+                parse_command("/mode ultra"),
+                preferences,
+            )
+        )
+
+        runtime.transition_mode.assert_called_once_with("ultra")
+        runtime.prepare_ultra_from_existing_goal.assert_not_called()
+        self.assertEqual(preferences.mode, InteractionMode.ULTRA)
+
     def test_persistent_controller_contains_last_intake_provider_failure(self):
         import time
 
@@ -304,6 +339,14 @@ class CLITests(unittest.TestCase):
             parse_command("/settings\tcolor\toff").args,
             {"key": "color", "value": "off"},
         )
+        self.assertEqual(
+            parse_command("/api-key openai").args,
+            {"key": "api_key", "value": "openai"},
+        )
+        self.assertEqual(
+            parse_command("/settings api-key gemini").args,
+            {"key": "api_key", "value": "gemini"},
+        )
 
     def test_sequential_main_commands_share_goal_mode_with_settings(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -329,6 +372,29 @@ class CLITests(unittest.TestCase):
             self.assertIn("Session settings", rendered)
             self.assertIn("mode       = normal", rendered)
             self.assertNotIn("API_KEY", rendered)
+
+    def test_startup_mode_is_persisted_before_the_first_intake(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = main(
+                    [
+                        "--workspace",
+                        directory,
+                        "--provider",
+                        "ollama",
+                        "--mode",
+                        "ultra",
+                        "--command",
+                        "/status",
+                        "--no-color",
+                    ]
+                )
+            with StateStore(directory) as state:
+                session = state.get_workflow_session("workspace-session")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(session["session_mode"], "ultra")
 
     def test_doctor_record_command_persists_benchmark_history(self):
         with tempfile.TemporaryDirectory() as directory:

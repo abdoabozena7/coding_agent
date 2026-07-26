@@ -1102,6 +1102,7 @@ class UltraConfig:
     max_nodes: int = 1_000
     max_fix_attempts: int = 3
     cloud_concurrency: int = 4
+    local_concurrency: int = 1
     max_concurrency: int = 8
     provider_retries: int = 3
     role_memory_ttl_hours: int = 24
@@ -1168,11 +1169,13 @@ class UltraOrchestrator:
         self.adaptive = AdaptiveConcurrency(
             self.execution_class,
             cloud_default=self.config.cloud_concurrency,
+            local_default=self.config.local_concurrency,
             maximum=self.config.max_concurrency,
         )
         self.scheduler = DeterministicWaveScheduler(
             self.execution_class,
             cloud_default=self.config.cloud_concurrency,
+            local_default=self.config.local_concurrency,
             maximum=self.config.max_concurrency,
             rate_limit_retries=self.config.provider_retries,
             rate_limit_backoff=rate_limit_backoff,
@@ -2445,17 +2448,15 @@ class UltraOrchestrator:
                 )
                 candidate = ArchitectureSpecV1.from_mapping(architecture_response.payload)
             except AgentProtocolError as exc:
-                candidate = self._fallback_architecture(prompt, candidate_index)
                 self.events.publish(
-                    "ultra.architecture_protocol_recovered",
-                    (
-                        f"Architecture candidate {candidate_index} used the typed harness "
-                        "fallback after malformed local-model output."
-                    ),
+                    "ultra.model_capability_exhausted",
+                    "Architecture output was invalid; no semantic fallback was created.",
                     run_id=self.run_state.id,
                     candidate_index=candidate_index,
                     error=str(exc),
+                    resumable=True,
                 )
+                raise
             candidate_specs.append(candidate)
             candidate_payloads.append(asdict(candidate))
         compact_candidates = [
@@ -2539,7 +2540,6 @@ class UltraOrchestrator:
                         self.architecture
                     ),
                     "module_bounds": {
-                        "preferred_min": self.config.min_top_modules,
                         "maximum": self.config.max_top_modules,
                     },
                 },
@@ -2553,13 +2553,14 @@ class UltraOrchestrator:
             )
             proposed_raw = MasterPlanV1.from_mapping(plan_response.payload)
         except AgentProtocolError as exc:
-            proposed_raw = self._fallback_master_plan(prompt)
             self.events.publish(
-                "ultra.master_plan_protocol_recovered",
-                "Master plan used the typed harness fallback after malformed local-model output.",
+                "ultra.model_capability_exhausted",
+                "Master plan output was invalid; no semantic fallback was created.",
                 run_id=self.run_state.id,
                 error=str(exc),
+                resumable=True,
             )
+            raise
         proposed = self._enforce_master_artifact_contract(prompt, proposed_raw)
         proposed = self._enforce_concern_coverage_contract(prompt, proposed)
         quality_checklist = (
@@ -2672,16 +2673,14 @@ class UltraOrchestrator:
                     GoalSpecV1.from_mapping(goal_response.payload),
                 )
             except AgentProtocolError as exc:
-                self.goal_spec = self._enforce_goal_artifact_contract(
-                    prompt,
-                    self._fallback_goal_spec(prompt),
-                )
                 self.events.publish(
-                    "ultra.goal_spec_protocol_recovered",
-                    "GoalSpec used the typed harness fallback after malformed local-model output.",
+                    "ultra.model_capability_exhausted",
+                    "Goal interpretation was invalid; no semantic fallback was created.",
                     run_id=self.run_state.id,
                     error=str(exc),
+                    resumable=True,
                 )
+                raise
             raw_questions = tuple(self.goal_spec.questions)
             questions = self._validated_questions(raw_questions)
             questions = tuple(
@@ -2807,6 +2806,9 @@ class UltraOrchestrator:
 
     @staticmethod
     def _task_family(value: str) -> str:
+        return "general"
+        # Legacy keyword implementation below is unreachable and retained only
+        # so old serialized traces can still be interpreted during migration.
         text = str(value).casefold()
         if any(
             marker in text
@@ -3066,6 +3068,7 @@ class UltraOrchestrator:
 
     @staticmethod
     def _requires_visual_artifact(prompt: str) -> bool:
+        return False
         text = str(prompt).casefold()
         return any(
             marker in text
@@ -3077,6 +3080,7 @@ class UltraOrchestrator:
 
     @classmethod
     def _final_output_paths(cls, prompt: str) -> tuple[str, ...]:
+        return ()
         text = str(prompt).casefold()
         refinement = any(
             marker in text

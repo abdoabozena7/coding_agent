@@ -305,6 +305,22 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
         )
 
     all_ids = [item["id"] for item in tasks]
+
+    def normalized_supports(raw_supports: Any) -> list[str]:
+        values = raw_supports
+        if values is None:
+            values = []
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+        result: list[str] = []
+        for raw_support in values:
+            number = _dependency_number(raw_support, legacy_ids)
+            if number is not None and 1 <= number <= len(all_ids):
+                result.append(f"T{number:03d}")
+        if not result and len(all_ids) == 1:
+            result = ["T001"]
+        return list(dict.fromkeys(result))
+
     applicability: list[dict[str, Any]] = []
     for evidence in raw.get("applicability_evidence", ()) or ():
         if not isinstance(evidence, Mapping):
@@ -312,24 +328,46 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
         fact = _text(evidence.get("fact"))
         source = _text(evidence.get("source"))
         if fact:
-            applicability.append({"fact": fact, "source": source, "supports_tasks": all_ids})
+            applicability.append(
+                {
+                    "fact": fact,
+                    "source": source,
+                    "supports_tasks": normalized_supports(
+                        evidence.get("supports_tasks")
+                    ),
+                }
+            )
     expected_changes: list[dict[str, Any]] = []
     for change in raw.get("expected_changes", ()) or ():
         if isinstance(change, Mapping):
             path, intent = _text(change.get("path")), _text(change.get("intent"))
+            basis = _text(change.get("basis"))
+            evidence_refs = _unique_text(change.get("evidence_refs"))
         else:
-            path, intent = "", _text(change)
-        if path or intent:
-            expected_changes.append({"path": path or "<resolved during execution>", "intent": intent, "supports_tasks": all_ids})
-    if not expected_changes:
-        for task in tasks:
-            for change in task.pop("expected_changes"):
-                expected_changes.append({"path": "<resolved during execution>", "intent": change, "supports_tasks": [task["id"]]})
-    else:
-        for task in tasks:
-            task.pop("expected_changes", None)
+            path, intent, basis, evidence_refs = "", _text(change), "", []
+        if path:
+            expected_changes.append(
+                {
+                    "path": path,
+                    "intent": intent,
+                    "basis": basis,
+                    "evidence_refs": evidence_refs,
+                    "supports_tasks": normalized_supports(
+                        change.get("supports_tasks")
+                    ),
+                }
+            )
+    for task in tasks:
+        # Task-local prose is not a path claim.  Keep it out of the mutation
+        # contract unless the model supplied an exact top-level path.
+        task.pop("expected_changes", None)
 
     normalized = {
+        "semantic_goal": (
+            dict(raw.get("semantic_goal"))
+            if isinstance(raw.get("semantic_goal"), Mapping)
+            else {}
+        ),
         "summary": _text(raw.get("summary", raw.get("objective"))),
         "applicability_evidence": applicability,
         "execution_strategy": _text(raw.get("execution_strategy", raw.get("strategy"))),
@@ -341,6 +379,13 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
 
 def validate_normalized_plan(value: Mapping[str, Any]) -> None:
     issues: list[PlanValidationIssue] = []
+    if not isinstance(value.get("semantic_goal"), Mapping) or not value.get("semantic_goal"):
+        issues.append(
+            PlanValidationIssue(
+                "/semantic_goal",
+                "a complete SemanticGoalV2 interpretation is required",
+            )
+        )
     if not _text(value.get("summary")):
         issues.append(PlanValidationIssue("/summary", "a non-empty objective summary is required"))
     tasks = value.get("tasks", ())

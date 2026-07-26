@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>GA3BAD · Local Web View</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Skip to workspace</a>
+  <div id="app" class="app-shell" aria-busy="true">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="brand-mark" aria-hidden="true">G3</div>
+        <div>
+          <strong class="brand">GA3BAD</strong>
+          <span class="surface-label">LOCAL WEB VIEW</span>
+        </div>
+      </div>
+      <div class="session-strip" aria-label="Session information">
+        <span id="viewName" class="view-name">Loading</span>
+        <span class="meta-divider" aria-hidden="true"></span>
+        <span id="sessionMeta">Session —</span>
+        <span id="artifactMeta">Artifact —</span>
+        <button id="refreshButton" class="quiet-button" type="button">Refresh</button>
+        <span id="connection" class="connection" role="status"><i></i> Connecting</span>
+      </div>
+    </header>
+
+    <main id="workspace" class="workspace" tabindex="-1">
+      <div id="loading" class="loading-state">
+        <span class="loader" aria-hidden="true"></span>
+        <p>Connecting to GA3BAD Core…</p>
+      </div>
+      <div id="errorState" class="error-state hidden" role="alert"></div>
+      <section id="viewRoot" class="view-root hidden" aria-live="polite"></section>
+    </main>
+
+    <footer class="footnote">
+      <span>Temporary local workspace · GA3BAD Core remains the source of truth</span>
+      <span>Close this tab to return to the terminal. Closing does not apply changes.</span>
+    </footer>
+  </div>
+  <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

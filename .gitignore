@@ -32,3 +32,10 @@ run-artifacts/*.out
 
 # One-off local state inspection helpers
 projects/*/check_state.py
+
+# Metadata-only standalone experiment repositories
+/projects/hill-climb-gemma4/
+/projects/hill-climb-gemma4-final/
+/projects/hill-climb-gemma4-final-v2/
+/projects/hill-climb-gemma4-final-v3/
+/projects/project-095/

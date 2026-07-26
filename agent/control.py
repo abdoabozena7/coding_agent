@@ -65,8 +65,71 @@ EXPECTED_CHANGE_SCHEMA: dict[str, Any] = {
             "type": "array", "minItems": 1, "maxItems": 80,
             "items": {"type": "string", "minLength": 1, "maxLength": 24},
         },
+        "basis": {
+            "type": "string",
+            "enum": [
+                "existing_inspected_path",
+                "repository_convention",
+                "explicit_user_requirement",
+            ],
+        },
+        "evidence_refs": {
+            "type": "array", "minItems": 1, "maxItems": 20,
+            "items": {"type": "string", "minLength": 1, "maxLength": 500},
+        },
     },
-    "required": ["path", "intent"],
+    "required": ["path", "intent", "basis", "evidence_refs"],
+    "additionalProperties": False,
+}
+
+SEMANTIC_GOAL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "original_request": {"type": "string", "minLength": 1, "maxLength": 20_000},
+        "interpreted_outcome": {"type": "string", "minLength": 1, "maxLength": 20_000},
+        "requested_effects": {
+            "type": "array",
+            "maxItems": 7,
+            "items": {
+                "type": "string",
+                "enum": [
+                    "answer", "read_workspace", "mutate_workspace",
+                    "execute_code", "install_dependencies", "use_network",
+                    "external_side_effect",
+                ],
+            },
+        },
+        "required_outcomes": {
+            "type": "array", "minItems": 1, "maxItems": 40,
+            "items": {"type": "string", "minLength": 1, "maxLength": 2_000},
+        },
+        "constraints": {
+            "type": "array", "maxItems": 40,
+            "items": {"type": "string", "minLength": 1, "maxLength": 2_000},
+        },
+        "exclusions": {
+            "type": "array", "maxItems": 40,
+            "items": {"type": "string", "minLength": 1, "maxLength": 2_000},
+        },
+        "acceptance_criteria": {
+            "type": "array", "minItems": 1, "maxItems": 40,
+            "items": {"type": "string", "minLength": 1, "maxLength": 2_000},
+        },
+        "unresolved_decisions": {
+            "type": "array", "maxItems": 20,
+            "items": {"type": "string", "minLength": 1, "maxLength": 2_000},
+        },
+        "repository_evidence_refs": {
+            "type": "array", "minItems": 1, "maxItems": 80,
+            "items": {"type": "string", "minLength": 1, "maxLength": 500},
+        },
+    },
+    "required": [
+        "original_request", "interpreted_outcome", "requested_effects",
+        "required_outcomes", "constraints", "exclusions",
+        "acceptance_criteria", "unresolved_decisions",
+        "repository_evidence_refs",
+    ],
     "additionalProperties": False,
 }
 
@@ -75,7 +138,8 @@ PROPOSE_PLAN = _fn(
     "propose_plan",
     (
         "Submit one concise inspected plan for explicit approval. Do not invent task ids, "
-        "database ids, supports_tasks, or global references; the harness owns them. Each task "
+        "database ids, or global references; the harness owns them. Evidence and resource "
+        "claims use supports_tasks with 1-based task numbers (for example ['1', '2']). Each task "
         "contains title, description, expected changes, acceptance criteria, verification, "
         "optional dependencies as earlier task numbers, and optional risk. Use one to three "
         "tasks for a simple artifact. This call never modifies files."
@@ -83,6 +147,7 @@ PROPOSE_PLAN = _fn(
     {
         "type": "object",
         "properties": {
+            "semantic_goal": SEMANTIC_GOAL_SCHEMA,
             "summary": {"type": "string", "minLength": 3, "maxLength": 2_000},
             "applicability_evidence": {
                 "type": "array", "maxItems": 40,
@@ -96,7 +161,7 @@ PROPOSE_PLAN = _fn(
             "tasks": {"type": "array", "minItems": 1, "maxItems": 80, "items": TASK_SCHEMA},
         },
         "required": [
-            "summary", "tasks",
+            "semantic_goal", "summary", "tasks",
         ],
         "additionalProperties": False,
     },
@@ -489,8 +554,6 @@ def validate_control_call(name: str, args: Any) -> dict[str, Any]:
         )
         if legacy:
             errors: list[str] = []
-            if "expected_changes" not in normalized:
-                errors.append("arguments.expected_changes is required")
             for index, item in enumerate(normalized.get("applicability_evidence", ())):
                 if isinstance(item, Mapping) and "supports_tasks" not in item:
                     errors.append(f"arguments.applicability_evidence[{index}].supports_tasks is required")

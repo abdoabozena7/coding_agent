@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ultra component preview</title>
+<style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#10151d}canvas{display:block}</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head><body><script>
+{
+window.buildPreview={THREE,scene,camera,renderer} => {
+    const chassis = new THREE.Mesh(new THREE.BoxGeometry(4.8, 2.8, 1.0), new THREE.MeshPhongMaterial({ color: 0xcc3300, shininess: 50 }));
+    chassis.position.y = 1.4;
+    scene.add(chassis);
+
+    const hood = new THREE.Mesh(new THREE.BoxGeometry(2.0, 1.2, 1.0), new THREE.MeshPhongMaterial({ color: 0xaa3300, shininess: 50 }));
+    hood.position.set(-1.5, 1.4 + 0.6, 0);
+    scene.add(hood);
+
+    const cabin = new THREE.Mesh(new THREE.BoxGeometry(2.8, 1.3, 1.0), new THREE.MeshPhongMaterial({ color: 0x5577aa, shininess: 60 }));
+    cabin.position.set(0, 1.4 + 0.65, 0);
+    scene.add(cabin);
+
+    const windshield = new THREE.Mesh(new THREE.BoxGeometry(2.5, 0.8, 0.1), new THREE.MeshPhongMaterial({ color: 0x00ffff, transparent: true, opacity: 0.6 }));
+    windshield.position.set(0, 1.4 + 0.35, 0.05);
+    scene.add(windshield);
+
+    const rearBumper = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.3, 0.2), new THREE.MeshPhongMaterial({ color: 0x444444 }));
+    rearBumper.position.set(1.5, 1.4 - 0.15, 0);
+    scene.add(rearBumper);
+
+    const frontBumper = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.3, 0.2), new THREE.MeshPhongMaterial({ color: 0x444444 }));
+    frontBumper.position.set(-1.5, 1.4 - 0.15, 0);
+    scene.add(frontBumper);
+
+    // Driver Silhouette (Simplified)
+    const driverBody = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1.0, 0.8), new THREE.MeshPhongMaterial({ color: 0x8b4513 }));
+    driverBody.position.set(0, 1.4 + 0.2, 0);
+    scene.add(driverBody);
+
+    // Wheels and Suspension (Using simple geometry for structure)
+    const wheelRadius = 0.75;
+    const wheelPositions = [
+        { x: -1.55, z: 0 }, // Front Left/Right pivot point approximation
+        { x: 1.55, z: 0 }   // Rear Left/Right pivot point approximation
+    ];
+
+    const createWheel = (x, z) => {
+        const tire = new THREE.Mesh(new THREE.CircleGeometry(wheelRadius, 32), new THREE.MeshPhongMaterial({ color: 0x111111 }));
+        tire.rotation.x = Math.PI / 2;
+        tire.position.set(x, -0.75, z);
+        const rim = new THREE.Mesh(new THREE.CircleGeometry(wheelRadius * 0.8, 32), new THREE.MeshPhongMaterial({ color: 0xaaaaaa }));
+        rim.rotation.x = Math.PI / 2;
+        rim.position.set(x, -0.75, z);
+        const hub = new THREE.Mesh(new THREE.SphereGeometry(0.2, 16, 16), new THREE.MeshPhongMaterial({ color: 0x333333 }));
+        hub.position.set(x, -0.75, z);
+
+        const wheelGroup = new THREE.Group();
+        wheelGroup.add(tire);
+        wheelGroup.add(rim);
+        wheelGroup.add(hub);
+        return wheelGroup;
+    };
+
+    // Front Wheels (Assuming they are attached to the chassis pivot points)
+    const frontWheel = createWheel(-1.55, 0);
+    frontWheel.name = 'frontWheel';
+    scene.add(frontWheel);
+
+    // Rear Wheels
+    const rearWheel = createWheel(1.55, 0);
+    rearWheel.name = 'rearWheel';
+    scene.add(rearWheel);
+
+    // Suspension (Simple connecting rods)
+    const suspensionMaterial = new THREE.MeshPhongMaterial({ color: 0x888888 });
+    const createSuspensionArm = (startPos, endPos) => {
+        const length = Math.sqrt((endPos.x - startPos.x)**2 + (endPos.z - startPos.z)**2);
+        const geometry = new THREE.BoxGeometry(0.1, 0.1, length);
+        const mesh = new THREE.Mesh(geometry, suspensionMaterial);
+        mesh.position.copy(startPos).add(endPos).multiplyScalar(0.5);
+        return mesh;
+    };
+
+    // Front Suspension (Connecting chassis area to front wheel pivot)
+    const frontSuspension = new THREE.Group();
+    frontSuspension.name = 'frontSuspension';
+    const fsaStart = new THREE.Vector3(-1.2, 1.4 - 0.15, 0); // Near chassis base
+    const fsaEnd = new THREE.Vector3(-1.55, -0.75 + 0.1, 0); // Near wheel center
+    frontSuspension.add(createSuspensionArm(fsaStart, fsaEnd));
+
+    // Rear Suspension (Connecting chassis area to rear wheel pivot)
+    const rearSuspension = new THREE.Group();
+    rearSuspension.name = 'rearSuspension';
+    const rsaStart = new THREE.Vector3(1.2, 1.4 - 0.15, 0); // Near chassis base
+    const rsaEnd = new THREE.Vector3(1.55, -0.75 + 0.1, 0); // Near wheel center
+    rearSuspension.add(createSuspensionArm(rsaStart, rsaEnd));
+
+    scene.add(frontSuspension);
+    scene.add(rearSuspension);
+
+
+    // Root Group and API Exposure
+    const root = new THREE.Group();
+    root.name = "VehicleRoot";
+    root.add(chassis);
+    root.add(hood);
+    root.add(cabin);
+    root.add(windshield);
+    root.add(rearBumper);
+    root.add(frontBumper);
+    root.add(driverBody);
+    root.add(frontWheel);
+    root.add(rearWheel);
+    root.add(frontSuspension);
+    root.add(rearSuspension);
+
+    scene.add(root);
+
+    window.VehicleAPI = {
+        root: root,
+        wheels: [rearWheel, frontWheel],
+        suspension: [rearSuspension, frontSuspension],
+        driver: driverBody,
+        forward: 'X'
+    };
+}
+if (typeof window.buildPreview !== "function" && typeof buildPreview === "function") {
+  window.buildPreview = buildPreview;
+}
+}
+
+if (typeof window.buildPreview !== "function") {
+  throw new Error("preview/scene.js must define window.buildPreview");
+}
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x9bc9e8);
+const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, .1, 1000);
+camera.position.set(12,10,16); camera.lookAt(0,0,0);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2)); renderer.setSize(innerWidth,innerHeight);
+renderer.shadowMap.enabled=true;
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure=0.82;
+if (THREE.sRGBEncoding) renderer.outputEncoding=THREE.sRGBEncoding;
+document.body.appendChild(renderer.domElement);
+scene.add(new THREE.HemisphereLight(0xffffff,0x334455,0.62));
+const key=new THREE.DirectionalLight(0xffffff,0.95); key.position.set(8,14,10);
+key.castShadow=true; scene.add(key);
+// A one-argument specialist may expect either a context object or the Scene
+// itself. This projection supports both without guessing from parameter names:
+// it inherits Scene behavior and also exposes the typed context fields.
+const previewContext=Object.assign(Object.create(scene),{THREE,scene,camera,renderer});
+
+const harnessChildrenBeforeBuild=new Set(scene.children);
+if (window.buildPreview.length >= 2) {
+  window.buildPreview(THREE,scene,camera,renderer);
+} else {
+  window.buildPreview(previewContext);
+}
+
+// Specialists may clear the scene while rebuilding their isolated root. The
+// harness owns neutral presentation lighting, so restore it after component
+// construction instead of forcing every weak-model leaf to reproduce it.
+if (!scene.children.some((item)=>item && item.isHemisphereLight)) {
+  scene.add(new THREE.HemisphereLight(0xffffff,0x334455,0.62));
+}
+if (!scene.children.some((item)=>item && item.isDirectionalLight)) {
+  const previewKey=new THREE.DirectionalLight(0xffffff,0.95);
+  previewKey.position.set(8,14,10); previewKey.castShadow=true;
+  scene.add(previewKey);
+}
+function frame(t){requestAnimationFrame(frame);renderer.render(scene,camera);}
+requestAnimationFrame(frame);
+addEventListener("resize",()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
+</script></body></html>

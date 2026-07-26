@@ -1402,10 +1402,7 @@ class WorkspaceUltraAgent:
         }
         effective_effort = configured_effort
         if self.provider_name == "ollama" and (
-            self.role in deterministic_roles
-            or request.phase in compact_foundation_phases
-            or component_leaf_quality_phase
-            or component_quality_triage_phase
+            component_leaf_quality_phase or component_quality_triage_phase
         ):
             effective_effort = "off"
             setattr(self.provider, "reasoning_effort", effective_effort)
@@ -1435,16 +1432,7 @@ class WorkspaceUltraAgent:
             # <unused50> token and return an empty response. Typed extraction,
             # validation, and one targeted repair are safer than format=json;
             # tool-using roles also need unconstrained native calls.
-            setattr(
-                self.provider,
-                "force_json",
-                bool(
-                    self.role in deterministic_roles
-                    or request.phase in compact_foundation_phases
-                    or component_leaf_quality_phase
-                    or component_quality_triage_phase
-                ),
-            )
+            setattr(self.provider, "force_json", False)
         self.events.publish(
             "ultra.reasoning_routed",
             f"[{self.role.value}] reasoning {configured_effort} -> {effective_effort}",
@@ -3314,6 +3302,7 @@ class StateStoreUltraAdapter(InMemoryUltraState):
         access_level: AccessLevel,
         config: UltraConfig,
         workspace: Path | None = None,
+        events: EventBus | None = None,
     ) -> None:
         super().__init__()
         self.store = store
@@ -3322,6 +3311,7 @@ class StateStoreUltraAdapter(InMemoryUltraState):
         self.access_level = access_level
         self.config = config
         self.workspace = workspace
+        self.events = events
         self.run_id: str | None = None
         self.plan: Plan | None = None
         self.approved = False
@@ -4174,11 +4164,7 @@ addEventListener("resize",()=>{camera.aspect=innerWidth/innerHeight;camera.updat
                 model=self.descriptor.model,
                 execution_class=self.descriptor.execution_class,
                 access_level=self.access_level,
-                concurrency=(
-                    1
-                    if self.descriptor.execution_class is ExecutionClass.LOCAL
-                    else max(1, min(8, run.concurrency))
-                ),
+                concurrency=max(1, min(8, run.concurrency)),
                 phase=_store_phase(run.phase),
                 status=_store_run_status(run.phase),
                 config=self._run_config(run),
@@ -6555,9 +6541,27 @@ window.buildPreview=(context)=>{
                             change_set.responsible_agent_id == item.id
                             and change_set.status is ChangeSetStatus.OPEN
                         ):
-                            self.store.save_change_set(
-                                replace(change_set, status=ChangeSetStatus.CLOSED, updated_at=utc_now())
+                            closed = self.store.save_change_set(
+                                replace(
+                                    change_set,
+                                    status=ChangeSetStatus.CLOSED,
+                                    updated_at=utc_now(),
+                                )
                             )
+                            if self.events is not None:
+                                self.events.publish(
+                                    "checkpoint.review_ready",
+                                    (
+                                        f"Checkpoint {closed.id} is ready for review · "
+                                        f"{len(closed.changed_files)} file(s) changed."
+                                    ),
+                                    checkpoint_id=closed.id,
+                                    plan_revision=(
+                                        self.plan.revision if self.plan is not None else None
+                                    ),
+                                    changed_files=len(closed.changed_files),
+                                    source="agent_runtime",
+                                )
             if item.id in self._persisted_agents:
                 self.store.update_agent_run(
                     item.id,
@@ -7545,45 +7549,15 @@ class UltraSession:
         return self.workspace / ".coding-agent" / "recovery" / safe_run_id
 
     def _capture_workspace_baseline(self, run_id: str) -> Mapping[str, Any]:
-        """Create one project-scoped recovery snapshot before the approval boundary."""
+        """Declare journal recovery; never copy the workspace."""
 
-        recovery_root = self._recovery_root(run_id)
-        baseline_root = recovery_root / "baseline"
-        manifest_path = recovery_root / "manifest.json"
-        if manifest_path.is_file():
-            try:
-                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError):
-                existing = None
-            if isinstance(existing, Mapping) and existing.get("files"):
-                return dict(existing)
-
-        files: dict[str, str] = {}
-        baseline_root.mkdir(parents=True, exist_ok=True)
-        for source in self.workspace.rglob("*"):
-            if not source.is_file() or source.is_symlink():
-                continue
-            relative = source.relative_to(self.workspace).as_posix()
-            if not self._recoverable_workspace_path(relative):
-                continue
-            try:
-                digest = hashlib.sha256(source.read_bytes()).hexdigest()
-                destination = baseline_root / PurePosixPath(relative)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, destination)
-            except OSError:
-                continue
-            files[relative] = digest
-        manifest = {
-            "schema": "WorkspaceRecoveryBaselineV1",
+        return {
+            "schema": "MutationJournalV1",
             "run_id": str(run_id),
             "captured_at": utc_now().isoformat(),
-            "files": files,
+            "files": {},
+            "storage": "state.db:mutation_journal",
         }
-        temporary = manifest_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temporary, manifest_path)
-        return manifest
 
     def _restore_workspace_baseline(
         self,
@@ -7593,6 +7567,20 @@ class UltraSession:
         reason: str,
     ) -> Mapping[str, Any]:
         """Restore only agent-recorded mutations; unrelated concurrent user files remain untouched."""
+
+        goal_id = getattr(self, "goal_id", None)
+        store = getattr(self, "store", None)
+        restored = (
+            store.rollback_mutation_journal(goal_id)
+            if goal_id and store is not None
+            else ()
+        )
+        return {
+            "schema": "MutationJournalRollbackV1",
+            "run_id": str(run_id),
+            "reason": str(reason),
+            "restored": list(restored),
+        }
 
         recovery_root = self._recovery_root(run_id)
         manifest_path = recovery_root / "manifest.json"
@@ -8172,6 +8160,7 @@ class UltraSession:
             self.permission_adapter.access_level,
             self.config,
             workspace=self.workspace,
+            events=self.events,
         )
         # The durable product goal exists above foundation generation.  A
         # malformed local-model architecture must therefore be recoverable
@@ -8368,6 +8357,7 @@ class UltraSession:
             self.permission_adapter.access_level,
             self.config,
             workspace=self.workspace,
+            events=self.events,
         )
         self.adapter.run_id = run.id
         self.adapter.plan = plan
@@ -8674,6 +8664,7 @@ class UltraSession:
         adaptive = AdaptiveConcurrency(
             descriptor.execution_class,
             cloud_default=self.config.cloud_concurrency,
+            local_default=self.config.local_concurrency,
             maximum=self.config.max_concurrency,
         )
         self.orchestrator.execution_class = descriptor.execution_class

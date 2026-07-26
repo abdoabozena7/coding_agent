@@ -1,16 +1,14 @@
-"""Harness-owned intent intake, clarification, and Normal/Ultra routing.
+"""Domain-neutral request preservation and execution-policy selection.
 
-The model may enrich an execution brief later, but the public interaction
-contract and routing floor are deterministic.  This keeps short or ambiguous
-requests from falling through to an unstructured chat turn.
+Intake keeps the user's text verbatim. Repository-grounded model planning and
+an independent critic own all semantic interpretation after inspection.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-import re
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 
 class RunMode(str, Enum):
@@ -131,7 +129,9 @@ class ClarificationQuestionV1:
             raise ValueError("clarification questions require id, header, and question")
         if len(self.options) != 3:
             raise ValueError("clarification questions require exactly three suggested answers")
-        recommended = [index for index, option in enumerate(self.options) if option.recommended]
+        recommended = [
+            index for index, option in enumerate(self.options) if option.recommended
+        ]
         if recommended != [0]:
             raise ValueError("the first option must be the only recommended answer")
         if not self.allow_freeform:
@@ -190,22 +190,9 @@ class ExecutionBriefV1:
         return value
 
     def canonical_prompt(self) -> str:
-        sections = [
-            self.objective.strip(),
-            "\nCANONICAL EXECUTION BRIEF:",
-            "Deliverables:\n- " + "\n- ".join(self.deliverables),
-            "Constraints:\n- " + "\n- ".join(self.constraints),
-            "Success criteria:\n- " + "\n- ".join(self.success_criteria),
-            "Assumptions:\n- " + "\n- ".join(self.assumptions),
-            "Risks:\n- " + "\n- ".join(self.risks),
-            f"Harness route: {self.routed_mode.value} ({self.route_reason})",
-        ]
-        if self.answers:
-            sections.append(
-                "User decisions:\n- "
-                + "\n- ".join(f"{key}: {value}" for key, value in sorted(self.answers.items()))
-            )
-        return "\n".join(section for section in sections if section.strip())
+        """Compatibility method that cannot add semantics to the request."""
+
+        return self.original_input
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,140 +204,88 @@ class IntakeDecisionV1:
 
     @property
     def status(self) -> IntakeStatus:
-        return IntakeStatus.AWAITING_ANSWERS if self.questions else IntakeStatus.READY
+        return (
+            IntakeStatus.AWAITING_ANSWERS
+            if self.questions
+            else IntakeStatus.READY
+        )
 
 
-_VISUAL_TERMS = (
-    "three.js", "threejs", "webgl", "3d", "game", "لعبة", "visual", "animation",
-    "interactive", "واجهة", "dashboard", "landing page", "تصميم",
-)
-_MIGRATION_TERMS = (
-    "migration", "migrate", "database schema", "security", "auth", "permission",
-    "production", "deploy", "ترحيل", "أمان", "صلاحيات", "نشر",
-)
-_MULTI_COMPONENT_TERMS = (
-    "frontend", "backend", "api", "database", "worker", "agent", "agents", "swarm",
-    "character", "vehicle", "road", "logic", "server", "client", "pipeline",
-    "واجهة", "خادم", "قاعدة بيانات", "شخصية", "عربية", "طريق", "منطق",
-)
-_VAGUE_ONLY = re.compile(
-    r"^(?:make|build|create|fix|improve|do|اعمل|سوي|سوّي|ظبط|اضبط|حسن|صلح)(?:\s+(?:it|this|ده|دي|الحاجة))?$",
-    re.IGNORECASE,
-)
-_REFINEMENT_TERMS = (
-    "more advanced",
-    "improve",
-    "improved",
-    "enhance",
-    "upgrade",
-    "polish",
-    "make it better",
-    "make this better",
-    "طور",
-    "تطوير",
-    "حسن",
-    "تحسين",
-    "خليه أحسن",
-)
+def normalize_question(
+    value: Mapping[str, Any], *, index: int = 1
+) -> ClarificationQuestionV1:
+    """Normalize model-authored questions without inventing task semantics."""
 
-
-def _contains(text: str, terms: Iterable[str]) -> tuple[str, ...]:
-    lowered = text.casefold()
-    return tuple(term for term in terms if term.casefold() in lowered)
-
-
-def _is_refinement_request(text: str) -> bool:
-    return bool(_contains(str(text), _REFINEMENT_TERMS))
-
-
-def _option(label: str, description: str, recommended: bool = False) -> QuestionOptionV1:
-    return QuestionOptionV1(label=label, description=description, recommended=recommended)
-
-
-def normalize_question(value: Mapping[str, Any], *, index: int = 1) -> ClarificationQuestionV1:
-    """Repair weak-model question shapes into the strict four-way UX contract."""
-
-    raw_options = [dict(item) for item in value.get("options", ()) if isinstance(item, Mapping)]
+    raw_options = [
+        dict(item)
+        for item in value.get("options", ())
+        if isinstance(item, Mapping)
+    ][:3]
     options: list[QuestionOptionV1] = []
-    for position, item in enumerate(raw_options[:3]):
-        label = str(item.get("label") or f"Option {position + 1}").strip()[:80]
-        description = str(item.get("description") or "Use this direction for the execution brief.").strip()[:500]
-        options.append(_option(label, description, recommended=position == 0))
-    fallbacks = (
-        _option("Best quality", "Let the agent choose the strongest quality-first direction."),
-        _option("Balanced scope", "Keep the scope complete while controlling unnecessary complexity."),
-        _option("Focused result", "Prioritize the smallest polished result that proves the goal."),
-    )
-    used = {item.label.casefold() for item in options}
-    for candidate in fallbacks:
-        if len(options) >= 3:
-            break
-        if candidate.label.casefold() not in used:
-            options.append(candidate)
-            used.add(candidate.label.casefold())
+    for position, item in enumerate(raw_options):
+        options.append(
+            QuestionOptionV1(
+                label=str(item.get("label") or f"Option {position + 1}").strip()[:80],
+                description=str(
+                    item.get("description")
+                    or "Use this user-selected planning decision."
+                ).strip()[:500],
+                recommended=position == 0,
+            )
+        )
+    while len(options) < 3:
+        position = len(options)
+        options.append(
+            QuestionOptionV1(
+                label=f"Option {position + 1}",
+                description="Use this user-selected planning decision.",
+                recommended=position == 0,
+            )
+        )
     options = [
-        QuestionOptionV1(item.label, item.description, recommended=position == 0)
-        for position, item in enumerate(options[:3])
+        QuestionOptionV1(
+            item.label,
+            item.description,
+            recommended=position == 0,
+        )
+        for position, item in enumerate(options)
     ]
     return ClarificationQuestionV1(
         id=str(value.get("id") or f"Q{index}").strip()[:64],
         header=str(value.get("header") or "Decision").strip()[:40],
-        question=str(value.get("question") or "Which direction should the agent use?").strip()[:1000],
+        question=str(
+            value.get("question") or "Which direction should planning use?"
+        ).strip()[:1000],
         options=tuple(options),
+        reason=str(
+            value.get("reason")
+            or "The inspected plan requires a consequential user decision."
+        ).strip()[:1000],
         allow_freeform=True,
-        reason=str(value.get("reason") or "Required to finalize the execution brief.").strip()[:1000],
     )
 
 
-def normalize_questions(values: Sequence[Mapping[str, Any]]) -> tuple[ClarificationQuestionV1, ...]:
-    return tuple(normalize_question(item, index=index) for index, item in enumerate(values[:3], 1))
+def normalize_questions(
+    values: Sequence[Mapping[str, Any]],
+) -> tuple[ClarificationQuestionV1, ...]:
+    return tuple(
+        normalize_question(item, index=index)
+        for index, item in enumerate(values[:3], 1)
+    )
 
 
 class IntentArchitect:
-    """Create a durable brief and choose the minimum quality-preserving mode."""
+    """Preserve request text and select only the explicit execution policy."""
 
     def assess_complexity(self, prompt: str) -> TaskComplexityAssessmentV1:
-        text = str(prompt).strip()
-        visual = _contains(text, _VISUAL_TERMS)
-        migrations = _contains(text, _MIGRATION_TERMS)
-        components = _contains(text, _MULTI_COMPONENT_TERMS)
-        component_count = max(1, len(set(components)))
-        hard: list[str] = []
-        reasons: list[str] = []
-        score = 0.12
-        if len(text) >= 600:
-            score += 0.18
-            reasons.append("long multi-requirement prompt")
-        if visual:
-            score += 0.35
-            reasons.append("visual or interactive quality")
-            hard.append("visual_interactive_showcase")
-        if migrations:
-            score += 0.35
-            reasons.append("high-risk migration/security/deployment")
-            hard.append("high_risk_change")
-        if component_count >= 3:
-            score += 0.30
-            reasons.append(f"{component_count} independently identifiable components")
-            hard.append("multi_component_system")
-        elif component_count == 2:
-            score += 0.18
-            reasons.append("multiple interacting subsystems")
-        if any(term in text.casefold() for term in ("recursive", "multi-agent", "multi agent", "specialist", "debate")):
-            score += 0.25
-            hard.append("recursive_specialization_benefit")
-            reasons.append("recursive specialist execution requested")
+        if not str(prompt).strip():
+            raise ValueError("intent input must not be empty")
         return TaskComplexityAssessmentV1(
-            score=min(1.0, score),
-            hard_triggers=tuple(dict.fromkeys(hard)),
-            component_count=component_count,
-            reasons=tuple(reasons) or ("cohesive bounded task",),
+            score=0.0,
+            hard_triggers=(),
+            component_count=1,
+            reasons=("repository-grounded assessment pending",),
         )
-
-    @staticmethod
-    def _mentions(text: str, values: Iterable[str]) -> bool:
-        lowered = text.casefold()
-        return any(value.casefold() in lowered for value in values)
 
     def evaluate_completeness(
         self,
@@ -359,259 +294,22 @@ class IntentArchitect:
         answers: Mapping[str, str] | None = None,
         repository_facts: Sequence[str] = (),
     ) -> PromptCompletenessV1:
-        """Classify consequential decisions semantically, never by prompt length."""
-
-        text = str(prompt).strip()
-        lowered = text.casefold()
-        answers = {
-            str(key).casefold(): str(value).strip()
-            for key, value in dict(answers or {}).items()
-            if str(value).strip()
-        }
-        discoverable_facts = tuple(
-            str(item).strip()
-            for item in repository_facts
-            if str(item).strip()
-            and not str(item).strip().casefold().startswith(
-                ("cross-run learned lesson:", "learned lesson:", "lesson:")
+        del answers, repository_facts
+        original = str(prompt).strip()
+        return PromptCompletenessV1(
+            (
+                PromptDecisionSlotV1(
+                    "goal_output",
+                    (
+                        PromptSlotStatus.EXPLICIT
+                        if original
+                        else PromptSlotStatus.MISSING_CONSEQUENTIAL
+                    ),
+                    original,
+                    "verbatim_user_request",
+                ),
             )
         )
-        facts_text = "\n".join(discoverable_facts).casefold()
-        refinement = _is_refinement_request(text) and bool(discoverable_facts)
-        visual = bool(_contains(text, _VISUAL_TERMS))
-        explicit_artifact = re.search(
-            r"\b[\w.-]+\.(?:html?|py|js|ts|tsx|jsx|css|json|md|ya?ml|toml)\b",
-            text,
-            re.I,
-        )
-        slots: list[PromptDecisionSlotV1] = []
-
-        def add(
-            name: str,
-            status: PromptSlotStatus,
-            value: str,
-            provenance: str,
-        ) -> None:
-            slots.append(PromptDecisionSlotV1(name, status, value, provenance))
-
-        if text and not _VAGUE_ONLY.fullmatch(text):
-            add("goal_output", PromptSlotStatus.EXPLICIT, text, "user_prompt")
-        else:
-            add(
-                "goal_output",
-                PromptSlotStatus.MISSING_CONSEQUENTIAL,
-                "",
-                "user_prompt_does_not_identify_an_outcome",
-            )
-
-        platform_terms = (
-            "browser", "web", "desktop", "mobile", "android", "ios", "cli",
-            "terminal", "windows", "linux", "macos", "متصفح", "موبايل", "ديسكتوب",
-        )
-        if "platform" in answers:
-            add("platform_audience", PromptSlotStatus.EXPLICIT, answers["platform"], "intake_answer")
-        elif self._mentions(lowered, platform_terms):
-            add("platform_audience", PromptSlotStatus.EXPLICIT, "declared in prompt", "user_prompt")
-        elif self._mentions(facts_text, platform_terms):
-            add("platform_audience", PromptSlotStatus.DISCOVERED, "repository platform", "repository_facts")
-        elif refinement:
-            add(
-                "platform_audience",
-                PromptSlotStatus.DISCOVERED,
-                "preserve existing project platform and audience",
-                "repository_refinement_baseline",
-            )
-        elif visual:
-            add(
-                "platform_audience",
-                PromptSlotStatus.MISSING_CONSEQUENTIAL,
-                "",
-                "input_controls_and_layout_depend_on_platform",
-            )
-        else:
-            add(
-                "platform_audience",
-                PromptSlotStatus.SAFELY_INFERRED,
-                "existing project platform",
-                "reversible repository-local default",
-            )
-
-        packaging_terms = (
-            "single html", "single-file", "single file", "one file", "self-contained",
-            "multi-file", "multiple files", "modular", "package", "ملف واحد",
-            "ملفات متعددة", "موديول",
-        )
-        if "packaging" in answers:
-            add("packaging", PromptSlotStatus.EXPLICIT, answers["packaging"], "intake_answer")
-        elif (
-            explicit_artifact
-            and not str(explicit_artifact.group(0)).casefold().endswith("three.js")
-        ):
-            add("packaging", PromptSlotStatus.EXPLICIT, explicit_artifact.group(0), "user_prompt")
-        elif self._mentions(lowered, packaging_terms):
-            add("packaging", PromptSlotStatus.EXPLICIT, "declared in prompt", "user_prompt")
-        elif refinement:
-            add(
-                "packaging",
-                PromptSlotStatus.DISCOVERED,
-                "preserve existing project packaging",
-                "repository_refinement_baseline",
-            )
-        elif visual:
-            add(
-                "packaging",
-                PromptSlotStatus.MISSING_CONSEQUENTIAL,
-                "",
-                "final_delivery_shape_affects_assembly_and_deployment",
-            )
-        else:
-            add(
-                "packaging",
-                PromptSlotStatus.SAFELY_INFERRED,
-                "follow repository conventions",
-                "reversible repository-local default",
-            )
-
-        visual_terms = (
-            "stylized", "realistic", "neon", "minimal", "material", "lighting",
-            "pixel", "low-poly", "art direction", "ستايل", "واقعي", "كرتوني",
-        )
-        if "visual_direction" in answers:
-            add(
-                "visual_direction",
-                PromptSlotStatus.EXPLICIT,
-                answers["visual_direction"],
-                "intake_answer",
-            )
-        elif refinement:
-            add(
-                "visual_direction",
-                PromptSlotStatus.DISCOVERED,
-                "preserve and polish the existing visual direction",
-                "repository_refinement_baseline",
-            )
-        elif not visual:
-            add(
-                "visual_direction",
-                PromptSlotStatus.SAFELY_INFERRED,
-                "not applicable",
-                "non_visual_task",
-            )
-        elif self._mentions(lowered, visual_terms):
-            add("visual_direction", PromptSlotStatus.EXPLICIT, "declared in prompt", "user_prompt")
-        else:
-            add(
-                "visual_direction",
-                PromptSlotStatus.MISSING_CONSEQUENTIAL,
-                "",
-                "visual_quality_requires_a_reviewable_art_direction",
-            )
-
-        constraint_terms = (
-            "must", "should", "accept", "test", "performance", "compatible",
-            "without", "no ", "لازم", "اختبار", "أداء", "متوافق", "بدون",
-        )
-        if self._mentions(lowered, constraint_terms):
-            add("constraints_acceptance", PromptSlotStatus.EXPLICIT, "declared in prompt", "user_prompt")
-        else:
-            add(
-                "constraints_acceptance",
-                PromptSlotStatus.SAFELY_INFERRED,
-                "functional, runtime, review, and regression gates",
-                "harness_quality_floor",
-            )
-
-        deployment_terms = ("deploy", "production", "publish", "hosting", "نشر", "إنتاج")
-        if self._mentions(lowered, deployment_terms):
-            add("deployment_irreversible", PromptSlotStatus.EXPLICIT, "declared in prompt", "user_prompt")
-        else:
-            add(
-                "deployment_irreversible",
-                PromptSlotStatus.SAFELY_INFERRED,
-                "local artifact only; no deployment",
-                "no irreversible side effect requested",
-            )
-        return PromptCompletenessV1(tuple(slots))
-
-    @staticmethod
-    def _needs_questions(completeness: PromptCompletenessV1) -> bool:
-        return not completeness.complete
-
-    def _questions(self, prompt: str) -> tuple[ClarificationQuestionV1, ...]:
-        visual = bool(_contains(prompt, _VISUAL_TERMS))
-        if visual:
-            values = (
-                {
-                    "id": "platform",
-                    "header": "Platform",
-                    "question": "Where should the finished experience work best?",
-                    "options": (
-                        {"label": "Desktop browser", "description": "Optimize controls, framing, and performance for desktop browsers."},
-                        {"label": "Mobile browser", "description": "Prioritize touch controls and smaller screens."},
-                        {"label": "Desktop and mobile", "description": "Build responsive controls and layouts for both."},
-                    ),
-                    "reason": "Platform changes input, layout, and performance decisions.",
-                },
-                {
-                    "id": "packaging",
-                    "header": "Packaging",
-                    "question": "How should the finished experience be packaged?",
-                    "options": (
-                        {"label": "Modular staging, best final", "description": "Build isolated components and let the assembler choose the strongest final packaging."},
-                        {"label": "Single self-contained HTML", "description": "Deliver one portable HTML file with runtime code and assets embedded."},
-                        {"label": "Multi-file project", "description": "Deliver maintainable source modules and a browser entrypoint."},
-                    ),
-                    "reason": "Packaging changes component contracts, integration, and deployment.",
-                },
-                {
-                    "id": "visual_direction",
-                    "header": "Visual style",
-                    "question": "Which visual direction should guide the specialists?",
-                    "options": (
-                        {"label": "Polished stylized", "description": "Use cohesive shapes, lighting, motion, and readable detail."},
-                        {"label": "Realistic", "description": "Favor physically plausible proportions, materials, and lighting."},
-                        {"label": "Arcade neon", "description": "Favor saturated color, speed effects, and dramatic feedback."},
-                    ),
-                    "reason": "A concrete art direction makes component reviews objective.",
-                },
-            )
-        else:
-            values = (
-                {
-                    "id": "outcome",
-                    "header": "Outcome",
-                    "question": "What kind of result should the agent produce?",
-                    "options": (
-                        {"label": "Complete implementation", "description": "Implement, test, review, and deliver the finished result."},
-                        {"label": "Fix existing work", "description": "Inspect the workspace and repair the most relevant existing artifact."},
-                        {"label": "Analysis only", "description": "Investigate and report without changing files."},
-                    ),
-                    "reason": "The requested outcome is not explicit enough to authorize execution.",
-                },
-                {
-                    "id": "priority",
-                    "header": "Priority",
-                    "question": "Which priority should control tradeoffs?",
-                    "options": (
-                        {"label": "Highest quality", "description": "Use deeper verification and revision even if execution takes longer."},
-                        {"label": "Balanced", "description": "Balance quality, scope, and execution time."},
-                        {"label": "Fastest useful result", "description": "Prefer a narrow result with essential checks."},
-                    ),
-                    "reason": "Priority determines review depth and stopping criteria.",
-                },
-                {
-                    "id": "scope",
-                    "header": "Scope",
-                    "question": "How broadly may the agent change the project?",
-                    "options": (
-                        {"label": "Relevant files", "description": "Change every file needed for a complete, integrated result."},
-                        {"label": "Small focused change", "description": "Keep mutations narrowly bounded to the immediate issue."},
-                        {"label": "Broader refactor", "description": "Allow structural cleanup when it improves the result."},
-                    ),
-                    "reason": "Scope affects ownership, risk, and the execution plan.",
-                },
-            )
-        return normalize_questions(values)
 
     def analyze(
         self,
@@ -625,177 +323,41 @@ class IntentArchitect:
         if not original:
             raise ValueError("intent input must not be empty")
         requested = RunMode.parse(requested_mode)
-        complexity = self.assess_complexity(original)
-        mode_answer = str((answers or {}).get("execution_mode", "")).casefold()
-        if requested is RunMode.PLAN:
-            routed = RunMode.PLAN
-        elif requested is RunMode.ULTRA or mode_answer.startswith("ultra"):
-            routed = RunMode.ULTRA
-        else:
-            # A large goal requested in Normal stays Normal unless the user
-            # explicitly accepts the cost/orchestration escalation below.
-            routed = RunMode.NORMAL
-        route_reason = (
-            "explicit Ultra request"
-            if requested is RunMode.ULTRA
-            else "; ".join(complexity.reasons)
-        )
         resolved_answers = {
             str(key): str(value)
             for key, value in dict(answers or {}).items()
             if str(value).strip()
         }
-        completeness = self.evaluate_completeness(
-            original,
-            answers=resolved_answers,
-            repository_facts=repository_facts,
-        )
-        question_by_slot = {
-            "platform_audience": "platform",
-            "packaging": "packaging",
-            "visual_direction": "visual_direction",
-            "goal_output": "outcome",
-        }
-        selected_question_ids = {
-            question_by_slot[name]
-            for name in completeness.missing_consequential
-            if name in question_by_slot
-        }
-        if "goal_output" in completeness.missing_consequential:
-            selected_question_ids.update({"outcome", "priority", "scope"})
-        questions = tuple(
-            item
-            for item in self._questions(original)
-            if item.id in selected_question_ids
-        )[:3]
-        if (
-            requested is RunMode.NORMAL
-            and complexity.ultra_required
-            and not resolved_answers.get("execution_mode")
-        ):
-            escalation = ClarificationQuestionV1(
-                id="execution_mode",
-                header="Large project",
-                question="This goal is large enough to benefit from Ultra specialists. How should it run?",
-                options=(
-                    QuestionOptionV1(
-                        "Ultra mode",
-                        "Use recursive specialists and deeper integration checks; this may cost more.",
-                        recommended=True,
-                    ),
-                    QuestionOptionV1(
-                        "Normal mode",
-                        "Keep one durable goal and the lower-cost orchestration.",
-                    ),
-                    QuestionOptionV1(
-                        "Edit request",
-                        "Pause here so the scope can be narrowed before planning.",
-                    ),
-                ),
-                reason="Complexity crossed the Ultra recommendation threshold.",
-            )
-            questions = (escalation, *questions)[:3]
-        visual_experience = bool(_contains(original, _VISUAL_TERMS))
-        packaging = resolved_answers.get("packaging", "")
-        single_html = (
-            "single" in packaging.casefold()
-            or "ملف واحد" in packaging
-            or bool(
-                re.search(
-                    r"\b(?:single[- ]file|one file|self-contained)\b",
-                    original,
-                    re.I,
-                )
-            )
-        )
-        deliverable = (
-            "A self-contained, playable index.html with integrated Three.js/runtime code and no split source output"
-            if visual_experience and single_html
-            else (
-                "Materialized specialist components plus the strongest integrated browser packaging"
-                if visual_experience
-                else (
-                    "A complete, integrated implementation with executable verification"
-                    if "analysis only" not in " ".join(resolved_answers.values()).casefold()
-                    else "An evidence-backed analysis without workspace mutation"
-                )
-            )
-        )
-        constraints = ["Preserve unrelated user work", "Use the real workspace and available tools"]
-        refinement = _is_refinement_request(original) and bool(repository_facts)
-        if refinement:
-            constraints.extend(
-                (
-                    "Treat the current working project as the accepted baseline; improve it instead of rebuilding it",
-                    "Preserve working behavior, public interfaces, packaging, and unrelated files unless an approved finding requires a change",
-                    "Build and evaluate a challenger against pre-change functional, visual, and repository baselines before promotion",
-                    "If the challenger does not measurably improve the project without regression, restore the accepted baseline",
-                )
-            )
-        if visual_experience:
-            constraints.extend(
-                (
-                    "FinalAssembler is the only writer of final output paths",
-                    "Specialists publish materialized component packages and cannot replace the final artifact",
-                )
-            )
-        success_criteria = [
-            "Every explicit requirement is covered",
-            "Critical functional checks pass",
-            "Independent review finds no unresolved blocking issue",
-        ]
-        if refinement:
-            success_criteria.extend(
-                (
-                    "The candidate wins an evidence-backed comparison against the pre-change baseline",
-                    "Previously working functional, visual, performance, and integration checks do not regress",
-                    "Rejected or interrupted candidates leave the accepted workspace unchanged",
-                )
-            )
-        if visual_experience:
-            success_criteria.extend(
-                (
-                    "The game is playable with zero browser console or WebGL runtime errors",
-                    "Overall quality is at least 0.95 and every critical visual category is at least 0.90",
-                )
-            )
         brief = ExecutionBriefV1(
             original_input=original,
             objective=original,
-            deliverables=(deliverable,),
-            constraints=tuple(constraints),
-            success_criteria=tuple(success_criteria),
-            assumptions=(
-                "Reversible technical choices use the strongest safe default",
-                "Quality is preferred over execution speed",
-                *tuple(str(item).strip() for item in repository_facts if str(item).strip()),
+            deliverables=(),
+            constraints=(),
+            success_criteria=(),
+            assumptions=tuple(
+                str(item).strip()
+                for item in repository_facts
+                if str(item).strip()
             ),
-            risks=(
-                "Ambiguous requirements are resolved before mutation",
-                *(
-                    (
-                        "A broad refinement request could cause speculative rewrites; transactional baseline promotion is required",
-                    )
-                    if refinement
-                    else ()
-                ),
-            ),
+            risks=(),
             requested_mode=requested,
-            routed_mode=routed,
-            route_reason=route_reason,
+            routed_mode=requested,
+            route_reason=(
+                "explicit user mode; execution depth is policy, not task semantics"
+            ),
             answers=resolved_answers,
         )
         return IntakeDecisionV1(
             brief=brief,
-            complexity=complexity,
-            completeness=completeness,
-            questions=questions,
+            complexity=self.assess_complexity(original),
+            completeness=self.evaluate_completeness(original),
+            questions=(),
         )
 
 
-def answer_from_value(question: ClarificationQuestionV1, value: str) -> tuple[str, str]:
-    """Resolve numeric/label/free-form input and return (answer, source)."""
-
+def answer_from_value(
+    question: ClarificationQuestionV1, value: str
+) -> tuple[str, str]:
     raw = str(value).strip()
     if not raw:
         raise ValueError("question answers must not be empty")
@@ -805,7 +367,9 @@ def answer_from_value(question: ClarificationQuestionV1, value: str) -> tuple[st
         if raw.casefold() == option.label.casefold():
             return option.label, "suggested"
     if raw == "4":
-        raise ValueError("choice 4 requires free-form text, for example: 4 your answer")
+        raise ValueError(
+            "choice 4 requires free-form text, for example: 4 your answer"
+        )
     if raw.startswith("4 "):
         raw = raw[2:].strip()
     return raw, "freeform"
