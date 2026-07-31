@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import re
 from typing import Iterable
 
@@ -20,6 +21,41 @@ _INSTALL = re.compile(
     r"(?:ثب[ّ]?ت|نز[ّ]?ل|مكتبات|اعتماديات)", re.IGNORECASE,
 )
 _QUESTION = re.compile(r"^\s*(how|why|what|when|where|who|explain|tell me|هل|لماذا|ليه|ما |ماذا|اشرح)", re.IGNORECASE)
+_PROJECT = re.compile(
+    r"\b(project|application|app|system|service|website|game|backend|frontend|"
+    r"refactor|migration|end[- ]to[- ]end|multiple files?|full workflow|"
+    r"polished|production[- ]ready)\b|"
+    r"(?:مشروع|تطبيق|موقع|لعبة|نظام|واجهة|خادم|كامل|متكامل)",
+    re.IGNORECASE,
+)
+_MULTISTEP = re.compile(
+    r"\b(and then|then|after that|implement.*test|build.*verify|fix.*tests?)\b|"
+    r"(?:وبعدين|ثم|وبعدها|نفذ.*اختبر|اعمل.*اختبر)",
+    re.IGNORECASE,
+)
+_REPOSITORY_REFINEMENT = re.compile(
+    r"\b(fix|repair|refactor|debug|resolve|improve|update)\b|"
+    r"(?:أصلح|اصلح|صحح|عد[ّ]?ل|حس[ّ]?ن|حل)",
+    re.IGNORECASE,
+)
+_FILE = re.compile(
+    r"(?<![\w./-])[A-Za-z0-9_.-]+\."
+    r"(?:html?|py|js|ts|tsx|jsx|css|json|md|txt|ya?ml|toml)\b",
+    re.IGNORECASE,
+)
+
+
+class RouteKind(str, Enum):
+    CHAT = "chat"
+    ACTION = "action"
+    GOAL = "goal"
+
+
+@dataclass(frozen=True, slots=True)
+class RouteDecisionV1:
+    kind: RouteKind
+    reason: str
+    explicit: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +122,41 @@ class ChatIntentV1:
         return tuple(missing)
 
 
+def route_input(text: str, *, explicit_goal: bool = False) -> RouteDecisionV1:
+    """Separate conversation, bounded actions, and durable project work."""
+
+    value = str(text).strip()
+    if explicit_goal:
+        return RouteDecisionV1(RouteKind.GOAL, "explicit goal command", True)
+    intent = ChatIntentV1.parse(value)
+    if not intent.actionable:
+        if _PROJECT.search(value) or _MULTISTEP.search(value) or len(value) > 320:
+            return RouteDecisionV1(
+                RouteKind.GOAL, "project-scale or multi-step outcome"
+            )
+        return RouteDecisionV1(
+            RouteKind.CHAT, "explanatory or conversational input"
+        )
+    files = tuple(dict.fromkeys(_FILE.findall(value)))
+    if _REPOSITORY_REFINEMENT.search(value) and not files:
+        return RouteDecisionV1(
+            RouteKind.GOAL,
+            "repository refinement needs inspection and durable verification",
+        )
+    if (
+        len(value) <= 260
+        and len(files) <= 1
+        and not _PROJECT.search(value)
+        and not _MULTISTEP.search(value)
+    ):
+        return RouteDecisionV1(
+            RouteKind.ACTION, "single bounded explicit action"
+        )
+    return RouteDecisionV1(
+        RouteKind.GOAL, "action requires a durable project workflow"
+    )
+
+
 def corrective_prompt(intent: ChatIntentV1, missing: tuple[str, ...], capabilities: str) -> str:
     return (
         "HARNESS ACTION REQUIREMENT: The user requested an executable action, but the prior "
@@ -97,4 +168,10 @@ def corrective_prompt(intent: ChatIntentV1, missing: tuple[str, ...], capabiliti
     )
 
 
-__all__ = ["ChatIntentV1", "corrective_prompt"]
+__all__ = [
+    "ChatIntentV1",
+    "RouteDecisionV1",
+    "RouteKind",
+    "corrective_prompt",
+    "route_input",
+]

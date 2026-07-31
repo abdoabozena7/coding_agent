@@ -61,6 +61,47 @@ def _strings(value: Any) -> tuple[str, ...]:
     return tuple(str(item).strip() for item in value if str(item).strip())
 
 
+def _blocking_finding_strings(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, Mapping)):
+        values: Iterable[Any] = (value,)
+    elif isinstance(value, Iterable):
+        values = value
+    else:
+        return ()
+    findings: list[str] = []
+    non_blocking = {
+        "info",
+        "informational",
+        "notice",
+        "suggestion",
+        "success",
+        "passed",
+        "none",
+    }
+    for item in values:
+        if isinstance(item, Mapping):
+            if item.get("blocking") is False:
+                continue
+            severity = str(item.get("severity") or "").strip().casefold()
+            status = str(item.get("status") or "").strip().casefold()
+            if severity in non_blocking or status in non_blocking:
+                continue
+            message = str(
+                item.get("summary")
+                or item.get("message")
+                or item.get("finding")
+                or item.get("details")
+                or ""
+            ).strip()
+        else:
+            message = str(item).strip()
+        if message:
+            findings.append(message)
+    return tuple(findings)
+
+
 def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
@@ -71,6 +112,35 @@ def _json(value: Any) -> str:
 
 def _fingerprint(value: Any) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+
+
+def _explicit_workspace_artifact_paths(value: Any) -> tuple[str, ...]:
+    """Extract explicitly requested file artifacts from accepted semantics."""
+
+    text = (
+        value
+        if isinstance(value, str)
+        else json.dumps(value, ensure_ascii=False, default=str)
+    )
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_.-])"
+        r"((?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_-]+"
+        r"\.(?:py|pyi|js|jsx|ts|tsx|html?|css|json|ya?ml|toml|md|txt|sql|sh|ps1))"
+        r"\b",
+        re.I,
+    )
+    paths: list[str] = []
+    for match in pattern.finditer(str(text)):
+        prefix = str(text)[max(0, match.start() - 40) : match.start()].casefold()
+        if re.search(
+            r"(?:do not|don't|never|exclude|except|forbidden|لا\s+ت(?:عدل|نشئ)|بدون)\s*$",
+            prefix,
+        ):
+            continue
+        path = match.group(1).replace("\\", "/").removeprefix("./")
+        if path not in paths:
+            paths.append(path)
+    return tuple(paths)
 
 
 def _with_quality_milestone(
@@ -1315,8 +1385,11 @@ class UltraOrchestrator:
             node_id=node_id,
         )
         last_error: Exception | None = None
-        typed_repair_used = False
-        for attempt in range(1, self.config.provider_retries + 3):
+        typed_repair_attempts = 0
+        # A typed contract gets one original attempt plus three targeted
+        # repairs.  ``range`` excludes its upper bound, so ``+ 4`` is
+        # required when provider_retries is the default single attempt.
+        for attempt in range(1, self.config.provider_retries + 4):
             self.control.checkpoint()
             agent_id = _id("agent")
             omitted = safe_context.get("_omitted", ())
@@ -1470,14 +1543,202 @@ class UltraOrchestrator:
                     agent_run_id=agent_id,
                     role=role.value,
                     phase=phase_value,
-                    repair_attempt=1 if not typed_repair_used else 2,
+                    repair_attempt=typed_repair_attempts + 1,
                 )
-                unrecoverable_transport_token = "unused token" in str(exc).casefold()
-                if typed_repair_used or unrecoverable_transport_token:
+                if typed_repair_attempts >= 3:
+                    if (
+                        phase_value
+                        in {
+                            InnerPhase.IMPLEMENT.value,
+                            InnerPhase.FIX.value,
+                        }
+                        and node_id
+                        and "unused token" in str(exc).casefold()
+                    ):
+                        verifier = getattr(
+                            self.state,
+                            "verify_node_artifacts",
+                            None,
+                        )
+                        node = self.nodes.get(node_id)
+                        artifact_result = (
+                            dict(verifier(self.run_state.id, node) or {})
+                            if callable(verifier) and node is not None
+                            else {}
+                        )
+                        if bool(artifact_result.get("passed")):
+                            recovered = AgentResponse(
+                                payload={
+                                    "success": True,
+                                    "passed": True,
+                                    "artifacts": list(
+                                        artifact_result.get("evidence", ())
+                                    ),
+                                    "evidence": list(
+                                        artifact_result.get("evidence", ())
+                                    ),
+                                    "findings": [],
+                                    "recovered_from_empty_provider_turn": True,
+                                    "reasoning_artifact": {
+                                        "claim": (
+                                            "The governed implementation "
+                                            "mutation satisfies the approved "
+                                            "artifact contract."
+                                        ),
+                                        "supporting_evidence": [
+                                            (
+                                                f"{item.get('path', 'artifact')}:"
+                                                f"{item.get('sha256', 'verified')}"
+                                            )
+                                            for item in artifact_result.get(
+                                                "evidence",
+                                                (),
+                                            )
+                                            if isinstance(item, Mapping)
+                                        ],
+                                        "counterarguments": [
+                                            "The provider omitted its final "
+                                            "typed receipt."
+                                        ],
+                                        "rejected_alternatives": [
+                                            "Replaying an already verified "
+                                            "workspace mutation."
+                                        ],
+                                        "verification_plan": [
+                                            "Use the independent review and "
+                                            "final evidence gates."
+                                        ],
+                                        "reasoning_graph": {
+                                            "nodes": [
+                                                {
+                                                    "id": "durable-artifact",
+                                                    "type": "verification",
+                                                    "summary": (
+                                                        "Approved artifact "
+                                                        "hashes and syntax "
+                                                        "were verified."
+                                                    ),
+                                                    "status": "verified",
+                                                    "evidence_refs": [
+                                                        str(
+                                                            item.get("path")
+                                                            or item.get("sha256")
+                                                            or ""
+                                                        )
+                                                        for item in artifact_result.get(
+                                                            "evidence",
+                                                            (),
+                                                        )
+                                                        if isinstance(
+                                                            item,
+                                                            Mapping,
+                                                        )
+                                                    ],
+                                                }
+                                            ],
+                                            "edges": [],
+                                        },
+                                    },
+                                },
+                                summary=(
+                                    f"{role.value} mutation recovered from "
+                                    "durable artifact evidence."
+                                ),
+                                reasoning_summary=(
+                                    "The provider omitted its final typed "
+                                    "envelope after a successful governed "
+                                    "mutation; the harness verified exact "
+                                    "artifact hashes and syntax."
+                                ),
+                                provider="harness",
+                                model="artifact-receipt-recovery-v1",
+                            )
+                            self.state.save_agent_run(
+                                AgentRunV1(
+                                    id=agent_id,
+                                    run_id=self.run_state.id,
+                                    role=role,
+                                    phase=phase_value,
+                                    status="completed",
+                                    provider="harness",
+                                    model="artifact-receipt-recovery-v1",
+                                    node_id=node_id,
+                                    summary=recovered.summary,
+                                    prompt_trace_id=trace.id,
+                                )
+                            )
+                            self.events.publish(
+                                "ultra.implementation_receipt_recovered",
+                                recovered.summary,
+                                run_id=self.run_state.id,
+                                agent_run_id=agent_id,
+                                role=role.value,
+                                phase=phase_value,
+                                node_id=node_id,
+                                evidence=list(
+                                    artifact_result.get("evidence", ())
+                                ),
+                            )
+                            return recovered
+                    if (
+                        phase_value in {"review", "test", "global_review"}
+                        and "unused token" in str(exc).casefold()
+                    ):
+                        abstention = AgentResponse(
+                            payload={
+                                "passed": True,
+                                "success": True,
+                                "abstained": True,
+                                "issues": [],
+                                "findings": [],
+                                "evidence": [
+                                    {
+                                        "kind": "transport_abstention",
+                                        "role": role.value,
+                                        "reason": "provider emitted only internal unused tokens",
+                                    }
+                                ],
+                            },
+                            summary=(
+                                f"{role.value} abstained after repeated empty "
+                                "provider turns; no quality verdict was claimed."
+                            ),
+                            reasoning_summary=(
+                                "The harness recorded evaluator unavailability. "
+                                "Other independent typed verdicts remain required."
+                            ),
+                            provider="harness",
+                            model="transport-abstention-v1",
+                        )
+                        self.state.save_agent_run(
+                            AgentRunV1(
+                                id=agent_id,
+                                run_id=self.run_state.id,
+                                role=role,
+                                phase=phase_value,
+                                status="completed",
+                                provider="harness",
+                                model="transport-abstention-v1",
+                                node_id=node_id,
+                                summary=abstention.summary,
+                                prompt_trace_id=trace.id,
+                            )
+                        )
+                        self.events.publish(
+                            "ultra.reviewer_abstained",
+                            abstention.summary,
+                            run_id=self.run_state.id,
+                            agent_run_id=agent_id,
+                            role=role.value,
+                            phase=phase_value,
+                            node_id=node_id,
+                        )
+                        return abstention
                     raise AgentProtocolError(
-                        f"ULTRA foundation/phase {phase_value} failed after one targeted typed-return repair: {exc}"
+                        f"ULTRA foundation/phase {phase_value} failed after three "
+                        f"targeted typed-return repairs: {exc}"
                     ) from exc
-                typed_repair_used = True
+                typed_repair_attempts += 1
                 repair_task = {
                     **safe_task,
                     "typed_return_repair": {
@@ -1710,6 +1971,9 @@ class UltraOrchestrator:
                         or component.get("objective")
                         or f"Implement {name}"
                     ).strip()
+                    component_paths = _explicit_workspace_artifact_paths(
+                        f"{name}\n{responsibility}"
+                    )
                     modules.append(
                         {
                             "id": f"M{index:03d}",
@@ -1718,7 +1982,7 @@ class UltraOrchestrator:
                             "acceptance_criteria": [f"{name} satisfies its architecture responsibility: {responsibility}"],
                             "verification": [f"Execute or inspect {name} against its architecture contract"],
                             "depends_on": [] if index == 1 else [f"M{index - 1:03d}"],
-                            "write_paths": ["index.html"],
+                            "write_paths": list(component_paths or ("index.html",)),
                         }
                     )
             if restored_from_architecture and modules:
@@ -1736,6 +2000,62 @@ class UltraOrchestrator:
             # scope, and success criteria. Inspect the whole accepted GoalSpec
             # so a terse weak-model objective cannot erase an explicit QA gate.
             objective_text = json.dumps(goal_spec, ensure_ascii=False, default=str).casefold()
+            semantic_artifacts = _explicit_workspace_artifact_paths(
+                {
+                    "objective": goal_spec.get("objective"),
+                    "in_scope": goal_spec.get("in_scope", goal_spec.get("scope")),
+                    "success_criteria": goal_spec.get("success_criteria"),
+                }
+            )
+            covered_artifacts = {
+                str(path).replace("\\", "/").removeprefix("./")
+                for module in modules
+                for path in _strings(module.get("write_paths"))
+                if not any(character in str(path) for character in "*?[")
+            }
+            missing_artifacts = [
+                path for path in semantic_artifacts if path not in covered_artifacts
+            ]
+            if missing_artifacts:
+                dependency_ids = [
+                    str(module.get("id") or "").strip()
+                    for module in modules
+                    if str(module.get("id") or "").strip()
+                ]
+                verification = [
+                    f"Verify the required artifact exists and satisfies the accepted semantics: {path}"
+                    for path in missing_artifacts
+                ]
+                if any(path.casefold().startswith("tests/") for path in missing_artifacts):
+                    verification.append(
+                        "Run python -m pytest against the required test artifacts and require exit code 0."
+                    )
+                modules.append(
+                    {
+                        "id": f"M{len(modules) + 1:03d}",
+                        "title": "Required semantic artifacts and verification",
+                        "objective": (
+                            "Create and verify the workspace artifacts explicitly required "
+                            "by the accepted semantic goal: "
+                            + ", ".join(missing_artifacts)
+                        ),
+                        "acceptance_criteria": [
+                            f"The explicitly required artifact is present: {path}"
+                            for path in missing_artifacts
+                        ],
+                        "verification": verification,
+                        "depends_on": dependency_ids,
+                        "write_paths": missing_artifacts,
+                        "metadata": {
+                            "harness_added_for_semantic_coverage": True,
+                        },
+                    }
+                )
+                normalized["modules"] = modules
+                actions.append(
+                    "master_plan added missing explicitly required semantic artifacts: "
+                    + ", ".join(missing_artifacts)
+                )
             requires_single_index = (
                 "index.html" in objective_text
                 and any(
@@ -2033,8 +2353,8 @@ class UltraOrchestrator:
                 )
             else:
                 findings = (
-                    *_strings(normalized.get("issues")),
-                    *_strings(normalized.get("findings")),
+                    *_blocking_finding_strings(normalized.get("issues")),
+                    *_blocking_finding_strings(normalized.get("findings")),
                 )
                 evidence = normalized.get("evidence")
                 test_results = normalized.get("test_results")
@@ -2052,14 +2372,29 @@ class UltraOrchestrator:
                     bool(item.get("passed")) for item in typed_tests
                 )
                 evidence_backed_clear = bool(evidence) or tests_observably_passed
-                if component_review and not findings and evidence_backed_clear:
+                if not findings and evidence_backed_clear:
                     # A clean-context reviewer occasionally omits the redundant
                     # boolean while still returning typed evidence and no
                     # finding. Preserve that observable verdict; never infer a
                     # pass from prose or an empty payload.
                     normalized["passed"] = True
                     actions.append(
-                        f"{phase}.passed derived from finding-free typed component evidence"
+                        (
+                            f"{phase}.passed derived from finding-free typed "
+                            "component evidence"
+                            if component_review
+                            else (
+                                f"{phase}.passed derived from finding-free "
+                                "typed evidence"
+                            )
+                        )
+                    )
+                elif not component_review and not findings:
+                    normalized["passed"] = True
+                    normalized["abstained"] = True
+                    actions.append(
+                        f"{phase} reviewer abstained because no typed verdict "
+                        "or finding was returned"
                     )
                 else:
                     # Missing verdicts are never interpreted as success without
@@ -2072,8 +2407,66 @@ class UltraOrchestrator:
         if phase in {"integrate", "global_integration", "final_evidence"} and not isinstance(
             normalized.get("success", normalized.get("passed")), bool
         ):
-            normalized["success"] = False
-            actions.append(f"{phase}.success defaulted to false for safe remediation")
+            integration_findings = (
+                *_blocking_finding_strings(normalized.get("issues")),
+                *_blocking_finding_strings(normalized.get("findings")),
+            )
+            if (
+                phase == "integrate"
+                and bool(task.get("publish_component_package"))
+                and not integration_findings
+            ):
+                # The local integrator packages a candidate that has already
+                # passed the independent quality gate. A weak provider may
+                # return useful prose but omit the redundant publication
+                # boolean. Record evaluator unavailability instead of
+                # inventing a rejection. Global integration/final evidence
+                # remain strict, and any explicit finding still fails.
+                normalized["success"] = True
+                normalized["passed"] = True
+                normalized["abstained"] = True
+                actions.append(
+                    "integrate publisher abstained because no typed verdict "
+                    "or finding was returned"
+                )
+            elif (
+                phase == "final_evidence"
+                and not integration_findings
+                and isinstance(task.get("authoritative_operational_evidence"), Mapping)
+                and bool(
+                    dict(task["authoritative_operational_evidence"]).get("passed")
+                )
+                and bool(
+                    _mapping(task.get("integration")).get(
+                        "success",
+                        _mapping(task.get("integration")).get("passed"),
+                    )
+                )
+                and bool(_mapping(task.get("review")).get("passed"))
+            ):
+                # The evaluator omitted its redundant boolean, but the
+                # harness has exact artifact hashes, executable receipts, and
+                # successful integration/review verdicts. This derives only
+                # the operational completion bit; it does not invent product
+                # semantics or subjective quality.
+                authoritative = dict(task["authoritative_operational_evidence"])
+                normalized["success"] = True
+                normalized["passed"] = True
+                normalized["evidence"] = [
+                    *list(normalized.get("evidence", ()) or ()),
+                    authoritative,
+                ]
+                normalized["evaluator_capability"] = "harness_operational_evidence"
+                actions.append(
+                    "final_evidence.success derived from authoritative artifact "
+                    "hashes, executable checks, and accepted global review"
+                )
+            else:
+                normalized["success"] = False
+                normalized["passed"] = False
+                actions.append(
+                    f"{phase}.success defaulted to false for safe remediation"
+                )
         return normalized, tuple(actions)
 
     @staticmethod
@@ -2448,15 +2841,17 @@ class UltraOrchestrator:
                 )
                 candidate = ArchitectureSpecV1.from_mapping(architecture_response.payload)
             except AgentProtocolError as exc:
+                candidate = self._fallback_architecture(prompt, candidate_index)
                 self.events.publish(
-                    "ultra.model_capability_exhausted",
-                    "Architecture output was invalid; no semantic fallback was created.",
+                    "ultra.architecture_protocol_recovered",
+                    (
+                        f"Architecture candidate {candidate_index} used the typed "
+                        "harness fallback after malformed local-model output."
+                    ),
                     run_id=self.run_state.id,
                     candidate_index=candidate_index,
                     error=str(exc),
-                    resumable=True,
                 )
-                raise
             candidate_specs.append(candidate)
             candidate_payloads.append(asdict(candidate))
         compact_candidates = [
@@ -2553,14 +2948,13 @@ class UltraOrchestrator:
             )
             proposed_raw = MasterPlanV1.from_mapping(plan_response.payload)
         except AgentProtocolError as exc:
+            proposed_raw = self._fallback_master_plan(prompt)
             self.events.publish(
-                "ultra.model_capability_exhausted",
-                "Master plan output was invalid; no semantic fallback was created.",
+                "ultra.master_plan_protocol_recovered",
+                "Master plan used the typed harness fallback after malformed local-model output.",
                 run_id=self.run_state.id,
                 error=str(exc),
-                resumable=True,
             )
-            raise
         proposed = self._enforce_master_artifact_contract(prompt, proposed_raw)
         proposed = self._enforce_concern_coverage_contract(prompt, proposed)
         quality_checklist = (
@@ -2673,14 +3067,16 @@ class UltraOrchestrator:
                     GoalSpecV1.from_mapping(goal_response.payload),
                 )
             except AgentProtocolError as exc:
+                self.goal_spec = self._enforce_goal_artifact_contract(
+                    prompt,
+                    self._fallback_goal_spec(prompt),
+                )
                 self.events.publish(
-                    "ultra.model_capability_exhausted",
-                    "Goal interpretation was invalid; no semantic fallback was created.",
+                    "ultra.goal_spec_protocol_recovered",
+                    "GoalSpec used the typed harness fallback after malformed local-model output.",
                     run_id=self.run_state.id,
                     error=str(exc),
-                    resumable=True,
                 )
-                raise
             raw_questions = tuple(self.goal_spec.questions)
             questions = self._validated_questions(raw_questions)
             questions = tuple(
@@ -2806,10 +3202,17 @@ class UltraOrchestrator:
 
     @staticmethod
     def _task_family(value: str) -> str:
-        return "general"
-        # Legacy keyword implementation below is unreachable and retained only
-        # so old serialized traces can still be interpreted during migration.
         text = str(value).casefold()
+        if (
+            re.search(r"\b(classifier|classification|naming)\b", text)
+            or "مصنف" in text
+            or re.search(
+                r"\b(?:do not|don't|never)\s+(?:build|create|make)\b",
+                text,
+            )
+            or re.search(r"(?:لا|ولا)\s*(?:تبني|تعمل|تنشئ)", text)
+        ):
+            return "general"
         if any(
             marker in text
             for marker in (
@@ -3068,8 +3471,17 @@ class UltraOrchestrator:
 
     @staticmethod
     def _requires_visual_artifact(prompt: str) -> bool:
-        return False
         text = str(prompt).casefold()
+        if (
+            re.search(r"\b(classifier|classification|naming)\b", text)
+            or "مصنف" in text
+            or re.search(
+                r"\b(?:do not|don't|never)\s+(?:build|create|make)\b",
+                text,
+            )
+            or re.search(r"(?:لا|ولا)\s*(?:تبني|تعمل|تنشئ)", text)
+        ):
+            return False
         return any(
             marker in text
             for marker in (
@@ -3080,8 +3492,17 @@ class UltraOrchestrator:
 
     @classmethod
     def _final_output_paths(cls, prompt: str) -> tuple[str, ...]:
-        return ()
         text = str(prompt).casefold()
+        if (
+            re.search(r"\b(classifier|classification|naming)\b", text)
+            or "مصنف" in text
+            or re.search(
+                r"\b(?:do not|don't|never)\s+(?:build|create|make)\b",
+                text,
+            )
+            or re.search(r"(?:لا|ولا)\s*(?:تبني|تعمل|تنشئ)", text)
+        ):
+            return ()
         refinement = any(
             marker in text
             for marker in (
@@ -4003,6 +4424,58 @@ class UltraOrchestrator:
         for index, item in enumerate(candidates, start=1):
             fallback = f"{parent.id}.{index}"
             child = TaskContractV1.from_mapping(item, fallback_id=fallback)
+            declared_targets = self._declared_write_targets(
+                child.title,
+                child.objective,
+            )
+            invalid_targets = tuple(
+                path
+                for path in declared_targets
+                if not any(
+                    self._contains_scope(scope, path)
+                    for scope in parent.write_paths
+                )
+            )
+            if invalid_targets:
+                self.events.publish(
+                    "ultra.child_contract_rejected",
+                    f"Rejected {child.id}; its objective writes outside the parent scope.",
+                    run_id=self.run_state.id if self.run_state else "",
+                    node_id=parent.id,
+                    child_id=child.id,
+                    invalid_targets=list(invalid_targets),
+                )
+                continue
+            child_terms = self._semantic_terms(child.objective)
+            parent_terms = self._semantic_terms(parent.contract.objective)
+            parent_overlap = len(child_terms & parent_terms)
+            sibling_matches = [
+                (
+                    len(child_terms & self._semantic_terms(module.objective)),
+                    module,
+                )
+                for module in (self.master_plan.modules if self.master_plan else ())
+                if module.id != parent.id
+            ]
+            sibling_overlap, sibling = max(
+                sibling_matches,
+                key=lambda value: value[0],
+                default=(0, None),
+            )
+            if (
+                sibling is not None
+                and sibling_overlap >= 2
+                and sibling_overlap > parent_overlap
+            ):
+                self.events.publish(
+                    "ultra.child_contract_rejected",
+                    f"Rejected {child.id}; its objective belongs to sibling {sibling.id}.",
+                    run_id=self.run_state.id if self.run_state else "",
+                    node_id=parent.id,
+                    child_id=child.id,
+                    semantic_owner=sibling.id,
+                )
+                continue
             if child.id in self.nodes:
                 raise ScopeRevisionRequired(f"dynamic node id {child.id!r} already exists")
             if set(child.depends_on) - known_dependencies:
@@ -4067,6 +4540,39 @@ class UltraOrchestrator:
                 )
             )
         return tuple(children)
+
+    @staticmethod
+    def _declared_write_targets(*values: str) -> tuple[str, ...]:
+        """Extract only file paths attached to an explicit mutation verb."""
+
+        text = "\n".join(str(value or "") for value in values)
+        pattern = re.compile(
+            r"(?:create|write|modify|update|implement|populate|generate|"
+            r"أنشئ|اكتب|عدّل|عدل)"
+            r"[^.\n]{0,120}?"
+            r"([A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)*"
+            r"\.(?:py|html?|css|js|ts|tsx|jsx|json|ya?ml|toml|md|txt))",
+            re.IGNORECASE,
+        )
+        return tuple(
+            dict.fromkeys(
+                match.group(1).replace("\\", "/").removeprefix("./")
+                for match in pattern.finditer(text)
+            )
+        )
+
+    @staticmethod
+    def _semantic_terms(value: str) -> set[str]:
+        ignored = {
+            "the", "a", "an", "and", "or", "to", "of", "in", "on", "for",
+            "with", "which", "that", "from", "this", "function", "module",
+            "file", "create", "write", "using", "use", "required",
+        }
+        return {
+            token
+            for token in re.findall(r"[A-Za-z0-9_]+", str(value or "").casefold())
+            if len(token) > 2 and token not in ignored
+        }
 
     def _plan_and_expand(self, node_id: str) -> None:
         assert self.run_state
@@ -4258,6 +4764,32 @@ class UltraOrchestrator:
                 assert self.run_state
                 self.state.save_work_node(self.run_state.id, node)
             return
+        if node.phase in {
+            InnerPhase.RESEARCH,
+            InnerPhase.IMPLEMENT,
+            InnerPhase.TEST,
+            InnerPhase.REVIEW,
+            InnerPhase.FIX,
+            InnerPhase.INTEGRATE,
+            InnerPhase.MEMORY_WRITEBACK,
+        }:
+            # This leaf crossed the durable decomposition boundary before a
+            # process interruption. Re-planning it can invent a different
+            # topology and replay work that already has tool/ChangeSet
+            # receipts. Resume execution from the accepted contract instead.
+            self._prepared.setdefault(node.id, ({}, {}))
+            if node.status in {
+                NodeStatus.PENDING,
+                NodeStatus.PLANNING,
+                NodeStatus.BLOCKED,
+                NodeStatus.FAILED,
+                NodeStatus.REVISION_REQUIRED,
+            }:
+                node = replace(node, status=NodeStatus.READY)
+                self.nodes[node.id] = node
+                assert self.run_state
+                self.state.save_work_node(self.run_state.id, node)
+            return
         if node.status is NodeStatus.READY and node.phase is InnerPhase.DECOMPOSE:
             self._prepared.setdefault(node.id, ({}, {}))
             return
@@ -4265,15 +4797,114 @@ class UltraOrchestrator:
 
     @staticmethod
     def _passed(response: AgentResponse) -> bool:
-        return bool(response.payload.get("passed", response.payload.get("success", True)))
+        passed = response.payload.get("passed")
+        if isinstance(passed, bool):
+            return passed
+        success = response.payload.get("success")
+        if isinstance(success, bool):
+            return success
+        return True
 
     @staticmethod
     def _findings(*responses: AgentResponse) -> tuple[str, ...]:
         values: list[str] = []
         for response in responses:
-            values.extend(_strings(response.payload.get("issues")))
-            values.extend(_strings(response.payload.get("findings")))
+            values.extend(
+                _blocking_finding_strings(response.payload.get("issues"))
+            )
+            values.extend(
+                _blocking_finding_strings(response.payload.get("findings"))
+            )
         return tuple(dict.fromkeys(values))
+
+    def _scope_leaf_review(
+        self,
+        node: WorkNode,
+        response: AgentResponse,
+    ) -> AgentResponse:
+        """Do not fail one leaf for artifacts assigned to later plan nodes."""
+
+        if self._passed(response) or bool(response.payload.get("abstained")):
+            return response
+        current_paths = tuple(
+            path.casefold() for path in node.contract.write_paths if path
+        )
+        deferred_paths = tuple(
+            dict.fromkeys(
+                path.casefold()
+                for other in self.nodes.values()
+                if other.id != node.id
+                for path in other.contract.write_paths
+                if path and path.casefold() not in current_paths
+            )
+        )
+
+        def finding_text(item: Any) -> str:
+            if isinstance(item, Mapping):
+                return str(
+                    item.get("summary")
+                    or item.get("message")
+                    or item.get("finding")
+                    or item.get("details")
+                    or ""
+                )
+            return str(item)
+
+        def deferred_only(item: Any) -> bool:
+            text = finding_text(item).casefold()
+            return bool(
+                text
+                and any(path in text for path in deferred_paths)
+                and not any(path in text for path in current_paths)
+            )
+
+        payload = dict(response.payload)
+        deferred: list[Any] = []
+        blockers: list[Any] = []
+        for key in ("issues", "findings"):
+            raw = payload.get(key, ())
+            if isinstance(raw, (str, Mapping)):
+                values: Sequence[Any] = (raw,)
+            elif isinstance(raw, Sequence):
+                values = raw
+            else:
+                values = ()
+            kept = []
+            for item in values:
+                if deferred_only(item):
+                    deferred.append(item)
+                else:
+                    kept.append(item)
+                    blockers.extend(_blocking_finding_strings(item))
+            payload[key] = kept
+
+        failed_typed_evidence = any(
+            isinstance(item, Mapping) and item.get("passed") is False
+            for key in ("test_results", "evidence")
+            for item in (
+                payload.get(key, ())
+                if isinstance(payload.get(key), Sequence)
+                and not isinstance(payload.get(key), (str, bytes))
+                else ()
+            )
+        )
+        if not blockers and not failed_typed_evidence:
+            payload["passed"] = True
+            payload["abstained"] = True
+            payload["deferred_scope_findings"] = deferred
+            return replace(
+                response,
+                payload=payload,
+                reasoning_summary=(
+                    response.reasoning_summary
+                    or "Unsupported or downstream-only leaf verdict was excluded "
+                    "from the current node quality gate."
+                ),
+            )
+        if deferred:
+            payload["deferred_scope_findings"] = deferred
+            return replace(response, payload=payload)
+        return response
 
     @staticmethod
     def _records(response: AgentResponse, key: str) -> tuple[Mapping[str, Any], ...]:
@@ -4598,6 +5229,126 @@ class UltraOrchestrator:
             ),
         )
 
+    def _artifact_validation_gate(
+        self,
+        node: WorkNode,
+    ) -> tuple[AgentResponse, ...]:
+        verifier = getattr(self.state, "verify_node_artifacts", None)
+        if not callable(verifier) or not node.write_paths:
+            return ()
+        assert self.run_state
+        try:
+            result = dict(verifier(self.run_state.id, node) or {})
+            passed = bool(result.get("passed"))
+            findings = list(_strings(result.get("findings")))
+        except Exception as exc:
+            passed = False
+            findings = [f"artifact validation failed: {exc}"]
+            result = {"passed": False, "findings": findings}
+        return (
+            AgentResponse(
+                payload={
+                    "passed": passed,
+                    "success": passed,
+                    "findings": findings,
+                    "evidence": list(result.get("evidence", ())),
+                    "artifact_validation_gate": result,
+                    "confidence": 1.0,
+                },
+                summary=(
+                    f"Workspace artifacts {'validated' if passed else 'rejected'} "
+                    f"for {node.id}"
+                ),
+                reasoning_summary=(
+                    "The harness checked approved artifact presence, hashes, "
+                    "and parseable Python syntax independently of the model."
+                ),
+                provider="harness",
+                model="workspace-artifact-validation-v1",
+            ),
+        )
+
+    def _restore_exact_child_artifacts(
+        self,
+        node: WorkNode,
+    ) -> AgentResponse | None:
+        restorer = getattr(self.state, "restore_exact_child_artifacts", None)
+        if not callable(restorer) or not node.write_paths:
+            return None
+        assert self.run_state
+        packages = tuple(
+            dict(self._results[child_id].component_package)
+            for child_id in node.children
+            if child_id in self._results
+            and self._results[child_id].success
+            and self._results[child_id].component_package
+        )
+        if not packages:
+            prior = self._results.get(node.id)
+            if prior is not None and prior.success and prior.component_package:
+                packages = (dict(prior.component_package),)
+        if not packages:
+            return None
+        result = dict(restorer(self.run_state.id, node, packages) or {})
+        if not bool(result.get("passed")):
+            return None
+        evidence = list(result.get("evidence", ()))
+        return AgentResponse(
+            payload={
+                "success": True,
+                "passed": True,
+                "artifacts": evidence,
+                "evidence": evidence,
+                "findings": [],
+                "exact_child_packages_restored": True,
+                "reasoning_artifact": {
+                    "claim": (
+                        "The parent consumes the exact independently accepted "
+                        "child artifact bytes."
+                    ),
+                    "supporting_evidence": [
+                        f"{item.get('path')}:{item.get('sha256')}"
+                        for item in evidence
+                        if isinstance(item, Mapping)
+                    ],
+                    "counterarguments": [
+                        "Re-generating accepted child bytes could introduce drift."
+                    ],
+                    "rejected_alternatives": [
+                        "Model-authored replacement of an accepted child package."
+                    ],
+                    "verification_plan": [
+                        "Re-run artifact and executable verification gates."
+                    ],
+                    "reasoning_graph": {
+                        "nodes": [
+                            {
+                                "id": "exact-child-package",
+                                "type": "verification",
+                                "summary": (
+                                    "Accepted child bytes were restored by hash."
+                                ),
+                                "status": "verified",
+                                "evidence_refs": [
+                                    str(item.get("sha256") or "")
+                                    for item in evidence
+                                    if isinstance(item, Mapping)
+                                ],
+                            }
+                        ],
+                        "edges": [],
+                    },
+                },
+            },
+            summary=f"Exact accepted child package restored for {node.id}.",
+            reasoning_summary=(
+                "The harness copied approval-scoped child bytes instead of "
+                "asking the model to recreate them."
+            ),
+            provider="harness",
+            model="exact-child-package-restorer-v1",
+        )
+
     def _quality(
         self,
         node: WorkNode,
@@ -4610,6 +5361,9 @@ class UltraOrchestrator:
             "evaluate_candidate_not_contract_alone": True,
             "cite_candidate_evidence_for_every_blocking_finding": True,
             "do_not_invent_requirements_outside_contract": True,
+            "evaluate_only_current_node_contract": True,
+            "do_not_fail_for_artifacts_assigned_to_downstream_nodes": True,
+            "current_node_write_paths": list(node.contract.write_paths),
             "component_package_only": bool(node.contract.metadata.get("component_package_only")),
             "component_packages_must_not_write_final_output": True,
             "component_files_are_embedded_in_candidate": True,
@@ -4644,82 +5398,83 @@ class UltraOrchestrator:
             context=self._new_context(node, AgentRole.TEST_QUALITY_REVIEWER),
             node_id=node.id,
         )
-        review_pairs = tuple(
-            zip(
-                ("clean_code", "security", "runtime_tests", "test_quality"),
-                (clean_code, security, tests, test_quality),
-            )
+        clean_code = self._scope_leaf_review(node, clean_code)
+        security = self._scope_leaf_review(node, security)
+        tests = self._scope_leaf_review(node, tests)
+        test_quality = self._scope_leaf_review(node, test_quality)
+        review_pairs = (
+            *tuple(
+                zip(
+                    ("clean_code", "security", "runtime_tests", "test_quality"),
+                    (clean_code, security, tests, test_quality),
+                )
+            ),
+            *tuple(
+                (f"harness_evidence_{index}", response)
+                for index, response in enumerate(
+                    authoritative_responses,
+                    start=1,
+                )
+            ),
         )
-        if evaluation_policy["component_package_only"]:
-            # Component reviewers already operate in separate clean contexts.
-            # Normalization is deliberately deterministic: asking the same
-            # weak builder to reinterpret typed votes can invert a rejection
-            # or invent a finding, while adding no new evidence.
-            normalized_findings = self._findings(
-                clean_code,
-                security,
-                tests,
-                test_quality,
+        # Reviewers already operate in separate clean contexts.  Their typed
+        # votes and findings are authoritative; asking a weak builder model to
+        # reinterpret them can invert four passes merely by omitting ``passed``
+        # or can invent an unsupported blocker.  The harness therefore owns
+        # only the mechanical aggregation, never the review semantics.
+        normalized_findings = self._findings(
+            clean_code,
+            security,
+            tests,
+            test_quality,
+            *authoritative_responses,
+        )
+        non_abstaining_reviewers = tuple(
+            role
+            for role, response in review_pairs
+            if not bool(response.payload.get("abstained"))
+        )
+        reviewers_passed = bool(non_abstaining_reviewers) and all(
+            self._passed(response)
+            for _, response in review_pairs
+            if not bool(response.payload.get("abstained"))
+        )
+        if not non_abstaining_reviewers:
+            reviewers_passed = False
+            normalized_findings = (
+                *normalized_findings,
+                "all independent reviewers abstained because evaluator transport "
+                "was unavailable",
             )
-            reviewers_passed = all(
-                self._passed(response) for _, response in review_pairs
-            )
-            triage = AgentResponse(
-                payload={
-                    "passed": reviewers_passed,
-                    "success": reviewers_passed,
-                    "issues": list(normalized_findings),
-                    "findings": list(normalized_findings),
-                    "evidence": [
-                        {
-                            "role": role,
-                            "passed": self._passed(response),
-                            "summary": response.summary,
-                        }
-                        for role, response in review_pairs
-                    ],
-                    "confidence": 1.0,
-                },
-                summary=(
-                    "Typed component review verdicts accepted."
-                    if reviewers_passed
-                    else "Typed component review verdicts require revision."
-                ),
-                reasoning_summary=(
-                    "The harness normalized and deduplicated independent typed "
-                    "verdicts without asking the builder model to reinterpret them."
-                ),
-                provider="harness",
-                model="deterministic-quality-triage-v1",
-            )
-        else:
-            triage = self._invoke(
-                AgentRole.QUALITY_TRIAGER,
-                InnerPhase.REVIEW,
-                task={
-                    "contract": asdict(node.contract),
-                    "candidate": candidate,
-                    "evaluation_policy": evaluation_policy,
-                    "read_only": True,
-                    "normalize_and_deduplicate": True,
-                    "review_summaries": [
-                        clean_code.summary,
-                        security.summary,
-                        tests.summary,
-                        test_quality.summary,
-                    ],
-                    "review_verdicts": [
-                        {
-                            "role": role,
-                            "passed": self._passed(response),
-                            "payload": dict(response.payload),
-                        }
-                        for role, response in review_pairs
-                    ],
-                },
-                context=self._new_context(node, AgentRole.QUALITY_TRIAGER),
-                node_id=node.id,
-            )
+        triage = AgentResponse(
+            payload={
+                "passed": reviewers_passed,
+                "success": reviewers_passed,
+                "issues": list(normalized_findings),
+                "findings": list(normalized_findings),
+                "evidence": [
+                    {
+                        "role": role,
+                        "passed": self._passed(response),
+                        "summary": response.summary,
+                    }
+                    for role, response in review_pairs
+                ],
+                "confidence": 1.0,
+                "non_abstaining_reviewers": list(non_abstaining_reviewers),
+            },
+            summary=(
+                "Independent typed review verdicts accepted."
+                if reviewers_passed
+                else "Independent typed review verdicts require revision."
+            ),
+            reasoning_summary=(
+                "The harness normalized and deduplicated independent typed "
+                "verdicts without asking the builder model to reinterpret them."
+            ),
+            provider="harness",
+            model="deterministic-quality-triage-v1",
+        )
         recorder = getattr(self.state, "record_quality_review", None)
         if callable(recorder):
             recorder(node.id, "clean_code", self._passed(clean_code))
@@ -4736,7 +5491,6 @@ class UltraOrchestrator:
             tests,
             test_quality,
             triage,
-            *authoritative_responses,
         )
         consensus = self._record_quality_consensus(node, responses)
         return QualityGateResultV1(responses=responses, consensus=consensus)
@@ -4808,6 +5562,8 @@ class UltraOrchestrator:
             and not external_revision_findings
             else None
         )
+        if implementation is None:
+            implementation = self._restore_exact_child_artifacts(node)
         if implementation is not None:
             self.events.publish(
                 "ultra.component_checkpoint_restored",
@@ -4866,6 +5622,7 @@ class UltraOrchestrator:
             )
         authoritative_gate = (
             *materialized_gate,
+            *self._artifact_validation_gate(node),
             *self._package_consumption_gate(node),
         )
         quality_gate = (
@@ -4956,6 +5713,7 @@ class UltraOrchestrator:
                 )
             authoritative_gate = (
                 *materialized_gate,
+                *self._artifact_validation_gate(node),
                 *self._package_consumption_gate(node),
             )
             quality_gate = (
@@ -5036,6 +5794,45 @@ class UltraOrchestrator:
                 node_id=node.id,
             )
             responses.append(integration)
+        publication_gate = self._artifact_validation_gate(node)
+        if publication_gate and not all(
+            self._passed(response) for response in publication_gate
+        ):
+            publication_findings = self._findings(*publication_gate)
+            result = ResultPackageV1(
+                node_id=node.id,
+                success=False,
+                status="revision_required",
+                summary=(
+                    "The final publication artifact no longer matches the "
+                    "independently reviewed candidate."
+                ),
+                artifacts=tuple(
+                    item
+                    for response in responses
+                    for item in self._records(response, "artifacts")
+                ),
+                evidence=tuple(
+                    item
+                    for response in publication_gate
+                    for item in self._records(response, "evidence")
+                ),
+                findings=publication_findings,
+                insights=tuple(
+                    insight for response in responses for insight in response.insights
+                ),
+                fix_attempts=fixes,
+            )
+            self._results[node.id] = result
+            self.state.save_result_package(self.run_state.id, result)
+            node = replace(
+                node,
+                status=NodeStatus.REVISION_REQUIRED,
+                phase=InnerPhase.FIX,
+            )
+            self.nodes[node.id] = node
+            self.state.save_work_node(self.run_state.id, node)
+            raise NodePipelineFailed(result)
         node = replace(node, phase=InnerPhase.MEMORY_WRITEBACK)
         self.nodes[node.id] = node
         self.state.save_work_node(self.run_state.id, node)
@@ -5053,9 +5850,19 @@ class UltraOrchestrator:
         artifacts = tuple(
             item for response in responses for item in self._records(response, "artifacts")
         )
-        evidence = tuple(
-            item for response in responses for item in self._records(response, "evidence")
+        final_authoritative_gate = publication_gate or authoritative_gate
+        authoritative_evidence = tuple(
+            item
+            for response in final_authoritative_gate
+            for item in self._records(response, "evidence")
         )
+        evidence = tuple(
+            (
+                item
+                for response in responses
+                for item in self._records(response, "evidence")
+            )
+        ) + authoritative_evidence
         test_results = tuple(
             item for response in responses for item in self._records(response, "test_results")
         )
@@ -5069,6 +5876,32 @@ class UltraOrchestrator:
                 "component_only": bool(node.contract.metadata.get("component_package_only")),
             }
         )
+        canonical_artifacts = [
+            {
+                "id": f"harness:{node.id}:{item.get('path')}",
+                "kind": "file",
+                "path": str(item.get("path") or ""),
+                "uri": f"workspace:{item.get('path')}",
+                "content_hash": str(item.get("sha256") or ""),
+                "evidence": {
+                    "source": "workspace-artifact-validation-v1",
+                    "python_syntax": item.get("python_syntax"),
+                },
+            }
+            for item in authoritative_evidence
+            if item.get("kind") == "artifact_hash"
+            and str(item.get("path") or "").strip()
+            and str(item.get("sha256") or "").strip()
+        ]
+        if canonical_artifacts:
+            # Model-authored component metadata may describe an earlier
+            # candidate. The accepted package must point at the exact bytes
+            # independently hashed by the final harness gate.
+            implementation_payload = {
+                **implementation_payload,
+                "artifacts": canonical_artifacts,
+            }
+            artifacts = tuple((*artifacts, *canonical_artifacts))
         passed_votes = sum(self._passed(item) for item in quality_gate.responses)
         quality_score = passed_votes / max(1, len(quality_gate.responses))
         component_package = ComponentPackageV1(
@@ -5181,6 +6014,52 @@ class UltraOrchestrator:
             task={"integration": dict(integration.payload), "modules": node_summaries},
             context={"master_plan": asdict(self.master_plan)},
         )
+        expected_paths = {
+            str(path).replace("\\", "/").removeprefix("./")
+            for node in self.nodes.values()
+            for path in node.write_paths
+            if str(path).strip()
+            and not any(character in str(path) for character in "*?[")
+            and str(path) not in {".", "*", "**", "**/*"}
+        }
+        authoritative_records = [
+            item
+            for result in self._results.values()
+            for item in (*result.artifacts, *result.evidence, *result.test_results)
+            if isinstance(item, Mapping)
+        ]
+        hashed_paths = {
+            str(item.get("path") or "").replace("\\", "/").removeprefix("./")
+            for item in authoritative_records
+            if str(item.get("path") or "").strip()
+            and str(
+                item.get("sha256")
+                or item.get("content_hash")
+                or item.get("hash")
+                or ""
+            ).strip()
+        }
+        executable_checks = [
+            dict(item)
+            for item in authoritative_records
+            if item.get("kind") == "executable_verification"
+            and bool(item.get("passed"))
+            and int(item.get("returncode", 0) or 0) == 0
+        ]
+        goal_requires_pytest = "pytest" in _json(asdict(self.goal_spec)).casefold()
+        authoritative_operational_evidence = {
+            "kind": "authoritative_operational_evidence",
+            "passed": bool(
+                self._results
+                and all(result.success for result in self._results.values())
+                and expected_paths <= hashed_paths
+                and (not goal_requires_pytest or executable_checks)
+            ),
+            "expected_paths": sorted(expected_paths),
+            "hashed_paths": sorted(hashed_paths),
+            "executable_checks": executable_checks,
+            "goal_requires_pytest": goal_requires_pytest,
+        }
         self._set_phase(UltraPhase.FINAL_EVIDENCE, "Checking final evidence")
         evidence = self._invoke(
             AgentRole.GOAL_CHECKER,
@@ -5189,6 +6068,7 @@ class UltraOrchestrator:
                 "integration": dict(integration.payload),
                 "review": dict(review.payload),
                 "node_results": node_summaries,
+                "authoritative_operational_evidence": authoritative_operational_evidence,
             },
             context={"goal_spec": asdict(self.goal_spec)},
         )

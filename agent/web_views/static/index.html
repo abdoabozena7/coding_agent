@@ -4,44 +4,83 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>GA3BAD · Local Web View</title>
+  <title>GA3BAD Workspace</title>
   <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <a class="skip-link" href="#workspace">Skip to workspace</a>
   <div id="app" class="app-shell" aria-busy="true">
     <header class="topbar">
-      <div class="brand-block">
-        <div class="brand-mark" aria-hidden="true">G3</div>
-        <div>
-          <strong class="brand">GA3BAD</strong>
-          <span class="surface-label">LOCAL WEB VIEW</span>
+      <a class="brand" href="#" aria-label="GA3BAD workspace home">
+        <span class="brand-mark" aria-hidden="true">G3</span>
+        <span>GA3BAD</span>
+      </a>
+
+      <nav id="workspaceNav" class="workspace-nav" aria-label="Workspace">
+        <button class="nav-button" data-view="plan" type="button">
+          Plan <span class="nav-badge hidden" data-badge="plan"></span>
+        </button>
+        <button class="nav-button" data-view="review" type="button">
+          Review <span class="nav-badge hidden" data-badge="review"></span>
+        </button>
+        <button class="nav-button" data-view="agents" type="button">
+          Execution <span class="nav-badge hidden" data-badge="agents"></span>
+        </button>
+      </nav>
+
+      <div class="top-actions">
+        <div class="mode-toggle" aria-label="Detail level">
+          <button id="simpleMode" class="selected" type="button">Simple</button>
+          <button id="advancedMode" type="button">Advanced</button>
         </div>
-      </div>
-      <div class="session-strip" aria-label="Session information">
-        <span id="viewName" class="view-name">Loading</span>
-        <span class="meta-divider" aria-hidden="true"></span>
-        <span id="sessionMeta">Session —</span>
-        <span id="artifactMeta">Artifact —</span>
-        <button id="refreshButton" class="quiet-button" type="button">Refresh</button>
-        <span id="connection" class="connection" role="status"><i></i> Connecting</span>
+        <button id="refreshButton" class="icon-button" type="button"
+                data-help="Reload the latest durable state.">
+          <span aria-hidden="true">↻</span><span class="sr-only">Refresh</span>
+        </button>
+        <span id="connection" class="connection" role="status">
+          <i aria-hidden="true"></i><span>Connecting</span>
+        </span>
       </div>
     </header>
 
     <main id="workspace" class="workspace" tabindex="-1">
-      <div id="loading" class="loading-state">
+      <section id="attention" class="attention hidden" aria-labelledby="attentionTitle">
+        <div>
+          <p id="attentionEyebrow" class="eyebrow"></p>
+          <h1 id="attentionTitle"></h1>
+          <p id="attentionBody" class="muted"></p>
+        </div>
+        <button id="attentionAction" class="primary-button hidden" type="button"></button>
+      </section>
+
+      <div id="loading" class="state-message">
         <span class="loader" aria-hidden="true"></span>
-        <p>Connecting to GA3BAD Core…</p>
+        <p>Connecting to the local workflow…</p>
       </div>
-      <div id="errorState" class="error-state hidden" role="alert"></div>
-      <section id="viewRoot" class="view-root hidden" aria-live="polite"></section>
+      <section id="errorState" class="state-message error hidden" role="alert"></section>
+      <section id="viewRoot" class="view-root hidden"></section>
     </main>
 
-    <footer class="footnote">
-      <span>Temporary local workspace · GA3BAD Core remains the source of truth</span>
-      <span>Close this tab to return to the terminal. Closing does not apply changes.</span>
+    <footer class="footer">
+      <span id="sessionMeta">Session —</span>
+      <span>The harness remains the source of truth.</span>
     </footer>
   </div>
+
+  <div id="drawerBackdrop" class="drawer-backdrop hidden"></div>
+  <aside id="drawer" class="drawer hidden" aria-modal="true" role="dialog"
+         aria-labelledby="drawerTitle">
+    <div class="drawer-head">
+      <div>
+        <p id="drawerEyebrow" class="eyebrow"></p>
+        <h2 id="drawerTitle"></h2>
+      </div>
+      <button id="drawerClose" class="icon-button" type="button" aria-label="Close">×</button>
+    </div>
+    <div id="drawerBody" class="drawer-body"></div>
+  </aside>
+
+  <div id="liveRegion" class="sr-only" aria-live="polite" aria-atomic="true"></div>
   <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
   <script src="/assets/app.js" defer></script>
 </body>

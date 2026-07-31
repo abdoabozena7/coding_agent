@@ -28,7 +28,7 @@ from tests.test_local_web_views import basis, task_value
 
 
 class LocalWebViewsBrowserTests(unittest.TestCase):
-    """Exercise the required artifact interactions in a real browser."""
+    """Exercise the unified workspace and its protected interactions."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -70,7 +70,33 @@ class LocalWebViewsBrowserTests(unittest.TestCase):
             GoalStatus.AWAITING_PLAN_APPROVAL,
             reason="browser plan ready",
         )
-        self.run = self.store.create_ultra_run(
+        self.server = LocalWebServer(self.runtime).start()
+        self.runtime.local_web_server = self.server
+        self.context = self.browser.new_context(viewport={"width": 1440, "height": 1000})
+        self.console_errors: list[str] = []
+        self.page_errors: list[str] = []
+        self.artifacts = Path("output/playwright")
+        self.artifacts.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        self.context.close()
+        self.runtime.close()
+        self.store.close()
+        self.temporary.cleanup()
+
+    def tracked_page(self):
+        page = self.context.new_page()
+        page.on(
+            "console",
+            lambda message: self.console_errors.append(message.text)
+            if message.type == "error" else None,
+        )
+        page.on("pageerror", lambda error: self.page_errors.append(str(error)))
+        return page
+
+    def create_review_fixture(self) -> tuple[WorkNode, AgentRun, ChangeSetV1]:
+        self.runtime.approve_plan(1)
+        run = self.store.create_ultra_run(
             UltraRun(
                 goal_id=self.goal.id,
                 provider="test",
@@ -82,9 +108,9 @@ class LocalWebViewsBrowserTests(unittest.TestCase):
                 config={"max_depth": 5, "max_nodes": 50},
             )
         )
-        self.node = self.store.create_work_node(
+        node = self.store.create_work_node(
             WorkNode(
-                ultra_run_id=self.run.id,
+                ultra_run_id=run.id,
                 title="Implement browser flow",
                 objective="Implement and verify the browser flow.",
                 contract=TaskContractV1(
@@ -96,10 +122,10 @@ class LocalWebViewsBrowserTests(unittest.TestCase):
                 assigned_role="frontend",
             )
         )
-        self.agent = self.store.create_agent_run(
+        agent = self.store.create_agent_run(
             AgentRun(
-                ultra_run_id=self.run.id,
-                work_node_id=self.node.id,
+                ultra_run_id=run.id,
+                work_node_id=node.id,
                 role="frontend",
                 provider="test",
                 model="offline",
@@ -108,11 +134,11 @@ class LocalWebViewsBrowserTests(unittest.TestCase):
                 usage={"progress": 62, "tools": ["filesystem", "test_runner"]},
             )
         )
-        self.checkpoint = self.store.save_change_set(
+        checkpoint = self.store.save_change_set(
             ChangeSetV1(
-                ultra_run_id=self.run.id,
-                responsible_agent_id=self.agent.id,
-                parent_id=self.node.id,
+                ultra_run_id=run.id,
+                responsible_agent_id=agent.id,
+                parent_id=node.id,
                 status=ChangeSetStatus.REVIEWING,
                 changed_files=("agent/example.py",),
                 diff=(
@@ -125,94 +151,99 @@ class LocalWebViewsBrowserTests(unittest.TestCase):
                     "+    checked = True\n"
                     "+    return 2\n"
                 ),
+                metadata={"reason": "Implement the approved browser flow."},
             )
         )
-        self.server = LocalWebServer(self.runtime).start()
-        self.runtime.local_web_server = self.server
-        self.context = self.browser.new_context(viewport={"width": 1440, "height": 1000})
+        return node, agent, checkpoint
 
-    def tearDown(self) -> None:
-        self.context.close()
-        self.runtime.close()
-        self.store.close()
-        self.temporary.cleanup()
-
-    def test_plan_edit_reorder_modes_apply_and_conflict(self):
-        page = self.context.new_page()
+    def test_plan_is_simple_read_first_and_approval_is_explicit(self):
+        page = self.tracked_page()
         page.goto(self.server.url_for("plan"))
-        page.get_by_role("heading", name="Plan Studio").wait_for()
-        page.wait_for_timeout(250)
-        self.assertEqual(
-            page.locator("#viewRoot").evaluate(
-                "element => getComputedStyle(element).opacity"
-            ),
-            "1",
-        )
-        self.assertEqual(
-            page.get_by_role("heading", name="Plan Studio").evaluate(
-                "element => getComputedStyle(element).color"
-            ),
-            "rgb(243, 244, 239)",
-        )
-        artifacts = Path("output/playwright")
-        artifacts.mkdir(parents=True, exist_ok=True)
-        page.screenshot(path=artifacts / "local-web-plan-studio.png", full_page=True)
+        page.get_by_role("heading", name="Plan", exact=True).wait_for()
+        page.get_by_role("heading", name="Review the plan before work starts").wait_for()
+        self.assertEqual(page.locator("select").count(), 0)
+        self.assertEqual(page.locator("text=completed").count(), 0)
 
         page.get_by_role("button", name="Advanced", exact=True).click()
-        self.assertTrue(page.get_by_label("Task ID").is_visible())
-        page.get_by_role("button", name="+ Add task").click()
-        task_titles = page.locator(".title-input")
-        task_titles.nth(1).fill("Verify the new flow")
-        page.locator(".task-row").nth(1).get_by_role("button", name="Move task up").click()
-        self.assertEqual(page.locator(".title-input").first.input_value(), "Verify the new flow")
+        page.locator(".task-row").first.get_by_role("button", name="Edit", exact=True).click()
+        page.get_by_label("Task ID").wait_for()
+        description = page.get_by_label("What this task must do")
+        description.fill("A longer explanation that wraps naturally without an inner scroll trap.")
+        self.assertEqual(
+            description.evaluate("element => getComputedStyle(element).overflowY"),
+            "hidden",
+        )
+        page.get_by_role("button", name="Add task").click()
+        page.locator("#task-1-title").fill("Verify the new flow")
+        page.locator(".task-row").nth(1).get_by_role("button", name="Up").click()
+        self.assertEqual(
+            page.locator(".task-row").first.locator("h4").text_content(),
+            "Verify the new flow",
+        )
         page.get_by_role("button", name="Simple", exact=True).click()
-        self.assertFalse(page.get_by_label("Task ID").first.is_visible())
-        page.get_by_role("button", name="Apply to GA3BAD").click()
-        page.get_by_text("Plan r1 → r2 applied.").wait_for()
+        self.assertFalse(page.get_by_label("Task ID").is_visible())
+
+        page.locator("[data-action='save-revision']").click()
+        page.locator("#toastRegion").get_by_text(
+            "Revision 2 saved. Nothing is running yet."
+        ).wait_for()
         self.assertEqual(self.store.get_latest_plan(self.goal.id).revision, 2)
+        self.assertIsNone(self.store.get_goal(self.goal.id).active_plan_revision)
 
-        stale = self.context.new_page()
-        stale.goto(self.server.url_for("plan"))
-        stale.get_by_role("heading", name="Plan Studio").wait_for()
-        current = self.context.new_page()
-        current.goto(self.server.url_for("plan"))
-        current.get_by_role("heading", name="Plan Studio").wait_for()
-        current.locator(".title-input").first.fill("Current revision edit")
-        current.get_by_role("button", name="Apply to GA3BAD").click()
-        current.get_by_text("Plan r2 → r3 applied.").wait_for()
-        stale.locator(".title-input").first.fill("Stale revision edit")
-        stale.get_by_role("button", name="Apply to GA3BAD").click()
-        stale.get_by_text("This page was opened with Plan r2. The current plan is Plan r3.").wait_for()
-        self.assertEqual(self.store.get_latest_plan(self.goal.id).tasks[0].title, "Current revision edit")
+        page.get_by_role("button", name="Approve & start").click()
+        page.get_by_role("button", name="Confirm and start").click()
+        page.locator("#toastRegion").get_by_text(
+            "Plan r2 approved. Execution has started."
+        ).wait_for()
+        self.assertEqual(self.store.get_goal(self.goal.id).active_plan_revision, 2)
 
-    def test_review_decisions_inline_comment_and_agent_panel(self):
-        review = self.context.new_page()
-        review.goto(self.server.url_for("review"))
-        review.get_by_role("heading", name="Change Review").wait_for()
-        review.wait_for_timeout(250)
-        review.screenshot(
-            path=Path("output/playwright/local-web-change-review.png"),
-            full_page=True,
+        page.wait_for_timeout(250)
+        page.screenshot(path=self.artifacts / "workspace-unified-desktop.png", full_page=True)
+        page.set_viewport_size({"width": 768, "height": 900})
+        page.screenshot(path=self.artifacts / "workspace-unified-tablet.png", full_page=True)
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.screenshot(path=self.artifacts / "workspace-unified-mobile.png", full_page=True)
+        self.assertEqual(self.console_errors, [])
+        self.assertEqual(self.page_errors, [])
+
+    def test_review_uses_inline_feedback_and_execution_has_no_fake_progress(self):
+        node, agent, _checkpoint = self.create_review_fixture()
+        page = self.tracked_page()
+        page.goto(self.server.url_for("review"))
+        page.get_by_role("heading", name="Review the recorded changes", exact=True).wait_for()
+        page.get_by_role("heading", name="Recorded changes", exact=True).wait_for()
+        page.wait_for_timeout(250)
+        page.locator("#attention").scroll_into_view_if_needed()
+        page.screenshot(path=self.artifacts / "workspace-unified-review.png")
+        self.assertEqual(page.get_by_text("0 of 1 files reviewed").count(), 1)
+        self.assertTrue(page.get_by_role("button", name="Submit review").is_disabled())
+
+        page.get_by_role("button", name="Request changes").click()
+        page.get_by_label("Required feedback").fill("Cover the invalid return path.")
+        page.get_by_role("button", name="Save change request").click()
+        self.assertEqual(page.get_by_text("1 of 1 files reviewed").count(), 1)
+        page.get_by_role("button", name="Submit review").click()
+        page.get_by_role("button", name="Confirm submit").click()
+        page.locator("#toastRegion").get_by_text(
+            "Review submitted. A fixer has started."
+        ).wait_for()
+        self.assertEqual(self.store.get_work_node(node.id).status, WorkNodeStatus.FIXING)
+
+        page.get_by_role("button", name="Execution").click()
+        page.get_by_role("heading", name="Execution", exact=True).wait_for()
+        self.assertEqual(page.get_by_text("62% authoritative").count(), 0)
+        self.assertEqual(
+            page.get_by_text("activity reported without an authoritative percentage").count(),
+            1,
         )
-        review.get_by_role("button", name="Accept file").click()
-        review.once("dialog", lambda dialog: dialog.accept("Keep the validation, but adjust the return path."))
-        review.get_by_role("button", name="Reject", exact=True).click()
-        review.once("dialog", lambda dialog: dialog.accept("Explain why this line changes."))
-        review.get_by_role("button", name="Comment on line 1").first.click()
-        review.get_by_role("button", name="Submit review").click()
-        review.get_by_text("Fixer started with your feedback.").wait_for()
-        self.assertEqual(self.store.get_work_node(self.node.id).status, WorkNodeStatus.FIXING)
-
-        agents = self.context.new_page()
-        agents.goto(self.server.url_for("agents"))
-        agents.get_by_role("heading", name="Execution Map").wait_for()
-        agents.locator("[data-agent-id]").click()
-        agents.get_by_text(self.agent.id, exact=True).wait_for()
-        agents.get_by_role("button", name="Request explanation").wait_for()
-        agents.screenshot(
-            path=Path("output/playwright/local-web-agent-tree.png"),
-            full_page=True,
-        )
+        page.get_by_role("button", name="Advanced", exact=True).click()
+        page.get_by_text(agent.id, exact=True).wait_for()
+        page.get_by_role("button", name="Ask for explanation").click()
+        page.get_by_role("heading", name="Request an explanation").wait_for()
+        self.assertEqual(page.locator("textarea#agentQuestion").count(), 1)
+        page.screenshot(path=self.artifacts / "workspace-unified-execution.png")
+        self.assertEqual(self.console_errors, [])
+        self.assertEqual(self.page_errors, [])
 
 
 if __name__ == "__main__":

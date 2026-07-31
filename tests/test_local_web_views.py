@@ -117,6 +117,8 @@ class LocalWebViewTestCase(unittest.TestCase):
             f"/api/sessions/{self.runtime.session_id}/plan"
         ).json()
         task = dict(snapshot["tasks"][0])
+        for protected_field in ("status", "paused", "disabled"):
+            task.pop(protected_field, None)
         task["title"] = title
         return {
             "base_revision": revision,
@@ -129,12 +131,12 @@ class LocalWebViewTestCase(unittest.TestCase):
 
 
 class PlanStudioIntegrationTests(LocalWebViewTestCase):
-    def test_apply_plan_end_to_end_creates_and_activates_revision(self):
+    def test_revision_and_approval_are_separate_explicit_actions(self):
         captured: list[UIEvent] = []
         unsubscribe = self.events.subscribe(captured.append)
         try:
             response = self.client.post(
-                f"/api/sessions/{self.runtime.session_id}/plan/apply",
+                f"/api/sessions/{self.runtime.session_id}/plan/revision",
                 headers=self.csrf_headers(),
                 json=self.plan_payload(),
             )
@@ -144,23 +146,33 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         self.assertEqual(body["revision"], 2)
+        self.assertFalse(body["approved"])
         latest = self.store.get_latest_plan(self.goal.id)
         self.assertEqual(latest.revision, 2)
         self.assertEqual(latest.tasks[0].title, "Implement the edited feature")
-        self.assertEqual(self.store.get_goal(self.goal.id).active_plan_revision, 2)
-        self.assertTrue(any(event.kind == "plan.revision.applied" for event in captured))
+        self.assertIsNone(self.store.get_goal(self.goal.id).active_plan_revision)
+        self.assertTrue(any(event.kind == "plan.revision.created" for event in captured))
         durable = self.store.list_recent_events(self.goal.id, limit=20)
-        self.assertTrue(any(event.event_type == "plan.revision.applied" for event in durable))
+        self.assertTrue(any(event.event_type == "plan.revision.created" for event in durable))
+
+        approved = self.client.post(
+            f"/api/sessions/{self.runtime.session_id}/plan/approve",
+            headers=self.csrf_headers(),
+            json={"revision": 2},
+        )
+        self.assertEqual(approved.status_code, 200, approved.text)
+        self.assertEqual(self.store.get_goal(self.goal.id).active_plan_revision, 2)
+        self.assertEqual(self.store.get_goal(self.goal.id).status, GoalStatus.RUNNING)
 
     def test_rejects_stale_plan_revision_without_overwriting_latest(self):
         first = self.client.post(
-            f"/api/sessions/{self.runtime.session_id}/plan/apply",
+            f"/api/sessions/{self.runtime.session_id}/plan/revision",
             headers=self.csrf_headers(),
             json=self.plan_payload(title="First accepted edit"),
         )
         self.assertEqual(first.status_code, 200, first.text)
         stale = self.client.post(
-            f"/api/sessions/{self.runtime.session_id}/plan/apply",
+            f"/api/sessions/{self.runtime.session_id}/plan/revision",
             headers=self.csrf_headers(),
             json=self.plan_payload(revision=1, title="Stale overwrite"),
         )
@@ -193,13 +205,63 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
         )
         payload["tasks"] = [first, second]
         response = self.client.post(
-            f"/api/sessions/{self.runtime.session_id}/plan/apply",
+            f"/api/sessions/{self.runtime.session_id}/plan/revision",
             headers=self.csrf_headers(),
             json=payload,
         )
         self.assertEqual(response.status_code, 422)
         self.assertIn("cycle", response.json()["error"])
         self.assertEqual(self.store.get_latest_plan(self.goal.id).revision, 1)
+
+    def test_task_status_is_read_only_and_active_plan_cannot_be_mutated(self):
+        forged = self.plan_payload()
+        forged["tasks"][0]["status"] = "completed"
+        rejected = self.client.post(
+            f"/api/sessions/{self.runtime.session_id}/plan/revision",
+            headers=self.csrf_headers(),
+            json=forged,
+        )
+        self.assertEqual(rejected.status_code, 422)
+        self.assertEqual(
+            rejected.json()["details"][0]["loc"][-1],
+            "status",
+        )
+        self.assertEqual(self.store.get_latest_plan(self.goal.id).tasks[0].status.value, "pending")
+
+        self.runtime.approve_plan(1)
+        active_edit = self.client.post(
+            f"/api/sessions/{self.runtime.session_id}/plan/revision",
+            headers=self.csrf_headers(),
+            json=self.plan_payload(),
+        )
+        self.assertEqual(active_edit.status_code, 422)
+        self.assertIn("read-only", active_edit.json()["error"])
+
+    def test_workspace_context_routes_only_mandatory_gates(self):
+        context = self.client.get(
+            f"/api/sessions/{self.runtime.session_id}/workspace"
+        )
+        self.assertEqual(context.status_code, 200)
+        self.assertEqual(context.json()["required_view"], "plan")
+        self.assertEqual(context.json()["attention"]["action"]["label"], "Review plan")
+        self.runtime.approve_plan(1)
+        running = self.client.get(
+            f"/api/sessions/{self.runtime.session_id}/workspace"
+        ).json()
+        self.assertIsNone(running["required_view"])
+        self.assertEqual(running["attention"]["state"], "working")
+
+    def test_future_queue_is_not_available_before_plan_approval(self):
+        response = self.client.post(
+            f"/api/sessions/{self.runtime.session_id}/queue",
+            headers=self.csrf_headers(),
+            json={"text": "Run this later"},
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(
+            self.store.list_queued_prompts(self.runtime.session_id),
+            (),
+        )
 
     def test_store_expected_parent_revision_is_atomic(self):
         with self.assertRaises(StalePlanError):
@@ -276,6 +338,62 @@ class SecurityAndLifecycleTests(LocalWebViewTestCase):
                 time.sleep(0.01)
         self.assertTrue(opened.called)
         self.assertIn("/review?token=", opened.call_args.args[0])
+
+
+class PromptQueueIntegrationTests(LocalWebViewTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.runtime.approve_plan(1)
+
+    def _enqueue(self, text: str) -> dict[str, object]:
+        response = self.client.post(
+            f"/api/sessions/{self.runtime.session_id}/queue",
+            headers=self.csrf_headers(),
+            json={"text": text},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["item"]
+
+    def test_pending_queue_reorders_without_moving_running_work(self):
+        first = self._enqueue("First request")
+        second = self._enqueue("Second request")
+        third = self._enqueue("Third request")
+        claimed = self.store.claim_next_prompt(self.runtime.session_id)
+        self.assertEqual(claimed.id, first["id"])
+
+        response = self.client.patch(
+            f"/api/sessions/{self.runtime.session_id}/queue/order",
+            headers=self.csrf_headers(),
+            json={"ordered_ids": [third["id"], second["id"]]},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        items = response.json()["queue"]["items"]
+        self.assertEqual(items[0]["id"], first["id"])
+        self.assertEqual(items[0]["status"], "running")
+        self.assertEqual(
+            [item["id"] for item in items if item["status"] == "pending"],
+            [third["id"], second["id"]],
+        )
+
+    def test_stale_queue_reorder_is_atomic(self):
+        first = self._enqueue("One")
+        second = self._enqueue("Two")
+        before = [
+            item.id
+            for item in self.store.list_queued_prompts(self.runtime.session_id)
+        ]
+        response = self.client.patch(
+            f"/api/sessions/{self.runtime.session_id}/queue/order",
+            headers=self.csrf_headers(),
+            json={"ordered_ids": [second["id"]]},
+        )
+        self.assertEqual(response.status_code, 409)
+        after = [
+            item.id
+            for item in self.store.list_queued_prompts(self.runtime.session_id)
+        ]
+        self.assertEqual(after, before)
+        self.assertIn(first["id"], after)
 
 
 class ReviewAndAgentIntegrationTests(LocalWebViewTestCase):
@@ -396,6 +514,36 @@ class ReviewAndAgentIntegrationTests(LocalWebViewTestCase):
         self.assertEqual(response.status_code, 422)
         self.assertEqual(self.store.list_change_sets(self.run.id)[0].status, ChangeSetStatus.REVIEWING)
 
+    def test_review_cannot_submit_with_an_unresolved_file(self):
+        second = self.store.save_change_set(
+            replace(
+                self.checkpoint,
+                id="changeset-two-files",
+                changed_files=("agent/auth.py", "agent/session.py"),
+            )
+        )
+        response = self.client.post(
+            f"/api/sessions/{self.runtime.session_id}/review/submit",
+            headers=self.csrf_headers(),
+            json={
+                "checkpoint_id": second.id,
+                "decisions": [
+                    {
+                        "target_type": "file",
+                        "file_path": "agent/auth.py",
+                        "decision": "accepted",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("agent/session.py", response.json()["error"])
+        saved = next(
+            item for item in self.store.list_change_sets(self.run.id)
+            if item.id == second.id
+        )
+        self.assertEqual(saved.status, ChangeSetStatus.REVIEWING)
+
     def test_agent_tree_uses_real_nodes_agents_and_side_panel_data(self):
         response = self.client.get(
             f"/api/sessions/{self.runtime.session_id}/agents"
@@ -405,6 +553,7 @@ class ReviewAndAgentIntegrationTests(LocalWebViewTestCase):
         self.assertEqual(body["nodes"][0]["id"], self.node.id)
         self.assertEqual(body["agents"][0]["id"], self.agent.id)
         self.assertEqual(body["agents"][0]["current_file"], "agent/auth.py")
+        self.assertIsNone(body["agents"][0]["progress"])
 
 
 if __name__ == "__main__":

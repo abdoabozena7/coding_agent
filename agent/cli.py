@@ -1361,37 +1361,13 @@ def _execute_model(runtime: AgentRuntime, console: ConsoleUI, value: str | None,
 def _run_auto(runtime: AgentRuntime, console: ConsoleUI) -> None:
     console.write(
         "Durable goal mode is active. No-progress attempts self-reprompt until completion or real user input; "
-        "repeated provider failures pause for repair; "
+        "the durable retry policy retries transient provider failures and pauses repeated failures for repair; "
         "press Ctrl-C to checkpoint."
     )
-    while True:
-        goal = runtime.active_goal()
-        if goal is None:
-            return
-        retryable = bool(goal.metadata.get("auto_retryable"))
-        if goal.status == GoalStatus.PAUSED and retryable:
-            runtime.wait_for_scheduled_retry()
-            try:
-                runtime.resume()
-            except RuntimeErrorBase:
-                current = runtime.active_goal()
-                if current is None or not (
-                    current.status == GoalStatus.PAUSED
-                    and current.metadata.get("auto_retryable")
-                ):
-                    raise
-                console.write(
-                    "Planning failed transiently; the durable retry policy will try again within its provider-failure limit."
-                )
-            _show_runtime_state(runtime, console)
-            continue
-        if goal.status != GoalStatus.RUNNING:
-            return
-        runtime.wait_for_scheduled_retry()
-        result = runtime.run_slice()
+    def checkpoint(_result: SliceResult) -> None:
         _show_runtime_state(runtime, console)
-        if result.completed or result.needs_user or result.status != GoalStatus.RUNNING.value:
-            return
+
+    runtime.continue_until_boundary(on_checkpoint=checkpoint)
 
 
 def _current_ultra_run(runtime: AgentRuntime) -> object | None:
@@ -2837,7 +2813,12 @@ def execute_command(
     if isinstance(pending_intake, (tuple, list)) and pending_intake:
         _show_questions(runtime, console)
     _show_runtime_state(runtime, console)
-    goal_mode_triggers = {CommandKind.APPROVE, CommandKind.RESUME, CommandKind.TEXT}
+    goal_mode_triggers = {
+        CommandKind.GOAL,
+        CommandKind.APPROVE,
+        CommandKind.RESUME,
+        CommandKind.TEXT,
+    }
     nonempty_guidance = command.kind != CommandKind.TEXT or bool(command.args.get("text", "").strip())
     if (
         command.kind in goal_mode_triggers
@@ -2850,6 +2831,7 @@ def execute_command(
                 CommandKind.APPROVE: "plan approved",
                 CommandKind.RESUME: "goal resumed",
                 CommandKind.TEXT: "guidance received",
+                CommandKind.GOAL: "goal submitted",
             }[command.kind]
             console.write(f"NORMAL mode: {reason}; continuing automatically.")
             _run_auto(runtime, console)
@@ -5325,6 +5307,19 @@ def main(argv: Iterable[str] | None = None) -> int:
                 return 130
             except UserExitRequested:
                 return 0
+        if not interactive_launch and preferences.mode == InteractionMode.ULTRA:
+            goal = runtime.active_goal()
+            if (
+                goal is not None
+                and goal.status is GoalStatus.RUNNING
+                and goal.metadata.get("ultra_run_id")
+            ):
+                console.write(
+                    "ULTRA approval accepted; waiting for autonomous execution "
+                    "to reach completion or a real boundary."
+                )
+                runtime.continue_until_boundary()
+                _show_runtime_state(runtime, console)
         if args.auto:
             try:
                 if preferences.mode == InteractionMode.ULTRA:

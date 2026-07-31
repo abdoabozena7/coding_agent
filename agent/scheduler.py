@@ -336,7 +336,9 @@ class ScheduleReport(Generic[R]):
 
     @property
     def successful(self) -> bool:
-        return bool(self.outcomes) and all(
+        # An empty report is the valid restart case where every dependency was
+        # already completed durably before the scheduler was rebuilt.
+        return all(
             outcome.status is ScheduleStatus.COMPLETED for outcome in self.outcomes
         )
 

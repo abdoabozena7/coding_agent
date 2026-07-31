@@ -53,6 +53,13 @@ class GoalStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class CompletionDisposition(str, Enum):
+    """Terminal evidence disposition stored in Goal metadata."""
+
+    VERIFIED = "verified"
+    COMPLETED_WITH_LIMITATIONS = "completed_with_limitations"
+
+
 class QueuedPromptStatus(str, Enum):
     """Durable lifecycle for one composer prompt waiting behind active work."""
 

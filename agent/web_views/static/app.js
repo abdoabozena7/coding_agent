@@ -1,636 +1,1299 @@
-(() => {
-  "use strict";
+"use strict";
 
-  const pathParts = location.pathname.split("/").filter(Boolean);
-  const sessionId = pathParts[1] || "";
-  const view = pathParts[2] || "plan";
-  const state = {
-    data: null,
-    mode: "simple",
-    selectedFile: 0,
-    selectedAgent: null,
-    decisions: new Map(),
-    comments: [],
-    dirty: false,
-    timer: null,
+const $ = (selector, root = document) => root.querySelector(selector);
+const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+const escapeHtml = (value) => String(value ?? "")
+  .replaceAll("&", "&amp;")
+  .replaceAll("<", "&lt;")
+  .replaceAll(">", "&gt;")
+  .replaceAll('"', "&quot;")
+  .replaceAll("'", "&#039;");
+const lines = (value) => Array.isArray(value) ? value.join("\n") : "";
+const parseLines = (value) => [...new Set(String(value || "").split("\n").map((x) => x.trim()).filter(Boolean))];
+
+const pathParts = location.pathname.split("/").filter(Boolean);
+const sessionId = pathParts[1] || "";
+const initialView = ["plan", "review", "agents"].includes(pathParts[2]) ? pathParts[2] : "plan";
+const csrf = decodeURIComponent(
+  (document.cookie.split("; ").find((item) => item.startsWith("ga3bad_csrf=")) || "=").split("=").slice(1).join("="),
+);
+
+const state = {
+  currentView: initialView,
+  detail: localStorage.getItem("ga3bad-detail") === "advanced" ? "advanced" : "simple",
+  context: null,
+  plan: null,
+  planModel: null,
+  planDirty: false,
+  editingTask: null,
+  editingSummary: false,
+  planConfirm: false,
+  review: null,
+  reviewExpanded: new Set(),
+  reviewDecisions: new Map(),
+  reviewComments: [],
+  reviewConfirm: false,
+  agents: null,
+  busy: false,
+  draggedPromptId: null,
+  contextTimer: null,
+};
+
+function statusLabel(status) {
+  const labels = {
+    pending: "Not started",
+    ready: "Ready",
+    in_progress: "Working",
+    verifying: "Checking",
+    reviewing: "Reviewing",
+    testing: "Checking",
+    fixing: "Fixing",
+    integrating: "Integrating",
+    blocked: "Needs attention",
+    failed: "Needs attention",
+    uncertain: "Needs attention",
+    completed: "Done",
+    accepted: "Approved",
+    pending_approval: "Awaiting approval",
+    open: "Ready for review",
   };
+  return labels[status] || String(status || "Unknown").replaceAll("_", " ");
+}
 
-  const $ = (selector, root = document) => root.querySelector(selector);
-  const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
-  const root = $("#viewRoot");
-  const csrf = () => document.cookie.split("; ").find(v => v.startsWith("ga3bad_csrf="))?.split("=")[1] || "";
-  const escapeHtml = value => String(value ?? "")
-    .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
-  const lines = value => String(value ?? "").split("\n").map(v => v.trim()).filter(Boolean);
-  const comma = value => String(value ?? "").split(",").map(v => v.trim()).filter(Boolean);
+function statusClass(status) {
+  if (["completed", "accepted", "approved", "integrated"].includes(status)) return "done";
+  if (["blocked", "failed", "uncertain", "changes_requested"].includes(status)) return "attention";
+  if (["pending", "pending_approval", "open"].includes(status)) return "waiting";
+  if (["ready", "in_progress", "verifying", "reviewing", "testing", "fixing", "integrating", "running"].includes(status)) return "working";
+  return "";
+}
 
-  function toast(message, kind = "") {
-    const item = document.createElement("div");
-    item.className = `toast ${kind}`;
-    item.textContent = message;
-    $("#toastRegion").append(item);
-    setTimeout(() => item.remove(), 4200);
+function badge(status) {
+  return `<span class="status-badge status-${statusClass(status)}">${escapeHtml(statusLabel(status))}</span>`;
+}
+
+async function api(path, options = {}) {
+  const headers = { Accept: "application/json", ...(options.headers || {}) };
+  if (options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    headers["X-GA3BAD-CSRF"] = csrf;
   }
-
-  async function api(url, options = {}) {
-    const headers = { "Accept": "application/json", ...(options.headers || {}) };
-    if (options.body) headers["Content-Type"] = "application/json";
-    if (!["GET", "HEAD"].includes(options.method || "GET")) headers["X-GA3BAD-CSRF"] = csrf();
-    const response = await fetch(url, { ...options, headers, credentials: "same-origin" });
-    let body = {};
-    try { body = await response.json(); } catch { body = {}; }
-    if (!response.ok) {
-      const error = new Error(body.error || body.detail || `Request failed (${response.status})`);
-      error.status = response.status;
-      error.body = body;
-      throw error;
-    }
-    return body;
-  }
-
-  function setChrome(name, artifact, session) {
-    $("#viewName").textContent = name;
-    $("#artifactMeta").textContent = artifact || "Live state";
-    $("#sessionMeta").textContent = `Session ${String(session || sessionId).slice(0, 8)}`;
-    document.title = `${name} · GA3BAD`;
-  }
-
-  function markConnected(connected = true) {
-    const node = $("#connection");
-    node.classList.toggle("offline", !connected);
-    node.lastChild.textContent = connected ? " Connected" : " Offline";
-  }
-
-  function showError(error) {
-    $("#loading").classList.add("hidden");
-    root.classList.add("hidden");
-    const node = $("#errorState");
-    node.classList.remove("hidden");
-    node.innerHTML = `<div><strong>Unable to open this workspace</strong><p>${escapeHtml(error.message || error)}</p></div>`;
-    markConnected(false);
-  }
-
-  function showRoot() {
-    $("#loading").classList.add("hidden");
-    $("#errorState").classList.add("hidden");
-    root.classList.remove("hidden");
-    $("#app").setAttribute("aria-busy", "false");
-    markConnected(true);
-  }
-
-  function planTaskTemplate(task, index) {
-    const retry = task.retry_policy || { max_retries: 2, backoff_seconds: 0 };
-    return `
-      <article class="task-row ${state.mode === "advanced" ? "expanded" : ""}" data-task-index="${index}" draggable="true">
-        <div class="task-index">${String(index + 1).padStart(2, "0")}</div>
-        <div class="task-main">
-          <div class="task-title-line">
-            <input class="title-input" aria-label="Task ${index + 1} title" data-field="title" value="${escapeHtml(task.title)}">
-            <select aria-label="Task ${index + 1} status" data-field="status">
-              ${["pending", "ready", "in_progress", "blocked", "completed"].map(value =>
-                `<option value="${value}" ${task.status === value ? "selected" : ""}>${value.replaceAll("_", " ")}</option>`).join("")}
-            </select>
-          </div>
-          <textarea class="description-input" aria-label="Task ${index + 1} description" data-field="description">${escapeHtml(task.description)}</textarea>
-        </div>
-        <div class="task-controls" aria-label="Task actions">
-          <button class="icon-button move-up" type="button" title="Move task up" aria-label="Move task up">↑</button>
-          <button class="icon-button move-down" type="button" title="Move task down" aria-label="Move task down">↓</button>
-          <button class="icon-button split-task" type="button" title="Split task" aria-label="Split task">⑂</button>
-          <button class="icon-button expand-task" type="button" title="Advanced fields" aria-label="Toggle advanced fields">•••</button>
-          <button class="icon-button danger delete-task" type="button" title="Delete task" aria-label="Delete task">×</button>
-        </div>
-        <div class="advanced-fields">
-          <div class="field-group">
-            <label class="field-label">Task ID</label>
-            <input data-field="id" value="${escapeHtml(task.id)}" aria-label="Task ID">
-          </div>
-          <div class="field-group">
-            <label class="field-label">Agent role</label>
-            <input data-field="agent_role" value="${escapeHtml(task.agent_role)}" aria-label="Agent role">
-          </div>
-          <div class="field-group">
-            <label class="field-label">Dependencies</label>
-            <input data-field="dependencies" value="${escapeHtml((task.dependencies || []).join(", "))}" aria-label="Dependencies">
-            <p class="field-help">Comma-separated task IDs</p>
-          </div>
-          <div class="field-group">
-            <label class="field-label">Risk level</label>
-            <select data-field="risk_level" aria-label="Risk level">
-              ${["low", "medium", "high", "critical"].map(value =>
-                `<option ${task.risk_level === value ? "selected" : ""}>${value}</option>`).join("")}
-            </select>
-          </div>
-          <div class="field-group">
-            <label class="field-label">Inputs</label>
-            <textarea data-field="inputs" aria-label="Inputs">${escapeHtml((task.inputs || []).join("\n"))}</textarea>
-          </div>
-          <div class="field-group">
-            <label class="field-label">Outputs</label>
-            <textarea data-field="outputs" aria-label="Outputs">${escapeHtml((task.outputs || []).join("\n"))}</textarea>
-          </div>
-          <div class="field-group wide">
-            <label class="field-label">Expected files</label>
-            <textarea data-field="expected_files" aria-label="Expected files">${escapeHtml((task.expected_files || []).join("\n"))}</textarea>
-          </div>
-          <div class="field-group">
-            <label class="field-label">Acceptance criteria</label>
-            <textarea data-field="acceptance_criteria" aria-label="Acceptance criteria">${escapeHtml((task.acceptance_criteria || []).join("\n"))}</textarea>
-          </div>
-          <div class="field-group">
-            <label class="field-label">Tests</label>
-            <textarea data-field="tests" aria-label="Tests">${escapeHtml((task.tests || []).join("\n"))}</textarea>
-          </div>
-          <div class="field-group">
-            <label class="field-label">Required tools</label>
-            <input data-field="required_tools" value="${escapeHtml((task.required_tools || []).join(", "))}" aria-label="Required tools">
-          </div>
-          <div class="field-group">
-            <label class="field-label">Memory dependencies</label>
-            <input data-field="memory_dependencies" value="${escapeHtml((task.memory_dependencies || []).join(", "))}" aria-label="Memory dependencies">
-          </div>
-          <div class="field-group">
-            <label class="field-label">Max retries</label>
-            <input type="number" min="0" max="20" data-field="max_retries" value="${retry.max_retries}" aria-label="Maximum retries">
-          </div>
-          <div class="field-group">
-            <label class="field-label">Backoff seconds</label>
-            <input type="number" min="0" max="3600" step="0.5" data-field="backoff_seconds" value="${retry.backoff_seconds}" aria-label="Retry backoff seconds">
-          </div>
-          <div class="field-group wide">
-            <label class="field-label">Constraints</label>
-            <textarea data-field="constraints" aria-label="Task constraints">${escapeHtml((task.constraints || []).join("\n"))}</textarea>
-          </div>
-          <div class="field-group wide">
-            <label class="field-label">Comments</label>
-            <textarea data-field="comments" aria-label="Task comments">${escapeHtml((task.comments || []).join("\n"))}</textarea>
-          </div>
-          <div class="field-group wide check-grid">
-            ${[
-              ["parallel", "May run in parallel"],
-              ["approval_gate", "Approval required before start"],
-              ["paused", "Pause this task"],
-              ["disabled", "Disable this task"],
-            ].map(([field, label]) => `<label class="check-label"><input type="checkbox" data-field="${field}" ${task[field] ? "checked" : ""}> ${label}</label>`).join("")}
-          </div>
-        </div>
-      </article>`;
-  }
-
-  function renderPlan() {
-    const data = state.data;
-    setChrome("Plan Studio", `Plan r${data.revision}`, data.session_short);
-    root.innerHTML = `
-      <header class="view-heading">
-        <div><span class="eyebrow">Editable artifact · revision protected</span><h1>Plan Studio</h1></div>
-        <div class="heading-tools">
-          <div class="mode-switch" role="group" aria-label="Plan detail mode">
-            <button type="button" class="mode-button ${state.mode === "simple" ? "active" : ""}" data-mode="simple">Simple</button>
-            <button type="button" class="mode-button ${state.mode === "advanced" ? "active" : ""}" data-mode="advanced">Advanced</button>
-          </div>
-          <button id="addTask" class="button" type="button">+ Add task</button>
-        </div>
-      </header>
-      <div id="conflictSlot"></div>
-      <div class="plan-layout">
-        <section class="primary-pane" aria-label="Plan tasks">
-          <div class="plan-summary">
-            <label class="field-label" for="planSummary">Plan summary</label>
-            <textarea id="planSummary">${escapeHtml(data.summary)}</textarea>
-          </div>
-          <div class="pane-header"><strong>${data.tasks.length} tasks</strong><span>Drag or use arrows to reorder</span></div>
-          <div id="taskList" class="task-list">${data.tasks.map(planTaskTemplate).join("")}</div>
-          <div class="action-bar">
-            <button id="discardPlan" class="button danger" type="button">Discard changes</button>
-            <button id="saveDraft" class="button" type="button">Save draft</button>
-            <button id="applyPlan" class="button primary" type="button">Apply to GA3BAD</button>
-          </div>
-        </section>
-        <aside class="secondary-pane" aria-label="Plan constraints">
-          <div class="pane-header"><strong>Plan boundaries</strong><span>Global</span></div>
-          <div class="secondary-content">
-            <section class="side-section">
-              <label class="field-label" for="globalConstraints">Global constraints</label>
-              <textarea id="globalConstraints" rows="8">${escapeHtml((data.global_constraints || []).join("\n"))}</textarea>
-              <p>One constraint per line. Agents receive these with the active revision.</p>
-            </section>
-            <section class="side-section">
-              <label class="field-label" for="protectedPaths">Protected files and directories</label>
-              <textarea id="protectedPaths" rows="7">${escapeHtml((data.protected_paths || []).join("\n"))}</textarea>
-              <p>Workspace-relative paths only. The web layer never modifies files directly.</p>
-            </section>
-            <section class="side-section">
-              <label class="field-label" for="changeNote">Revision note</label>
-              <textarea id="changeNote" rows="4">Edited in Plan Studio</textarea>
-            </section>
-            <section class="side-section">
-              <h2>Snapshot</h2>
-              <div class="tag-list">
-                <span class="tag">OPENED r${data.revision}</span>
-                <span class="tag">${escapeHtml(data.status)}</span>
-                <span class="tag">${new Date(data.updated_at).toLocaleTimeString()}</span>
-              </div>
-            </section>
-          </div>
-        </aside>
-      </div>`;
-    bindPlan();
-    state.dirty = false;
-    showRoot();
-  }
-
-  function readTask(row) {
-    const value = field => $(`[data-field="${field}"]`, row);
-    return {
-      id: value("id").value.trim(),
-      title: value("title").value.trim(),
-      description: value("description").value.trim(),
-      status: value("status").value,
-      parent_id: null,
-      dependencies: comma(value("dependencies").value),
-      agent_role: value("agent_role").value.trim() || "coder",
-      inputs: lines(value("inputs").value),
-      outputs: lines(value("outputs").value),
-      expected_files: lines(value("expected_files").value),
-      acceptance_criteria: lines(value("acceptance_criteria").value),
-      tests: lines(value("tests").value),
-      risk_level: value("risk_level").value,
-      required_tools: comma(value("required_tools").value),
-      memory_dependencies: comma(value("memory_dependencies").value),
-      retry_policy: {
-        max_retries: Number(value("max_retries").value || 0),
-        backoff_seconds: Number(value("backoff_seconds").value || 0),
-      },
-      approval_gate: value("approval_gate").checked,
-      constraints: lines(value("constraints").value),
-      parallel: value("parallel").checked,
-      paused: value("paused").checked,
-      disabled: value("disabled").checked,
-      comments: lines(value("comments").value),
-    };
-  }
-
-  function planPayload() {
-    return {
-      base_revision: state.data.revision,
-      summary: $("#planSummary").value.trim(),
-      tasks: $$(".task-row").map(readTask),
-      global_constraints: lines($("#globalConstraints").value),
-      protected_paths: lines($("#protectedPaths").value),
-      change_note: $("#changeNote").value.trim(),
-    };
-  }
-
-  function newTask() {
-    const ids = new Set($$(".task-row").map(row => $("[data-field=id]", row).value.toUpperCase()));
-    let n = 1;
-    while (ids.has(`T${String(n).padStart(3, "0")}`)) n++;
-    const id = `T${String(n).padStart(3, "0")}`;
-    return {
-      id, title: "Untitled task", description: "", status: "pending", dependencies: [],
-      agent_role: "coder", inputs: [], outputs: [], expected_files: [],
-      acceptance_criteria: ["Define observable completion criteria"],
-      tests: ["Define the direct verification method"], risk_level: "medium",
-      required_tools: [], memory_dependencies: [], retry_policy: { max_retries: 2, backoff_seconds: 0 },
-      approval_gate: false, constraints: [], parallel: false, paused: false, disabled: false, comments: [],
-    };
-  }
-
-  function rerenderPlanTasks(tasks) {
-    $("#taskList").innerHTML = tasks.map(planTaskTemplate).join("");
-    bindTaskRows();
-    state.dirty = true;
-  }
-
-  function bindTaskRows() {
-    $$(".task-row").forEach((row, index) => {
-      $(".move-up", row).onclick = () => {
-        const tasks = $$(".task-row").map(readTask);
-        if (index > 0) [tasks[index - 1], tasks[index]] = [tasks[index], tasks[index - 1]];
-        rerenderPlanTasks(tasks);
-      };
-      $(".move-down", row).onclick = () => {
-        const tasks = $$(".task-row").map(readTask);
-        if (index < tasks.length - 1) [tasks[index + 1], tasks[index]] = [tasks[index], tasks[index + 1]];
-        rerenderPlanTasks(tasks);
-      };
-      $(".delete-task", row).onclick = () => {
-        if ($$(".task-row").length === 1) return toast("A plan must keep at least one task.", "error");
-        row.remove();
-        rerenderPlanTasks($$(".task-row").map(readTask));
-      };
-      $(".expand-task", row).onclick = () => row.classList.toggle("expanded");
-      $(".split-task", row).onclick = () => {
-        const tasks = $$(".task-row").map(readTask);
-        const original = tasks[index];
-        const child = newTask();
-        child.title = `${original.title} — follow-up`;
-        child.description = "Complete the second bounded part of the original task.";
-        child.dependencies = [original.id];
-        tasks.splice(index + 1, 0, child);
-        rerenderPlanTasks(tasks);
-      };
-      row.addEventListener("input", () => state.dirty = true);
-      row.addEventListener("dragstart", event => event.dataTransfer.setData("text/plain", String(index)));
-      row.addEventListener("dragover", event => event.preventDefault());
-      row.addEventListener("drop", event => {
-        event.preventDefault();
-        const from = Number(event.dataTransfer.getData("text/plain"));
-        const tasks = $$(".task-row").map(readTask);
-        const [moved] = tasks.splice(from, 1);
-        tasks.splice(index, 0, moved);
-        rerenderPlanTasks(tasks);
-      });
-    });
-  }
-
-  function showConflict(error) {
-    const current = error.body?.current_revision ?? "?";
-    $("#conflictSlot").innerHTML = `
-      <div class="conflict-banner" role="alert">
-        <div><strong>This page was opened with Plan r${state.data.revision}. The current plan is Plan r${current}.</strong>
-          <p>Your edits were not applied. Keep them as a draft or reload the latest revision.</p></div>
-        <div class="conflict-actions">
-          <button id="keepDraftConflict" class="button small" type="button">Keep as draft</button>
-          <button id="reloadConflict" class="button small primary" type="button">Reload latest</button>
-        </div>
-      </div>`;
-    $("#keepDraftConflict").onclick = () => submitPlan("draft");
-    $("#reloadConflict").onclick = () => load(true);
-  }
-
-  async function submitPlan(kind) {
-    const payload = planPayload();
-    try {
-      if (kind === "draft") {
-        await api(`/api/sessions/${sessionId}/plan/draft`, { method: "POST", body: JSON.stringify(payload) });
-        toast(`Draft saved against Plan r${payload.base_revision}.`);
-        state.dirty = false;
-      } else {
-        const result = await api(`/api/sessions/${sessionId}/plan/apply`, { method: "POST", body: JSON.stringify(payload) });
-        toast(`Plan r${result.previous_revision} → r${result.revision} applied.`);
-        await load(true);
-      }
-    } catch (error) {
-      if (error.status === 409) showConflict(error);
-      else toast(error.message, "error");
-    }
-  }
-
-  function bindPlan() {
-    bindTaskRows();
-    $$("[data-mode]").forEach(button => button.onclick = () => {
-      state.mode = button.dataset.mode;
-      $$(".mode-button").forEach(item => item.classList.toggle("active", item === button));
-      $$(".task-row").forEach(row => row.classList.toggle("expanded", state.mode === "advanced"));
-    });
-    $("#addTask").onclick = () => rerenderPlanTasks([...$$(".task-row").map(readTask), newTask()]);
-    $("#saveDraft").onclick = () => submitPlan("draft");
-    $("#applyPlan").onclick = () => submitPlan("apply");
-    $("#discardPlan").onclick = async () => {
-      await api(`/api/sessions/${sessionId}/plan/draft`, { method: "DELETE" });
-      await load(true);
-      toast("Local edits discarded.");
-    };
-    ["#planSummary", "#globalConstraints", "#protectedPaths", "#changeNote"].forEach(selector =>
-      $(selector).addEventListener("input", () => state.dirty = true));
-  }
-
-  function decisionKey(type, path, hunk = "") { return `${type}|${path}|${hunk}`; }
-
-  function setDecision(type, path, hunk, decision) {
-    let reason = "";
-    if (decision !== "accepted") {
-      reason = window.prompt(decision === "rejected" ? "Why should this change be rejected?" : "What needs to change?") || "";
-      if (!reason.trim()) return;
-    }
-    state.decisions.set(decisionKey(type, path, hunk), {
-      target_type: type, file_path: path, hunk_id: hunk || null, decision, reason: reason.trim(),
-    });
-    renderReviewWorkspace();
-  }
-
-  function addLineComment(file, hunk, line) {
-    const body = window.prompt(`Comment on ${file}:${line}`);
-    if (!body?.trim()) return;
-    state.comments.push({ file_path: file, hunk_id: hunk || null, line, body: body.trim() });
-    renderReviewWorkspace();
-    toast("Inline comment added.");
-  }
-
-  function reviewInspector(file) {
-    const comments = state.comments.filter(item => item.file_path === file.path);
-    return `
-      <div class="inspector-header"><strong>Change context</strong><span>${escapeHtml(file.status)}</span></div>
-      <div class="inspector-content">
-        <section class="side-section"><h2>Why this changed</h2><p>${escapeHtml(file.reason)}</p></section>
-        <section class="side-section">
-          <dl class="definition-list">
-            <dt>Task</dt><dd>${escapeHtml(file.task)}</dd>
-            <dt>Agent</dt><dd>${escapeHtml(file.agent)}</dd>
-            <dt>Checkpoint</dt><dd>${escapeHtml(state.data.checkpoint_id)}</dd>
-            <dt>Plan</dt><dd>r${escapeHtml(state.data.plan_revision)}</dd>
-          </dl>
-        </section>
-        <section class="side-section"><h2>Test results</h2>
-          <pre>${escapeHtml(JSON.stringify(file.tests || {}, null, 2))}</pre>
-        </section>
-        <section class="side-section"><h2>Evidence</h2>
-          ${(file.evidence || []).length ? `<div class="tag-list">${file.evidence.map(item => `<span class="tag">${escapeHtml(item.summary)}</span>`).join("")}</div>` : "<p>No linked evidence.</p>"}
-        </section>
-        <section class="side-section"><h2>Review comments · ${comments.length}</h2>
-          <div class="comment-list">${comments.map(item => `<div class="comment"><strong>LINE ${item.line || "FILE"}</strong><p>${escapeHtml(item.body)}</p></div>`).join("") || "<p>No comments yet. Use + beside a diff line.</p>"}</div>
-        </section>
-      </div>`;
-  }
-
-  function renderReviewWorkspace() {
-    const file = state.data.files[state.selectedFile];
-    const fileDecision = state.decisions.get(decisionKey("file", file.path));
-    $("#diffWorkspace").innerHTML = `
-      <div class="diff-toolbar">
-        <div><div class="diff-path">${escapeHtml(file.path)}</div>
-          ${fileDecision ? `<span class="decision-badge ${fileDecision.decision}">${fileDecision.decision.replaceAll("_", " ")}</span>` : ""}
-        </div>
-        <div class="decision-controls" aria-label="File decision">
-          <button class="button small accept-file" type="button">Accept file</button>
-          <button class="button small request-file" type="button">Request changes</button>
-          <button class="button small danger reject-file" type="button">Reject file</button>
-        </div>
-      </div>
-      <div class="diff-scroll">
-        ${file.hunks.length ? file.hunks.map(hunk => {
-          const decision = state.decisions.get(decisionKey("hunk", file.path, hunk.id));
-          return `<section class="hunk">
-            <div class="hunk-header"><span>${escapeHtml(hunk.header)}</span>
-              <span class="hunk-actions">
-                ${decision ? `<span class="decision-badge ${decision.decision}">${decision.decision.replaceAll("_", " ")}</span>` : ""}
-                <button class="button small accept-hunk" data-hunk="${escapeHtml(hunk.id)}" type="button">Accept</button>
-                <button class="button small request-hunk" data-hunk="${escapeHtml(hunk.id)}" type="button">Change</button>
-                <button class="button small danger reject-hunk" data-hunk="${escapeHtml(hunk.id)}" type="button">Reject</button>
-              </span></div>
-            ${hunk.lines.map(line => `<div class="diff-line ${line.kind}">
-              <span class="line-no">${line.number}</span>
-              <button class="comment-trigger" type="button" data-comment-hunk="${escapeHtml(hunk.id)}" data-line="${line.number}" aria-label="Comment on line ${line.number}">+</button>
-              <code>${escapeHtml(line.text)}</code>
-            </div>`).join("")}
-          </section>`;
-        }).join("") : `<div class="empty-state"><div><strong>Diff content unavailable</strong><p>The checkpoint records this file but has no unified diff body.</p></div></div>`}
-      </div>`;
-    $("#reviewInspector").innerHTML = reviewInspector(file);
-    $(".accept-file").onclick = () => setDecision("file", file.path, null, "accepted");
-    $(".request-file").onclick = () => setDecision("file", file.path, null, "changes_requested");
-    $(".reject-file").onclick = () => setDecision("file", file.path, null, "rejected");
-    $$(".accept-hunk").forEach(button => button.onclick = () => setDecision("hunk", file.path, button.dataset.hunk, "accepted"));
-    $$(".request-hunk").forEach(button => button.onclick = () => setDecision("hunk", file.path, button.dataset.hunk, "changes_requested"));
-    $$(".reject-hunk").forEach(button => button.onclick = () => setDecision("hunk", file.path, button.dataset.hunk, "rejected"));
-    $$("[data-comment-hunk]").forEach(button => button.onclick = () =>
-      addLineComment(file.path, button.dataset.commentHunk, Number(button.dataset.line)));
-  }
-
-  function renderReview() {
-    const data = state.data;
-    setChrome("Change Review", `Checkpoint ${data.checkpoint_id.slice(0, 12)}`, data.session_short);
-    root.innerHTML = `
-      <header class="view-heading">
-        <div><span class="eyebrow">Immutable checkpoint · review workspace</span><h1>Change Review</h1></div>
-        <p>This diff remains fixed while you review it. Decisions affect the checkpoint; this page never writes repository files.</p>
-      </header>
-      <div class="review-layout">
-        <nav class="file-list" aria-label="Changed files">
-          <div class="list-header"><strong>${data.files.length} changed files</strong><span>r${data.plan_revision}</span></div>
-          ${data.files.map((file, index) => `<button type="button" class="file-item ${index === state.selectedFile ? "active" : ""}" data-file-index="${index}">
-            <span class="file-path">${escapeHtml(file.path)}</span>
-            <span class="file-stats"><b class="plus">+${file.additions}</b> <b class="minus">−${file.deletions}</b></span>
-          </button>`).join("")}
-        </nav>
-        <section id="diffWorkspace" class="primary-pane" aria-label="Code diff"></section>
-        <aside id="reviewInspector" class="inspector-pane" aria-label="Change details"></aside>
-      </div>
-      <div class="action-bar">
-        <span>${state.decisions.size} decisions · ${state.comments.length} comments</span>
-        <button id="submitReview" class="button primary" type="button">Submit review</button>
-      </div>`;
-    $$("[data-file-index]").forEach(button => button.onclick = () => {
-      state.selectedFile = Number(button.dataset.fileIndex);
-      $$("[data-file-index]").forEach(item => item.classList.toggle("active", item === button));
-      renderReviewWorkspace();
-    });
-    $("#submitReview").onclick = submitReview;
-    renderReviewWorkspace();
-    showRoot();
-  }
-
-  async function submitReview() {
-    if (!state.decisions.size) return toast("Record at least one file or hunk decision.", "warning");
-    const payload = {
-      checkpoint_id: state.data.checkpoint_id,
-      decisions: [...state.decisions.values()],
-      comments: state.comments,
-      summary: "Review submitted from Change Review.",
-    };
-    try {
-      const result = await api(`/api/sessions/${sessionId}/review/submit`, { method: "POST", body: JSON.stringify(payload) });
-      toast(`${result.counts.approved} files approved · ${result.counts.changes_requested} require changes.`);
-      if (result.fixer_started) toast("Fixer started with your feedback.");
-      await load(true);
-    } catch (error) { toast(error.message, "error"); }
-  }
-
-  function agentInspector(agent) {
-    if (!agent) return `<div class="empty-state"><div><strong>Select an agent</strong><p>Inspect its actual task, context, files, logs, memory, and retry history.</p></div></div>`;
-    return `
-      <div class="inspector-header"><strong>${escapeHtml(agent.role)}</strong><span class="status-badge ${escapeHtml(agent.status)}">${escapeHtml(agent.status)}</span></div>
-      <div class="inspector-content">
-        <section class="side-section"><span class="eyebrow">Current goal</span><h2>${escapeHtml(agent.goal)}</h2><p>${escapeHtml(agent.task)}</p></section>
-        <section class="side-section"><dl class="definition-list">
-          <dt>Agent ID</dt><dd>${escapeHtml(agent.id)}</dd>
-          <dt>Plan</dt><dd>r${escapeHtml(agent.plan_revision)}</dd>
-          <dt>Current file</dt><dd>${escapeHtml(agent.current_file || "—")}</dd>
-          <dt>Elapsed</dt><dd>${Math.floor(agent.elapsed_seconds / 60)}m ${agent.elapsed_seconds % 60}s</dd>
-          <dt>Retries</dt><dd>${agent.retries}</dd>
-          <dt>Parent</dt><dd>${escapeHtml(agent.parent_node || "GA3BAD Core")}</dd>
-          <dt>Children</dt><dd>${agent.child_agents}</dd>
-        </dl></section>
-        <section class="side-section"><h2>Files inspected</h2><div class="tag-list">${agent.files_inspected.map(item => `<span class="tag">${escapeHtml(item)}</span>`).join("") || "<span class='tag'>NONE</span>"}</div></section>
-        <section class="side-section"><h2>Files being modified</h2><div class="tag-list">${agent.files_modifying.map(item => `<span class="tag">${escapeHtml(item)}</span>`).join("") || "<span class='tag'>NONE</span>"}</div></section>
-        <section class="side-section"><h2>Memory references</h2><div class="tag-list">${agent.memory.map(item => `<span class="tag">${escapeHtml(item.title)}</span>`).join("") || "<span class='tag'>NONE</span>"}</div></section>
-        <section class="side-section"><h2>Recent logs</h2><div class="log-list">${agent.logs.map(item => `<div class="log-row"><i></i><span>${escapeHtml(item.summary)}</span></div>`).join("") || "<p>No recent logs.</p>"}</div></section>
-        <section class="side-section"><h2>Latest output</h2><pre>${escapeHtml(JSON.stringify(agent.latest_output || {}, null, 2))}</pre></section>
-        <button id="requestExplanation" class="button" type="button">Request explanation</button>
-      </div>`;
-  }
-
-  function renderAgents() {
-    const data = state.data;
-    setChrome("Agent Tree", data.plan_revision ? `Plan r${data.plan_revision}` : "No active plan", data.session_short);
-    const byNode = new Map(data.nodes.map(node => [node.id, []]));
-    data.agents.forEach(agent => {
-      if (!byNode.has(agent.task_id)) byNode.set(agent.task_id, []);
-      byNode.get(agent.task_id).push(agent);
-    });
-    const selected = data.agents.find(agent => agent.id === state.selectedAgent) || null;
-    root.innerHTML = `
-      <header class="view-heading">
-        <div><span class="eyebrow">Live state · refreshes every 2 seconds</span><h1>Execution Map</h1></div>
-        <p>Read-only operational view of GA3BAD Core, work nodes, dependencies, assignments, retries, and blockers.</p>
-      </header>
-      <div class="agent-layout">
-        <section class="primary-pane">
-          <div class="pane-header"><strong>${data.agents.length} agents · ${data.nodes.length} nodes</strong><span>Updated ${new Date(data.updated_at).toLocaleTimeString()}</span></div>
-          <div class="execution-canvas">
-            <div class="core-node"><span class="eyebrow">Root coordinator</span><strong>${escapeHtml(data.core.name)}</strong><span>${escapeHtml(data.core.status)}</span></div>
-            ${data.nodes.length ? `<div class="node-grid">${data.nodes.map(node => {
-              const agents = byNode.get(node.id) || [];
-              return `<article class="execution-node ${node.blocked ? "blocked" : ""} ${agents.some(item => item.status === "running") ? "active" : ""}">
-                <div class="node-header"><div><strong>${escapeHtml(node.title)}</strong><small>${escapeHtml(node.id)}</small></div><span class="status-badge ${escapeHtml(node.status)}">${escapeHtml(node.status)}</span></div>
-                ${agents.map(agent => `<button type="button" class="agent-item ${agent.id === state.selectedAgent ? "active" : ""}" data-agent-id="${escapeHtml(agent.id)}">
-                  <span class="agent-avatar">${escapeHtml(agent.role.slice(0, 2).toUpperCase())}</span>
-                  <span class="agent-copy"><strong>${escapeHtml(agent.role)}</strong><small>${escapeHtml(agent.last_action)}</small><span class="progress-track"><span class="progress-fill" style="width:${Math.max(0, Math.min(100, agent.progress))}%"></span></span></span>
-                  <span class="status-badge ${escapeHtml(agent.status)}">${agent.blocked ? "blocked" : escapeHtml(agent.status)}</span>
-                </button>`).join("") || `<div class="empty-state"><p>Waiting for an agent assignment.</p></div>`}
-              </article>`;
-            }).join("")}</div>` : `<div class="empty-state"><div><strong>No active agent graph</strong><p>GA3BAD Core is available, but this session has not started an Ultra execution graph.</p></div></div>`}
-          </div>
-        </section>
-        <aside id="agentInspector" class="inspector-pane" aria-label="Agent details">${agentInspector(selected)}</aside>
-      </div>`;
-    $$("[data-agent-id]").forEach(button => button.onclick = () => {
-      state.selectedAgent = button.dataset.agentId;
-      renderAgents();
-    });
-    if (selected && $("#requestExplanation")) $("#requestExplanation").onclick = async () => {
-      const question = window.prompt("What should this agent explain?", "Explain your current work and any blockers.");
-      if (!question?.trim()) return;
-      try {
-        await api(`/api/sessions/${sessionId}/agents/explain`, {
-          method: "POST", body: JSON.stringify({ agent_id: selected.id, question: question.trim() }),
-        });
-        toast("Explanation request sent to the agent event queue.");
-      } catch (error) { toast(error.message, "error"); }
-    };
-    showRoot();
-  }
-
-  async function load(force = false) {
-    if (view === "plan" && state.dirty && !force) return toast("Save, apply, or discard your plan edits before refreshing.", "warning");
-    try {
-      state.data = await api(`/api/sessions/${sessionId}/${view}`);
-      if (view === "plan") renderPlan();
-      else if (view === "review") renderReview();
-      else renderAgents();
-    } catch (error) { showError(error); }
-  }
-
-  $("#refreshButton").onclick = () => load(false);
-  window.addEventListener("beforeunload", event => {
-    if (view === "plan" && state.dirty) {
-      event.preventDefault();
-      event.returnValue = "";
-    }
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}${path}`, {
+    credentials: "same-origin",
+    ...options,
+    headers,
   });
+  let payload = {};
+  try { payload = await response.json(); } catch { payload = {}; }
+  if (!response.ok) {
+    const error = new Error(payload.error || `Request failed (${response.status})`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
+  return payload;
+}
 
-  load(true);
-  if (view === "agents") state.timer = setInterval(() => load(true), 2000);
-})();
+function announce(message, isError = false) {
+  $("#liveRegion").textContent = message;
+  const toast = document.createElement("div");
+  toast.className = `toast${isError ? " error" : ""}`;
+  toast.textContent = message;
+  $("#toastRegion").append(toast);
+  setTimeout(() => toast.remove(), 4400);
+}
+
+function setBusy(busy) {
+  state.busy = busy;
+  $("#app").setAttribute("aria-busy", String(busy));
+  $$("button").forEach((button) => {
+    if (button.dataset.keepEnabled !== "true") button.disabled = busy;
+  });
+}
+
+function autoGrow(target) {
+  const items = target ? [target] : $$("textarea");
+  items.forEach((area) => {
+    // Chromium uses CSS field-sizing: content. Touching the value forces a
+    // layout pass without introducing CSP-blocked inline style attributes.
+    area.rows = Math.max(1, String(area.value || "").split("\n").length);
+  });
+}
+
+function showError(error) {
+  $("#loading").classList.add("hidden");
+  $("#viewRoot").classList.add("hidden");
+  const root = $("#errorState");
+  root.classList.remove("hidden");
+  root.innerHTML = `
+    <div>
+      <p class="eyebrow">The workspace could not load</p>
+      <h2>${escapeHtml(error.message || error)}</h2>
+      <p>Your durable work was not changed. Refresh after the local runtime is available.</p>
+      <button class="secondary-button" id="retryLoad" type="button">Try again</button>
+    </div>`;
+  $("#retryLoad").addEventListener("click", () => loadView(state.currentView, true));
+  setConnection(false);
+}
+
+function setConnection(connected) {
+  const node = $("#connection");
+  node.classList.toggle("connected", connected);
+  node.classList.toggle("offline", !connected);
+  $("span", node).textContent = connected ? "Connected" : "Offline";
+}
+
+function renderChrome() {
+  document.body.classList.toggle("advanced", state.detail === "advanced");
+  $("#simpleMode").classList.toggle("selected", state.detail === "simple");
+  $("#advancedMode").classList.toggle("selected", state.detail === "advanced");
+  $$(".nav-button").forEach((button) => {
+    button.classList.toggle("selected", button.dataset.view === state.currentView);
+    button.setAttribute("aria-current", button.dataset.view === state.currentView ? "page" : "false");
+  });
+  if (!state.context) return;
+  $("#sessionMeta").textContent = `Session ${state.context.session_short} · ${state.context.mode}`;
+  Object.entries(state.context.navigation || {}).forEach(([view, item]) => {
+    const node = $(`[data-badge="${view}"]`);
+    const count = Number(item.badge || 0);
+    node.textContent = String(count);
+    node.classList.toggle("hidden", count === 0);
+  });
+  const attention = state.context.attention;
+  const root = $("#attention");
+  root.classList.remove("hidden");
+  $("#attentionEyebrow").textContent = attention.eyebrow;
+  $("#attentionTitle").textContent = attention.title;
+  $("#attentionBody").textContent = attention.body;
+  const action = $("#attentionAction");
+  action.classList.toggle("hidden", !attention.action);
+  if (attention.action) {
+    action.textContent = attention.action.label;
+    action.dataset.view = attention.action.view;
+  }
+}
+
+async function refreshContext({ enforceGate = true } = {}) {
+  try {
+    const context = await api("/workspace");
+    state.context = context;
+    setConnection(true);
+    if (enforceGate && context.required_view && context.required_view !== state.currentView) {
+      await navigate(context.required_view, { gate: true });
+      return;
+    }
+    renderChrome();
+  } catch (error) {
+    setConnection(false);
+    if (!state.context) throw error;
+  }
+}
+
+async function navigate(view, { replace = false, gate = false } = {}) {
+  if (!["plan", "review", "agents"].includes(view)) return;
+  if (state.planDirty && state.currentView === "plan" && view !== "plan" && !gate) {
+    announce("Save or discard the current plan draft before leaving.", true);
+    return;
+  }
+  state.currentView = view;
+  const url = `/sessions/${encodeURIComponent(sessionId)}/${view}`;
+  history[replace ? "replaceState" : "pushState"]({ view }, "", url);
+  window.scrollTo({ top: 0, behavior: "auto" });
+  renderChrome();
+  await loadView(view, true);
+}
+
+function planPayload() {
+  const model = state.planModel;
+  return {
+    base_revision: model.base_revision,
+    summary: model.summary.trim(),
+    tasks: model.tasks.map((task) => ({
+      id: task.id,
+      title: task.title.trim(),
+      description: task.description.trim(),
+      parent_id: task.parent_id || null,
+      dependencies: [...task.dependencies],
+      agent_role: task.agent_role || "coder",
+      inputs: [...task.inputs],
+      outputs: [...task.outputs],
+      expected_files: [...task.expected_files],
+      acceptance_criteria: [...task.acceptance_criteria],
+      tests: [...task.tests],
+      risk_level: task.risk_level || "medium",
+      required_tools: [...task.required_tools],
+      memory_dependencies: [...task.memory_dependencies],
+      retry_policy: { ...task.retry_policy },
+      approval_gate: Boolean(task.approval_gate),
+      constraints: [...task.constraints],
+      parallel: Boolean(task.parallel),
+      comments: [...task.comments],
+    })),
+    global_constraints: [...model.global_constraints],
+    protected_paths: [...model.protected_paths],
+    change_note: model.change_note || "Edited in Plan Studio",
+  };
+}
+
+function makePlanModel(snapshot) {
+  const source = snapshot.draft || snapshot;
+  const byId = new Map(snapshot.tasks.map((task) => [task.id, task]));
+  return {
+    base_revision: snapshot.revision,
+    summary: source.summary ?? snapshot.summary,
+    tasks: (source.tasks || snapshot.tasks).map((task) => ({
+      ...task,
+      status: byId.get(task.id)?.status || "pending",
+      parent_id: task.parent_id || null,
+      dependencies: [...(task.dependencies || [])],
+      inputs: [...(task.inputs || [])],
+      outputs: [...(task.outputs || [])],
+      expected_files: [...(task.expected_files || [])],
+      acceptance_criteria: [...(task.acceptance_criteria || ["Requested behavior is implemented."])],
+      tests: [...(task.tests || ["Run the relevant verification."])],
+      required_tools: [...(task.required_tools || [])],
+      memory_dependencies: [...(task.memory_dependencies || [])],
+      constraints: [...(task.constraints || [])],
+      comments: [...(task.comments || [])],
+      retry_policy: { max_retries: 2, backoff_seconds: 0, ...(task.retry_policy || {}) },
+    })),
+    global_constraints: [...(source.global_constraints || snapshot.global_constraints || [])],
+    protected_paths: [...(source.protected_paths || snapshot.protected_paths || [])],
+    change_note: source.change_note || "Edited in Plan Studio",
+  };
+}
+
+function planPhase(plan) {
+  if (plan.goal_status === "awaiting_plan_approval") return "Awaiting approval";
+  if (plan.goal_status === "completed") return "Completed";
+  return "Running";
+}
+
+function taskEditor(task, index) {
+  return `
+    <div class="task-editor" data-editor="${index}">
+      <div class="form-grid">
+        <div class="form-field">
+          <label for="task-${index}-title">Title</label>
+          <input id="task-${index}-title" data-task="${index}" data-field="title"
+                 value="${escapeHtml(task.title)}" maxlength="180">
+        </div>
+        <div class="form-field advanced-only">
+          <label for="task-${index}-id">Task ID</label>
+          <input id="task-${index}-id" data-task="${index}" data-field="id"
+                 value="${escapeHtml(task.id)}" maxlength="24">
+        </div>
+        <div class="form-field full">
+          <label for="task-${index}-description">What this task must do</label>
+          <textarea id="task-${index}-description" data-task="${index}" data-field="description">${escapeHtml(task.description)}</textarea>
+        </div>
+        <div class="form-field">
+          <label for="task-${index}-criteria">Acceptance criteria <small>(one per line)</small></label>
+          <textarea id="task-${index}-criteria" data-task="${index}" data-field="acceptance_criteria" data-list="true">${escapeHtml(lines(task.acceptance_criteria))}</textarea>
+        </div>
+        <div class="form-field">
+          <label for="task-${index}-tests">Verification <small>(one per line)</small></label>
+          <textarea id="task-${index}-tests" data-task="${index}" data-field="tests" data-list="true">${escapeHtml(lines(task.tests))}</textarea>
+        </div>
+      </div>
+      <details class="advanced-section advanced-only">
+        <summary>Scope and dependencies</summary>
+        <div class="form-grid">
+          <div class="form-field">
+            <label>Depends on <small>(task IDs, one per line)</small></label>
+            <textarea data-task="${index}" data-field="dependencies" data-list="true">${escapeHtml(lines(task.dependencies))}</textarea>
+          </div>
+          <div class="form-field">
+            <label>Expected files <small>(one per line)</small></label>
+            <textarea data-task="${index}" data-field="expected_files" data-list="true">${escapeHtml(lines(task.expected_files))}</textarea>
+          </div>
+          <div class="form-field">
+            <label>Inputs <small>(one per line)</small></label>
+            <textarea data-task="${index}" data-field="inputs" data-list="true">${escapeHtml(lines(task.inputs))}</textarea>
+          </div>
+          <div class="form-field">
+            <label>Outputs <small>(one per line)</small></label>
+            <textarea data-task="${index}" data-field="outputs" data-list="true">${escapeHtml(lines(task.outputs))}</textarea>
+          </div>
+        </div>
+      </details>
+      <details class="advanced-section advanced-only">
+        <summary>Agent and retry policy</summary>
+        <div class="form-grid">
+          <div class="form-field">
+            <label>Agent role</label>
+            <input data-task="${index}" data-field="agent_role" value="${escapeHtml(task.agent_role)}">
+          </div>
+          <div class="form-field">
+            <label>Risk level</label>
+            <select data-task="${index}" data-field="risk_level">
+              ${["low", "medium", "high", "critical"].map((value) =>
+                `<option value="${value}"${task.risk_level === value ? " selected" : ""}>${value}</option>`).join("")}
+            </select>
+          </div>
+          <div class="form-field">
+            <label>Max retries</label>
+            <input type="number" min="0" max="20" data-task="${index}"
+                   data-field="retry_policy.max_retries" value="${Number(task.retry_policy.max_retries)}">
+          </div>
+          <div class="form-field">
+            <label>Backoff seconds</label>
+            <input type="number" min="0" max="3600" data-task="${index}"
+                   data-field="retry_policy.backoff_seconds" value="${Number(task.retry_policy.backoff_seconds)}">
+          </div>
+        </div>
+      </details>
+      <div class="editor-actions">
+        <button class="quiet-button" data-action="cancel-task-edit" type="button">Close editor</button>
+        <button class="danger-button" data-action="delete-task" data-index="${index}" type="button">Remove task</button>
+      </div>
+    </div>`;
+}
+
+function renderPlan() {
+  const plan = state.plan;
+  const model = state.planModel;
+  const canEdit = Boolean(plan.capabilities.can_edit);
+  const phase = planPhase(plan);
+  const active = plan.tasks.find((task) => ["in_progress", "verifying", "blocked"].includes(task.status));
+  const taskRows = model.tasks.map((task, index) => `
+    <li class="task-row">
+      <div class="task-main">
+        <span class="task-order">${String(index + 1).padStart(2, "0")}</span>
+        <div class="task-copy">
+          <h4>${escapeHtml(task.title)}</h4>
+          <p>${escapeHtml(task.description || "No description yet.")}</p>
+          <div class="meta-line">
+            <span>${escapeHtml(task.id)}</span>
+            ${task.dependencies.length ? `<span>After ${escapeHtml(task.dependencies.join(", "))}</span>` : "<span>No dependencies</span>"}
+          </div>
+        </div>
+        <div class="row-actions">
+          ${badge(task.status)}
+          ${canEdit ? `
+            <button class="quiet-button" data-action="move-task-up" data-index="${index}"
+                    data-help="Moves priority earlier. Dependencies still control when it can run."
+                    type="button"${index === 0 ? " disabled" : ""}>Up</button>
+            <button class="quiet-button" data-action="move-task-down" data-index="${index}"
+                    data-help="Moves priority later. Dependencies remain authoritative."
+                    type="button"${index === model.tasks.length - 1 ? " disabled" : ""}>Down</button>
+            <button class="quiet-button" data-action="edit-task" data-index="${index}" type="button">
+              ${state.editingTask === index ? "Close" : "Edit"}
+            </button>` : ""}
+        </div>
+      </div>
+      ${state.editingTask === index ? taskEditor(task, index) : ""}
+      <div class="advanced-only">
+        <details class="advanced-section">
+          <summary>Task contract</summary>
+          <div class="meta-line">
+            <span>Role: ${escapeHtml(task.agent_role)}</span>
+            <span>Risk: ${escapeHtml(task.risk_level)}</span>
+            <span>Retries: ${Number(task.retry_policy.max_retries)}</span>
+            <span>Expected: ${escapeHtml(task.expected_files.join(", ") || "resolved during execution")}</span>
+          </div>
+        </details>
+      </div>
+    </li>`).join("");
+
+  $("#viewRoot").innerHTML = `
+    <header class="view-head">
+      <div>
+        <p class="eyebrow">${escapeHtml(phase)}</p>
+        <h2>Plan</h2>
+        <p>Revision ${plan.revision} · ${model.tasks.length} tasks · ${escapeHtml(plan.session_mode)} mode</p>
+      </div>
+      ${badge(plan.status)}
+    </header>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h3>Outcome</h3>
+          <p>The exact project objective and the execution outline.</p>
+        </div>
+        ${canEdit && !state.editingSummary
+          ? `<button class="quiet-button" data-action="edit-summary" type="button">Edit</button>`
+          : ""}
+      </div>
+      ${state.editingSummary ? `
+        <div class="inline-edit">
+          <textarea id="planSummary" aria-label="Plan summary">${escapeHtml(model.summary)}</textarea>
+          <div class="editor-actions">
+            <button class="quiet-button" data-action="cancel-summary" type="button">Cancel</button>
+            <button class="secondary-button" data-action="commit-summary" type="button">Keep in draft</button>
+          </div>
+        </div>` : `
+        <div class="editable-copy">
+          <div>
+            <p class="reading">${escapeHtml(model.summary)}</p>
+            <p class="subtle">${escapeHtml(plan.objective)}</p>
+          </div>
+        </div>`}
+    </section>
+
+    ${!canEdit && active ? `
+      <section class="section">
+        <div class="section-head"><div><h3>Current work</h3><p>This task is controlled by the harness and cannot be interrupted here.</p></div></div>
+        <div class="current-work">
+          <h4>${escapeHtml(active.title)}</h4>
+          <p>${escapeHtml(active.description)} · ${escapeHtml(statusLabel(active.status))}</p>
+        </div>
+      </section>` : ""}
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h3>${canEdit ? "Execution order" : "Plan tasks"}</h3>
+          <p>${canEdit
+            ? "Reordering changes priority only. Dependencies still decide when a task becomes ready."
+            : "Statuses are read-only and updated only by the workflow harness."}</p>
+        </div>
+        ${canEdit ? `<button class="secondary-button" data-action="add-task" type="button">Add task</button>` : ""}
+      </div>
+      <ol class="task-list">${taskRows}</ol>
+    </section>
+
+    ${canEdit ? `
+      <section class="section advanced-only">
+        <div class="section-head"><div><h3>Plan boundaries</h3><p>These constraints are included with every task in this revision.</p></div></div>
+        <div class="form-grid">
+          <div class="form-field">
+            <label for="globalConstraints">Global constraints <small>(one per line)</small></label>
+            <textarea id="globalConstraints" data-plan-field="global_constraints">${escapeHtml(lines(model.global_constraints))}</textarea>
+          </div>
+          <div class="form-field">
+            <label for="protectedPaths">Protected files and directories <small>(one per line)</small></label>
+            <textarea id="protectedPaths" data-plan-field="protected_paths">${escapeHtml(lines(model.protected_paths))}</textarea>
+          </div>
+        </div>
+      </section>` : ""}
+
+    ${plan.capabilities.can_manage_queue ? renderQueue(plan.queue) : ""}
+
+    ${(canEdit || plan.capabilities.can_approve) ? `
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <h3>Save or start</h3>
+            <p>${plan.session_mode === "ultra"
+              ? "This Ultra plan is orchestrator-governed and read-only here. Approval starts the bounded workflow."
+              : plan.session_mode === "plan"
+              ? "Plan mode can save a revision. Switch to Normal or Ultra before execution."
+              : "Saving a revision never starts work. Approval is always explicit."}</p>
+          </div>
+          <div class="section-actions">
+            ${canEdit ? `<button class="quiet-button" data-action="save-draft"
+                    data-help="Creates a draft only. Nothing will run yet." type="button">Save draft</button>
+            <button class="secondary-button" data-action="save-revision"
+                    data-help="Creates a new pending revision. It is not approved." type="button">Save revision</button>` : ""}
+            ${plan.capabilities.can_approve ? `
+              <button class="primary-button" data-action="prepare-approval" type="button">
+                ${state.planDirty ? "Save revision & approve" : "Approve & start"}
+              </button>` : ""}
+          </div>
+        </div>
+        ${state.planConfirm ? `
+          <div class="confirm-panel" role="alert">
+            <p>${state.planDirty
+              ? "A new revision will be saved, then approved once. Execution will continue autonomously within this scope."
+              : `Plan r${plan.revision} will be approved once and execution will start.`}</p>
+            <div class="section-actions">
+              <button class="quiet-button" data-action="cancel-approval" type="button">Not yet</button>
+              <button class="primary-button" data-action="confirm-approval" type="button">Confirm and start</button>
+            </div>
+          </div>` : ""}
+      </section>` : ""}
+  `;
+  bindPlan();
+  autoGrow();
+}
+
+function renderQueue(queue) {
+  const items = queue?.items || [];
+  const pendingIds = items.filter((item) => item.status === "pending").map((item) => item.id);
+  return `
+    <section class="section" id="promptQueue">
+      <div class="section-head">
+        <div>
+          <h3>Up next</h3>
+          <p>Add requests without interrupting current work. Only waiting requests can move.</p>
+        </div>
+        <span class="subtle">${items.length} of ${queue?.capacity || 10}</span>
+      </div>
+      ${items.length ? `<ol class="queue-list">
+        ${items.map((item) => {
+          const pendingIndex = pendingIds.indexOf(item.id);
+          return `
+          <li class="queue-row" data-prompt-id="${escapeHtml(item.id)}"
+              draggable="${item.status === "pending"}">
+            <div class="queue-main">
+              <span class="drag-handle" aria-hidden="true">${item.status === "pending" ? "⠿" : "•"}</span>
+              <div class="queue-copy">
+                <h4>${escapeHtml(item.text)}</h4>
+                <p>${escapeHtml(item.mode)} mode · ${escapeHtml(statusLabel(item.status))}</p>
+              </div>
+              <div class="row-actions">
+                ${badge(item.status)}
+                ${item.status === "pending" ? `
+                  <button class="quiet-button" data-action="queue-up" data-id="${escapeHtml(item.id)}"
+                          data-help="Moves this waiting request earlier. Current work will not be interrupted."
+                          type="button"${pendingIndex === 0 ? " disabled" : ""}>Up</button>
+                  <button class="quiet-button" data-action="queue-down" data-id="${escapeHtml(item.id)}"
+                          data-help="Moves this waiting request later. Current work will not be interrupted."
+                          type="button"${pendingIndex === pendingIds.length - 1 ? " disabled" : ""}>Down</button>` : ""}
+              </div>
+            </div>
+          </li>`;
+        }).join("")}
+      </ol>` : `<p class="empty-state">No waiting requests. The current project can finish without another instruction.</p>`}
+      <div class="queue-compose">
+        <textarea id="queuePrompt" placeholder="Add a request for after the current work"
+                  aria-label="New queued request"></textarea>
+        <button class="secondary-button" data-action="enqueue" type="button">Add request</button>
+      </div>
+      <p class="subtle">Ctrl/Cmd + Enter adds the request. It inherits the current workflow mode.</p>
+    </section>`;
+}
+
+function markPlanDirty() {
+  state.planDirty = true;
+  state.planConfirm = false;
+}
+
+function bindPlan() {
+  $$("[data-action]", $("#viewRoot")).forEach((button) => button.addEventListener("click", handlePlanAction));
+  $$("[data-task]", $("#viewRoot")).forEach((input) => {
+    input.addEventListener("input", () => {
+      const task = state.planModel.tasks[Number(input.dataset.task)];
+      const field = input.dataset.field;
+      let value = input.dataset.list === "true" ? parseLines(input.value) : input.value;
+      if (field.startsWith("retry_policy.")) {
+        task.retry_policy[field.split(".")[1]] = Number(value);
+      } else {
+        task[field] = value;
+      }
+      markPlanDirty();
+      if (input.tagName === "TEXTAREA") autoGrow(input);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (input.tagName === "INPUT" && event.key === "Enter") {
+        event.preventDefault();
+        input.blur();
+        announce("Kept in the local draft. Running work was not changed.");
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        state.editingTask = null;
+        state.planModel = makePlanModel(state.plan);
+        state.planDirty = false;
+        renderPlan();
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
+        saveDraft();
+      }
+    });
+  });
+  $$("[data-plan-field]", $("#viewRoot")).forEach((area) => {
+    area.addEventListener("input", () => {
+      state.planModel[area.dataset.planField] = parseLines(area.value);
+      markPlanDirty();
+      autoGrow(area);
+    });
+  });
+  const summary = $("#planSummary");
+  if (summary) {
+    summary.addEventListener("input", () => autoGrow(summary));
+    summary.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        state.editingSummary = false;
+        renderPlan();
+      } else if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
+        state.planModel.summary = summary.value;
+        markPlanDirty();
+        saveDraft();
+      }
+    });
+  }
+  bindQueue();
+}
+
+async function handlePlanAction(event) {
+  const action = event.currentTarget.dataset.action;
+  const index = Number(event.currentTarget.dataset.index);
+  if (action === "enqueue") return enqueuePrompt();
+  if (action === "queue-up") return handleQueueMove(event.currentTarget.dataset.id, -1);
+  if (action === "queue-down") return handleQueueMove(event.currentTarget.dataset.id, 1);
+  if (action === "edit-summary") state.editingSummary = true;
+  if (action === "cancel-summary") state.editingSummary = false;
+  if (action === "commit-summary") {
+    state.planModel.summary = $("#planSummary").value;
+    state.editingSummary = false;
+    markPlanDirty();
+    announce("Kept in the draft. Running work was not changed.");
+  }
+  if (action === "edit-task") state.editingTask = state.editingTask === index ? null : index;
+  if (action === "cancel-task-edit") state.editingTask = null;
+  if (action === "move-task-up" && index > 0) {
+    [state.planModel.tasks[index - 1], state.planModel.tasks[index]] =
+      [state.planModel.tasks[index], state.planModel.tasks[index - 1]];
+    markPlanDirty();
+  }
+  if (action === "move-task-down" && index < state.planModel.tasks.length - 1) {
+    [state.planModel.tasks[index + 1], state.planModel.tasks[index]] =
+      [state.planModel.tasks[index], state.planModel.tasks[index + 1]];
+    markPlanDirty();
+  }
+  if (action === "add-task") {
+    const used = new Set(state.planModel.tasks.map((task) => task.id));
+    let number = state.planModel.tasks.length + 1;
+    while (used.has(`T${String(number).padStart(3, "0")}`)) number += 1;
+    state.planModel.tasks.push({
+      id: `T${String(number).padStart(3, "0")}`,
+      title: "New task",
+      description: "Describe the required outcome.",
+      status: "pending",
+      parent_id: null,
+      dependencies: [],
+      agent_role: "coder",
+      inputs: [],
+      outputs: [],
+      expected_files: [],
+      acceptance_criteria: ["The requested outcome is implemented."],
+      tests: ["Run the relevant verification."],
+      risk_level: "medium",
+      required_tools: [],
+      memory_dependencies: [],
+      retry_policy: { max_retries: 2, backoff_seconds: 0 },
+      approval_gate: false,
+      constraints: [],
+      parallel: false,
+      comments: [],
+    });
+    state.editingTask = state.planModel.tasks.length - 1;
+    markPlanDirty();
+  }
+  if (action === "delete-task" && state.planModel.tasks.length > 1) {
+    state.planModel.tasks.splice(index, 1);
+    state.editingTask = null;
+    markPlanDirty();
+  }
+  if (action === "save-draft") return saveDraft();
+  if (action === "save-revision") return saveRevision();
+  if (action === "prepare-approval") state.planConfirm = true;
+  if (action === "cancel-approval") state.planConfirm = false;
+  if (action === "confirm-approval") return confirmApproval();
+  renderPlan();
+}
+
+async function saveDraft() {
+  try {
+    setBusy(true);
+    await api("/plan/draft", { method: "POST", body: JSON.stringify(planPayload()) });
+    state.planDirty = false;
+    announce("Saved to draft — running work was not changed.");
+  } catch (error) {
+    announce(error.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function saveRevision() {
+  try {
+    setBusy(true);
+    const result = await api("/plan/revision", { method: "POST", body: JSON.stringify(planPayload()) });
+    state.planDirty = false;
+    state.editingTask = null;
+    state.editingSummary = false;
+    announce(`Revision ${result.revision} saved. Nothing is running yet.`);
+    await loadView("plan", true);
+    return result;
+  } catch (error) {
+    announce(error.message, true);
+    throw error;
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function confirmApproval() {
+  try {
+    setBusy(true);
+    let revision = state.plan.revision;
+    if (state.planDirty) {
+      const result = await api("/plan/revision", { method: "POST", body: JSON.stringify(planPayload()) });
+      revision = result.revision;
+    }
+    await api("/plan/approve", {
+      method: "POST",
+      body: JSON.stringify({ revision }),
+    });
+    state.planDirty = false;
+    state.planConfirm = false;
+    announce(`Plan r${revision} approved. Execution has started.`);
+    await refreshContext({ enforceGate: false });
+    await loadView("plan", true);
+  } catch (error) {
+    announce(error.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function pendingQueueIds() {
+  return (state.plan?.queue?.items || []).filter((item) => item.status === "pending").map((item) => item.id);
+}
+
+async function persistQueue(ids) {
+  try {
+    setBusy(true);
+    const result = await api("/queue/order", {
+      method: "PATCH",
+      body: JSON.stringify({ ordered_ids: ids }),
+    });
+    state.plan.queue = result.queue;
+    announce("Waiting requests reordered. Current work was not interrupted.");
+    renderPlan();
+  } catch (error) {
+    announce(error.message, true);
+    await loadView("plan", true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function bindQueue() {
+  const prompt = $("#queuePrompt");
+  if (prompt) {
+    prompt.addEventListener("input", () => autoGrow(prompt));
+    prompt.addEventListener("keydown", (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
+        enqueuePrompt();
+      }
+    });
+  }
+  $$(".queue-row[draggable='true']").forEach((row) => {
+    row.addEventListener("dragstart", () => {
+      state.draggedPromptId = row.dataset.promptId;
+      row.classList.add("dragging");
+    });
+    row.addEventListener("dragend", () => {
+      row.classList.remove("dragging");
+      $$(".queue-row").forEach((item) => item.classList.remove("drag-over"));
+    });
+    row.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      row.classList.add("drag-over");
+    });
+    row.addEventListener("dragleave", () => row.classList.remove("drag-over"));
+    row.addEventListener("drop", (event) => {
+      event.preventDefault();
+      const target = row.dataset.promptId;
+      const ids = pendingQueueIds();
+      const from = ids.indexOf(state.draggedPromptId);
+      const to = ids.indexOf(target);
+      if (from >= 0 && to >= 0 && from !== to) {
+        const [moved] = ids.splice(from, 1);
+        ids.splice(to, 0, moved);
+        persistQueue(ids);
+      }
+    });
+  });
+}
+
+async function enqueuePrompt() {
+  const prompt = $("#queuePrompt");
+  const text = prompt?.value.trim();
+  if (!text) return announce("Write a request before adding it.", true);
+  try {
+    setBusy(true);
+    const result = await api("/queue", { method: "POST", body: JSON.stringify({ text }) });
+    state.plan.queue = result.queue;
+    announce("Request added to Up next.");
+    renderPlan();
+  } catch (error) {
+    announce(error.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function handleQueueMove(id, direction) {
+  const ids = pendingQueueIds();
+  const index = ids.indexOf(id);
+  const target = index + direction;
+  if (index < 0 || target < 0 || target >= ids.length) return;
+  [ids[index], ids[target]] = [ids[target], ids[index]];
+  await persistQueue(ids);
+}
+
+function decisionForFile(file) {
+  const direct = state.reviewDecisions.get(`file:${file.path}`);
+  if (direct) return direct;
+  const hunks = file.hunks || [];
+  if (hunks.length && hunks.every((hunk) => state.reviewDecisions.has(`hunk:${file.path}:${hunk.id}`))) {
+    return { decision: "resolved_by_hunks" };
+  }
+  return null;
+}
+
+function reviewedCount() {
+  return (state.review?.files || []).filter((file) => decisionForFile(file)).length;
+}
+
+function renderReview() {
+  const review = state.review;
+  const reviewed = reviewedCount();
+  const total = review.files.length;
+  const files = review.files.map((file) => {
+    const fileDecision = state.reviewDecisions.get(`file:${file.path}`);
+    const expanded = state.reviewExpanded.has(file.path);
+    return `
+      <li class="file-row">
+        <div class="file-summary">
+          <div class="file-copy">
+            <h4>${escapeHtml(file.path)}</h4>
+            <p>${escapeHtml(file.reason)} · +${file.additions} −${file.deletions}</p>
+          </div>
+          <div class="decision-group">
+            <button class="decision-button accept ${fileDecision?.decision === "accepted" ? "selected" : ""}"
+                    data-review="accept-file" data-file="${escapeHtml(file.path)}" type="button">Looks good</button>
+            <button class="decision-button change ${fileDecision?.decision === "changes_requested" ? "selected" : ""}"
+                    data-review="change-file" data-file="${escapeHtml(file.path)}" type="button">Request changes</button>
+            <button class="quiet-button" data-review="toggle-file" data-file="${escapeHtml(file.path)}"
+                    type="button" aria-expanded="${expanded}">${expanded ? "Hide" : "Details"}</button>
+          </div>
+        </div>
+        ${expanded ? `
+          <div class="file-details">
+            <dl class="file-facts">
+              <div class="fact"><dt>Why it changed</dt><dd>${escapeHtml(file.reason)}</dd></div>
+              <div class="fact"><dt>Verification</dt><dd>${escapeHtml(typeof file.tests === "string" ? file.tests : JSON.stringify(file.tests || "Not recorded"))}</dd></div>
+              <div class="fact"><dt>Responsible work</dt><dd>${escapeHtml(file.task || "Workflow")}</dd></div>
+            </dl>
+            <button class="quiet-button" data-review="comment-file" data-file="${escapeHtml(file.path)}" type="button">Add comment</button>
+            <div class="advanced-only">
+              ${(file.hunks || []).map((hunk) => {
+                const key = `hunk:${file.path}:${hunk.id}`;
+                const choice = state.reviewDecisions.get(key);
+                return `
+                  <details class="advanced-section">
+                    <summary>${escapeHtml(hunk.header)}</summary>
+                    <div class="decision-group">
+                      <button class="decision-button accept ${choice?.decision === "accepted" ? "selected" : ""}"
+                              data-review="accept-hunk" data-file="${escapeHtml(file.path)}"
+                              data-hunk="${escapeHtml(hunk.id)}" type="button">Accept hunk</button>
+                      <button class="decision-button change ${choice?.decision === "changes_requested" ? "selected" : ""}"
+                              data-review="change-hunk" data-file="${escapeHtml(file.path)}"
+                              data-hunk="${escapeHtml(hunk.id)}" type="button">Request hunk change</button>
+                    </div>
+                    <pre>${escapeHtml(hunk.content)}</pre>
+                  </details>`;
+              }).join("")}
+              ${file.diff ? `<details class="advanced-section"><summary>Raw diff</summary><pre>${escapeHtml(file.diff)}</pre></details>` : ""}
+            </div>
+          </div>` : ""}
+      </li>`;
+  }).join("");
+  const changes = [...state.reviewDecisions.values()].filter((item) =>
+    ["changes_requested", "rejected"].includes(item.decision)).length;
+
+  $("#viewRoot").innerHTML = `
+    <header class="view-head">
+      <div>
+        <p class="eyebrow">What you are reviewing</p>
+        <h2>Recorded changes</h2>
+        <p>Checkpoint ${escapeHtml(review.checkpoint_id)} · Plan r${review.plan_revision}</p>
+      </div>
+      ${badge(review.checkpoint_status)}
+    </header>
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h3>Decide every file</h3>
+          <p>Looks good continues execution. Request changes sends precise feedback to a fixer.</p>
+        </div>
+        <span class="review-progress">${reviewed} of ${total} files reviewed</span>
+      </div>
+      <ul class="file-list">${files}</ul>
+    </section>
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h3>What happens after submit</h3>
+          <p>${changes
+            ? "A fixer will start for the requested changes. Accepted work is preserved unless a fix makes a related edit unavoidable."
+            : "Once every file is approved, the harness continues to the next execution or verification step."}</p>
+        </div>
+        <button class="primary-button" data-review="prepare-submit" type="button"
+                ${reviewed !== total || total === 0 ? "disabled" : ""}>Submit review</button>
+      </div>
+      ${state.reviewConfirm ? `
+        <div class="confirm-panel" role="alert">
+          <p>${changes
+            ? `${changes} change request(s) will start a fixer.`
+            : "All files are resolved. Execution will continue after submission."}</p>
+          <div class="section-actions">
+            <button class="quiet-button" data-review="cancel-submit" type="button">Go back</button>
+            <button class="primary-button" data-review="confirm-submit" type="button">Confirm submit</button>
+          </div>
+        </div>` : ""}
+    </section>`;
+  $$("[data-review]").forEach((button) => button.addEventListener("click", handleReviewAction));
+}
+
+function removeHunkDecisions(filePath) {
+  [...state.reviewDecisions.keys()].filter((key) => key.startsWith(`hunk:${filePath}:`))
+    .forEach((key) => state.reviewDecisions.delete(key));
+}
+
+function openDecisionDrawer({ filePath, hunkId = null }) {
+  openDrawer({
+    eyebrow: "Request changes",
+    title: hunkId ? "What should change in this hunk?" : `What should change in ${filePath}?`,
+    body: `
+      <div class="form-field">
+        <label for="changeReason">Required feedback</label>
+        <textarea id="changeReason" placeholder="Describe the expected correction and why it matters."></textarea>
+      </div>
+      <div class="editor-actions">
+        <button class="primary-button" id="saveChangeRequest" type="button">Save change request</button>
+      </div>`,
+    onReady: () => {
+      const area = $("#changeReason");
+      autoGrow(area);
+      area.addEventListener("input", () => autoGrow(area));
+      $("#saveChangeRequest").addEventListener("click", () => {
+        const reason = area.value.trim();
+        if (!reason) return announce("A change request needs a reason.", true);
+        if (hunkId) {
+          state.reviewDecisions.delete(`file:${filePath}`);
+          state.reviewDecisions.set(`hunk:${filePath}:${hunkId}`, {
+            target_type: "hunk", file_path: filePath, hunk_id: hunkId,
+            decision: "changes_requested", reason,
+          });
+        } else {
+          removeHunkDecisions(filePath);
+          state.reviewDecisions.set(`file:${filePath}`, {
+            target_type: "file", file_path: filePath, hunk_id: null,
+            decision: "changes_requested", reason,
+          });
+        }
+        closeDrawer();
+        state.reviewConfirm = false;
+        renderReview();
+      });
+      area.focus();
+    },
+  });
+}
+
+function openCommentDrawer(filePath) {
+  openDrawer({
+    eyebrow: "Review note",
+    title: `Add a comment to ${filePath}`,
+    body: `
+      <div class="form-field">
+        <label for="reviewComment">Comment</label>
+        <textarea id="reviewComment" placeholder="Add context for the next agent or reviewer."></textarea>
+      </div>
+      <div class="editor-actions">
+        <button class="primary-button" id="saveReviewComment" type="button">Add comment</button>
+      </div>`,
+    onReady: () => {
+      const area = $("#reviewComment");
+      autoGrow(area);
+      area.addEventListener("input", () => autoGrow(area));
+      $("#saveReviewComment").addEventListener("click", () => {
+        const body = area.value.trim();
+        if (!body) return announce("Write a comment first.", true);
+        state.reviewComments.push({ file_path: filePath, hunk_id: null, line: null, body });
+        closeDrawer();
+        announce("Comment added to this review.");
+      });
+      area.focus();
+    },
+  });
+}
+
+async function handleReviewAction(event) {
+  const action = event.currentTarget.dataset.review;
+  const filePath = event.currentTarget.dataset.file;
+  const hunkId = event.currentTarget.dataset.hunk || null;
+  if (action === "toggle-file") {
+    state.reviewExpanded.has(filePath) ? state.reviewExpanded.delete(filePath) : state.reviewExpanded.add(filePath);
+  }
+  if (action === "accept-file") {
+    removeHunkDecisions(filePath);
+    state.reviewDecisions.set(`file:${filePath}`, {
+      target_type: "file", file_path: filePath, hunk_id: null, decision: "accepted", reason: "",
+    });
+    state.reviewConfirm = false;
+  }
+  if (action === "change-file") return openDecisionDrawer({ filePath });
+  if (action === "comment-file") return openCommentDrawer(filePath);
+  if (action === "accept-hunk") {
+    state.reviewDecisions.delete(`file:${filePath}`);
+    state.reviewDecisions.set(`hunk:${filePath}:${hunkId}`, {
+      target_type: "hunk", file_path: filePath, hunk_id: hunkId, decision: "accepted", reason: "",
+    });
+    state.reviewConfirm = false;
+  }
+  if (action === "change-hunk") return openDecisionDrawer({ filePath, hunkId });
+  if (action === "prepare-submit") state.reviewConfirm = true;
+  if (action === "cancel-submit") state.reviewConfirm = false;
+  if (action === "confirm-submit") return submitReview();
+  renderReview();
+}
+
+async function submitReview() {
+  try {
+    setBusy(true);
+    const result = await api("/review/submit", {
+      method: "POST",
+      body: JSON.stringify({
+        checkpoint_id: state.review.checkpoint_id,
+        decisions: [...state.reviewDecisions.values()],
+        comments: state.reviewComments,
+        summary: "Reviewed in the local workspace.",
+      }),
+    });
+    announce(result.fixer_started ? "Review submitted. A fixer has started." : "Review submitted. Execution can continue.");
+    state.reviewConfirm = false;
+    await refreshContext({ enforceGate: false });
+    await loadView("review", true);
+  } catch (error) {
+    announce(error.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function renderAgents() {
+  const data = state.agents;
+  const activeAgent = data.agents.find((agent) => ["running", "queued"].includes(agent.status));
+  const nextNode = data.nodes.find((node) => ["ready", "pending"].includes(node.status));
+  const blockers = [
+    ...data.nodes.filter((node) => node.blocked).map((node) => node.title),
+    ...data.agents.flatMap((agent) => agent.blockers || []),
+  ];
+  const phase = activeAgent?.phase || data.core.status;
+  $("#viewRoot").innerHTML = `
+    <header class="view-head">
+      <div>
+        <p class="eyebrow">Optional live view</p>
+        <h2>Execution</h2>
+        <p>Read-only operational state · Plan r${data.plan_revision || "—"}</p>
+      </div>
+      ${badge(data.core.status)}
+    </header>
+    <dl class="execution-summary">
+      <div class="fact"><dt>Current phase</dt><dd>${escapeHtml(statusLabel(phase))}</dd></div>
+      <div class="fact"><dt>Active work</dt><dd>${escapeHtml(activeAgent?.task || "No active task")}</dd></div>
+      <div class="fact"><dt>Next work</dt><dd>${escapeHtml(nextNode?.title || "Determined by the harness")}</dd></div>
+      <div class="fact"><dt>Your attention</dt><dd>${blockers.length ? "Needed for a blocker" : "Not required"}</dd></div>
+    </dl>
+    <section class="section">
+      <div class="section-head"><div><h3>Work map</h3><p>Tasks and authoritative phase changes. Percentages appear only when reported by the runtime.</p></div></div>
+      ${data.nodes.length ? `<ul class="node-list">${data.nodes.map((node) => `
+        <li class="node-row">
+          <div class="node-main">
+            <div class="node-copy">
+              <h4>${escapeHtml(node.title)}</h4>
+              <p>${escapeHtml(node.assigned_role || "Harness assigned")} · ${node.dependencies.length ? `After ${escapeHtml(node.dependencies.join(", "))}` : "No dependencies"}</p>
+            </div>
+            ${badge(node.status)}
+          </div>
+        </li>`).join("")}</ul>` : `<p class="empty-state">No Ultra work nodes are active. Normal execution remains visible in the Plan view.</p>`}
+    </section>
+    <section class="section">
+      <div class="section-head"><div><h3>Active agents</h3><p>Open Advanced for IDs, logs, memory, tool use, and raw results.</p></div></div>
+      ${data.agents.length ? `<ul class="agent-list">${data.agents.map((agent) => `
+        <li class="agent-row">
+          <div class="agent-main">
+            <i class="activity-dot ${agent.status === "running" ? "live" : ""}" aria-hidden="true"></i>
+            <div class="agent-copy">
+              <h4>${escapeHtml(agent.name)}</h4>
+              <p>${escapeHtml(agent.task)} · ${escapeHtml(statusLabel(agent.phase || agent.status))}
+                ${agent.progress === null ? " · activity reported without an authoritative percentage" : ` · ${agent.progress}% authoritative`}</p>
+            </div>
+            <div class="row-actions">
+              ${badge(agent.status)}
+              <button class="quiet-button" data-agent-explain="${escapeHtml(agent.id)}" type="button">Ask for explanation</button>
+            </div>
+          </div>
+          <div class="technical-grid advanced-only">
+            <dl class="fact"><dt>Agent run ID</dt><dd>${escapeHtml(agent.id)}</dd></dl>
+            <dl class="fact"><dt>Current file</dt><dd>${escapeHtml(agent.current_file || "None")}</dd></dl>
+            <dl class="fact"><dt>Retries</dt><dd>${agent.retries}</dd></dl>
+            <dl class="fact"><dt>Tools</dt><dd>${escapeHtml((agent.tools || []).join(", ") || "None recorded")}</dd></dl>
+            <dl class="fact"><dt>Recent logs</dt><dd>${escapeHtml((agent.logs || []).map((log) => log.summary).join(" · ") || "No logs")}</dd></dl>
+            <dl class="fact"><dt>Memory entries</dt><dd>${escapeHtml((agent.memory || []).map((item) => item.title).join(", ") || "None")}</dd></dl>
+          </div>
+        </li>`).join("")}</ul>` : `<p class="empty-state">No delegated agents are running.</p>`}
+    </section>
+    ${blockers.length ? `
+      <section class="section"><div class="section-head"><div><h3>Blockers</h3><p>${escapeHtml(blockers.join(" · "))}</p></div></div></section>` : ""}`;
+  $$("[data-agent-explain]").forEach((button) => button.addEventListener("click", () =>
+    openExplanationDrawer(button.dataset.agentExplain)));
+}
+
+function openExplanationDrawer(agentId) {
+  openDrawer({
+    eyebrow: "Ask the running agent",
+    title: "Request an explanation",
+    body: `
+      <p class="muted">This question is posted to the selected agent's durable inbox. Its response appears when the workflow processes that message.</p>
+      <div class="form-field">
+        <label for="agentQuestion">Question</label>
+        <textarea id="agentQuestion">Explain your current work and any blockers.</textarea>
+      </div>
+      <div class="editor-actions">
+        <button class="primary-button" id="sendAgentQuestion" type="button">Send question</button>
+      </div>`,
+    onReady: () => {
+      const area = $("#agentQuestion");
+      autoGrow(area);
+      area.addEventListener("input", () => autoGrow(area));
+      $("#sendAgentQuestion").addEventListener("click", async () => {
+        const question = area.value.trim();
+        if (!question) return announce("Write a question first.", true);
+        try {
+          setBusy(true);
+          await api("/agents/explain", {
+            method: "POST",
+            body: JSON.stringify({ agent_id: agentId, question }),
+          });
+          closeDrawer();
+          announce("Question sent to the agent's durable inbox.");
+        } catch (error) {
+          announce(error.message, true);
+        } finally {
+          setBusy(false);
+        }
+      });
+      area.focus();
+    },
+  });
+}
+
+function openDrawer({ eyebrow, title, body, onReady }) {
+  $("#drawerEyebrow").textContent = eyebrow;
+  $("#drawerTitle").textContent = title;
+  $("#drawerBody").innerHTML = body;
+  $("#drawer").classList.remove("hidden");
+  $("#drawerBackdrop").classList.remove("hidden");
+  document.body.classList.add("drawer-open");
+  onReady?.();
+}
+
+function closeDrawer() {
+  $("#drawer").classList.add("hidden");
+  $("#drawerBackdrop").classList.add("hidden");
+  document.body.classList.remove("drawer-open");
+}
+
+async function loadView(view, force = false) {
+  if (state.busy && !force) return;
+  $("#errorState").classList.add("hidden");
+  $("#loading").classList.remove("hidden");
+  $("#viewRoot").classList.add("hidden");
+  try {
+    if (view === "plan") {
+      const snapshot = await api("/plan");
+      state.plan = snapshot;
+      if (!state.planDirty || force) {
+        state.planModel = makePlanModel(snapshot);
+        state.planDirty = Boolean(snapshot.draft);
+      }
+      renderPlan();
+    } else if (view === "review") {
+      state.review = await api("/review");
+      state.reviewDecisions = new Map();
+      state.reviewComments = [];
+      state.reviewConfirm = false;
+      renderReview();
+    } else {
+      state.agents = await api("/agents");
+      renderAgents();
+    }
+    $("#loading").classList.add("hidden");
+    $("#viewRoot").classList.remove("hidden");
+    $("#workspace").focus({ preventScroll: true });
+    setConnection(true);
+  } catch (error) {
+    if (error.status === 404 && view !== "plan") {
+      $("#loading").classList.add("hidden");
+      $("#viewRoot").classList.remove("hidden");
+      $("#viewRoot").innerHTML = `
+        <header class="view-head"><div><p class="eyebrow">${view === "review" ? "No review gate" : "No execution map"}</p>
+        <h2>${view === "review" ? "Review" : "Execution"}</h2></div></header>
+        <p class="empty-state">${escapeHtml(error.message)}. Nothing is required from you on this page.</p>`;
+    } else {
+      showError(error);
+    }
+  } finally {
+    $("#app").setAttribute("aria-busy", "false");
+  }
+}
+
+function wireGlobalEvents() {
+  $("#simpleMode").addEventListener("click", () => {
+    state.detail = "simple";
+    localStorage.setItem("ga3bad-detail", state.detail);
+    renderChrome();
+  });
+  $("#advancedMode").addEventListener("click", () => {
+    state.detail = "advanced";
+    localStorage.setItem("ga3bad-detail", state.detail);
+    renderChrome();
+  });
+  $$(".nav-button").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.view)));
+  $("#attentionAction").addEventListener("click", () => navigate($("#attentionAction").dataset.view));
+  $("#refreshButton").addEventListener("click", async () => {
+    await refreshContext({ enforceGate: true });
+    await loadView(state.currentView, true);
+    announce("Workspace refreshed.");
+  });
+  $("#drawerClose").addEventListener("click", closeDrawer);
+  $("#drawerBackdrop").addEventListener("click", closeDrawer);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !$("#drawer").classList.contains("hidden")) closeDrawer();
+  });
+  window.addEventListener("popstate", () => {
+    const view = location.pathname.split("/").filter(Boolean)[2] || "plan";
+    state.currentView = view;
+    renderChrome();
+    loadView(view, true);
+  });
+}
+
+async function boot() {
+  wireGlobalEvents();
+  renderChrome();
+  try {
+    await refreshContext({ enforceGate: false });
+    if (state.context.required_view) {
+      state.currentView = state.context.required_view;
+      history.replaceState({ view: state.currentView }, "", `/sessions/${sessionId}/${state.currentView}`);
+    }
+    renderChrome();
+    await loadView(state.currentView, true);
+    state.contextTimer = setInterval(async () => {
+      await refreshContext({ enforceGate: true });
+      const canRefreshView = state.currentView === "agents"
+        || (state.currentView === "plan" && !state.planDirty);
+      if (!state.busy && canRefreshView && document.visibilityState === "visible") {
+        await loadView(state.currentView, false);
+      }
+    }, 4000);
+  } catch (error) {
+    showError(error);
+  }
+}
+
+boot();

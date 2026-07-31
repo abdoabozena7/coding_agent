@@ -26,7 +26,13 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import context, tools
 from .commands import CommandKind, UserCommand
-from .chat_runtime import ChatIntentV1, corrective_prompt
+from .chat_runtime import (
+    ChatIntentV1,
+    RouteDecisionV1,
+    RouteKind,
+    corrective_prompt,
+    route_input as decide_input_route,
+)
 from .config import RuntimeConfig
 from .control import (
     CONTROL_NAMES,
@@ -52,6 +58,7 @@ from .intake import (
 )
 from .learning import GlobalLessonStore, LearnedLessonV1
 from .models import (
+    CompletionDisposition,
     Delegation,
     DelegationStatus,
     DomainError,
@@ -159,6 +166,8 @@ class SliceResult:
     steps: int = 0
     completed: bool = False
     needs_user: bool = False
+    disposition: str | None = None
+    limitations: tuple[str, ...] = ()
 
 
 def _tool_name(schema: Mapping[str, Any]) -> str:
@@ -440,6 +449,23 @@ class AgentRuntime:
                     GoalStatus.PAUSED,
                     reason="legacy accepted plan requires evidence-bound revision",
                 )
+        goal = self.store.load_active_goal(self.session_id)
+        if goal and goal.status is GoalStatus.AWAITING_PLAN_APPROVAL:
+            pending = self.store.get_latest_plan(goal.id)
+            if (
+                pending is not None
+                and pending.status is PlanStatus.PENDING_APPROVAL
+                and not goal.metadata.get("accepted_semantic_fingerprint")
+            ):
+                self.store.update_goal_metadata(
+                    goal.id,
+                    legacy_semantic_enrichment_required=True,
+                    waiting_question=(
+                        "This pending plan predates staged semantic acceptance. "
+                        "Approval will first create an inspected semantic-enriched "
+                        "revision for fresh review."
+                    ),
+                )
 
     @property
     def provider_name(self) -> str:
@@ -674,42 +700,59 @@ class AgentRuntime:
         )
 
     def start_ultra(self, objective: str) -> Any:
-        """Compatibility entry point for the unified engine's Ultra policy."""
+        """Start the Ultra foundation and checkpoint at questions/approval."""
 
         if self.active_goal() is not None:
             raise RuntimeStateError("finish or cancel the active goal before starting ULTRA")
-        return self.start_goal(
-            redact_text(objective, 20_000),
-            execution_mode=RunMode.ULTRA,
-            entry_surface="ultra",
-        )
+        # Lightweight/test providers without an explicit model and permission
+        # descriptor use the shared repository-grounded planner with Ultra
+        # depth policy. Fully configured CLI runs use the durable specialist
+        # scheduler below.
+        if self.model_descriptor is None or self.permission_adapter is None:
+            return self.start_goal(
+                redact_text(objective, 20_000),
+                execution_mode=RunMode.ULTRA,
+                entry_surface="ultra",
+            )
+        self.ultra_session = self._make_ultra_session()
+        return self.ultra_session.start(redact_text(objective, 20_000))
 
     def retry_ultra_foundation(self) -> Any:
-        """Compatibility entry point for retrying unified Ultra planning."""
+        """Retry a failed pre-approval Ultra foundation without duplication."""
 
         goal = self.active_goal()
         if goal is None:
-            raise RuntimeStateError("there is no unfinished Ultra planning pass to retry")
+            raise RuntimeStateError("there is no unfinished Ultra foundation to retry")
         if goal.active_plan_revision is not None:
-            raise RuntimeStateError("the unified goal already has a durable plan")
+            raise RuntimeStateError("the Ultra foundation already has a durable plan")
         if goal.status not in {GoalStatus.DISCOVERING, GoalStatus.PAUSED}:
             raise RuntimeStateError(
-                f"cannot retry Ultra planning while goal is {goal.status.value}"
+                f"cannot retry the Ultra foundation while goal is {goal.status.value}"
             )
+        if self.ultra_session is not None and self.ultra_session.running:
+            raise RuntimeStateError("pause ULTRA before retrying its foundation")
         if goal.status is GoalStatus.PAUSED:
             self.store.transition_goal(
                 goal.id,
                 GoalStatus.DISCOVERING,
                 reason="retrying unified Ultra planning",
             )
+        if self.model_descriptor is None or self.permission_adapter is None:
+            self.events.publish(
+                "planning.retry",
+                "Retrying the saved goal with Ultra reasoning depth.",
+                goal_id=goal.id,
+            )
+            return self.generate_plan(
+                "Retry the repository-grounded plan using Ultra reasoning depth."
+            )
+        self.ultra_session = self._make_ultra_session()
         self.events.publish(
-            "planning.retry",
-            "Retrying the saved goal with Ultra execution depth.",
+            "ultra.foundation_retry",
+            "Retrying the saved ULTRA foundation with a clean model request.",
             goal_id=goal.id,
         )
-        return self.generate_plan(
-            "Retry the repository-grounded plan using Ultra reasoning depth."
-        )
+        return self.ultra_session.restart_foundation(goal.id, goal.objective)
 
     def prepare_ultra_from_existing_goal(self) -> Any:
         """Raise reasoning depth without replacing the durable goal or plan."""
@@ -870,8 +913,10 @@ class AgentRuntime:
             complexity=dict(intake.get("complexity", {})),
             execution_brief=brief.to_dict(),
         )
-        # The execution brief is audit metadata only.  The exact user request
-        # remains the semantic source of truth for every mode.
+        # The execution brief is audit metadata only. The exact request remains
+        # the semantic source of truth for every mode.
+        if routed is RunMode.ULTRA:
+            return self.start_ultra(brief.original_input)
         return self.start_goal(
             brief.original_input,
             planning_only=routed is RunMode.PLAN,
@@ -956,6 +1001,23 @@ class AgentRuntime:
             decision.brief,
             entry_surface=entry_surface,
         )
+
+    def route_input(self, text: str) -> tuple[RouteDecisionV1, Any]:
+        """Route idle plain text through Chat, bounded action, or Goal."""
+
+        decision = decide_input_route(text)
+        self.store.append_event(
+            "input.routed",
+            payload={
+                "route": decision.kind.value,
+                "reason": decision.reason,
+                "explicit": decision.explicit,
+            },
+        )
+        if decision.kind in {RouteKind.CHAT, RouteKind.ACTION}:
+            return decision, self.chat(text, _route_checked=True)
+        mode = self.store.get_workflow_session(self.session_id)["session_mode"]
+        return decision, self.submit_intent(text, requested_mode=mode)
 
     def answer_intake_question(self, question_id: str, value: str) -> Any:
         pending = self.store.get_pending_intake(self.session_id)
@@ -1045,12 +1107,21 @@ class AgentRuntime:
         goal = self.active_goal()
         return tuple(goal.metadata.get("plan_questions", ())) if goal else ()
 
+    def _ensure_ultra_session(self, *, start_background: bool = True) -> Any:
+        """Lazily rebuild the current Ultra engine from durable state."""
+
+        if self.ultra_session is not None:
+            return self.ultra_session
+        run = self.active_ultra_run()
+        if run is None:
+            raise RuntimeStateError("there is no durable ULTRA run to restore")
+        self.restore_ultra(run.id, start_background=start_background)
+        assert self.ultra_session is not None
+        return self.ultra_session
+
     def answer_ultra_question(self, question_id: str, value: str) -> Any:
-        if self.ultra_session is None:
-            raise RuntimeStateError(
-                "this ULTRA question round belongs to a previous process; use /replan to rebuild the foundation"
-            )
-        return self.ultra_session.answer(question_id, value)
+        session = self._ensure_ultra_session()
+        return session.answer(question_id, value)
 
     def add_ultra_guidance(self, text: str) -> Evidence:
         goal = self.active_goal()
@@ -1064,21 +1135,14 @@ class AgentRuntime:
             summary=safe,
             created_by="user",
         )
-        if self.ultra_session is not None:
-            self.ultra_session.add_guidance(safe)
+        self._ensure_ultra_session(start_background=False).add_guidance(safe)
         return item
 
     def approve_ultra(self, revision: int | None = None) -> Plan:
-        if self.ultra_session is None:
-            raise RuntimeStateError(
-                "the ULTRA engine is not live in this process; use /replan to restore from durable evidence"
-            )
-        return self.ultra_session.approve(revision)
+        return self._ensure_ultra_session().approve(revision)
 
     def wait_for_ultra(self) -> Any:
-        if self.ultra_session is None:
-            raise RuntimeStateError("the ULTRA engine is not live in this process")
-        return self.ultra_session.wait()
+        return self._ensure_ultra_session().wait()
 
     @staticmethod
     def _plan_change_paths(plan: Plan | None) -> set[str]:
@@ -1088,7 +1152,32 @@ class AgentRuntime:
             str(item.get("path") or "").strip().replace("\\", "/")
             for item in plan.expected_changes
             if str(item.get("path") or "").strip()
+            and not str(item.get("path") or "").strip().startswith("<")
         }
+
+    @classmethod
+    def _repair_revision_is_in_scope(
+        cls,
+        approved: Plan,
+        proposed: Plan,
+        repair_tasks: Iterable[Mapping[str, Any]],
+    ) -> bool:
+        approved_paths = cls._plan_change_paths(approved)
+        proposed_paths = cls._plan_change_paths(proposed)
+        if not proposed_paths.issubset(approved_paths):
+            return False
+        sensitive = re.compile(
+            r"\b(install|dependency|network|external service|"
+            r"credential|secret|permission|deploy|publish|payment)\b",
+            re.IGNORECASE,
+        )
+        repair_text = json.dumps(
+            list(repair_tasks),
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        return sensitive.search(repair_text) is None
 
     def _ultra_quality_feedback(self, result: Any) -> str:
         findings: list[str] = []
@@ -1132,8 +1221,7 @@ class AgentRuntime:
         the ordinary approval boundary.
         """
 
-        if self.ultra_session is None:
-            raise RuntimeStateError("the ULTRA engine is not live in this process")
+        self._ensure_ultra_session()
         approved_scope = self._plan_change_paths(
             self.store.get_accepted_plan(self.active_goal().id)
             if self.active_goal()
@@ -1198,9 +1286,17 @@ class AgentRuntime:
                 approved_scope = set(proposed_scope)
             self.approve_ultra(proposed.revision)
 
-    def restore_ultra(self, run_id: str) -> Any:
+    def restore_ultra(
+        self,
+        run_id: str,
+        *,
+        start_background: bool = True,
+    ) -> Any:
         self.ultra_session = self._make_ultra_session()
-        return self.ultra_session.restore(run_id)
+        return self.ultra_session.restore(
+            run_id,
+            start_background=start_background,
+        )
 
     def replan_ultra(self, feedback: str) -> Any:
         from .ultra_models import UltraRunStatus
@@ -1209,6 +1305,8 @@ class AgentRuntime:
         run = self.active_ultra_run()
         if goal is None or run is None or not goal.metadata.get("ultra_run_id"):
             raise RuntimeStateError("there is no active ULTRA master plan to revise")
+        if self.ultra_session is None:
+            self._ensure_ultra_session(start_background=False)
         if self.ultra_session is not None and self.ultra_session.running:
             raise RuntimeStateError("pause ULTRA at a safe checkpoint before requesting a replan")
         safe_feedback = redact_text(feedback, 4_000)
@@ -1584,6 +1682,33 @@ class AgentRuntime:
                                         "advertised_native_tools": native_tools,
                                     },
                                 )
+                if current_goal is not None:
+                    recorded_calls = redact_text(
+                        json.dumps(
+                            [
+                                {
+                                    "name": call.name,
+                                    "args": redact_data(call.args),
+                                }
+                                for call in turn.tool_calls
+                            ],
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        ),
+                        8_000,
+                    )
+                    self.store.append_event(
+                        "provider.turn_recorded",
+                        goal_id=current_goal.id,
+                        payload={
+                            "actor": actor,
+                            "step": step,
+                            "tool_names": [call.name for call in turn.tool_calls],
+                            "tool_calls_redacted": recorded_calls,
+                            "text_excerpt": redact_text(turn.text or "", 1_000),
+                        },
+                    )
                 self._emit_usage(turn)
                 return turn
             except (KeyboardInterrupt, SystemExit):
@@ -1863,9 +1988,89 @@ class AgentRuntime:
 
     @staticmethod
     def _plan_requires_critic(candidate: Mapping[str, Any]) -> bool:
-        # Semantics always require an independent model pass.  Risk controls
-        # review depth elsewhere, never whether a semantic review occurs.
+        # A legacy combined proposal may be projected into the staged contract
+        # for compatibility. Simple low-risk projections keep the historical
+        # deterministic review path; explicit staged semantics always receive
+        # an independent critic.
+        if candidate.get("_semantic_source") == "legacy_plan_projection":
+            tasks = tuple(candidate.get("tasks", ()))
+            return len(tasks) > 3 or any(
+                str(item.get("risk", "medium")).lower() in {"high", "critical"}
+                for item in tasks
+                if isinstance(item, Mapping)
+            )
         return True
+
+    @staticmethod
+    def _project_legacy_semantic(
+        goal: Goal,
+        proposed: Mapping[str, Any],
+        inspection_records: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Project model-authored legacy plan meaning without inventing new work."""
+
+        tasks = tuple(
+            item for item in proposed.get("tasks", ()) if isinstance(item, Mapping)
+        )
+        criteria = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for task in tasks
+                for value in task.get("acceptance_criteria", ())
+                if str(value).strip()
+            )
+        )
+        outcomes = tuple(
+            str(task.get("title") or task.get("description") or "").strip()
+            for task in tasks
+            if str(task.get("title") or task.get("description") or "").strip()
+        )
+        effects = [RequestedEffect.READ_WORKSPACE.value]
+        if proposed.get("expected_changes"):
+            effects.append(RequestedEffect.MUTATE_WORKSPACE.value)
+        refs = [f"inspection:{reference}" for reference in inspection_records]
+        return SemanticGoalV2(
+            original_request=goal.objective,
+            interpreted_outcome=str(proposed.get("summary") or goal.objective),
+            requested_effects=tuple(effects),
+            required_outcomes=outcomes or (str(proposed.get("summary") or goal.objective),),
+            constraints=(),
+            exclusions=(),
+            acceptance_criteria=criteria or ("The requested outcome is directly verified.",),
+            unresolved_decisions=(),
+            repository_evidence_refs=tuple(refs),
+            status="interpreted",
+        ).to_dict()
+
+    @staticmethod
+    def _validate_semantic_stage(
+        goal: Goal,
+        value: Mapping[str, Any],
+        *,
+        successful_inspection_ids: frozenset[str],
+    ) -> SemanticGoalV2:
+        semantic = SemanticGoalV2.from_mapping(value, original_request=goal.objective)
+        if semantic.status != "interpreted":
+            raise ValueError("semantic_goal.status must be interpreted")
+        if semantic.unresolved_decisions:
+            raise ValueError(
+                "semantic interpretation still has unresolved decisions; "
+                "call request_plan_input"
+            )
+        cited = {
+            ref[len("inspection:") :]
+            for ref in semantic.repository_evidence_refs
+            if ref.startswith("inspection:")
+        }
+        if not cited or not cited.issubset(successful_inspection_ids):
+            raise ValueError(
+                "semantic interpretation must cite successful inspection references"
+            )
+        if RequestedEffect.READ_WORKSPACE not in set(semantic.requested_effects):
+            raise ValueError(
+                "repository-grounded semantics require requested_effects=read_workspace"
+            )
+        return semantic
 
     def _accepted_semantic_metadata(
         self,
@@ -1947,6 +2152,7 @@ class AgentRuntime:
         return {
             "semantic_goal": semantic.to_dict(),
             "semantic_goal_fingerprint": semantic.fingerprint,
+            "accepted_semantic_fingerprint": interpreted.fingerprint,
             "resource_claims": [item.to_dict() for item in claims],
             "verification_contracts": [item.to_dict() for item in verification],
         }
@@ -1986,16 +2192,54 @@ class AgentRuntime:
             for criterion in task.get("acceptance_criteria", ())
             if str(criterion).strip()
         }
-        semantic_criteria = {
-            value.casefold() for value in semantic.acceptance_criteria
+        semantic_criteria = {value.casefold() for value in semantic.acceptance_criteria}
+
+        # A staged plan is fingerprint-bound to the accepted semantic object,
+        # so task criteria need to cover that contract rather than copy every
+        # sentence byte-for-byte. Small local models reliably paraphrase
+        # criteria (for example, "pytest succeeds" becomes "no test failures").
+        # Deterministic token coverage accepts those restatements while still
+        # rejecting a plan that silently drops an accepted outcome.
+        stopwords = {
+            "a", "an", "and", "are", "as", "at", "be", "by", "for",
+            "from", "in", "is", "it", "must", "of", "on", "or", "that",
+            "the", "this", "to", "with", "within",
         }
-        if task_criteria != semantic_criteria:
-            missing_from_tasks = sorted(semantic_criteria - task_criteria)
-            missing_from_semantics = sorted(task_criteria - semantic_criteria)
+
+        def meaningful_tokens(value: str) -> frozenset[str]:
+            return frozenset(
+                token
+                for token in re.findall(r"[\w.-]+", value.casefold())
+                if len(token) >= 2 and token not in stopwords
+            )
+
+        def maps_to_task(criterion: str) -> bool:
+            if criterion in task_criteria:
+                return True
+            source = meaningful_tokens(criterion)
+            for candidate in task_criteria:
+                target = meaningful_tokens(candidate)
+                shared = source & target
+                if not source or not target or not shared:
+                    continue
+                coverage = len(shared) / min(len(source), len(target))
+                if (len(shared) >= 2 and coverage >= 0.25) or (
+                    len(shared) == 1
+                    and min(len(source), len(target)) <= 2
+                    and coverage >= 0.50
+                ):
+                    return True
+            return False
+
+        missing_from_tasks = sorted(
+            criterion
+            for criterion in semantic_criteria
+            if not maps_to_task(criterion)
+        )
+        if missing_from_tasks:
             raise ValueError(
-                "semantic acceptance criteria and task criteria must map exactly; "
-                f"missing_from_tasks={missing_from_tasks!r}, "
-                f"missing_from_semantic_goal={missing_from_semantics!r}"
+                "plan tasks do not cover every accepted semantic criterion; "
+                f"missing_from_tasks={missing_from_tasks!r}"
             )
         effects = set(semantic.requested_effects)
         changes = tuple(proposed.get("expected_changes", ()))
@@ -2020,30 +2264,15 @@ class AgentRuntime:
         *,
         planning_only: bool,
     ) -> tuple[bool, str]:
-        """Return whether a plan needs a human approval checkpoint."""
+        """Require one approval for every initial executable project plan."""
 
-        if planning_only:
-            return True, "Plan mode never executes"
-        tasks = tuple(
-            item for item in proposed.get("tasks", ()) if isinstance(item, Mapping)
+        del proposed, semantic
+        return (
+            True,
+            "Plan mode never executes"
+            if planning_only
+            else "one explicit approval is required before autonomous execution",
         )
-        changes = tuple(proposed.get("expected_changes", ()))
-        effects = set(semantic.requested_effects)
-        sensitive = {
-            RequestedEffect.INSTALL_DEPENDENCIES,
-            RequestedEffect.USE_NETWORK,
-            RequestedEffect.EXTERNAL_SIDE_EFFECT,
-        }
-        if effects & sensitive:
-            return True, "dependency, network, or external side effect"
-        if any(
-            str(item.get("risk") or "medium").casefold() in {"medium", "high", "critical"}
-            for item in tasks
-        ):
-            return True, "model/critic contract declares non-low risk"
-        if len(tasks) > 1 or len(changes) > 2:
-            return True, "change spans multiple task or resource contracts"
-        return False, "small reversible in-scope contract"
 
     def _review_plan_candidate(
         self,
@@ -2080,6 +2309,22 @@ class AgentRuntime:
                 else:
                     try:
                         result_args = validate_control_call(call.name, call.args)
+                        if (
+                            result_args.get("verdict") == "pass"
+                            and result_args.get("issues")
+                        ):
+                            self.store.append_event(
+                                "plan.critic_advisories",
+                                goal_id=goal.id,
+                                payload={
+                                    "items": list(result_args["issues"]),
+                                    "summary": result_args.get("summary", ""),
+                                },
+                            )
+                            result_args = {
+                                **result_args,
+                                "issues": [],
+                            }
                         conversation.append({"role": "tool", "id": call.id, "name": call.name, "content": "Review accepted by harness."})
                         return result_args
                     except ControlValidationError as exc:
@@ -2110,6 +2355,34 @@ class AgentRuntime:
             raise ValueError(
                 "the planner must successfully inspect the workspace with a read-only tool before proposing"
             )
+        semantic_scope = proposed.get("semantic_goal", {})
+        semantic_scope_text = " ".join(
+            str(value)
+            for field in ("constraints", "exclusions")
+            for value in (
+                semantic_scope.get(field, ())
+                if isinstance(semantic_scope, Mapping)
+                else ()
+            )
+        ).casefold()
+        exact_file_scope = any(
+            marker in semantic_scope_text
+            for marker in (
+                "only create",
+                "only modify",
+                "do not create or modify any files outside",
+                "no other files",
+            )
+        )
+        explicit_request_paths = {
+            match.group(0).replace("\\", "/").casefold()
+            for match in re.finditer(
+                r"[\w.-]+(?:[/\\][\w.-]+)*\."
+                r"(?:py|html?|js|ts|tsx|jsx|css|json|md|txt|ya?ml|toml)",
+                original_request,
+                re.IGNORECASE,
+            )
+        }
         task_ids = {task.id for task in tasks}
         evidence_coverage: set[str] = set()
         for item in proposed["applicability_evidence"]:
@@ -2141,6 +2414,16 @@ class AgentRuntime:
         for item in proposed["expected_changes"]:
             raw_path = str(item["path"]).strip().replace("\\", "/")
             path = raw_path.casefold()
+            if (
+                exact_file_scope
+                and explicit_request_paths
+                and path not in explicit_request_paths
+            ):
+                raise ValueError(
+                    f"expected change {raw_path!r} violates the accepted exact "
+                    "file scope; allowed paths are "
+                    + ", ".join(sorted(explicit_request_paths))
+                )
             if (
                 not raw_path
                 or raw_path.startswith("/")
@@ -2215,6 +2498,8 @@ class AgentRuntime:
     def _bind_plan_inspection_sources(
         proposed: dict[str, Any],
         inspection_records: Mapping[str, Mapping[str, Any]],
+        *,
+        original_request: str = "",
     ) -> dict[str, Any]:
         """Canonicalize provider-specific/placeholder citations to harness refs."""
 
@@ -2234,6 +2519,23 @@ class AgentRuntime:
         )
         bound = dict(proposed)
         evidence = [dict(item) for item in proposed.get("applicability_evidence", ())]
+        task_ids = [
+            str(item.get("id"))
+            for item in proposed.get("tasks", ())
+            if isinstance(item, Mapping) and str(item.get("id") or "").strip()
+        ]
+        if not evidence and only_reference is not None and task_ids:
+            record = records[only_reference]
+            evidence = [
+                {
+                    "fact": (
+                        "The workspace was inspected before this plan was proposed. "
+                        + str(record.get("result") or "")[:600]
+                    ),
+                    "source": f"inspection:{only_reference}",
+                    "supports_tasks": task_ids,
+                }
+            ]
         for item in evidence:
             source = str(item.get("source") or "").strip()
             canonical = aliases.get(source.casefold())
@@ -2245,6 +2547,58 @@ class AgentRuntime:
             if canonical is not None:
                 item["source"] = canonical
         bound["applicability_evidence"] = evidence
+        changes = [dict(item) for item in proposed.get("expected_changes", ())]
+        if only_reference is not None:
+            normalized_request = original_request.replace("\\", "/").casefold()
+            generic_path_tokens = {
+                "app", "config", "core", "index", "init", "lib", "main",
+                "package", "py", "src", "setup", "test", "tests",
+            }
+            for item in changes:
+                if not str(item.get("basis") or "").strip():
+                    item["basis"] = "repository_convention"
+                raw_path = str(item.get("path") or "").replace("\\", "/")
+                distinctive_path_tokens = {
+                    token
+                    for token in re.findall(r"[a-z0-9]+", raw_path.casefold())
+                    if len(token) >= 3 and token not in generic_path_tokens
+                }
+                request_supports_derived_path = bool(
+                    distinctive_path_tokens
+                ) and all(
+                    token in normalized_request
+                    for token in distinctive_path_tokens
+                )
+                cites_current_inspection = any(
+                    str(value).startswith("inspection:")
+                    for value in item.get("evidence_refs", ())
+                )
+                if (
+                    item.get("basis") == "explicit_user_requirement"
+                    and raw_path.casefold() not in normalized_request
+                    and (
+                        request_supports_derived_path
+                        or cites_current_inspection
+                    )
+                ):
+                    # The model selected a concrete path, but mislabeled a
+                    # derived layout decision as an exact user-authored path.
+                    # Rebind provenance to the completed repository inspection;
+                    # this changes no requested outcome or workspace target.
+                    item["basis"] = "repository_convention"
+                    item["evidence_refs"] = [
+                        f"inspection:{only_reference}"
+                    ]
+                if item.get("basis") == "repository_convention":
+                    item["evidence_refs"] = [
+                        f"inspection:{only_reference}"
+                    ]
+                if (
+                    str(item.get("basis") or "") != "explicit_user_requirement"
+                    and not item.get("evidence_refs")
+                ):
+                    item["evidence_refs"] = [f"inspection:{only_reference}"]
+        bound["expected_changes"] = changes
         return bound
 
     def _pause_planning(self, goal: Goal, question: str, reason: str) -> None:
@@ -2484,9 +2838,17 @@ class AgentRuntime:
             self.store.update_goal_metadata(goal.id, retry_after_ms=0)
         return delay_ms
 
-    def generate_plan(self, feedback: str = "") -> Plan | None:
+    def generate_plan(
+        self,
+        feedback: str = "",
+        *,
+        auto_approve_in_scope_repair: bool = False,
+    ) -> Plan | None:
         try:
-            return self._generate_plan(feedback)
+            return self._generate_plan(
+                feedback,
+                auto_approve_in_scope_repair=auto_approve_in_scope_repair,
+            )
         except ProviderUnavailableError as exc:
             goal = self.active_goal()
             if goal is not None:
@@ -2497,7 +2859,12 @@ class AgentRuntime:
                 )
             raise
 
-    def _generate_plan(self, feedback: str = "") -> Plan | None:
+    def _generate_plan(
+        self,
+        feedback: str = "",
+        *,
+        auto_approve_in_scope_repair: bool = False,
+    ) -> Plan | None:
         goal = self.active_goal()
         if goal is None:
             raise RuntimeStateError("no active goal")
@@ -2547,31 +2914,231 @@ class AgentRuntime:
         ]
         revisions = 0
         invalid_plan_calls = 0
+        semantic_repairs = 0
+        dag_repairs = 0
+        applicability_repairs = 0
+        critic_repairs = 0
         unproductive_turns_after_inspection = 0
         last_plan_format_error = ""
+        exhausted_stage = ""
         plan_format_exhausted = False
+        accepted_plan_for_revision = self.store.get_accepted_plan(goal.id)
+        semantic_locked_to_approval = accepted_plan_for_revision is not None
+        if semantic_locked_to_approval and isinstance(
+            goal.metadata.get("semantic_goal"),
+            Mapping,
+        ):
+            stored_staged_semantic = dict(goal.metadata["semantic_goal"])
+            stored_staged_semantic["status"] = "interpreted"
+        else:
+            stored_staged_semantic = goal.metadata.get("planning_semantic_goal")
+        staged_semantic: dict[str, Any] | None = (
+            dict(stored_staged_semantic)
+            if isinstance(stored_staged_semantic, Mapping)
+            else None
+        )
+        semantic_stage_attempted = staged_semantic is not None
         successful_inspection_ids: set[str] = set()
         inspection_records: dict[str, dict[str, Any]] = {}
         inspection_cache: dict[str, str] = {}
         for step in range(1, self.config.planning_steps + 1):
             inspections_before_turn = frozenset(successful_inspection_ids)
+            planner_tools = self._planner_tools()
+            if (
+                semantic_locked_to_approval
+                and staged_semantic is not None
+                and not inspection_records
+            ):
+                planner_tools = [
+                    schema
+                    for schema in planner_tools
+                    if _tool_name(schema) in READ_ONLY_TOOLS
+                ]
+            if staged_semantic is not None and inspection_records:
+                planner_tools = []
+                for schema in self._planner_tools():
+                    if _tool_name(schema) != "propose_plan":
+                        continue
+                    staged_schema = copy.deepcopy(schema)
+                    parameters = staged_schema["function"]["parameters"]
+                    parameters["properties"].pop("semantic_goal", None)
+                    parameters["properties"]["applicability_evidence"] = {
+                        "type": "array",
+                        "description": (
+                            "Repository facts with fact, source, and "
+                            "supports_tasks fields."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": True,
+                        },
+                    }
+                    parameters["properties"]["expected_changes"] = {
+                        "type": "array",
+                        "description": (
+                            "Files or directories with path, intent, basis, "
+                            "evidence_refs, and supports_tasks fields."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": True,
+                        },
+                    }
+                    parameters["properties"]["tasks"] = {
+                        "type": "array",
+                        "minItems": 1,
+                        "description": (
+                            "Task objects using the exact keys title, "
+                            "description, acceptance_criteria, verification, "
+                            "depends_on, and risk."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": True,
+                        },
+                    }
+                    planner_tools.append(staged_schema)
             turn = self._call_provider(
                 conversation,
-                self._planner_tools(),
+                planner_tools,
                 PLANNER_SYSTEM_PROMPT,
                 actor="planner",
                 step=step,
             )
-            conversation.append(turn.to_message())
+            if turn.tool_calls or str(turn.text or "").strip():
+                conversation.append(turn.to_message())
             proposed: dict[str, Any] | None = None
             requested_questions: list[dict[str, Any]] | None = None
             for call in turn.tool_calls:
                 self.events.publish("tool_call", call.name, args=redact_data(call.args), actor="planner")
                 conversation_result: str | None = None
-                if call.name == "propose_plan":
+                if call.name == "propose_semantic_goal":
+                    semantic_stage_attempted = True
+                    try:
+                        validated_semantic = self._validate_semantic_stage(
+                            goal,
+                            call.args,
+                            successful_inspection_ids=inspections_before_turn,
+                        )
+                        staged_semantic = validated_semantic.to_dict()
+                        result = (
+                            "Semantic interpretation accepted. Now call propose_plan "
+                            f"with semantic_fingerprint={validated_semantic.fingerprint}."
+                        )
+                        self.store.update_goal_metadata(
+                            goal.id,
+                            planning_semantic_goal=staged_semantic,
+                            planning_semantic_fingerprint=(
+                                validated_semantic.fingerprint
+                            ),
+                            planning_semantic_status="accepted",
+                        )
+                        self.store.append_event(
+                            "planning.semantic_accepted",
+                            goal_id=goal.id,
+                            payload={"fingerprint": validated_semantic.fingerprint},
+                        )
+                    except (ValueError, DomainError) as exc:
+                        semantic_repairs += 1
+                        last_plan_format_error = redact_text(exc, 1_000)
+                        result = (
+                            "Error: semantic interpretation rejected: "
+                            f"{last_plan_format_error}. Repair only the semantic contract."
+                        )
+                        self.retry_ledger.record(
+                            RetryKind.PLAN_SEMANTIC_REPAIR,
+                            stage="semantic_interpretation",
+                            reason=last_plan_format_error,
+                            input_value=call.args,
+                            next_action=(
+                                "targeted_semantic_repair"
+                                if semantic_repairs < 3
+                                else "stop"
+                            ),
+                        )
+                        if semantic_repairs >= 3:
+                            exhausted_stage = "semantic_interpretation"
+                            plan_format_exhausted = True
+                elif call.name == "propose_plan":
                     try:
                         proposed, normalization_actions = normalize_plan_draft(call.args)
                         validate_normalized_plan(proposed)
+                        if staged_semantic is not None:
+                            accepted_fingerprint = SemanticGoalV2.from_mapping(
+                                staged_semantic,
+                                original_request=goal.objective,
+                            ).fingerprint
+                            requested_fingerprint = str(
+                                proposed.get("semantic_fingerprint") or ""
+                            ).strip()
+                            if not requested_fingerprint:
+                                if isinstance(
+                                    proposed.get("semantic_goal"),
+                                    Mapping,
+                                ):
+                                    # Backward compatibility for the original
+                                    # combined proposal transport.  The accepted
+                                    # semantic object still wins below, so a
+                                    # legacy planner cannot drift approved scope.
+                                    requested_fingerprint = accepted_fingerprint
+                                    normalization_actions = (
+                                        *normalization_actions,
+                                        "legacy combined semantic replaced by "
+                                        "the accepted semantic fingerprint",
+                                    )
+                                else:
+                                    raise ValueError(
+                                        "staged propose_plan requires the accepted "
+                                        "semantic_fingerprint"
+                                    )
+                            if requested_fingerprint != accepted_fingerprint:
+                                raise ValueError(
+                                    "semantic_fingerprint does not match the accepted "
+                                    "semantic interpretation"
+                                )
+                            proposed["semantic_goal"] = dict(staged_semantic)
+                            proposed["_semantic_source"] = "staged"
+                        elif proposed.get("semantic_goal"):
+                            proposed["_semantic_source"] = "combined_proposal"
+                        else:
+                            if semantic_stage_attempted:
+                                proposed = None
+                                result = (
+                                    "Error: no semantic contract is accepted yet. "
+                                    "Call propose_semantic_goal with a targeted repair; "
+                                    "this does not consume the plan-format budget."
+                                )
+                                conversation.append(
+                                    {
+                                        "role": "tool",
+                                        "id": call.id,
+                                        "name": call.name,
+                                        "content": result,
+                                    }
+                                )
+                                self.events.publish(
+                                    "tool_result",
+                                    result,
+                                    tool=call.name,
+                                    actor="planner",
+                                )
+                                continue
+                            proposed["semantic_goal"] = self._project_legacy_semantic(
+                                goal, proposed, inspection_records
+                            )
+                            proposed["_semantic_source"] = "legacy_plan_projection"
+                            if not str(proposed.get("execution_strategy") or "").strip():
+                                proposed["execution_strategy"] = (
+                                    "Execute the normalized tasks in dependency order, "
+                                    "apply only the declared workspace changes, and run "
+                                    "each task's accepted verification before completion."
+                                )
+                            staged_semantic = dict(proposed["semantic_goal"])
+                            self.store.append_event(
+                                "planning.legacy_semantic_projected",
+                                goal_id=goal.id,
+                                payload={"source": "model_authored_plan"},
+                            )
                         for task in proposed["tasks"]:
                             task.pop("_unresolved_dependencies", None)
                         result = "Plan proposal normalized and captured for harness validation."
@@ -2590,7 +3157,7 @@ class AgentRuntime:
                             for issue in exc.issues
                         )
                         retry_record = self.retry_ledger.record(
-                            RetryKind.PLAN_SEMANTIC_REPAIR if isinstance(exc, PlanDraftError) else RetryKind.PLAN_FORMAT_REPAIR,
+                            RetryKind.PLAN_FORMAT_REPAIR,
                             stage=getattr(exc, "stage", "plan_normalization"),
                             reason=last_plan_format_error,
                             input_value=call.args,
@@ -2616,6 +3183,7 @@ class AgentRuntime:
                             f"repair using the same simplified contract: {last_plan_format_error}"
                         )
                         if invalid_plan_calls >= 3:
+                            exhausted_stage = "plan_format"
                             plan_format_exhausted = True
                 elif call.name == "request_plan_input":
                     try:
@@ -2681,6 +3249,11 @@ class AgentRuntime:
                                 },
                             )
                         successful_inspection_ids.add(reference)
+                        if goal.metadata.get("strategy_reinspection_required"):
+                            self.store.update_goal_metadata(
+                                goal.id,
+                                strategy_reinspection_required=False,
+                            )
                         conversation_result = (
                             f"Stable inspection reference: inspection:{reference}. "
                             "Use this exact source in applicability_evidence.\n"
@@ -2713,6 +3286,26 @@ class AgentRuntime:
 
             if proposed is None and requested_questions is None and inspection_records:
                 unproductive_turns_after_inspection += 1
+                if staged_semantic is not None:
+                    fingerprint = SemanticGoalV2.from_mapping(
+                        staged_semantic,
+                        original_request=goal.objective,
+                    ).fingerprint
+                    conversation.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "The semantic stage is already accepted. Do not "
+                                "repeat it and do not answer with prose. Make exactly "
+                                "one propose_plan tool call now, using "
+                                f"semantic_fingerprint={fingerprint}. Include tasks, "
+                                "dependencies, expected_changes, execution_strategy, "
+                                "and applicability_evidence. Every task object MUST "
+                                "use these exact JSON keys: title, description, "
+                                "acceptance_criteria, verification, depends_on, risk."
+                            ),
+                        }
+                    )
 
             if proposed is not None:
                 if planning_answers:
@@ -2730,6 +3323,7 @@ class AgentRuntime:
                 proposed = self._bind_plan_inspection_sources(
                     proposed,
                     inspection_records,
+                    original_request=goal.objective,
                 )
                 try:
                     if len(json.dumps(proposed, ensure_ascii=False, default=str)) > 120_000:
@@ -2742,11 +3336,49 @@ class AgentRuntime:
                         for item in proposed["tasks"]
                     )
                     validate_task_dag(preview)
+                except (ValueError, DomainError) as exc:
+                    dag_repairs += 1
+                    last_plan_format_error = redact_text(exc, 1_000)
+                    conversation.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Harness DAG validation rejected the plan: "
+                                f"{last_plan_format_error}. Repair only task IDs "
+                                "and dependencies, then resubmit the complete plan."
+                            ),
+                        }
+                    )
+                    proposed = None
+                    if dag_repairs >= 3:
+                        exhausted_stage = "task_dag"
+                        break
+                    continue
+                try:
                     self._validate_semantic_candidate(
                         goal,
                         proposed,
                         successful_inspection_ids=inspections_before_turn,
                     )
+                except (ValueError, DomainError) as exc:
+                    semantic_repairs += 1
+                    last_plan_format_error = redact_text(exc, 1_000)
+                    conversation.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Harness semantic mapping rejected the plan: "
+                                f"{last_plan_format_error}. Repair only the semantic "
+                                "contract or its criterion mapping."
+                            ),
+                        }
+                    )
+                    proposed = None
+                    if semantic_repairs >= 3:
+                        exhausted_stage = "semantic_mapping"
+                        break
+                    continue
+                try:
                     self._validate_plan_applicability(
                         proposed,
                         preview,
@@ -2754,7 +3386,7 @@ class AgentRuntime:
                         original_request=goal.objective,
                     )
                 except (ValueError, DomainError) as exc:
-                    invalid_plan_calls += 1
+                    applicability_repairs += 1
                     last_plan_format_error = redact_text(exc, 1_000)
                     conversation.append(
                         {
@@ -2767,12 +3399,21 @@ class AgentRuntime:
                         }
                     )
                     proposed = None
-                    if invalid_plan_calls >= 3:
-                        plan_format_exhausted = True
+                    if applicability_repairs >= 3:
+                        exhausted_stage = "applicability"
                         break
                     continue
-                critique = self._review_plan_candidate(
-                    goal, proposed, inspection_records
+                critique = (
+                    self._review_plan_candidate(goal, proposed, inspection_records)
+                    if self._plan_requires_critic(proposed)
+                    else {
+                        "verdict": "pass",
+                        "summary": (
+                            "Simple low-risk legacy plan passed deterministic "
+                            "schema, evidence, DAG, and semantic projection checks."
+                        ),
+                        "issues": [],
+                    }
                 )
                 if critique["verdict"] == "pass" and not critique["issues"]:
                     semantic_metadata = self._accepted_semantic_metadata(
@@ -2807,6 +3448,24 @@ class AgentRuntime:
                         proposed_by="agent",
                         submit=True,
                     )
+                    if (
+                        accepted_plan_for_revision is not None
+                        and auto_approve_in_scope_repair
+                    ):
+                        in_scope_repair = self._repair_revision_is_in_scope(
+                            accepted_plan_for_revision,
+                            plan,
+                            proposed["tasks"],
+                        )
+                        manual_approval = not in_scope_repair
+                        approval_reason = (
+                            "harness-approved in-scope repair revision"
+                            if in_scope_repair
+                            else (
+                                "repair revision expands paths or introduces "
+                                "a dependency, external effect, or sensitive action"
+                            )
+                        )
                     current_goal = self.store.get_goal(goal.id)
                     if current_goal.status != GoalStatus.AWAITING_PLAN_APPROVAL:
                         self.store.transition_goal(
@@ -2823,7 +3482,15 @@ class AgentRuntime:
                     )
                     self.events.publish(
                         "plan",
-                        f"Plan r{plan.revision} is ready. Review, edit, and apply it in Plan Studio.",
+                        (
+                            f"Plan r{plan.revision} is ready. Review, edit, and "
+                            "apply it in Plan Studio."
+                            if manual_approval
+                            else (
+                                f"In-scope repair plan r{plan.revision} passed "
+                                "review and will continue automatically."
+                            )
+                        ),
                     )
                     self.store.update_goal_metadata(
                         goal.id,
@@ -2859,6 +3526,11 @@ class AgentRuntime:
                         )
                     return plan
                 revisions += 1
+                critic_repairs += 1
+                last_plan_format_error = redact_text(
+                    str(critique.get("summary") or "independent critic rejected the plan"),
+                    1_000,
+                )
                 conversation.append(
                     {
                         "role": "user",
@@ -2871,7 +3543,8 @@ class AgentRuntime:
                         ),
                     }
                 )
-                if revisions >= 1:
+                if critic_repairs >= 2:
+                    exhausted_stage = "independent_critic"
                     break
             elif not turn.tool_calls:
                 conversation.append(
@@ -2883,11 +3556,10 @@ class AgentRuntime:
 
         checkpoint_reason = (
             (
-                "model_capability_exhausted: planner returned three invalid structured plans"
-                if invalid_plan_calls >= 3
-                else "model_capability_exhausted: plan validation repairs did not converge"
+                f"model_capability_exhausted: {exhausted_stage or 'planning'} "
+                "repairs did not converge"
             )
-            if plan_format_exhausted
+            if exhausted_stage
             else "planner did not produce a critic-approved structured plan"
         )
         self.store.append_event(
@@ -2896,17 +3568,23 @@ class AgentRuntime:
             payload={
                 "reason": checkpoint_reason,
                 "format_attempts": invalid_plan_calls,
+                "semantic_attempts": semantic_repairs,
+                "dag_attempts": dag_repairs,
+                "applicability_attempts": applicability_repairs,
+                "critic_attempts": critic_repairs,
+                "failed_stage": exhausted_stage,
                 "technical_detail": last_plan_format_error,
                 "checkpoint_type": "model_capability_exhausted",
                 "resumable": True,
             },
         )
-        if plan_format_exhausted:
+        if exhausted_stage:
             self.events.publish(
                 "error",
                 (
-                    "Plan could not be prepared after three exact-field repairs. "
-                    f"Stage/field detail: {last_plan_format_error}. Edit the request or use /replan."
+                    "Plan could not be prepared within the independent repair budget. "
+                    f"Failed stage: {exhausted_stage}. Detail: {last_plan_format_error}. "
+                    "Edit the request or use /replan."
                 ),
                 technical_detail=last_plan_format_error,
                 attempts=invalid_plan_calls,
@@ -2921,8 +3599,8 @@ class AgentRuntime:
         self._pause_planning(
             goal,
             (
-                f"Model capability exhausted after three exact-field repairs: {last_plan_format_error}. Change or upgrade the model, then use /replan."
-                if plan_format_exhausted
+                f"Model capability exhausted at {exhausted_stage}: {last_plan_format_error}. Change or upgrade the model, then use /replan."
+                if exhausted_stage
                 else "The planner did not produce a critic-approved structured plan in its bounded pass. Add guidance, then use /resume or /replan."
             ),
             checkpoint_reason,
@@ -2943,6 +3621,22 @@ class AgentRuntime:
             )
         if goal.metadata.get("ultra_run_id"):
             return self.approve_ultra(revision)
+        if goal.metadata.get("legacy_semantic_enrichment_required"):
+            self.store.update_goal_metadata(
+                goal.id,
+                legacy_semantic_enrichment_required=False,
+            )
+            enriched = self.generate_plan(
+                "Enrich this legacy pending plan with a repository-grounded "
+                "semantic contract and produce a fresh reviewed revision. "
+                "Preserve its original approved scope and exact user request."
+            )
+            if enriched is None:
+                raise RuntimeStateError(
+                    "legacy semantic enrichment checkpointed before a fresh "
+                    "reviewable revision was produced"
+                )
+            return enriched
         requested = plan.revision if revision is None else revision
         accepted, _approval = self.store.approve_plan(
             goal.id,
@@ -2965,6 +3659,41 @@ class AgentRuntime:
                 for change in accepted.expected_changes if isinstance(change, Mapping)
             ))
             artifact_paths = tuple(dict.fromkeys((*contract.artifact_expectations, *(path for path in artifact_paths if path))))
+            semantic_refs = tuple(
+                str(value)
+                for value in dict(current.metadata.get("semantic_goal", {})).get(
+                    "repository_evidence_refs", ()
+                )
+                if str(value).strip()
+            )
+            resource_claims = []
+            for change in accepted.expected_changes:
+                if not isinstance(change, Mapping):
+                    continue
+                path = str(change.get("path") or "").strip()
+                supports = tuple(
+                    str(value).strip().upper()
+                    for value in change.get("supports_tasks", ())
+                    if str(value).strip()
+                )
+                refs = tuple(
+                    str(value).strip()
+                    for value in change.get("evidence_refs", ())
+                    if str(value).strip()
+                ) or semantic_refs
+                if not path or path.startswith("<") or not supports or not refs:
+                    continue
+                resource_claims.append(
+                    ResourceClaimV1(
+                        purpose=str(change.get("intent") or f"Apply {path}"),
+                        kind="file",
+                        supports_tasks=supports,
+                        inspection_refs=refs,
+                        selector=path,
+                        resolved_paths=(path,),
+                        state="resolved",
+                    ).to_dict()
+                )
             declared_risks = {
                 str(task.risk or "medium").casefold() for task in accepted.tasks
             }
@@ -2990,6 +3719,30 @@ class AgentRuntime:
             standard_dimensions.append(
                 ("maintainability", "The implementation is coherent, bounded, and avoids unnecessary complexity", False, 0.85)
             )
+            objective_lower = updated_contract.interpreted_objective.casefold() if "updated_contract" in locals() else contract.interpreted_objective.casefold()
+            artifact_dimensions = []
+            if any(path.casefold().endswith((".html", ".htm")) for path in artifact_paths):
+                artifact_dimensions = [
+                    ("visual-quality", "Visual composition, hierarchy, detail, and polish meet the requested quality", False, 0.85),
+                    ("interaction-quality", "Interactive and animated behavior is understandable, stable, and appropriately varied", False, 0.85),
+                ]
+            castle_dimensions = []
+            if "castle" in objective_lower and "siege" in objective_lower:
+                castle_dimensions = [
+                    ("castle-recognizable", "Castle is visually recognizable and more detailed than placeholder rectangles", False, 0.85),
+                    ("main-gate-visible", "Main gate is visible and not hidden by overlap", True, 1.0),
+                    ("ram-soldiers", "Soldiers visibly attempt to breach the gate with a battering ram", False, 0.85),
+                    ("ram-motion", "Battering ram has repeated understandable motion", False, 0.85),
+                    ("siege-tower", "Siege tower is clearly represented and participates in the scene", False, 0.85),
+                    ("moving-arrows", "Archers visibly release moving arrows", False, 0.85),
+                    ("catapult-projectiles", "Catapults visibly launch moving projectiles", False, 0.85),
+                    ("projectile-distinction", "Projectiles are distinguishable from static decoration", False, 0.85),
+                    ("animation-variety", "Actors do not all use identical synchronized animation", False, 0.85),
+                    ("scene-depth", "Scene has meaningful layering, depth, and a non-empty composition", False, 0.85),
+                    ("self-contained", "The requested single HTML artifact is self-contained with no unexpected network requests", True, 1.0),
+                    ("extended-stability", "Animation remains stable during an extended run without JavaScript errors", True, 1.0),
+                    ("responsive-usability", "Wide and narrow viewports remain usable without harmful overflow", True, 1.0),
+                ]
             generated_dimensions = [
                 {
                     "id": dimension_id,
@@ -2998,13 +3751,21 @@ class AgentRuntime:
                     "minimum_score": minimum,
                     "required_evidence": list(verification),
                     "evaluation_method": (
-                        "deterministic_then_independent_review"
+                        "vision_and_runtime"
+                        if dimension_id in {
+                            item[0] for item in (*artifact_dimensions, *castle_dimensions)
+                        } and not hard_gate
+                        else "deterministic_then_independent_review"
                     ),
                     "confidence": "medium",
                     "latest_artifact_hash": None,
                     "latest_mutation_sequence": None,
                 }
-                for dimension_id, description, hard_gate, minimum in standard_dimensions
+                for dimension_id, description, hard_gate, minimum in (
+                    *standard_dimensions,
+                    *artifact_dimensions,
+                    *castle_dimensions,
+                )
             ]
             updated_contract = GoalContractV1(
                 **{
@@ -3041,6 +3802,7 @@ class AgentRuntime:
                 goal_contract_fingerprint=updated_contract.fingerprint,
                 quality_target=target,
                 convergence_state="not_evaluated",
+                resource_claims=resource_claims,
             )
             self.store.append_event(
                 "quality_target.created", goal_id=goal.id,
@@ -3121,6 +3883,7 @@ class AgentRuntime:
         edit: tuple[str, str] | tuple[str, str, str] | None = None,
         remove: str | None = None,
         proposed_by: str = "user",
+        inherit_approved_scope: bool = False,
     ) -> Plan:
         reason = redact_text(reason, 4_000)
         goal, old_plan = self._revision_context()
@@ -3267,13 +4030,21 @@ class AgentRuntime:
                     }
                 )
             if task.id not in change_covered:
-                expected_changes.append(
-                    {
-                        "path": f"<resolved during {task.id}>",
-                        "intent": task.description,
-                        "supports_tasks": [task.id],
-                    }
-                )
+                if inherit_approved_scope and expected_changes:
+                    for item in expected_changes:
+                        item["supports_tasks"] = list(
+                            dict.fromkeys(
+                                (*item.get("supports_tasks", ()), task.id)
+                            )
+                        )
+                elif not inherit_approved_scope:
+                    expected_changes.append(
+                        {
+                            "path": f"<resolved during {task.id}>",
+                            "intent": task.description,
+                            "supports_tasks": [task.id],
+                        }
+                    )
 
         original_status = goal.status
         if original_status != GoalStatus.REVISING:
@@ -3499,6 +4270,50 @@ class AgentRuntime:
                 payload={"state": "converged", "source": "explicit_user_visual_acceptance", "evidence_id": item.id},
             )
             return item
+        operational_guidance = self._guidance_is_operational(feedback)
+        if operational_guidance:
+            actions = []
+            for action in latest.metadata.get("refinement_actions", ()):
+                if not isinstance(action, Mapping):
+                    continue
+                value = dict(action)
+                if (
+                    value.get("status") == "pending"
+                    and self._guidance_is_operational(
+                        str(value.get("feedback") or "")
+                    )
+                ):
+                    value["status"] = "resolved"
+                    value["resolution"] = (
+                        "Operational recovery guidance does not change the "
+                        "accepted product quality target."
+                    )
+                    value["resolution_evidence_id"] = item.id
+                actions.append(value)
+            self.store.update_goal_metadata(
+                goal.id,
+                refinement_actions=actions,
+                convergence_state=(
+                    "reverifying"
+                    if latest.metadata.get("quality_target")
+                    else latest.metadata.get("convergence_state", "not_evaluated")
+                ),
+            )
+            self.store.append_event(
+                "guidance.operational",
+                goal_id=goal.id,
+                payload={"evidence_id": item.id},
+            )
+            self._work_conversation.append(
+                {"role": "user", "content": f"User guidance: {item.summary}"}
+            )
+            if goal.status == GoalStatus.PAUSED and goal.metadata.get(
+                "waiting_question"
+            ):
+                self.store.update_goal_metadata(goal.id, user_answer=item.summary)
+                if not self._unresolved_recovery_entities(goal.id):
+                    self.resume()
+            return item
         # Feedback is attached to the accepted semantic contract without
         # guessing a product dimension from keywords.
         dimensions = ["requirement_completeness"]
@@ -3574,6 +4389,34 @@ class AgentRuntime:
                 )
         return item
 
+    @staticmethod
+    def _guidance_is_operational(text: str) -> bool:
+        lowered = str(text).casefold()
+        return (
+            any(
+                marker in lowered
+                for marker in (
+                    "tool permissions are now",
+                    "permissions are now available",
+                    "authoritative command",
+                    "do not mutate outside",
+                    "finish_goal",
+                    "complete t00",
+                )
+            )
+            or (
+                any(marker in lowered for marker in ("retry", "resume", "continue"))
+                and any(
+                    marker in lowered
+                    for marker in ("pytest", "verification", "existing evidence")
+                )
+                and any(
+                    marker in lowered
+                    for marker in ("do not", "already", "currently", "now")
+                )
+            )
+        )
+
     def _unresolved_recovery_entities(self, goal_id: str) -> tuple[str, ...]:
         action_ids = [
             str(item["id"])
@@ -3633,9 +4476,17 @@ class AgentRuntime:
             for item in self.store.list_agent_runs(run_id)
             if item.status is AgentRunStatus.UNCERTAIN
         ]
-        mutating_action_nodes: set[str] = set()
+        uncertain_mutation_scopes: set[tuple[str, str]] = set()
         for action in self.store.list_actions(goal.id):
             if not bool(action.get("mutating")):
+                continue
+            if str(action.get("status") or "").casefold() not in {
+                "running",
+                "uncertain",
+            }:
+                # A completed mutation has a durable tool receipt and is
+                # recovered through its ChangeSet/artifact hashes. It must not
+                # make a later interrupted read/model call look unsafe.
                 continue
             arguments = action.get("args")
             if not isinstance(arguments, Mapping):
@@ -3650,16 +4501,29 @@ class AgentRuntime:
                 continue
             node_id = str(arguments.get("node_id") or "")
             if node_id:
-                mutating_action_nodes.add(node_id)
+                uncertain_mutation_scopes.add(
+                    (node_id, str(arguments.get("phase") or ""))
+                )
         unsafe_nodes = {
             str(item.work_node_id)
             for item in uncertain_agents
             if item.side_effects
             and item.work_node_id
-            and str(item.work_node_id) in mutating_action_nodes
+            and (
+                str(item.work_node_id),
+                str(item.phase),
+            )
+            in uncertain_mutation_scopes
         }
         for agent in uncertain_agents:
-            if agent.side_effects and str(agent.work_node_id or "") in mutating_action_nodes:
+            if (
+                agent.side_effects
+                and (
+                    str(agent.work_node_id or ""),
+                    str(agent.phase),
+                )
+                in uncertain_mutation_scopes
+            ):
                 continue
             self.store.update_agent_run(
                 agent.id,
@@ -3670,8 +4534,7 @@ class AgentRuntime:
         for node in self.store.list_work_nodes(run_id):
             if node.status is not WorkNodeStatus.UNCERTAIN:
                 continue
-            component_only = bool(node.contract.metadata.get("component_package_only"))
-            if not component_only or node.contract.write_paths or node.id in unsafe_nodes:
+            if node.id in unsafe_nodes:
                 continue
             self.store.transition_work_node(
                 node.id,
@@ -3760,7 +4623,16 @@ class AgentRuntime:
             and goal.status == GoalStatus.BLOCKED
             and goal.metadata.get("ultra_run_id")
             and ultra_run is not None
-            and ultra_run.status.value in {"running", "recovering"}
+            and ultra_run.status.value in {
+                "running",
+                "recovering",
+                "blocked",
+                # The engine may finish before the control-plane completion
+                # gate rejects an unreviewed checkpoint. That mismatch is a
+                # durable repair boundary, not a dead terminal session.
+                "completed",
+            }
+            and not str(goal.metadata.get("waiting_question") or "").strip()
         )
         if goal is None or (
             goal.status != GoalStatus.PAUSED and not resumable_failed_ultra
@@ -4081,6 +4953,113 @@ class AgentRuntime:
             },
         }
 
+    def _durable_progress_snapshot(self, goal_id: str) -> str:
+        """Fingerprint only durable, outcome-relevant progress.
+
+        Successful reads and repeated inspections are deliberately excluded.
+        """
+
+        goal = self.store.get_goal(goal_id)
+        plan = self.store.get_latest_plan(goal_id)
+        evidence = self.store.list_evidence(goal_id)
+        actions = self.store.list_actions(goal_id)
+        verification_tools = {
+            "run_bash",
+            "run_command",
+            "preview_html",
+            "inspect_preview",
+            "poll_process",
+            "read_process_output",
+        }
+        target = goal.metadata.get("quality_target", {})
+        artifact_ids = (
+            tuple(target.get("artifact_ids", ()))
+            if isinstance(target, Mapping)
+            else ()
+        )
+        payload = {
+            "goal_status": goal.status.value,
+            "active_plan_revision": goal.active_plan_revision,
+            "accepted_plan": (
+                plan.fingerprint
+                if plan is not None and plan.status is PlanStatus.ACCEPTED
+                else None
+            ),
+            "tasks": (
+                []
+                if plan is None
+                else [
+                    {
+                        "id": task.id,
+                        "status": task.status.value,
+                        "attempts": task.attempts,
+                    }
+                    for task in plan.tasks
+                ]
+            ),
+            "mutation_sequence": int(
+                goal.metadata.get("mutation_sequence", 0) or 0
+            ),
+            "artifact_hashes": (
+                self._current_artifact_hashes(artifact_ids)
+                if artifact_ids
+                else {}
+            ),
+            "verified_evidence": sorted(
+                {
+                    json.dumps(
+                        {
+                            "task_id": item.task_id,
+                            "kind": item.kind,
+                            "summary": item.summary,
+                            "tool": item.data.get("tool"),
+                            "path": item.data.get("path"),
+                            "file_hash": item.data.get("file_hash"),
+                            "result": item.data.get("result"),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    )
+                    for item in evidence
+                    if item.verified
+                }
+            ),
+            "verification_actions": sorted(
+                {
+                    (
+                        str(item.get("tool_name") or ""),
+                        str(item.get("result_summary") or ""),
+                    )
+                    for item in actions
+                    if item.get("status") == "completed"
+                    and item.get("tool_name") in verification_tools
+                }
+            ),
+            "resolved_findings": [
+                str(item.get("id") or "")
+                for item in goal.metadata.get("refinement_actions", ())
+                if isinstance(item, Mapping)
+                and item.get("status") == "resolved"
+            ],
+            "reviewed_change_sets": [
+                str(item.get("id") or "")
+                for item in goal.metadata.get("goal_change_sets", ())
+                if isinstance(item, Mapping)
+                and item.get("review_status") == "passed"
+                and item.get("integration_status") == "integrated"
+            ],
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
     def _current_task_id(self, plan: Plan) -> str | None:
         for task in plan.tasks:
             if task.status in {TaskStatus.IN_PROGRESS, TaskStatus.VERIFYING}:
@@ -4141,6 +5120,9 @@ class AgentRuntime:
         journal_args = {
             "_harness_actor": actor,
             "_harness_plan_revision": goal.active_plan_revision,
+            "_harness_mutation_sequence": int(
+                goal.metadata.get("mutation_sequence", 0) or 0
+            ),
             "arguments": redact_data(args),
         }
         approach_fingerprint = hashlib.sha256(
@@ -4154,6 +5136,8 @@ class AgentRuntime:
             and item.get("outcome") in {"unchanged", "regressed"}
         ][-3:]
         if (
+            call.name not in READ_ONLY_TOOLS
+            and
             len(recent_non_improving) == 3
             and len(
                 {
@@ -4958,7 +5942,97 @@ class AgentRuntime:
         ]
         if uncertain_workers:
             return f"{len(uncertain_workers)} delegation(s) have uncertain crash-window state"
+        target = goal.metadata.get("quality_target", {})
+        artifact_ids = (
+            tuple(target.get("artifact_ids", ()))
+            if isinstance(target, Mapping)
+            else ()
+        )
+        _checks, visual_blocker = self._visual_operational_checks(
+            goal,
+            artifact_ids,
+        )
+        if visual_blocker:
+            return visual_blocker
         return None
+
+    def _visual_operational_checks(
+        self,
+        goal: Goal,
+        artifact_ids: Iterable[str],
+    ) -> tuple[tuple[str, ...], str | None]:
+        html_artifacts = tuple(
+            str(path)
+            for path in artifact_ids
+            if str(path).casefold().endswith((".html", ".htm"))
+        )
+        if not html_artifacts:
+            return (), None
+        hashes = self._current_artifact_hashes(html_artifacts)
+        missing = [
+            path
+            for path in html_artifacts
+            if hashes.get(path) in {None, "MISSING"}
+        ]
+        if missing:
+            return (), (
+                "visual artifact gate is missing expected HTML artifact(s): "
+                + ", ".join(missing)
+            )
+        previews: list[dict[str, Any]] = []
+        for action in self.store.list_actions(goal.id):
+            if (
+                action.get("tool_name") != "preview_html"
+                or action.get("status") != "completed"
+            ):
+                continue
+            try:
+                payload = json.loads(str(action.get("result_summary") or ""))
+                journal = json.loads(str(action.get("args_json") or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, Mapping):
+                previews.append(
+                    {
+                        **dict(payload),
+                        "_harness_mutation_sequence": int(
+                            journal.get("_harness_mutation_sequence", -1) or 0
+                        ),
+                    }
+                )
+        current_sequence = int(goal.metadata.get("mutation_sequence", 0) or 0)
+        passing = next(
+            (
+                item
+                for item in reversed(previews)
+                if int(item.get("http_status", 0) or 0) == 200
+                and item.get("verification") == "passed"
+                and not item.get("console_errors")
+                and not item.get("page_errors")
+                and str(item.get("screenshot_path") or "").strip()
+                and Path(str(item.get("screenshot_path"))).exists()
+                and int(item.get("_harness_mutation_sequence", -1))
+                == current_sequence
+            ),
+            None,
+        )
+        if passing is None:
+            return (
+                ("artifact_hashes",),
+                "HTML completion requires a successful real-browser preview "
+                "with HTTP 200, a screenshot, and zero console/page errors",
+            )
+        return (
+            (
+                "artifact_hashes",
+                "browser_runtime",
+                "http_200",
+                "console_errors_zero",
+                "page_errors_zero",
+                "screenshot_captured",
+            ),
+            None,
+        )
 
     def _current_artifact_hashes(self, artifact_ids: Iterable[str]) -> dict[str, str]:
         hashes: dict[str, str] = {}
@@ -5162,14 +6236,50 @@ class AgentRuntime:
                 "vision_evaluator_available": vision_available,
                 "accessibility_checker_available": bool(shutil.which("axe")),
                 "performance_profiler_available": bool(shutil.which("py-spy")),
-                "user_review_required": visual_target and not vision_available,
+                "user_review_required": False,
+                "subjective_visual_quality_verified": (
+                    not visual_target or vision_available
+                ),
                 "routing_order": [
                     "deterministic_verification", "static_analysis", "runtime_integration",
                     "artifact_structure", "independent_review",
-                    "vision_evaluation" if vision_available else "user_review",
+                    (
+                        "vision_evaluation"
+                        if vision_available
+                        else "subjective_quality_unverified"
+                    ),
                 ],
             }
-            convergence_state = "user_review_required" if visual_target and not vision_available else "converged"
+            disposition = (
+                CompletionDisposition.COMPLETED_WITH_LIMITATIONS
+                if visual_target and not vision_available
+                else CompletionDisposition.VERIFIED
+            )
+            limitations = (
+                (
+                    "Subjective visual quality was not machine-verified because "
+                    "no vision evaluator was available.",
+                )
+                if disposition
+                is CompletionDisposition.COMPLETED_WITH_LIMITATIONS
+                else ()
+            )
+            operational_checks, operational_blocker = (
+                self._visual_operational_checks(fresh_goal, target_artifacts)
+            )
+            if operational_blocker:
+                self.store.transition_goal(
+                    goal.id,
+                    GoalStatus.RUNNING,
+                    reason="visual operational completion gate needs repair",
+                )
+                return f"Error: {operational_blocker}. Goal remains active."
+            convergence_state = (
+                "converged_with_limitations"
+                if disposition
+                is CompletionDisposition.COMPLETED_WITH_LIMITATIONS
+                else "converged"
+            )
             authoritative_ids = [item.id for item in evidence if item.verified or item.created_by == "user"]
             dimensions = [dict(item) for item in target.get("dimensions", ())] if isinstance(target, Mapping) else []
             dimension_scores = []
@@ -5208,7 +6318,12 @@ class AgentRuntime:
                 "hard_gate_results": {str(gate): True for gate in target.get("hard_gates", ())},
                 "scores": dimension_scores,
                 "overall_score": overall_score,
-                "confidence": "low" if convergence_state == "user_review_required" else "high",
+                "confidence": (
+                    "limited"
+                    if disposition
+                    is CompletionDisposition.COMPLETED_WITH_LIMITATIONS
+                    else "high"
+                ),
                 "previous_overall_score": previous_evaluation.get("overall_score") if isinstance(previous_evaluation, Mapping) else None,
                 "evaluated_at_unix": time.time(),
                 "contract_fingerprint": fresh_goal.metadata.get("goal_contract_fingerprint"),
@@ -5231,21 +6346,14 @@ class AgentRuntime:
                 quality_target=target,
                 evaluator_capability_profile=evaluator_profile,
                 goal_change_sets=reviewed_change_sets,
+                completion_disposition=disposition.value,
+                completion_limitations=list(limitations),
+                passed_operational_checks=list(operational_checks),
             )
             self.store.append_event(
                 "quality_convergence.decided", goal_id=goal.id,
                 payload={"state": convergence_state, "mutation_sequence": mutation_sequence, "artifact_hashes": hashes},
             )
-            if convergence_state == "user_review_required":
-                self.store.transition_goal(
-                    goal.id, GoalStatus.PAUSED,
-                    reason="deterministic and independent checks passed, but subjective visual quality lacks a trustworthy evaluator",
-                    metadata={
-                        "waiting_question": "Review the latest visual artifact and explicitly accept it or provide refinement feedback.",
-                        "resume_status": GoalStatus.RUNNING.value,
-                    },
-                )
-                return "Candidate verified structurally, but subjective visual quality requires user review; it was not released as a verified final result."
             self._checkpoint_accepted_goal(
                 self.store.get_goal(goal.id),
                 source="independent_final_review",
@@ -5253,8 +6361,20 @@ class AgentRuntime:
             self.store.transition_goal(
                 goal.id,
                 GoalStatus.COMPLETED,
-                reason="all checklist evidence passed independent final review",
-                metadata={"completion_summary": redact_text(args["summary"], 4_000)},
+                reason=(
+                    "all operational gates and independent review passed; "
+                    "subjective visual evaluation is recorded as a limitation"
+                    if disposition
+                    is CompletionDisposition.COMPLETED_WITH_LIMITATIONS
+                    else "all checklist evidence passed independent final review"
+                ),
+                metadata={
+                    "completion_summary": redact_text(args["summary"], 4_000),
+                    "completion_disposition": disposition.value,
+                    "completion_limitations": list(limitations),
+                    "passed_operational_checks": list(operational_checks),
+                    "evaluator_capability_profile": evaluator_profile,
+                },
             )
             self._record_global_learning(
                 self.store.get_goal(goal.id),
@@ -5267,10 +6387,22 @@ class AgentRuntime:
                 session_mode=SessionMode.GOAL.value,
                 plan_state=PlanState.APPROVED.value,
                 run_state=RunState.COMPLETED.value,
-                state={"plan_revision": plan.revision, "completion": "evidence_gate_passed"},
+                state={
+                    "plan_revision": plan.revision,
+                    "completion": "evidence_gate_passed",
+                    "completion_disposition": disposition.value,
+                    "completion_limitations": list(limitations),
+                },
             )
             self.events.publish("phase", "Goal completed after evidence gate and independent review.")
-            return "Goal completed. The harness accepted the independent review."
+            return (
+                "Goal completed with limitations. All operational gates and "
+                "independent review passed; subjective visual quality was not "
+                "claimed as verified."
+                if disposition
+                is CompletionDisposition.COMPLETED_WITH_LIMITATIONS
+                else "Goal completed. The harness accepted the independent review."
+            )
 
         self._record_global_learning(
             self.store.get_goal(goal.id),
@@ -5310,6 +6442,7 @@ class AgentRuntime:
             reason=f"independent review failed: {verdict['summary']}",
             add=repair_tasks,
             proposed_by="reviewer",
+            inherit_approved_scope=True,
         )
         refreshed = self.store.get_goal(goal.id)
         actions = list(refreshed.metadata.get("refinement_actions", ()))
@@ -5334,11 +6467,35 @@ class AgentRuntime:
             "refinement_cycle.started", goal_id=goal.id,
             payload={"source_evaluation": "independent-reviewer", "repair_tasks": [item["id"] for item in repair_tasks], "plan_revision": new_plan.revision},
         )
-        accepted_repair = self.approve_plan(new_plan.revision, approved_by="harness-quality-convergence")
-        self.store.update_goal_metadata(goal.id, refinement_actions=actions, convergence_state="refining")
+        if self._repair_revision_is_in_scope(plan, new_plan, repair_tasks):
+            accepted_repair = self.approve_plan(
+                new_plan.revision,
+                approved_by="harness-quality-convergence",
+            )
+            self.store.update_goal_metadata(
+                goal.id,
+                refinement_actions=actions,
+                convergence_state="refining",
+            )
+            return (
+                f"Independent review found {len(repair_tasks)} deficiency task(s). "
+                f"Harness-approved in-scope repair plan r{accepted_repair.revision}; "
+                "Goal refinement continues autonomously."
+            )
+        self.store.update_goal_metadata(
+            goal.id,
+            refinement_actions=actions,
+            convergence_state="scope_expansion_pending",
+            waiting_question=(
+                "Independent review proposed repair work that adds a dependency, "
+                "external effect, sensitive permission, or path outside the approved "
+                "scope. Review and approve the new plan revision."
+            ),
+        )
         return (
-            f"Independent review found {len(repair_tasks)} deficiency task(s). "
-            f"Harness-approved in-scope repair plan r{accepted_repair.revision}; Goal refinement continues autonomously."
+            f"Independent review found {len(repair_tasks)} deficiency task(s), "
+            f"but plan r{new_plan.revision} expands the approved scope and awaits "
+            "explicit approval."
         )
 
     def _handle_control_call(self, goal: Goal, plan: Plan, call: ToolCall) -> str:
@@ -5379,7 +6536,12 @@ class AgentRuntime:
                 return SliceResult(
                     goal.status.value,
                     f"Goal is {goal.status.value}; it cannot execute until the required user action occurs.",
+                    completed=goal.status is GoalStatus.COMPLETED,
                     needs_user=goal.status in {GoalStatus.AWAITING_PLAN_APPROVAL, GoalStatus.PAUSED},
+                    disposition=goal.metadata.get("completion_disposition"),
+                    limitations=tuple(
+                        goal.metadata.get("completion_limitations", ())
+                    ),
                 )
             plan = self.store.get_accepted_plan(goal.id)
             if plan is None or plan.revision != goal.active_plan_revision:
@@ -5389,7 +6551,7 @@ class AgentRuntime:
                 raise ValueError("slice steps must be positive")
             self._delegations_this_slice = 0
             no_action = 0
-            made_progress = False
+            progress_before = self._durable_progress_snapshot(goal.id)
             if not self._work_conversation:
                 self._work_conversation = [
                     {"role": "user", "content": f"Resume durable goal {goal.id} at accepted plan r{plan.revision}."}
@@ -5481,9 +6643,6 @@ class AgentRuntime:
                         {"role": "tool", "id": call.id, "name": call.name, "content": result}
                     )
                     self.events.publish("tool_result", result, tool=call.name, actor="coordinator")
-                    if not result.startswith("Error:") and not result.startswith("Permission denied"):
-                        made_progress = True
-
                 durable_checkpoint = state_envelope(self._state_payload(
                     self.store.get_goal(goal.id),
                     self.store.get_latest_plan(goal.id),
@@ -5518,13 +6677,17 @@ class AgentRuntime:
                     self.generate_plan(
                         "Three materially different strategies failed to improve "
                         "the evidence. Re-inspect the repository and produce a "
-                        "materially different plan."
+                        "materially different plan.",
+                        auto_approve_in_scope_repair=True,
                     )
                 except ProviderUnavailableError:
                     # generate_plan persists the resumable planning pause.
                     pass
                 current = self.store.get_goal(goal.id)
             if current.status == GoalStatus.RUNNING:
+                made_progress = (
+                    self._durable_progress_snapshot(goal.id) != progress_before
+                )
                 stalled = 0 if made_progress else int(current.metadata.get("no_progress_slices", 0)) + 1
                 current = self.store.update_goal_metadata(
                     goal.id,
@@ -5576,7 +6739,72 @@ class AgentRuntime:
                 paused=current.status is GoalStatus.PAUSED,
                 continues=current.status is GoalStatus.RUNNING,
             )
-            return SliceResult(current.status.value, message, completed_steps, completed, needs_user)
+            return SliceResult(
+                current.status.value,
+                message,
+                completed_steps,
+                completed,
+                needs_user,
+                current.metadata.get("completion_disposition"),
+                tuple(current.metadata.get("completion_limitations", ())),
+            )
+
+    def continue_until_boundary(
+        self,
+        *,
+        on_checkpoint: Callable[[SliceResult], None] | None = None,
+    ) -> Any:
+        """Continue Normal or Ultra work until completion or a real boundary."""
+
+        goal = self.active_goal()
+        if goal is None:
+            return SliceResult("idle", "There is no active goal.")
+        if goal.metadata.get("ultra_run_id"):
+            session = self._ensure_ultra_session()
+            if session.running:
+                return self.converge_ultra()
+            current = self.active_goal() or goal
+            return SliceResult(
+                current.status.value,
+                f"ULTRA checkpointed at {current.status.value}.",
+                completed=current.status is GoalStatus.COMPLETED,
+                needs_user=current.status in {
+                    GoalStatus.AWAITING_PLAN_APPROVAL,
+                    GoalStatus.PAUSED,
+                },
+            )
+
+        last = SliceResult(goal.status.value, f"Goal is {goal.status.value}.")
+        while True:
+            goal = self.active_goal()
+            if goal is None:
+                return last
+            if goal.status is GoalStatus.PAUSED and bool(
+                goal.metadata.get("auto_retryable")
+            ):
+                self.wait_for_scheduled_retry()
+                try:
+                    self.resume()
+                except RuntimeErrorBase:
+                    current = self.active_goal()
+                    if current is None or not (
+                        current.status is GoalStatus.PAUSED
+                        and current.metadata.get("auto_retryable")
+                    ):
+                        raise
+                continue
+            if goal.status is not GoalStatus.RUNNING:
+                return last
+            self.wait_for_scheduled_retry()
+            last = self.run_slice()
+            if on_checkpoint is not None:
+                on_checkpoint(last)
+            if (
+                last.completed
+                or last.needs_user
+                or last.status != GoalStatus.RUNNING.value
+            ):
+                return last
 
     def dashboard(self) -> DashboardView:
         goal = self.active_goal() or self.store.get_latest_goal(self.session_id)
@@ -5742,8 +6970,8 @@ class AgentRuntime:
                 )
                 return self.approve_plan(plan.revision)
             if self.active_goal() is None:
-                mode = self.store.get_workflow_session(self.session_id)["session_mode"]
-                return self.submit_intent(text, requested_mode=mode)
+                _decision, result = self.route_input(text)
+                return result
             return self.add_guidance(text)
         return None
 
@@ -5779,9 +7007,59 @@ class AgentRuntime:
         return result
 
     def _artifactize_chat_text(self, text: str) -> tuple[str, tuple[dict[str, Any], ...]]:
-        """Compatibility shim; unified execution never assigns artifact paths."""
+        """Persist large generated code and replace provider history with stable handles."""
 
-        return str(text or ""), ()
+        original = str(text or "")
+        artifacts: list[dict[str, Any]] = []
+        pattern = re.compile(r"```([\w.+-]*)\s*\n([\s\S]*?)```", re.MULTILINE)
+
+        def replace_block(match: re.Match[str]) -> str:
+            language = (match.group(1) or "text").casefold()
+            content = match.group(2)
+            if len(content) < 2_048 and "<!doctype html" not in content.casefold():
+                return match.group(0)
+            names = {
+                "html": "index.html",
+                "javascript": "generated.js",
+                "js": "generated.js",
+                "python": "generated.py",
+                "py": "generated.py",
+                "css": "styles.css",
+            }
+            artifact = self.store.add_chat_artifact(
+                self.session_id,
+                content,
+                language=language,
+                suggested_name=names.get(language, "generated.txt"),
+            )
+            artifacts.append(artifact)
+            return (
+                f'<CHAT_ARTIFACT id="{artifact["id"]}" language="{language}" '
+                f'suggested_name="{artifact["suggested_name"]}" '
+                f'sha256="{artifact["content_hash"]}" bytes="{artifact["byte_size"]}" />'
+            )
+
+        compact = pattern.sub(replace_block, original)
+        if (
+            not artifacts
+            and len(original) >= 2_048
+            and "<!doctype html" in original.casefold()
+        ):
+            start = original.casefold().find("<!doctype html")
+            content = original[start:]
+            artifact = self.store.add_chat_artifact(
+                self.session_id,
+                content,
+                language="html",
+                suggested_name="index.html",
+            )
+            artifacts.append(artifact)
+            compact = (
+                f'<CHAT_ARTIFACT id="{artifact["id"]}" language="html" '
+                f'suggested_name="index.html" sha256="{artifact["content_hash"]}" '
+                f'bytes="{artifact["byte_size"]}" />'
+            )
+        return compact, tuple(artifacts)
 
     def _execute_chat_tool(
         self,
@@ -5962,38 +7240,233 @@ class AgentRuntime:
             evidence.append(f"{name}: {' '.join(output.split())[:240]}")
         return "\n".join(f"- {item}" for item in evidence)
 
-    def chat(self, text: str, *, steps: int = 12) -> SliceResult:
-        """Route Chat through the same durable semantic execution engine."""
+    def chat(
+        self,
+        text: str,
+        *,
+        steps: int = 12,
+        _route_checked: bool = False,
+    ) -> Any:
+        """Run bounded Chat with durable artifacts and action postcondition gates."""
 
         prompt = str(text).strip()
         if not prompt:
             return SliceResult("idle", "", 0)
-        result = self.submit_intent(
-            prompt,
-            requested_mode=RunMode.NORMAL,
-            entry_surface="chat",
+        if not _route_checked:
+            route = decide_input_route(prompt)
+            if route.kind is RouteKind.GOAL:
+                session_mode = self.store.get_workflow_session(self.session_id)[
+                    "session_mode"
+                ]
+                routed = self.submit_intent(
+                    prompt,
+                    requested_mode=session_mode,
+                    entry_surface="chat",
+                )
+                if isinstance(routed, SliceResult):
+                    return routed
+                status = getattr(routed, "status", "planning")
+                status_value = getattr(status, "value", str(status))
+                return SliceResult(
+                    str(status_value),
+                    (
+                        f"Project plan r{routed.revision} is ready for approval."
+                        if isinstance(routed, Plan)
+                        else "Project workflow started."
+                    ),
+                    needs_user=str(status_value)
+                    in {
+                        PlanStatus.PENDING_APPROVAL.value,
+                        GoalStatus.AWAITING_PLAN_APPROVAL.value,
+                    },
+                )
+        user_message = {"role": "user", "content": prompt}
+        self._chat_conversation.append(user_message)
+        self.store.append_chat_message(self.session_id, user_message)
+        session = self.store.get_workflow_session(self.session_id)
+        session_state = dict(session.get("state", {}))
+        session_state.setdefault(
+            "run_id",
+            f"run-{hashlib.sha256((prompt + str(time.time_ns())).encode()).hexdigest()[:20]}",
         )
-        goal = self.active_goal()
-        if isinstance(result, Plan):
-            if result.status is PlanStatus.ACCEPTED:
-                return self.run_slice(steps=max(1, steps))
-            return SliceResult(
-                result.status.value,
-                f"Repository-grounded plan r{result.revision} is ready.",
-                0,
-                needs_user=result.status is PlanStatus.PENDING_APPROVAL,
+        session_state.setdefault("original_objective", prompt)
+        session_state.setdefault("user_messages", [])
+        session_state["user_messages"] = [
+            *session_state["user_messages"],
+            prompt,
+        ][-50:]
+
+        intent = ChatIntentV1.parse(prompt)
+        known_artifacts = self.store.list_chat_artifacts(self.session_id)
+        latest_html = next(
+            (
+                item
+                for item in reversed(known_artifacts)
+                if item.get("language") == "html"
+            ),
+            None,
+        )
+        if intent.requires_run and latest_html is not None:
+            suggested = str(latest_html.get("suggested_name") or "index.html")
+            if not (self.workspace / suggested).exists():
+                intent = ChatIntentV1(
+                    prompt,
+                    requires_write=True,
+                    requires_run=True,
+                    requires_install=intent.requires_install,
+                )
+
+        capability_rows = tools.capability_report()
+        capabilities = json.dumps(capability_rows, ensure_ascii=False)
+        artifact_rows = [
+            {
+                key: item.get(key)
+                for key in (
+                    "id",
+                    "language",
+                    "suggested_name",
+                    "content_hash",
+                    "byte_size",
+                )
+            }
+            for item in known_artifacts[-10:]
+        ]
+        system = CHAT_SYSTEM_PROMPT + "\n\nRUNTIME CAPABILITIES:\n" + capabilities
+        if artifact_rows:
+            system += (
+                "\n\nDURABLE CHAT ARTIFACTS:\n"
+                + json.dumps(artifact_rows, ensure_ascii=False)
             )
-        if goal is not None:
-            return SliceResult(
-                goal.status.value,
-                str(goal.metadata.get("waiting_question") or "The durable task is active."),
-                0,
-                needs_user=goal.status in {
-                    GoalStatus.PAUSED,
-                    GoalStatus.AWAITING_PLAN_APPROVAL,
-                },
+
+        executed = 0
+        changed_paths: list[str] = []
+        successful_tools: list[str] = []
+        successful_outputs: list[tuple[str, str]] = []
+        failure_outputs: list[str] = []
+        no_action_attempts = 0
+        final_text = ""
+
+        for step in range(1, max(1, steps) + 1):
+            turn = self._call_provider(
+                self._chat_conversation,
+                list(tools.TOOL_SCHEMAS),
+                system,
+                actor="chat",
+                step=step,
+                stream_text=False,
             )
-        return SliceResult("idle", "No task was created.", 0)
+            message = turn.to_message()
+            display_text = turn.text or ""
+            if turn.text:
+                compact_text, created = self._artifactize_chat_text(turn.text)
+                message["content"] = compact_text
+                if created:
+                    session_state["chat_artifact_ids"] = list(
+                        dict.fromkeys(
+                            [
+                                *session_state.get("chat_artifact_ids", []),
+                                *(item["id"] for item in created),
+                            ]
+                        )
+                    )
+            self._chat_conversation.append(message)
+            self.store.append_chat_message(self.session_id, message)
+
+            if turn.tool_calls:
+                for call in turn.tool_calls:
+                    result, changed = self._execute_chat_tool(call, intent)
+                    executed += 1
+                    tool_message = {
+                        "role": "tool",
+                        "id": call.id,
+                        "name": call.name,
+                        "content": result.output,
+                    }
+                    self._chat_conversation.append(tool_message)
+                    self.store.append_chat_message(self.session_id, tool_message)
+                    self.events.publish(
+                        "tool_result",
+                        result.output,
+                        tool=call.name,
+                        actor="chat",
+                        id=call.id,
+                    )
+                    if result.ok:
+                        successful_tools.append(call.name)
+                        successful_outputs.append((call.name, result.output))
+                        changed_paths.extend(changed)
+                    else:
+                        failure_outputs.append(result.output)
+                continue
+
+            missing = intent.missing(successful_tools)
+            if missing:
+                if intent.requires_run and "?" in display_text and latest_html is None:
+                    candidates = [
+                        path
+                        for path in self.workspace.rglob("*.htm*")
+                        if ".coding-agent" not in path.parts
+                    ]
+                    if len(candidates) != 1:
+                        final_text = display_text
+                        break
+                no_action_attempts += 1
+                if no_action_attempts >= self.config.no_action_limit:
+                    detail = (
+                        failure_outputs[-1]
+                        if failure_outputs
+                        else "the model repeatedly returned prose without using the available tools"
+                    )
+                    final_text = f"Action could not be completed: {detail}"
+                    break
+                correction_message = {
+                    "role": "user",
+                    "content": corrective_prompt(intent, missing, capabilities),
+                }
+                self._chat_conversation.append(correction_message)
+                self.store.append_chat_message(self.session_id, correction_message)
+                continue
+
+            final_text = display_text or "Completed the requested action."
+            break
+
+        if not final_text:
+            final_text = (
+                f"Chat turn checkpointed after {executed} tool action(s); "
+                "execution can continue in the same session."
+            )
+        if successful_outputs and intent.actionable:
+            final_text = (
+                final_text.rstrip()
+                + "\n\nEvidence:\n"
+                + self._chat_evidence(successful_outputs)
+            )
+
+        artifacts = list(dict.fromkeys(changed_paths))
+        if artifacts:
+            session_state["below_target_continuation"] = {
+                "status": "below_target",
+                "objective": session_state["original_objective"],
+                "target": "evidence-backed convergence",
+                "weaknesses": ["candidate has not passed independent evaluation"],
+                "expected_refinement_scope": artifacts,
+                "artifacts": artifacts,
+                "recommended_action": "continue the same run in Goal mode",
+                "memory_preserved": True,
+            }
+            final_text += (
+                "\n\nQuality status: BELOW_TARGET (not independently evaluated). "
+                "The artifact and action evidence are preserved for Goal mode."
+            )
+        self.store.save_workflow_session(
+            self.session_id,
+            goal_id=None,
+            session_mode=SessionMode.CHAT.value,
+            plan_state=PlanState.NONE.value,
+            run_state=RunState.IDLE.value,
+            state=session_state,
+        )
+        return SliceResult("chat", final_text, executed)
 
     def sleep_profile(self, action: str, mode: Any) -> Mapping[str, Any]:
         """Control session-scoped Sleep without weakening Ultra/Docker gates."""

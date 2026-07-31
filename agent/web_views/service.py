@@ -8,7 +8,15 @@ from datetime import datetime, timezone
 from threading import RLock
 from typing import Any, Iterable, Mapping
 
-from ..models import GoalStatus, Plan, RoleProfile, TaskStatus, validate_task_dag
+from ..models import (
+    GoalStatus,
+    Plan,
+    PlanStatus,
+    QueuedPromptStatus,
+    RoleProfile,
+    TaskStatus,
+    validate_task_dag,
+)
 from ..quality import ChangeSetStatus
 from ..store import NotFoundError, StalePlanError
 from ..ultra_models import WorkNodeStatus
@@ -155,6 +163,7 @@ class CoreWebAdapter:
         self.events = runtime.events
         self.session_id = runtime.session_id
         self._lock = RLock()
+        self._requested_view = "plan"
 
     def _goal(self) -> Any:
         goal = self.runtime.active_goal() or self.store.get_latest_goal(self.session_id)
@@ -162,11 +171,231 @@ class CoreWebAdapter:
             raise NotFoundError("this session does not have a plan yet")
         return goal
 
+    @staticmethod
+    def _can_manage_queue(goal: Any) -> bool:
+        return goal.status in {
+            GoalStatus.RUNNING,
+            GoalStatus.VERIFYING,
+            GoalStatus.REVIEWING,
+            GoalStatus.PAUSED,
+            GoalStatus.RECOVERING,
+            GoalStatus.BLOCKED,
+            GoalStatus.COMPLETED,
+        }
+
+    def request_view(self, view_name: str) -> None:
+        if view_name not in {"plan", "review", "agents"}:
+            raise ValueError(f"unknown workspace view: {view_name}")
+        with self._lock:
+            self._requested_view = view_name
+
+    @staticmethod
+    def _queued_prompt_snapshot(item: Any) -> dict[str, Any]:
+        return {
+            "id": item.id,
+            "sequence": item.sequence,
+            "text": item.text,
+            "mode": item.mode,
+            "status": item.status.value,
+            "goal_id": item.goal_id,
+            "error": item.error,
+            "created_at": item.created_at.isoformat(),
+            "started_at": item.started_at.isoformat() if item.started_at else None,
+        }
+
+    def queue_snapshot(self) -> dict[str, Any]:
+        items = self.store.list_queued_prompts(
+            self.session_id,
+            include_terminal=False,
+            limit=10,
+        )
+        return {
+            "items": [self._queued_prompt_snapshot(item) for item in items],
+            "pending_count": sum(
+                item.status is QueuedPromptStatus.PENDING for item in items
+            ),
+            "capacity": 10,
+        }
+
+    def enqueue_queue_prompt(self, text: str, mode: str | None = None) -> dict[str, Any]:
+        goal = self._goal()
+        if not self._can_manage_queue(goal):
+            raise ValueError(
+                "Future requests can be added only while a project is active or completed."
+            )
+        session = self.store.get_workflow_session(self.session_id)
+        selected_mode = mode or str(session["session_mode"])
+        item = self.store.enqueue_prompt(self.session_id, text, selected_mode)
+        self.events.publish(
+            "prompt.queued",
+            "A new request was added to Up next.",
+            session_id=self.session_id,
+            prompt_id=item.id,
+            sequence=item.sequence,
+            mode=item.mode,
+            source="local_web",
+            actor="user",
+        )
+        return {
+            "queued": True,
+            "item": self._queued_prompt_snapshot(item),
+            "queue": self.queue_snapshot(),
+        }
+
+    def reorder_queue(self, ordered_ids: Iterable[str]) -> dict[str, Any]:
+        goal = self._goal()
+        if not self._can_manage_queue(goal):
+            raise ValueError(
+                "Future requests can be reordered only while a project is active or completed."
+            )
+        items = self.store.reorder_pending_prompts(self.session_id, ordered_ids)
+        self.events.publish(
+            "prompt.queue_reordered",
+            "Waiting requests were reordered.",
+            session_id=self.session_id,
+            ordered_ids=list(ordered_ids),
+            source="local_web",
+            actor="user",
+        )
+        return {
+            "reordered": True,
+            "queue": {
+                "items": [self._queued_prompt_snapshot(item) for item in items],
+                "pending_count": sum(
+                    item.status is QueuedPromptStatus.PENDING for item in items
+                ),
+                "capacity": 10,
+            },
+        }
+
+    def workspace_context(self) -> dict[str, Any]:
+        goal = self.runtime.active_goal() or self.store.get_latest_goal(self.session_id)
+        session = self.store.get_workflow_session(self.session_id)
+        queue = self.queue_snapshot()
+        required_view: str | None = None
+        checkpoint_id: str | None = None
+        review_badge = 0
+        plan_badge = 0
+        if goal is not None:
+            run = self.store.get_active_ultra_run(goal.id)
+            if run is not None:
+                change_sets = self.store.list_change_sets(run.id)
+                reviewable = [
+                    item
+                    for item in change_sets
+                    if item.status in REVIEWABLE_CHANGE_SET_STATES
+                    and not (
+                        item.status is ChangeSetStatus.BLOCKED
+                        and bool(item.metadata.get("latest_user_review"))
+                    )
+                ]
+                if reviewable:
+                    required_view = "review"
+                    checkpoint_id = reviewable[-1].id
+                    review_badge = 1
+            if (
+                required_view is None
+                and goal.status is GoalStatus.AWAITING_PLAN_APPROVAL
+            ):
+                required_view = "plan"
+                plan_badge = 1
+        if required_view == "review":
+            attention = {
+                "state": "waiting",
+                "eyebrow": "Your decision is needed",
+                "title": "Review the recorded changes",
+                "body": "Resolve every changed file. Approved work continues; requested changes start a fixer.",
+                "action": {"label": "Review changes", "view": "review"},
+            }
+        elif required_view == "plan":
+            attention = {
+                "state": "waiting",
+                "eyebrow": "Your decision is needed",
+                "title": "Review the plan before work starts",
+                "body": "You can edit this revision, save a draft, or approve it once.",
+                "action": {"label": "Review plan", "view": "plan"},
+            }
+        elif goal is None:
+            attention = {
+                "state": "idle",
+                "eyebrow": "No project yet",
+                "title": "Start from the terminal",
+                "body": "Create a Goal to see its plan, review gates, and execution here.",
+                "action": None,
+            }
+        elif goal.status is GoalStatus.COMPLETED:
+            attention = {
+                "state": "complete",
+                "eyebrow": "Project complete",
+                "title": "The workflow has finished",
+                "body": "The final plan and execution evidence remain available for inspection.",
+                "action": None,
+            }
+        elif goal.status in {GoalStatus.BLOCKED, GoalStatus.PAUSED}:
+            attention = {
+                "state": "blocked",
+                "eyebrow": "Workflow needs attention",
+                "title": "Work cannot continue yet",
+                "body": "Return to the terminal for the blocking question, permission, or recovery action.",
+                "action": None,
+            }
+        else:
+            attention = {
+                "state": "working",
+                "eyebrow": "System is working",
+                "title": "No action is required from you",
+                "body": "You can inspect progress or add a request for after the current work.",
+                "action": None,
+            }
+        with self._lock:
+            requested_view = self._requested_view
+        return {
+            "session_id": self.session_id,
+            "session_short": self.session_id[:8],
+            "requested_view": requested_view,
+            "required_view": required_view,
+            "current_view": required_view or requested_view,
+            "checkpoint_id": checkpoint_id,
+            "goal": (
+                {
+                    "id": goal.id,
+                    "objective": goal.objective,
+                    "status": goal.status.value,
+                    "plan_revision": goal.active_plan_revision,
+                }
+                if goal is not None
+                else None
+            ),
+            "mode": str(session["session_mode"]),
+            "attention": attention,
+            "navigation": {
+                "plan": {"badge": plan_badge},
+                "review": {"badge": review_badge},
+                "agents": {"badge": 0},
+            },
+            "capabilities": {
+                "can_manage_queue": (
+                    goal is not None
+                    and self._can_manage_queue(goal)
+                ),
+                "can_open_execution": goal is not None,
+            },
+            "queue": queue,
+            "updated_at": _iso_now(),
+        }
+
     def plan_snapshot(self) -> dict[str, Any]:
         goal = self._goal()
         plan = self.store.get_latest_plan(goal.id)
         if plan is None:
             raise NotFoundError("this session does not have a plan yet")
+        session = self.store.get_workflow_session(self.session_id)
+        session_mode = str(session["session_mode"])
+        can_edit = (
+            goal.status is GoalStatus.AWAITING_PLAN_APPROVAL
+            and session_mode in {"plan", "normal"}
+            and plan.status is PlanStatus.PENDING_APPROVAL
+        )
         draft = dict(self.runtime.session_snapshot().get("web_plan_draft") or {})
         return {
             "session_id": self.session_id,
@@ -175,6 +404,8 @@ class CoreWebAdapter:
             "objective": goal.objective,
             "revision": plan.revision,
             "status": plan.status.value,
+            "goal_status": goal.status.value,
+            "session_mode": session_mode,
             "summary": plan.summary,
             "tasks": [_task_snapshot(task) for task in plan.tasks],
             "global_constraints": list(
@@ -182,20 +413,24 @@ class CoreWebAdapter:
             ),
             "protected_paths": list(goal.metadata.get("protected_paths") or ()),
             "draft": draft if draft.get("base_revision") == plan.revision else None,
+            "capabilities": {
+                "can_edit": can_edit,
+                "can_save_draft": can_edit,
+                "can_create_revision": can_edit,
+                "can_approve": (
+                    goal.status is GoalStatus.AWAITING_PLAN_APPROVAL
+                    and plan.status is PlanStatus.PENDING_APPROVAL
+                    and session_mode != "plan"
+                ),
+                "can_manage_queue": self._can_manage_queue(goal),
+            },
+            "queue": self.queue_snapshot(),
             "updated_at": plan.updated_at.isoformat(),
             "connection": "connected",
         }
 
     @staticmethod
     def _task_value(item: Any, index: int) -> dict[str, Any]:
-        status = item.status
-        if item.disabled:
-            status = TaskStatus.OBSOLETE.value
-        elif item.paused and status not in {
-            TaskStatus.COMPLETED.value,
-            TaskStatus.OBSOLETE.value,
-        }:
-            status = TaskStatus.BLOCKED.value
         metadata = {
             "inputs": item.inputs,
             "outputs": item.outputs,
@@ -206,8 +441,6 @@ class CoreWebAdapter:
             "approval_gate": item.approval_gate,
             "constraints": item.constraints,
             "parallel": item.parallel,
-            "paused": item.paused,
-            "disabled": item.disabled,
             "comments": item.comments,
         }
         return {
@@ -215,7 +448,9 @@ class CoreWebAdapter:
             "title": item.title,
             "description": item.description,
             "parent_id": item.parent_id.upper() if item.parent_id else None,
-            "status": status,
+            # A revision describes intended future work. Runtime state belongs
+            # to the harness and is never accepted from the browser payload.
+            "status": TaskStatus.PENDING.value,
             "depends_on": [dependency.upper() for dependency in item.dependencies],
             "acceptance_criteria": item.acceptance_criteria,
             "verification": item.tests,
@@ -295,6 +530,10 @@ class CoreWebAdapter:
 
     def save_plan_draft(self, payload: PlanPayload) -> dict[str, Any]:
         current = self.plan_snapshot()
+        if not bool(current["capabilities"]["can_save_draft"]):
+            raise ValueError(
+                "The active plan is read-only. Wait for a planning checkpoint before editing it."
+            )
         session = self.store.get_workflow_session(self.session_id)
         state = dict(session.get("state") or {})
         state["web_plan_draft"] = {
@@ -330,14 +569,20 @@ class CoreWebAdapter:
         )
         return {"saved": True, "base_revision": payload.base_revision}
 
-    def apply_plan(self, payload: PlanPayload) -> dict[str, Any]:
+    def save_plan_revision(self, payload: PlanPayload) -> dict[str, Any]:
         with self._lock:
             goal = self._goal()
             session = self.store.get_workflow_session(self.session_id)
-            if str(session["session_mode"]) != "normal":
+            session_mode = str(session["session_mode"])
+            if goal.status is not GoalStatus.AWAITING_PLAN_APPROVAL:
                 raise ValueError(
-                    "Applying a Plan Studio revision requires Normal mode. "
-                    "Change mode in the terminal, then reload this snapshot."
+                    "The active plan is read-only while work is running. "
+                    "Wait for a planning checkpoint before creating a revision."
+                )
+            if session_mode not in {"plan", "normal"}:
+                raise ValueError(
+                    "Ultra plans are governed by the orchestrator. "
+                    "Use the guided replan flow to change this plan."
                 )
             old_plan = self.store.get_latest_plan(goal.id)
             if old_plan is None:
@@ -370,7 +615,7 @@ class CoreWebAdapter:
                 self.store.transition_goal(
                     goal.id,
                     GoalStatus.REVISING,
-                    reason="Plan Studio apply requested",
+                    reason="Plan Studio revision requested",
                 )
             try:
                 plan = self.store.create_plan(
@@ -398,14 +643,13 @@ class CoreWebAdapter:
                     GoalStatus.AWAITING_PLAN_APPROVAL,
                     reason=f"Plan Studio created r{plan.revision}",
                 )
-                applied = self.runtime.approve_plan(plan.revision, approved_by="user@local-web")
             except Exception:
                 current = self.store.get_goal(goal.id)
                 if current.status is GoalStatus.REVISING and original_status is not GoalStatus.REVISING:
                     self.store.transition_goal(
                         goal.id,
                         original_status,
-                        reason="Plan Studio apply rolled back before revision creation",
+                        reason="Plan Studio revision rolled back before creation",
                     )
                 raise
             session = self.store.get_workflow_session(self.session_id)
@@ -413,7 +657,7 @@ class CoreWebAdapter:
             state.pop("web_plan_draft", None)
             state["web_plan_change_summary"] = {
                 "parent_revision": payload.base_revision,
-                "revision": applied.revision,
+                "revision": plan.revision,
                 "timestamp": _iso_now(),
                 "session_id": self.session_id,
                 "tasks_added": added,
@@ -431,18 +675,18 @@ class CoreWebAdapter:
                 state=state,
             )
             message = (
-                f"Plan applied · r{payload.base_revision} → r{applied.revision} · "
-                f"{len(modified)} modified · {len(added)} added."
+                f"Plan revision created: r{payload.base_revision} -> r{plan.revision}; "
+                f"{len(modified)} modified; {len(added)} added."
             )
             self.store.append_event(
-                "plan.revision.applied",
+                "plan.revision.created",
                 goal_id=goal.id,
                 entity_type="plan",
-                entity_id=applied.id,
+                entity_id=plan.id,
                 payload={
                     "session_id": self.session_id,
                     "parent_revision": payload.base_revision,
-                    "revision": applied.revision,
+                    "revision": plan.revision,
                     "tasks_added": added,
                     "tasks_deleted": deleted,
                     "tasks_modified": modified,
@@ -451,11 +695,11 @@ class CoreWebAdapter:
                 },
             )
             self.events.publish(
-                "plan.revision.applied",
+                "plan.revision.created",
                 message,
                 session_id=self.session_id,
                 previous_revision=payload.base_revision,
-                plan_revision=applied.revision,
+                plan_revision=plan.revision,
                 tasks_added=len(added),
                 tasks_deleted=len(deleted),
                 tasks_modified=len(modified),
@@ -463,14 +707,61 @@ class CoreWebAdapter:
                 actor="user",
             )
             return {
-                "applied": True,
+                "saved": True,
+                "approved": False,
                 "previous_revision": payload.base_revision,
-                "revision": applied.revision,
+                "revision": plan.revision,
                 "summary": {
                     "tasks_added": len(added),
                     "tasks_deleted": len(deleted),
                     "tasks_modified": len(modified),
                 },
+            }
+
+    def apply_plan(self, payload: PlanPayload) -> dict[str, Any]:
+        """Compatibility alias that creates an unapproved revision."""
+
+        return self.save_plan_revision(payload)
+
+    def approve_plan(self, revision: int) -> dict[str, Any]:
+        with self._lock:
+            goal = self._goal()
+            plan = self.store.get_latest_plan(goal.id)
+            if plan is None:
+                raise NotFoundError("there is no plan to approve")
+            if plan.revision != revision:
+                raise StalePlanError(
+                    f"Plan r{revision} is stale. The current plan is Plan r{plan.revision}."
+                )
+            if goal.status is not GoalStatus.AWAITING_PLAN_APPROVAL:
+                raise ValueError("This plan is not waiting for approval.")
+            if plan.status is not PlanStatus.PENDING_APPROVAL:
+                raise ValueError(f"Plan r{revision} is already {plan.status.value}.")
+            session = self.store.get_workflow_session(self.session_id)
+            if str(session["session_mode"]) == "plan":
+                raise ValueError(
+                    "Plan mode can save revisions, but execution requires Normal or Ultra mode."
+                )
+            approved = self.runtime.approve_plan(
+                revision,
+                approved_by="user@local-web",
+            )
+            self.store.append_event(
+                "plan.approved.local_web",
+                goal_id=goal.id,
+                entity_type="plan",
+                entity_id=approved.id,
+                payload={
+                    "session_id": self.session_id,
+                    "revision": approved.revision,
+                    "source": "local_web",
+                    "actor": "user",
+                },
+            )
+            return {
+                "approved": True,
+                "revision": approved.revision,
+                "goal_status": self.store.get_goal(goal.id).status.value,
             }
 
     def discard_plan_draft(self) -> dict[str, Any]:
@@ -546,18 +837,64 @@ class CoreWebAdapter:
                 raise ValueError(f"checkpoint {checkpoint.id} is closed for review")
             files = _diff_files(checkpoint.diff, checkpoint.changed_files)
             file_paths = {item["path"] for item in files}
-            hunk_ids = {
-                hunk["id"]
+            hunks_by_file = {
+                item["path"]: {hunk["id"] for hunk in item["hunks"]}
                 for item in files
-                for hunk in item["hunks"]
+            }
+            hunk_ids = set().union(*hunks_by_file.values()) if hunks_by_file else set()
+            seen_targets: set[tuple[str, str, str | None]] = set()
+            file_decisions: set[str] = set()
+            hunk_decisions: dict[str, set[str]] = {
+                path: set() for path in file_paths
             }
             for decision in payload.decisions:
                 if decision.file_path not in file_paths:
                     raise ValueError(f"decision references a file outside the checkpoint: {decision.file_path}")
-                if decision.target_type == "hunk" and decision.hunk_id not in hunk_ids:
-                    raise ValueError(f"decision references an invalid hunk: {decision.hunk_id}")
+                target = (
+                    decision.target_type,
+                    decision.file_path,
+                    decision.hunk_id,
+                )
+                if target in seen_targets:
+                    raise ValueError("the same review target was submitted more than once")
+                seen_targets.add(target)
+                if decision.target_type == "file":
+                    if decision.hunk_id is not None:
+                        raise ValueError("file decisions cannot include a hunk id")
+                    file_decisions.add(decision.file_path)
+                else:
+                    if decision.hunk_id not in hunks_by_file[decision.file_path]:
+                        raise ValueError(
+                            f"decision references an invalid hunk for "
+                            f"{decision.file_path}: {decision.hunk_id}"
+                        )
+                    hunk_decisions[decision.file_path].add(str(decision.hunk_id))
                 if decision.decision in {"rejected", "changes_requested"} and not decision.reason:
                     raise ValueError("rejections and change requests require a reason")
+            mixed = sorted(
+                path
+                for path in file_paths
+                if path in file_decisions and hunk_decisions[path]
+            )
+            if mixed:
+                raise ValueError(
+                    "choose either a file decision or hunk decisions, not both: "
+                    + ", ".join(mixed)
+                )
+            unresolved = sorted(
+                path
+                for path in file_paths
+                if path not in file_decisions
+                and (
+                    not hunks_by_file[path]
+                    or hunk_decisions[path] != hunks_by_file[path]
+                )
+            )
+            if unresolved:
+                raise ValueError(
+                    "every changed file must be resolved before submit: "
+                    + ", ".join(unresolved)
+                )
             for comment in payload.comments:
                 if comment.file_path not in file_paths:
                     raise ValueError(f"comment references a file outside the checkpoint: {comment.file_path}")
@@ -722,6 +1059,13 @@ class CoreWebAdapter:
                 ),
             )
             result = agent.result.to_dict() if agent.result else {}
+            progress_value = agent.usage.get("progress")
+            progress = (
+                int(progress_value)
+                if bool(agent.usage.get("progress_authoritative"))
+                and isinstance(progress_value, (int, float))
+                else None
+            )
             agent_rows.append(
                 {
                     "id": agent.id,
@@ -731,7 +1075,8 @@ class CoreWebAdapter:
                     "task_id": agent.work_node_id,
                     "task": node.title if node else agent.phase,
                     "goal": node.objective if node else goal.objective,
-                    "progress": int(agent.usage.get("progress", 100 if agent.finished_at else 25)),
+                    "progress": progress,
+                    "phase": agent.phase,
                     "last_action": logs[-1]["summary"] if logs else agent.phase,
                     "current_file": (
                         node.contract.write_paths[0]

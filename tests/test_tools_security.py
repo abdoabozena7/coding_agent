@@ -62,6 +62,27 @@ class ToolSecurityTests(unittest.TestCase):
         self.assertEqual((second / "second.txt").read_text(), "two")
         self.assertEqual((self.workspace / "first.txt").read_text(), "one")
 
+    def test_python_source_write_invalidates_derived_bytecode(self) -> None:
+        source = self.workspace / "package" / "module.py"
+        cache = source.parent / "__pycache__"
+        cache.mkdir(parents=True)
+        legacy = source.with_suffix(".pyc")
+        tagged = cache / "module.cpython-313.pyc"
+        unrelated = cache / "other.cpython-313.pyc"
+        for candidate in (legacy, tagged, unrelated):
+            candidate.write_bytes(b"derived")
+
+        result = self.call(
+            "write_file",
+            path="package/module.py",
+            content="VALUE = 2\n",
+        )
+
+        self.assertIn("Wrote", result)
+        self.assertFalse(legacy.exists())
+        self.assertFalse(tagged.exists())
+        self.assertTrue(unrelated.exists())
+
     def test_empty_optional_list_path_uses_the_documented_workspace_default(self) -> None:
         (self.workspace / "example.txt").write_text("safe", encoding="utf-8")
 
@@ -354,6 +375,49 @@ class ToolSecurityTests(unittest.TestCase):
             }
         )
         self.assertEqual(scrubbed, {"PATH": "safe-path"})
+
+    def test_shell_execution_path_starts_with_selected_python_environment(self) -> None:
+        environment = run_bash._execution_environment()
+        path_value = environment["PATH"]
+        self.assertEqual(
+            Path(path_value.split(os.pathsep)[0]).resolve(),
+            Path(sys.executable).resolve().parent,
+        )
+        self.assertNotIn("OPENAI_API_KEY", environment)
+
+    def test_pytest_console_command_uses_selected_python_environment(self) -> None:
+        normalized = run_bash._normalize_python_entrypoint(
+            "pytest tests/test_example.py -q"
+        )
+        self.assertTrue(
+            normalized.startswith(f'"{Path(sys.executable).resolve()}" -m pytest')
+        )
+        self.assertTrue(
+            normalized.endswith(
+                " tests/test_example.py -q -p no:cacheprovider"
+            )
+        )
+        self.assertEqual(
+            run_bash._normalize_python_entrypoint("python -m pytest"),
+            "python -m pytest -p no:cacheprovider",
+        )
+        self.assertEqual(
+            run_bash._normalize_python_entrypoint("echo pytest"),
+            "echo pytest",
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows command normalization")
+    def test_posix_mkdir_p_does_not_create_a_literal_dash_p_directory(self) -> None:
+        normalized = run_bash._normalize_platform_command("mkdir -p tests")
+        self.assertEqual(normalized, "if not exist tests mkdir tests")
+        result = run_bash.run("mkdir -p tests")
+        self.assertIn("exit code: 0", result)
+        self.assertTrue((self.workspace / "tests").is_dir())
+        self.assertFalse((self.workspace / "-p").exists())
+
+    def test_execution_environment_disables_python_bytecode_cache(self) -> None:
+        environment = run_bash._execution_environment()
+        self.assertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
 
 
 if __name__ == "__main__":

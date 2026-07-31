@@ -6797,6 +6797,73 @@ class StateStore:
                 (str(session_id),),
             ).fetchone()[0])
 
+    def reorder_pending_prompts(
+        self,
+        session_id: str,
+        ordered_ids: Iterable[str],
+    ) -> tuple[QueuedPrompt, ...]:
+        """Atomically reorder only the pending slots in one durable prompt queue."""
+
+        requested = tuple(str(item).strip() for item in ordered_ids)
+        if not requested or any(not item for item in requested):
+            raise ValueError("pending prompt order must contain at least one id")
+        if len(set(requested)) != len(requested):
+            raise ValueError("pending prompt order contains duplicate ids")
+        with self.transaction() as connection:
+            session = connection.execute(
+                "SELECT 1 FROM workflow_sessions WHERE id=?",
+                (str(session_id),),
+            ).fetchone()
+            if session is None:
+                raise NotFoundError(f"workflow session not found: {session_id}")
+            rows = connection.execute(
+                "SELECT id,sequence,status FROM queued_prompts WHERE session_id=? "
+                "AND status IN ('pending','running','blocked') ORDER BY sequence",
+                (str(session_id),),
+            ).fetchall()
+            pending = tuple(
+                str(row["id"])
+                for row in rows
+                if str(row["status"]) == QueuedPromptStatus.PENDING.value
+            )
+            if set(requested) != set(pending) or len(requested) != len(pending):
+                raise StateStoreError(
+                    "prompt queue changed while it was being reordered; reload and try again"
+                )
+            pending_slots = sorted(
+                int(row["sequence"])
+                for row in rows
+                if str(row["status"]) == QueuedPromptStatus.PENDING.value
+            )
+            # Move pending entries through distinct temporary values so swaps
+            # never collide with the (session_id, sequence) unique index.
+            for row in rows:
+                if str(row["status"]) == QueuedPromptStatus.PENDING.value:
+                    connection.execute(
+                        "UPDATE queued_prompts SET sequence=? "
+                        "WHERE id=? AND session_id=? AND status='pending'",
+                        (-int(row["sequence"]), str(row["id"]), str(session_id)),
+                    )
+            for prompt_id, sequence in zip(requested, pending_slots):
+                connection.execute(
+                    "UPDATE queued_prompts SET sequence=? "
+                    "WHERE id=? AND session_id=? AND status='pending'",
+                    (sequence, prompt_id, str(session_id)),
+                )
+            self._event(
+                connection,
+                "prompt.queue_reordered",
+                entity_type="workflow_session",
+                entity_id=str(session_id),
+                payload={"ordered_ids": list(requested)},
+            )
+            updated = connection.execute(
+                "SELECT * FROM queued_prompts WHERE session_id=? "
+                "AND status IN ('pending','running','blocked') ORDER BY sequence",
+                (str(session_id),),
+            ).fetchall()
+        return tuple(self._queued_prompt_from_row(row) for row in updated)
+
     def claim_next_prompt(self, session_id: str) -> QueuedPrompt | None:
         with self.transaction() as connection:
             row = connection.execute(

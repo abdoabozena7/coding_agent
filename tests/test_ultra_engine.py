@@ -4,7 +4,7 @@ import threading
 import time
 import unittest
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping
 
 from agent.events import EventBus
@@ -239,6 +239,18 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(report.waves[0], ("A", "C"))
         self.assertNotIn("B", report.waves[0])
         self.assertGreaterEqual(len(report.waves), 2)
+        self.assertTrue(report.successful)
+
+    def test_empty_restart_wave_is_successful_when_all_work_is_already_durable(self):
+        scheduler = DeterministicWaveScheduler(ExecutionClass.LOCAL)
+        report = scheduler.run(
+            (),
+            lambda _item: self.fail("no worker should run"),
+            initially_completed=("A", "B"),
+        )
+
+        self.assertEqual(report.outcomes, ())
+        self.assertEqual(report.waves, ())
         self.assertTrue(report.successful)
 
     def test_prewrite_hash_conflict_blocks_before_worker(self):
@@ -584,6 +596,95 @@ class UltraEngineTests(unittest.TestCase):
             result.node_results[0].component_package["replan"]["revision"],
             "change approach",
         )
+
+    def test_leaf_review_does_not_fail_for_downstream_plan_artifacts(self):
+        modules = [
+            module("M1", "mathlib.py"),
+            module("M2", "formatter.py", depends_on=("M1",)),
+        ]
+        fix_nodes = []
+
+        def downstream_only_review(request: AgentRequest) -> AgentResponse:
+            response = standard_handler(request, modules=modules)
+            if (
+                request.node_id
+                and request.node_id.endswith(".M001")
+                and request.phase in {InnerPhase.REVIEW.value, InnerPhase.TEST.value}
+                and request.role is not AgentRole.SECURITY_REVIEWER
+            ):
+                return AgentResponse(
+                    payload={
+                        "passed": False,
+                        "issues": [
+                            "formatter.py is not implemented yet; it is required downstream."
+                        ],
+                    },
+                    summary="Future module is pending.",
+                )
+            if request.phase == InnerPhase.FIX.value:
+                fix_nodes.append(request.node_id)
+            return response
+
+        engine, _, _ = prepared_engine(
+            handler=downstream_only_review,
+            modules=modules,
+        )
+        result = engine.run()
+
+        self.assertTrue(result.successful)
+        self.assertNotIn(
+            next(node_id for node_id in engine.nodes if node_id.endswith(".M001")),
+            fix_nodes,
+        )
+
+    def test_leaf_review_keeps_current_path_failure_blocking(self):
+        modules = [
+            module("M1", "mathlib.py"),
+            module("M2", "formatter.py", depends_on=("M1",)),
+        ]
+        engine, _, _ = prepared_engine(modules=modules)
+        node = next(
+            node
+            for node in engine.nodes.values()
+            if node.id.endswith(".M001")
+        )
+        scoped = engine._scope_leaf_review(
+            node,
+            AgentResponse(
+                payload={
+                    "passed": False,
+                    "issues": ["mathlib.py returns subtraction instead of addition."],
+                },
+                summary="Current component is incorrect.",
+            ),
+        )
+
+        self.assertFalse(scoped.payload["passed"])
+        self.assertFalse(scoped.payload.get("abstained", False))
+        self.assertEqual(
+            scoped.payload["issues"],
+            ["mathlib.py returns subtraction instead of addition."],
+        )
+
+    def test_recovered_fix_checkpoint_does_not_redecompose_leaf(self):
+        modules = [module("M1", "mathlib.py")]
+        engine, factory, _ = prepared_engine(modules=modules)
+        node_id = next(
+            node_id for node_id in engine.nodes if node_id.endswith(".M001")
+        )
+        engine.nodes[node_id] = replace(
+            engine.nodes[node_id],
+            status=type(engine.nodes[node_id].status).PENDING,
+            phase=InnerPhase.FIX,
+            children=(),
+        )
+        before = len(factory.requests)
+
+        engine._ensure_expanded(node_id)
+
+        self.assertEqual(len(factory.requests), before)
+        self.assertEqual(engine.nodes[node_id].status.value, "ready")
+        self.assertEqual(engine.nodes[node_id].phase, InnerPhase.FIX)
 
     def test_replan_refines_contract_without_expanding_scope(self):
         original = TaskContractV1.from_mapping(module("M1", "src/one"))

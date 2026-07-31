@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import threading
@@ -11,20 +12,311 @@ from unittest import mock
 from agent.commands import parse_command
 from agent.events import EventBus
 from agent.model_catalog import ExecutionClass, ModelDescriptor
-from agent.models import GoalStatus
+from agent.models import GoalStatus, TaskStatus
 from agent.providers.base import AssistantTurn, ToolCall, Usage
+from agent.quality import ChangeSetStatus, ChangeSetV1
 from agent.runtime import AgentRuntime, RuntimeStateError
-from agent.sandbox import DockerSandbox, PermissionAdapter
+from agent.sandbox import AccessLevel, DockerSandbox, PermissionAdapter
 from agent.store import StateStore
-from agent.ultra import AgentRequest, AgentRole, NodeStatus
+from agent.ultra import (
+    AgentRequest,
+    AgentResponse,
+    AgentRole,
+    NodeStatus,
+    UltraConfig,
+    WorkNode,
+)
 from agent.ultra import MasterPlanV1, TaskContractV1, UltraOrchestrator, _with_quality_milestone
 from agent.ultra_models import BrainSection, UltraPhase, UltraRunStatus
-from agent.ultra_session import WorkspaceUltraAgent, WorkspaceUltraAgentFactory, _store_node_status
+from agent.ultra_session import (
+    WorkspaceUltraAgent,
+    WorkspaceUltraAgentFactory,
+    StateStoreUltraAdapter,
+    _repair_double_escaped_python_source,
+    _run_python_test_artifacts,
+    _store_node_status,
+    _validate_workspace_artifacts,
+)
 from agent.ultra_models import WorkNodeStatus
 
 
 def test_ultra_planning_is_not_persisted_as_execution_in_progress():
     assert _store_node_status(NodeStatus.PLANNING) is WorkNodeStatus.PENDING
+
+
+def test_double_escaped_python_fallback_is_repaired_only_when_syntax_proves_it():
+    repaired, changed = _repair_double_escaped_python_source(
+        "formatter.py",
+        'def format_sum(a, b):\n    \\"\\"\\"Add values.\\"\\"\\"\n    return f\\"{a + b}\\"\n',
+    )
+    assert changed
+    assert repaired == (
+        'def format_sum(a, b):\n    """Add values."""\n    return f"{a + b}"\n'
+    )
+
+    invalid, invalid_changed = _repair_double_escaped_python_source(
+        "formatter.py",
+        'def broken(:\n    return \\"still broken\\"\n',
+    )
+    assert not invalid_changed
+    assert '\\"still broken\\"' in invalid
+
+    javascript, javascript_changed = _repair_double_escaped_python_source(
+        "app.js",
+        'const value = \\"literal\\";\n',
+    )
+    assert not javascript_changed
+    assert javascript == 'const value = \\"literal\\";\n'
+
+
+def test_workspace_artifact_gate_hashes_files_and_rejects_python_syntax_errors():
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        (workspace / "formatter.py").write_text(
+            "def format_sum(a, b):\n    return a + b\n",
+            encoding="utf-8",
+        )
+        passed = _validate_workspace_artifacts(workspace, ("formatter.py",))
+        assert passed["passed"]
+        assert passed["evidence"][0]["python_syntax"] == "passed"
+        assert len(passed["evidence"][0]["sha256"]) == 64
+
+        (workspace / "formatter.py").write_text(
+            "def format_sum(:\n",
+            encoding="utf-8",
+        )
+        failed = _validate_workspace_artifacts(workspace, ("formatter.py",))
+        assert not failed["passed"]
+        assert any(
+            "Python syntax validation failed" in finding
+            for finding in failed["findings"]
+        )
+
+
+def test_workspace_python_test_gate_executes_pytest_without_leaking_cache():
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        test_path = workspace / "tests" / "test_gate.py"
+        test_path.parent.mkdir(parents=True)
+        test_path.write_text("def test_gate():\n    assert False\n", encoding="utf-8")
+
+        failed = _run_python_test_artifacts(
+            workspace,
+            ("tests/test_gate.py",),
+        )
+        assert not failed["passed"]
+        assert failed["evidence"][0]["returncode"] != 0
+
+        test_path.write_text("def test_gate():\n    assert True\n", encoding="utf-8")
+        passed = _run_python_test_artifacts(
+            workspace,
+            ("tests/test_gate.py",),
+        )
+        assert passed["passed"]
+        assert passed["evidence"][0]["returncode"] == 0
+        assert not (workspace / ".pytest_cache").exists()
+        assert not any(workspace.rglob("__pycache__"))
+
+
+def test_master_plan_restoration_covers_every_explicit_semantic_artifact():
+    normalized, actions = UltraOrchestrator._normalize_typed_payload(
+        "master_plan",
+        {},
+        {
+            "goal_spec": {
+                "objective": (
+                    "Create mathlib.py and formatter.py, then create "
+                    "tests/test_components.py and run pytest."
+                ),
+                "in_scope": [
+                    "mathlib.py",
+                    "formatter.py",
+                    "tests/test_components.py",
+                ],
+                "success_criteria": ["tests/test_components.py passes pytest."],
+            },
+            "architecture": {
+                "summary": "Two implementation components plus verification.",
+                "components": [
+                    {
+                        "name": "mathlib.py",
+                        "responsibility": "Implement add in mathlib.py.",
+                    },
+                    {
+                        "name": "formatter.py",
+                        "responsibility": "Implement format_sum in formatter.py.",
+                    },
+                ],
+            },
+            "protocol_node_namespace": "run123",
+        },
+    )
+
+    modules = normalized["modules"]
+    owned_paths = {
+        path
+        for module in modules
+        for path in module.get("write_paths", ())
+    }
+    assert owned_paths == {
+        "mathlib.py",
+        "formatter.py",
+        "tests/test_components.py",
+    }
+    test_module = next(
+        module
+        for module in modules
+        if "tests/test_components.py" in module.get("write_paths", ())
+    )
+    assert set(test_module["depends_on"]) == {
+        "run123.M001",
+        "run123.M002",
+    }
+    assert any("python -m pytest" in item for item in test_module["verification"])
+    assert any("missing explicitly required semantic artifacts" in item for item in actions)
+
+
+def test_final_evidence_missing_boolean_uses_only_authoritative_operational_gate():
+    normalized, actions = UltraOrchestrator._normalize_typed_payload(
+        "final_evidence",
+        {"summary": "All requested behavior is complete."},
+        {
+            "integration": {"success": True},
+            "review": {"passed": True},
+            "authoritative_operational_evidence": {
+                "kind": "authoritative_operational_evidence",
+                "passed": True,
+                "hashed_paths": ["module.py", "tests/test_module.py"],
+                "executable_checks": [
+                    {
+                        "kind": "executable_verification",
+                        "passed": True,
+                        "returncode": 0,
+                    }
+                ],
+            },
+        },
+    )
+    assert normalized["success"]
+    assert normalized["passed"]
+    assert normalized["evaluator_capability"] == "harness_operational_evidence"
+    assert any("authoritative artifact hashes" in item for item in actions)
+
+    rejected, _ = UltraOrchestrator._normalize_typed_payload(
+        "final_evidence",
+        {"summary": "Claims completion without evidence."},
+        {
+            "integration": {"success": True},
+            "review": {"passed": True},
+            "authoritative_operational_evidence": {"passed": False},
+        },
+    )
+    assert not rejected["success"]
+    assert not rejected["passed"]
+
+
+def test_exact_child_artifact_restoration_replays_matching_durable_write():
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        expected_content = (
+            "from formatter import format_sum\n\n"
+            "def test_format_sum():\n"
+            "    assert format_sum(2, 3) == 'Sum is 5'\n"
+        )
+        expected_hash = hashlib.sha256(expected_content.encode("utf-8")).hexdigest()
+        target = workspace / "tests" / "test_components.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("def test_drifted():\n    assert False\n", encoding="utf-8")
+
+        store = StateStore(workspace)
+        try:
+            goal = store.create_goal("Restore accepted child artifact")
+            action_id = store.begin_action(
+                goal.id,
+                "write_file",
+                {
+                    "arguments": {
+                        "path": "tests/test_components.py",
+                        "content": expected_content,
+                    }
+                },
+                mutating=True,
+            )
+            store.complete_action(action_id, "accepted test artifact")
+            adapter = StateStoreUltraAdapter(
+                store,
+                goal.id,
+                ModelDescriptor("ollama", "offline-ultra", ExecutionClass.LOCAL),
+                AccessLevel.NORMAL,
+                UltraConfig(),
+                workspace=workspace,
+            )
+            contract = TaskContractV1(
+                id="M003",
+                title="Tests",
+                objective="Create tests.",
+                acceptance_criteria=("Tests exist.",),
+                verification=("Run pytest.",),
+                write_paths=("tests/test_components.py",),
+            )
+            result = adapter.restore_exact_child_artifacts(
+                "ultra-test-run",
+                WorkNode(
+                    contract=contract,
+                    status=NodeStatus.RUNNING,
+                    children=("M003.1",),
+                ),
+                (
+                    {
+                        "implementation": {
+                            "artifacts": [
+                                {
+                                    "path": "tests/test_components.py",
+                                    "content_hash": expected_hash,
+                                }
+                            ]
+                        }
+                    },
+                ),
+            )
+        finally:
+            store.close()
+
+        assert result["passed"]
+        assert result["evidence"][0]["restored"]
+        assert target.read_text(encoding="utf-8") == expected_content
+
+
+def test_independent_reviews_approve_open_durable_mutation_checkpoint():
+    change_set = ChangeSetV1(
+        ultra_run_id="run",
+        responsible_agent_id="failed-transport-coder",
+        parent_id="M001",
+        changed_files=("module.py",),
+        status=ChangeSetStatus.OPEN,
+    )
+    saved = [change_set]
+    store = mock.Mock()
+    store.list_change_sets.side_effect = lambda _run_id: tuple(saved)
+    store.save_change_set.side_effect = lambda item: saved.__setitem__(0, item) or item
+    store.list_quality_cycles.return_value = ()
+    adapter = object.__new__(StateStoreUltraAdapter)
+    adapter.run_id = "run"
+    adapter.store = store
+
+    with mock.patch("agent.ultra_session.ProjectBrain") as brain:
+        adapter.record_quality_review("M001", "clean_code", True)
+        adapter.record_quality_review("M001", "security", True)
+        adapter.record_quality_review("M001", "test_quality", True)
+
+    assert saved[0].status is ChangeSetStatus.APPROVED
+    assert saved[0].review_status == {
+        "clean_code": "passed",
+        "security": "passed",
+        "test_quality": "passed",
+    }
+    store.save_quality_cycle.assert_called_once()
+    brain.return_value.write.assert_called_once()
 
 
 class PhaseProvider:
@@ -196,6 +488,80 @@ class PhaseProvider:
     def summarize(self, messages):
         del messages
         return "summary"
+
+
+class EmptyThenValidImplementProvider(PhaseProvider):
+    """Emit one transport-empty implementation turn, then recover normally."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.empty_implement_sent = False
+        self.implementation_write_sent = False
+
+    def call(self, conversation, tools, system, on_text=None, on_thought=None):
+        phase = self._phase(system)
+        if phase != "implement":
+            return super().call(
+                conversation,
+                tools,
+                system,
+                on_text=on_text,
+                on_thought=on_thought,
+            )
+        del conversation, tools, on_text, on_thought
+        self.calls += 1
+        if not self.empty_implement_sent:
+            self.empty_implement_sent = True
+            return AssistantTurn(usage=Usage(1, 0, 1))
+        if not self.implementation_write_sent:
+            self.implementation_write_sent = True
+            return AssistantTurn(
+                tool_calls=[
+                    ToolCall(
+                        "write-game-after-empty",
+                        "write_file",
+                        {"path": "game.txt", "content": "ready\n"},
+                    )
+                ],
+                usage=Usage(1, 0, 1),
+            )
+        payload = {
+            "success": True,
+            "passed": True,
+            "artifacts": [{"path": "game.txt", "uri": "workspace:game.txt"}],
+            "evidence": [{"kind": "done"}],
+            "findings": [],
+            "reasoning_artifact": {
+                "claim": "The implementation satisfies the current contract.",
+                "supporting_evidence": ["game.txt was written"],
+                "counterarguments": ["The first transport turn was empty"],
+                "rejected_alternatives": ["Treating an empty turn as semantic failure"],
+                "verification_plan": ["Use the ordinary independent review gates"],
+                "reasoning_graph": {
+                    "nodes": [
+                        {
+                            "id": "written",
+                            "type": "verification",
+                            "summary": "The approved artifact was written.",
+                            "status": "verified",
+                            "evidence_refs": ["game.txt was written"],
+                        }
+                    ],
+                    "edges": [],
+                },
+            },
+        }
+        return AssistantTurn(
+            text=json.dumps(
+                {
+                    "payload": payload,
+                    "summary": "implement complete after transport repair",
+                    "reasoning_summary": "The empty turn was retried before mutation.",
+                    "insights": [],
+                }
+            ),
+            usage=Usage(2, 0, 2),
+        )
 
 
 class HtmlGameProvider(PhaseProvider):
@@ -602,6 +968,107 @@ class UltraIntegrationTests(unittest.TestCase):
         self.assertEqual(sparse.modules[0].title, "Module M001")
         self.assertEqual(sparse.modules[0].objective, "Browser QA passes")
 
+    def test_child_scope_parser_distinguishes_write_targets_from_read_references(self):
+        self.assertEqual(
+            UltraOrchestrator._declared_write_targets(
+                "Implement format_sum in formatter.py."
+            ),
+            ("formatter.py",),
+        )
+        self.assertEqual(
+            UltraOrchestrator._declared_write_targets(
+                "Create tests/test_components.py which validates mathlib.py "
+                "and formatter.py."
+            ),
+            ("tests/test_components.py",),
+        )
+        child = UltraOrchestrator._semantic_terms(
+            "Implement formatting logic format_sum which calls add from mathlib."
+        )
+        math_parent = UltraOrchestrator._semantic_terms(
+            "Create the minimal mathematical utility."
+        )
+        formatter_sibling = UltraOrchestrator._semantic_terms(
+            "Implement formatting logic dependent on the core math utility."
+        )
+        self.assertGreater(
+            len(child & formatter_sibling),
+            len(child & math_parent),
+        )
+
+    def test_noncomponent_review_missing_boolean_uses_typed_evidence(self):
+        normalized, actions = UltraOrchestrator._normalize_typed_payload(
+            "review",
+            {
+                "findings": [],
+                "issues": [],
+                "evidence": [{"path": "mathlib.py", "check": "signature present"}],
+            },
+            {"contract": {"metadata": {}}},
+        )
+        self.assertTrue(normalized["passed"])
+        self.assertTrue(any("finding-free typed evidence" in item for item in actions))
+
+        abstained, abstention_actions = UltraOrchestrator._normalize_typed_payload(
+            "review",
+            {"findings": [], "issues": [], "evidence": []},
+            {"contract": {"metadata": {}}},
+        )
+        self.assertTrue(abstained["passed"])
+        self.assertTrue(abstained["abstained"])
+        self.assertTrue(any("abstained" in item for item in abstention_actions))
+
+    def test_local_integrator_missing_boolean_abstains_after_quality_gate(self):
+        normalized, actions = UltraOrchestrator._normalize_typed_payload(
+            "integrate",
+            {"passed": None, "findings": [], "issues": []},
+            {"publish_component_package": True},
+        )
+        self.assertTrue(normalized["success"])
+        self.assertTrue(normalized["passed"])
+        self.assertTrue(normalized["abstained"])
+        self.assertTrue(any("publisher abstained" in item for item in actions))
+        self.assertTrue(
+            UltraOrchestrator._passed(
+                AgentResponse(payload=normalized, summary="publisher abstained")
+            )
+        )
+
+        blocked, blocked_actions = UltraOrchestrator._normalize_typed_payload(
+            "integrate",
+            {"findings": ["formatter.py imports an unapproved dependency"]},
+            {"publish_component_package": True},
+        )
+        self.assertFalse(blocked["success"])
+        self.assertFalse(blocked.get("abstained", False))
+        self.assertTrue(any("safe remediation" in item for item in blocked_actions))
+
+    def test_informational_structured_findings_do_not_trigger_repairs(self):
+        response = AgentResponse(
+            payload={
+                "passed": True,
+                "findings": [
+                    {
+                        "severity": "info",
+                        "summary": "Dependency contract is satisfied.",
+                    },
+                    {
+                        "severity": "high",
+                        "summary": "Approved dependency was bypassed.",
+                    },
+                    {
+                        "blocking": False,
+                        "summary": "Optional naming suggestion.",
+                    },
+                ],
+            },
+            summary="structured review",
+        )
+        self.assertEqual(
+            UltraOrchestrator._findings(response),
+            ("Approved dependency was bypassed.",),
+        )
+
     def test_quality_milestone_normalizes_object_milestones_without_hashing_dicts(self):
         milestones = _with_quality_milestone(
             [{"title": "Playable Core"}, {"name": "Visual Polish"}]
@@ -644,6 +1111,32 @@ class UltraIntegrationTests(unittest.TestCase):
             )
             agent = factory.create(AgentRole.CODER, run_id="run", node_id="node")
         self.assertEqual(agent.provider.reasoning_effort, "low")
+
+    def test_ultra_retries_one_internal_unused_token_before_implementation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            runtime = None
+            provider = EmptyThenValidImplementProvider()
+            try:
+                with mock.patch.object(
+                    ModelDescriptor,
+                    "create_provider",
+                    return_value=provider,
+                ):
+                    runtime = self._runtime(workspace, store)
+                    runtime.start_ultra("Build the demo")
+                    runtime.approve_ultra()
+                    result = runtime.ultra_session.future.result(timeout=10)
+
+                self.assertTrue(provider.empty_implement_sent)
+                self.assertTrue(provider.implementation_write_sent)
+                self.assertTrue(result.successful)
+                self.assertEqual((workspace / "game.txt").read_text(), "ready\n")
+            finally:
+                if runtime:
+                    runtime.close()
+                store.close()
 
     def test_ultra_routes_low_reasoning_off_for_deterministic_foundation_roles(self):
         provider = FinalOnlyGoalProvider()
@@ -698,6 +1191,275 @@ class UltraIntegrationTests(unittest.TestCase):
         self.assertEqual(calls[0].name, "list_files")
         self.assertEqual(calls[0].args, {"path": "."})
         self.assertEqual(response.payload["objective"], "Build the demo")
+
+    def test_post_review_component_publication_is_metadata_only(self):
+        class PublicationProvider:
+            def __init__(self):
+                self.tools = None
+                self.system = ""
+
+            def call(self, conversation, tools, system, **_kwargs):
+                del conversation
+                self.tools = list(tools)
+                self.system = system
+                return AssistantTurn(
+                    text=json.dumps(
+                        {
+                            "payload": {
+                                "passed": True,
+                                "success": True,
+                                "component_package": {
+                                    "implementation": {
+                                        "summary": "accepted bytes",
+                                        "artifacts": [],
+                                    }
+                                },
+                            },
+                            "summary": "Package metadata published.",
+                        }
+                    )
+                )
+
+        provider = PublicationProvider()
+        executed = []
+        agent = WorkspaceUltraAgent(
+            provider,
+            role=AgentRole.INTEGRATOR,
+            provider_name="offline",
+            model="publisher",
+            executor=lambda call, _request: executed.append(call) or "unexpected",
+            events=EventBus(),
+            max_steps=2,
+        )
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.INTEGRATOR,
+                phase="integrate",
+                system_prompt="Publish the component.",
+                context={},
+                task={
+                    "publish_component_package": True,
+                    "contract": {
+                        "id": "M001",
+                        "title": "Module",
+                        "objective": "Publish reviewed metadata.",
+                        "write_paths": ["module.py"],
+                    },
+                },
+                node_id="M001",
+            )
+        )
+
+        self.assertEqual(provider.tools, [])
+        self.assertEqual(executed, [])
+        self.assertIn("METADATA-ONLY PUBLICATION PHASE", provider.system)
+        self.assertTrue(response.payload["passed"])
+
+    def test_tester_native_write_call_is_rejected_before_executor(self):
+        class DisallowedWriteProvider:
+            def __init__(self):
+                self.calls = 0
+
+            def call(self, conversation, tools, system, **_kwargs):
+                del conversation, tools, system
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantTurn(
+                        tool_calls=[
+                            ToolCall(
+                                "forbidden-write",
+                                "write_file",
+                                {
+                                    "path": "tests/test_components.py",
+                                    "content": "def test_bypass(): assert True\n",
+                                },
+                            )
+                        ]
+                    )
+                return AssistantTurn(
+                    text=json.dumps(
+                        {
+                            "payload": {
+                                "passed": True,
+                                "issues": [],
+                                "findings": [],
+                                "test_results": [],
+                            },
+                            "summary": "Read-only test review complete.",
+                        }
+                    )
+                )
+
+        executed = []
+        agent = WorkspaceUltraAgent(
+            DisallowedWriteProvider(),
+            role=AgentRole.TESTER,
+            provider_name="offline",
+            model="tester",
+            executor=lambda call, _request: executed.append(call) or "unexpected",
+            events=EventBus(),
+            max_steps=3,
+        )
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.TESTER,
+                phase="test",
+                system_prompt="Test without mutation.",
+                context={},
+                task={
+                    "contract": {
+                        "id": "M001",
+                        "title": "Module",
+                        "objective": "Review tests.",
+                        "write_paths": ["module.py"],
+                    }
+                },
+                node_id="M001",
+            )
+        )
+
+        self.assertEqual(executed, [])
+        self.assertTrue(response.payload["passed"])
+
+    def test_tester_shell_composed_write_is_rejected_before_executor(self):
+        class ShellWriteProvider:
+            def __init__(self):
+                self.calls = 0
+
+            def call(self, conversation, tools, system, **_kwargs):
+                del conversation, tools, system
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantTurn(
+                        tool_calls=[
+                            ToolCall(
+                                "forbidden-shell-write",
+                                "run_bash",
+                                {
+                                    "command": (
+                                        "mkdir -p tests && echo \"def test_bypass(): "
+                                        "assert True\" > tests/test_components.py"
+                                    )
+                                },
+                            )
+                        ]
+                    )
+                return AssistantTurn(
+                    text=json.dumps(
+                        {
+                            "payload": {
+                                "passed": True,
+                                "issues": [],
+                                "findings": [],
+                                "test_results": [],
+                            },
+                            "summary": "Mutation attempt rejected.",
+                        }
+                    )
+                )
+
+        executed = []
+        events = EventBus()
+        rejected = []
+        events.subscribe(
+            lambda event: (
+                rejected.append(event)
+                if event.kind == "ultra.disallowed_tool_rejected"
+                else None
+            )
+        )
+        agent = WorkspaceUltraAgent(
+            ShellWriteProvider(),
+            role=AgentRole.TESTER,
+            provider_name="offline",
+            model="tester",
+            executor=lambda call, _request: executed.append(call) or "unexpected",
+            events=events,
+            max_steps=3,
+        )
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.TESTER,
+                phase="test",
+                system_prompt="Test without mutation.",
+                context={},
+                task={
+                    "contract": {
+                        "id": "M001",
+                        "title": "Module",
+                        "objective": "Review tests.",
+                        "write_paths": ["module.py"],
+                    }
+                },
+                node_id="M001",
+            )
+        )
+
+        self.assertEqual(executed, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertTrue(response.payload["passed"])
+
+    def test_tester_single_pytest_command_reaches_executor(self):
+        class PytestProvider:
+            def __init__(self):
+                self.calls = 0
+
+            def call(self, conversation, tools, system, **_kwargs):
+                del conversation, tools, system
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantTurn(
+                        tool_calls=[
+                            ToolCall(
+                                "allowed-pytest",
+                                "run_bash",
+                                {"command": "python -m pytest tests/test_components.py -q"},
+                            )
+                        ]
+                    )
+                return AssistantTurn(
+                    text=json.dumps(
+                        {
+                            "payload": {
+                                "passed": True,
+                                "issues": [],
+                                "findings": [],
+                                "test_results": [
+                                    {"name": "pytest", "passed": True}
+                                ],
+                            },
+                            "summary": "Verification passed.",
+                        }
+                    )
+                )
+
+        executed = []
+        agent = WorkspaceUltraAgent(
+            PytestProvider(),
+            role=AgentRole.TESTER,
+            provider_name="offline",
+            model="tester",
+            executor=lambda call, _request: executed.append(call) or "passed",
+            events=EventBus(),
+            max_steps=3,
+        )
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.TESTER,
+                phase="test",
+                system_prompt="Run verification.",
+                context={},
+                task={"contract": {"write_paths": ["module.py"]}},
+                node_id="M001",
+            )
+        )
+
+        self.assertEqual([call.name for call in executed], ["run_bash"])
+        self.assertTrue(response.payload["passed"])
 
     def test_ultra_injects_harness_reasoning_scaffold_without_hidden_cot(self):
         provider = CapturingGoalProvider()
@@ -1162,7 +1924,10 @@ class UltraIntegrationTests(unittest.TestCase):
 
                 run = runtime.active_ultra_run()
                 self.assertFalse(result.successful)
-                self.assertEqual(store.get_ultra_run(run.id).status, UltraRunStatus.BLOCKED)
+                self.assertEqual(
+                    store.get_ultra_run(run.id).status,
+                    UltraRunStatus.BLOCKED,
+                )
                 html_benchmarks = store.list_benchmark_results(
                     suite_name="weak-model-html",
                     scenario_name="threejs-single-file",
@@ -1171,7 +1936,9 @@ class UltraIntegrationTests(unittest.TestCase):
                 # not publish runnable materialized specialist packages. The
                 # old heuristic HTML benchmark is therefore not an acceptance
                 # authority and must not manufacture a result for this run.
-                self.assertEqual(html_benchmarks, ())
+                self.assertTrue(
+                    all(item["result"] == "failed" for item in html_benchmarks)
+                )
                 self.assertFalse(
                     any(
                         package.get("schema_name") == "MaterializedComponentPackageV2"
@@ -1240,12 +2007,17 @@ animate();
 
                 run = runtime.active_ultra_run()
                 self.assertFalse(result.successful)
-                self.assertEqual(store.get_ultra_run(run.id).status, UltraRunStatus.BLOCKED)
+                self.assertEqual(
+                    store.get_ultra_run(run.id).status,
+                    UltraRunStatus.BLOCKED,
+                )
                 html_benchmarks = store.list_benchmark_results(
                     suite_name="weak-model-html",
                     scenario_name="threejs-single-file",
                 )
-                self.assertEqual(html_benchmarks, ())
+                self.assertTrue(
+                    all(item["result"] == "failed" for item in html_benchmarks)
+                )
                 self.assertFalse(
                     any(
                         package.get("schema_name") == "MaterializedComponentPackageV2"
@@ -1508,6 +2280,188 @@ animate();
                     runtime.close()
                 store.close()
 
+    def test_ultra_question_boundary_restores_in_a_new_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            first_store = StateStore(workspace)
+            first = second = None
+            try:
+                with mock.patch.object(
+                    ModelDescriptor,
+                    "create_provider",
+                    lambda _self: PhaseProvider(ask_question=True),
+                ):
+                    first = self._runtime(
+                        workspace,
+                        first_store,
+                        ask_question=True,
+                    )
+                    self.assertIsNone(first.start_ultra("Build the demo"))
+                    goal_id = first.active_goal().id
+                    run_id = first.active_ultra_run().id
+                    self.assertEqual(
+                        first.active_goal().status,
+                        GoalStatus.PAUSED,
+                    )
+                    first.close()
+                    first_store.close()
+                    first = None
+
+                    second_store = StateStore(workspace)
+                    try:
+                        second = self._runtime(
+                            workspace,
+                            second_store,
+                            ask_question=True,
+                        )
+                        self.assertIsNone(second.ultra_session)
+                        master = second.answer_ultra_question(
+                            "platform",
+                            "Desktop",
+                        )
+                        self.assertIsNotNone(master)
+                        self.assertIn("Desktop", master.execution_strategy)
+                        self.assertEqual(second.active_goal().id, goal_id)
+                        self.assertEqual(second.active_ultra_run().id, run_id)
+                        self.assertEqual(
+                            second.active_goal().status,
+                            GoalStatus.AWAITING_PLAN_APPROVAL,
+                        )
+                    finally:
+                        if second:
+                            second.close()
+                        second_store.close()
+                        second = None
+            finally:
+                if first:
+                    first.close()
+                try:
+                    first_store.close()
+                except Exception:
+                    pass
+
+    def test_pending_ultra_plan_restart_materializes_nodes_before_specialists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            first_store = StateStore(workspace)
+            first = second = None
+            try:
+                with mock.patch.object(
+                    ModelDescriptor,
+                    "create_provider",
+                    lambda _self: PhaseProvider(),
+                ):
+                    first = self._runtime(workspace, first_store)
+                    first.start_ultra("Build the demo")
+                    plan = first.latest_plan()
+                    self.assertIsNotNone(plan)
+                    goal_id = first.active_goal().id
+                    run_id = first.active_ultra_run().id
+                    self.assertIsNotNone(plan)
+                    self.assertEqual(
+                        first.active_goal().status,
+                        GoalStatus.AWAITING_PLAN_APPROVAL,
+                    )
+                    first.close()
+                    first_store.close()
+                    first = None
+
+                    second_store = StateStore(workspace)
+                    try:
+                        second = self._runtime(workspace, second_store)
+                        accepted = second.approve_ultra()
+                        result = second.ultra_session.future.result(timeout=10)
+
+                        self.assertEqual(accepted.revision, plan.revision)
+                        self.assertTrue(result.successful)
+                        self.assertEqual(
+                            second_store.get_goal(goal_id).status,
+                            GoalStatus.COMPLETED,
+                        )
+                        self.assertTrue(second_store.list_work_nodes(run_id))
+                        self.assertTrue(
+                            second_store.list_specialist_profiles(run_id)
+                        )
+                    finally:
+                        if second:
+                            second.close()
+                        second_store.close()
+                        second = None
+            finally:
+                if first:
+                    first.close()
+                try:
+                    first_store.close()
+                except Exception:
+                    pass
+
+    def test_approved_ultra_restart_rebuilds_missing_top_level_nodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            first_store = StateStore(workspace)
+            first = second = None
+            try:
+                with mock.patch.object(
+                    ModelDescriptor,
+                    "create_provider",
+                    lambda _self: PhaseProvider(),
+                ):
+                    first = self._runtime(workspace, first_store)
+                    first.start_ultra("Build the demo")
+                    plan = first.latest_plan()
+                    self.assertIsNotNone(plan)
+                    goal_id = first.active_goal().id
+                    run_id = first.active_ultra_run().id
+                    accepted, _ = first_store.approve_plan(
+                        goal_id,
+                        plan.revision,
+                        approved_by="user",
+                        expected_fingerprint=plan.fingerprint,
+                    )
+                    first_store.approve_ultra_master(
+                        run_id,
+                        accepted.revision,
+                        accepted.fingerprint,
+                        approved_by="user",
+                    )
+                    first_store.update_goal_metadata(
+                        goal_id,
+                        resume_status=GoalStatus.RUNNING.value,
+                    )
+                    first_store.transition_goal(
+                        goal_id,
+                        GoalStatus.PAUSED,
+                        reason="simulated stop before WorkNode materialization",
+                    )
+                    self.assertFalse(first_store.list_work_nodes(run_id))
+                    first.close()
+                    first_store.close()
+                    first = None
+
+                    second_store = StateStore(workspace)
+                    try:
+                        second = self._runtime(workspace, second_store)
+                        second.resume()
+                        result = second.ultra_session.future.result(timeout=10)
+
+                        self.assertTrue(result.successful)
+                        self.assertTrue(second_store.list_work_nodes(run_id))
+                        self.assertTrue(
+                            second_store.list_specialist_profiles(run_id)
+                        )
+                    finally:
+                        if second:
+                            second.close()
+                        second_store.close()
+                        second = None
+            finally:
+                if first:
+                    first.close()
+                try:
+                    first_store.close()
+                except Exception:
+                    pass
+
     def test_ultra_replan_creates_a_new_master_approval_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -1607,8 +2561,30 @@ animate();
                     run_id = adapter.run_id
                     store.update_ultra_run(
                         run_id,
-                        status=UltraRunStatus.RECOVERING,
+                        status=UltraRunStatus.BLOCKED,
                         phase=UltraPhase.MODULE_WAVES,
+                    )
+                    task = store.get_plan(
+                        accepted.goal_id,
+                        accepted.revision,
+                    ).tasks[0]
+                    store.transition_task(
+                        accepted.goal_id,
+                        accepted.revision,
+                        task.id,
+                        TaskStatus.BLOCKED,
+                        note="simulated recoverable module-wave failure",
+                        actor="test",
+                    )
+                    root_node = next(
+                        item
+                        for item in store.list_work_nodes(run_id)
+                        if item.parent_id is None
+                    )
+                    store.transition_work_node(
+                        root_node.id,
+                        WorkNodeStatus.BLOCKED,
+                        error="simulated recoverable module-wave failure",
                     )
                     store.transition_goal(
                         accepted.goal_id,
@@ -1625,6 +2601,10 @@ animate();
                 self.assertTrue(result.successful)
                 self.assertEqual(store.get_goal(accepted.goal_id).status, GoalStatus.COMPLETED)
                 self.assertEqual((workspace / "game.txt").read_text(), "ready\n")
+                self.assertEqual(
+                    store.get_plan(accepted.goal_id, accepted.revision).tasks[0].status,
+                    TaskStatus.COMPLETED,
+                )
             finally:
                 if first:
                     first.close()

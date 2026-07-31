@@ -277,6 +277,8 @@ class SemanticCoreV14Tests(unittest.TestCase):
                 )
                 plan = runtime.start_goal(request)
                 self.assertEqual(plan.expected_changes, ())
+                self.assertEqual(plan.status, PlanStatus.PENDING_APPROVAL)
+                plan = runtime.approve_plan(plan.revision)
                 self.assertEqual(plan.status, PlanStatus.ACCEPTED)
                 self.assertEqual(
                     store.get_goal(plan.goal_id).metadata["resource_claims"], []
@@ -371,6 +373,164 @@ class SemanticCoreV14Tests(unittest.TestCase):
                     "model_capability_exhausted",
                 )
                 self.assertTrue(checkpoints[-1].payload["resumable"])
+            finally:
+                store.close()
+
+    def test_staged_semantic_repair_does_not_consume_plan_format_budget(self) -> None:
+        request = "Repair the inspected classifier."
+        criterion = "The repaired classifier passes its focused regression test."
+        semantic = {
+            "original_request": request,
+            "interpreted_outcome": "Repair the existing classifier.",
+            "requested_effects": [
+                "read_workspace",
+                "mutate_workspace",
+                "execute_code",
+            ],
+            "required_outcomes": ["The classifier is repaired."],
+            "constraints": ["Preserve unrelated behavior."],
+            "exclusions": [],
+            "acceptance_criteria": [criterion],
+            "unresolved_decisions": [],
+            "repository_evidence_refs": ["inspection:I001"],
+        }
+        fingerprint = SemanticGoalV2.from_mapping(
+            semantic,
+            original_request=request,
+        ).fingerprint
+        invalid_semantic = {
+            "tool_calls": [
+                {
+                    "id": "bad-semantic",
+                    "name": "propose_semantic_goal",
+                    "args": {**semantic, "original_request": "A different request"},
+                }
+            ]
+        }
+        premature_plan = {
+            "tool_calls": [
+                {
+                    "id": "premature-plan",
+                    "name": "propose_plan",
+                    "args": {
+                        "summary": "Premature plan",
+                        "tasks": [
+                            {
+                                "title": "Repair classifier",
+                                "description": "Repair the classifier.",
+                                "acceptance_criteria": [criterion],
+                                "verification": ["Run the focused regression test."],
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        valid_semantic = {
+            "tool_calls": [
+                {
+                    "id": "semantic",
+                    "name": "propose_semantic_goal",
+                    "args": semantic,
+                }
+            ]
+        }
+        staged_plan = {
+            "tool_calls": [
+                {
+                    "id": "plan",
+                    "name": "propose_plan",
+                    "args": {
+                        "semantic_fingerprint": fingerprint,
+                        "semantic_goal": {
+                            **semantic,
+                            "requested_effects": ["mutate_workspace"],
+                        },
+                        "summary": "Repair and verify the classifier.",
+                        "applicability_evidence": [
+                            {
+                                "fact": "The workspace inspection identified the target.",
+                                "source": "inspection:I001",
+                                "supports_tasks": ["T001"],
+                            }
+                        ],
+                        "execution_strategy": "Apply the focused repair and run its regression test.",
+                        "expected_changes": [
+                            {
+                                "path": "agent/classifier.py",
+                                "intent": "Repair the classifier.",
+                                "basis": "existing_inspected_path",
+                                "evidence_refs": ["inspection:I001"],
+                                "supports_tasks": ["T001"],
+                            }
+                        ],
+                        "tasks": [
+                            {
+                                "title": "Repair classifier",
+                                "description": "Repair the classifier.",
+                                "acceptance_criteria": [criterion],
+                                "verification": ["Run the focused regression test."],
+                                "risk": "medium",
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "agent").mkdir()
+            (workspace / "agent" / "classifier.py").write_text(
+                "def classify(value): return value\n",
+                encoding="utf-8",
+            )
+            store = StateStore(workspace)
+            try:
+                provider = ScriptedProvider(
+                    [
+                        inspection(),
+                        invalid_semantic,
+                        premature_plan,
+                        valid_semantic,
+                        staged_plan,
+                        critic_pass(),
+                    ]
+                )
+                runtime = AgentRuntime(provider, store, workspace)
+                plan = runtime.start_goal(request)
+                self.assertEqual(plan.status, PlanStatus.PENDING_APPROVAL)
+                goal = runtime.active_goal()
+                self.assertEqual(
+                    goal.metadata["accepted_semantic_fingerprint"],
+                    fingerprint,
+                )
+                retries = [
+                    event
+                    for event in store.list_recent_events(goal.id, limit=200)
+                    if event.event_type == "workflow.retry"
+                ]
+                self.assertFalse(
+                    any(
+                        event.payload.get("kind") == "plan_format_repair"
+                        for event in retries
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        event.event_type == "planning.semantic_accepted"
+                        for event in store.list_recent_events(goal.id, limit=200)
+                    )
+                )
+                staged_schema = next(
+                    item
+                    for item in provider.calls[4].tools
+                    if item["function"]["name"] == "propose_plan"
+                )
+                self.assertNotIn(
+                    "semantic_goal",
+                    staged_schema["function"]["parameters"]["properties"],
+                )
+                provider.assert_exhausted()
             finally:
                 store.close()
 
@@ -595,7 +755,8 @@ class SemanticCoreV14Tests(unittest.TestCase):
                     approval=lambda *_: True,
                 )
                 plan = runtime.start_goal(request)
-                self.assertEqual(plan.status, PlanStatus.ACCEPTED)
+                self.assertEqual(plan.status, PlanStatus.PENDING_APPROVAL)
+                runtime.approve_plan(plan.revision)
                 runtime.run_slice(steps=1)
                 self.assertEqual(target.read_text(encoding="utf-8"), "after\n")
                 goal = store.get_goal(plan.goal_id)
@@ -644,6 +805,8 @@ class SemanticCoreV14Tests(unittest.TestCase):
                     approval=lambda *_: True,
                 )
                 plan = runtime.start_goal(request)
+                self.assertEqual(plan.status, PlanStatus.PENDING_APPROVAL)
+                runtime.approve_plan(plan.revision)
                 runtime.run_slice(steps=1)
                 goal = store.get_goal(plan.goal_id)
                 self.assertEqual(goal.status, GoalStatus.PAUSED)
@@ -673,6 +836,233 @@ class SemanticCoreV14Tests(unittest.TestCase):
             self.assertTrue(
                 all(item.evidence_path == "package.json" for item in plugins)
             )
+
+    def test_semantic_mapping_accepts_paraphrase_but_rejects_omission(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(directory)
+            try:
+                goal = store.create_goal(
+                    "Create a calculator package, test it with pytest, and verify it."
+                )
+                semantic_criteria = [
+                    (
+                        "A Python package structure named 'calculator' must be "
+                        "created in the workspace."
+                    ),
+                    (
+                        "Pytest tests must be written for the 'add' function "
+                        "within the 'calculator' package."
+                    ),
+                    (
+                        "Running pytest must successfully execute all tests "
+                        "without failure or errors."
+                    ),
+                    (
+                        "The 'calculator' package must contain a module with "
+                        "an 'add' function."
+                    ),
+                ]
+                proposed = {
+                    "semantic_goal": {
+                        "original_request": goal.objective,
+                        "interpreted_outcome": goal.objective,
+                        "requested_effects": [
+                            "read_workspace",
+                            "mutate_workspace",
+                            "execute_code",
+                        ],
+                        "required_outcomes": [
+                            "A tested calculator package exists."
+                        ],
+                        "constraints": [],
+                        "exclusions": [],
+                        "acceptance_criteria": semantic_criteria,
+                        "unresolved_decisions": [],
+                        "repository_evidence_refs": ["inspection:I001"],
+                        "status": "interpreted",
+                    },
+                    "expected_changes": [
+                        {"path": "calculator/__init__.py"}
+                    ],
+                    "tasks": [
+                        {
+                            "acceptance_criteria": [
+                                "The directory structure 'calculator/' must exist.",
+                                (
+                                    "The file 'calculator/__init__.py' must be "
+                                    "present and contain a working add(a, b) function."
+                                ),
+                                (
+                                    "The file 'tests/test_calculator.py' must contain "
+                                    "at least three distinct pytest cases for add."
+                                ),
+                                (
+                                    "Execution of pytest must run without any test "
+                                    "failures or errors across all scenarios."
+                                ),
+                            ]
+                        }
+                    ],
+                }
+                accepted = AgentRuntime._validate_semantic_candidate(
+                    goal,
+                    proposed,
+                    successful_inspection_ids=frozenset({"I001"}),
+                )
+                self.assertEqual(
+                    accepted.acceptance_criteria,
+                    tuple(semantic_criteria),
+                )
+
+                proposed["tasks"][0]["acceptance_criteria"] = [
+                    "The directory structure 'calculator/' must exist."
+                ]
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "do not cover every accepted semantic criterion",
+                ):
+                    AgentRuntime._validate_semantic_candidate(
+                        goal,
+                        proposed,
+                        successful_inspection_ids=frozenset({"I001"}),
+                    )
+            finally:
+                store.close()
+
+    def test_derived_path_provenance_is_rebound_without_changing_the_path(self) -> None:
+        proposed = {
+            "tasks": [{"id": "T001"}],
+            "applicability_evidence": [],
+            "expected_changes": [
+                {
+                    "path": "calculator/__init__.py",
+                    "intent": "Create the requested calculator package.",
+                    "basis": "explicit_user_requirement",
+                    "evidence_refs": ["user:request"],
+                    "supports_tasks": ["T001"],
+                }
+            ],
+        }
+        bound = AgentRuntime._bind_plan_inspection_sources(
+            proposed,
+            {
+                "I001": {
+                    "call_id": "inspect",
+                    "tool": "list_files",
+                    "result": "(no files)",
+                }
+            },
+            original_request="Create a Python package named calculator.",
+        )
+        change = bound["expected_changes"][0]
+        self.assertEqual(change["path"], "calculator/__init__.py")
+        self.assertEqual(change["basis"], "repository_convention")
+        self.assertEqual(change["evidence_refs"], ["inspection:I001"])
+
+    def test_plan_critic_pass_advisories_do_not_force_scope_expansion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(directory)
+            try:
+                goal = store.create_goal("Create and verify the requested package.")
+                runtime = AgentRuntime(
+                    ScriptedProvider(
+                        [
+                            {
+                                "tool_calls": [
+                                    {
+                                        "id": "review",
+                                        "name": "submit_plan_review",
+                                        "args": {
+                                            "verdict": "pass",
+                                            "summary": "The plan fully covers the goal.",
+                                            "issues": [
+                                                "Optionally install another tool."
+                                            ],
+                                        },
+                                    }
+                                ]
+                            }
+                        ]
+                    ),
+                    store,
+                    directory,
+                )
+                result = runtime._review_plan_candidate(goal, {}, {})
+                self.assertEqual(result["verdict"], "pass")
+                self.assertEqual(result["issues"], [])
+                self.assertTrue(
+                    any(
+                        event.event_type == "plan.critic_advisories"
+                        for event in store.list_recent_events(goal.id, limit=20)
+                    )
+                )
+            finally:
+                store.close()
+
+    def test_exact_file_scope_rejects_an_extra_model_invented_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(directory)
+            try:
+                goal = store.create_goal(
+                    "Create calculator.py and tests/test_calculator.py only."
+                )
+                runtime = AgentRuntime(ScriptedProvider([]), store, directory)
+                task_value = {
+                    "id": "T001",
+                    "title": "Create and test calculator",
+                    "description": "Create only the requested files.",
+                    "acceptance_criteria": ["Tests pass."],
+                    "verification": ["Run python -m pytest."],
+                    "risk": "low",
+                }
+                task_item = store.coerce_task(
+                    task_value,
+                    goal.id,
+                    1,
+                    "agent",
+                )
+                proposed = {
+                    "semantic_goal": {
+                        "constraints": [
+                            "Only create calculator.py and "
+                            "tests/test_calculator.py."
+                        ],
+                        "exclusions": ["No other files may be created."],
+                    },
+                    "applicability_evidence": [
+                        {
+                            "fact": "The empty workspace needs the task.",
+                            "source": "inspection:I001",
+                            "supports_tasks": ["T001"],
+                        }
+                    ],
+                    "expected_changes": [
+                        {
+                            "path": "calculator.py",
+                            "basis": "repository_convention",
+                            "evidence_refs": ["inspection:I001"],
+                            "supports_tasks": ["T001"],
+                        },
+                        {
+                            "path": "pytest_run.sh",
+                            "basis": "repository_convention",
+                            "evidence_refs": ["inspection:I001"],
+                            "supports_tasks": ["T001"],
+                        },
+                    ],
+                }
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "violates the accepted exact file scope",
+                ):
+                    runtime._validate_plan_applicability(
+                        proposed,
+                        [task_item],
+                        successful_inspection_ids=frozenset({"I001"}),
+                        original_request=goal.objective,
+                    )
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

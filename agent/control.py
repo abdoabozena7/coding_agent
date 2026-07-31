@@ -134,10 +134,23 @@ SEMANTIC_GOAL_SCHEMA: dict[str, Any] = {
 }
 
 
+PROPOSE_SEMANTIC_GOAL = _fn(
+    "propose_semantic_goal",
+    (
+        "Submit the repository-grounded semantic interpretation before constructing "
+        "tasks. Preserve original_request exactly, cite successful inspection references, "
+        "and leave consequential unresolved decisions for request_plan_input."
+    ),
+    {
+        **SEMANTIC_GOAL_SCHEMA,
+    },
+)
+
+
 PROPOSE_PLAN = _fn(
     "propose_plan",
     (
-        "Submit one concise inspected plan for explicit approval. Do not invent task ids, "
+        "Submit one concise inspected plan after semantic interpretation. Do not invent task ids, "
         "database ids, or global references; the harness owns them. Evidence and resource "
         "claims use supports_tasks with 1-based task numbers (for example ['1', '2']). Each task "
         "contains title, description, expected changes, acceptance criteria, verification, "
@@ -147,7 +160,14 @@ PROPOSE_PLAN = _fn(
     {
         "type": "object",
         "properties": {
+            # Backward-compatible combined proposals may still carry this
+            # object. New staged planners call propose_semantic_goal first.
             "semantic_goal": SEMANTIC_GOAL_SCHEMA,
+            "semantic_fingerprint": {
+                "type": "string",
+                "minLength": 16,
+                "maxLength": 128,
+            },
             "summary": {"type": "string", "minLength": 3, "maxLength": 2_000},
             "applicability_evidence": {
                 "type": "array", "maxItems": 40,
@@ -160,9 +180,7 @@ PROPOSE_PLAN = _fn(
             },
             "tasks": {"type": "array", "minItems": 1, "maxItems": 80, "items": TASK_SCHEMA},
         },
-        "required": [
-            "semantic_goal", "summary", "tasks",
-        ],
+        "required": ["summary", "tasks"],
         "additionalProperties": False,
     },
 )
@@ -426,7 +444,7 @@ SUBMIT_REVIEW = _fn(
 )
 
 
-PLANNER_SCHEMAS = [PROPOSE_PLAN, REQUEST_PLAN_INPUT]
+PLANNER_SCHEMAS = [PROPOSE_SEMANTIC_GOAL, PROPOSE_PLAN, REQUEST_PLAN_INPUT]
 PLAN_REVIEWER_SCHEMAS = [SUBMIT_PLAN_REVIEW]
 COORDINATOR_SCHEMAS = [UPDATE_TASK, PROPOSE_PLAN_CHANGE, DELEGATE_TASK, INSPECT_TASK, RECORD_MEMORY, REQUEST_USER, FINISH_GOAL]
 WORKER_SCHEMAS = [RETURN_WORK]

@@ -266,6 +266,26 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
         if isinstance(item.get("verification"), str):
             actions.append(f"/tasks/{index - 1}/verification converted to an array")
         acceptance = _unique_text(item.get("acceptance_criteria", item.get("acceptance")))
+        if not verification and acceptance:
+            verification_source = " ".join(
+                (
+                    _text(item.get("title")),
+                    _text(item.get("description", item.get("objective"))),
+                    " ".join(acceptance),
+                    _text(raw.get("execution_strategy")),
+                )
+            ).casefold()
+            if "python -m pytest" in verification_source:
+                verification = [
+                    "Run python -m pytest and require exit code 0."
+                ]
+            elif re.search(r"\bpytest\b", verification_source):
+                verification = ["Run pytest and require exit code 0."]
+            if verification:
+                actions.append(
+                    f"/tasks/{index - 1}/verification projected from an "
+                    "explicit command in its task contract"
+                )
         expected = _unique_text(item.get("expected_changes", item.get("changes")))
         dependencies_raw = item.get("depends_on", item.get("dependencies", ()))
         if dependencies_raw is None:
@@ -282,6 +302,12 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
             dependencies.append(f"T{number:03d}")
         dependencies = list(dict.fromkeys(dependencies))
         risk = _text(item.get("risk", "medium")).lower()
+        risk_prefix = re.match(r"^(low|medium|high|critical)\b", risk)
+        if risk_prefix and risk != risk_prefix.group(1):
+            risk = risk_prefix.group(1)
+            actions.append(
+                f"/tasks/{index - 1}/risk normalized to {risk}"
+            )
         title = _text(item.get("title"))
         description = _text(item.get("description", item.get("objective")))
         if not description and title and acceptance and verification:
@@ -341,22 +367,92 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
     for change in raw.get("expected_changes", ()) or ():
         if isinstance(change, Mapping):
             path, intent = _text(change.get("path")), _text(change.get("intent"))
-            basis = _text(change.get("basis"))
+            raw_basis = _text(change.get("basis"))
+            basis_aliases = {
+                "existing inspected path": "existing_inspected_path",
+                "existing_inspected_path": "existing_inspected_path",
+                "repository convention": "repository_convention",
+                "repository_convention": "repository_convention",
+                "explicit user requirement": "explicit_user_requirement",
+                "explicit user": "explicit_user_requirement",
+                "explicit_user_requirement": "explicit_user_requirement",
+                "user request": "explicit_user_requirement",
+                "user:request": "explicit_user_requirement",
+            }
+            normalized_basis_text = raw_basis.casefold().replace("-", " ")
+            basis = basis_aliases.get(normalized_basis_text, raw_basis)
+            if "repository convention" in normalized_basis_text:
+                basis = "repository_convention"
+            elif (
+                "explicit user requirement" in normalized_basis_text
+                or "user requirement" in normalized_basis_text
+                or "user objective" in normalized_basis_text
+                or "project requirement" in normalized_basis_text
+                or (
+                    "objective" in normalized_basis_text
+                    and "require" in normalized_basis_text
+                )
+            ):
+                basis = "explicit_user_requirement"
+            if raw_basis and basis != raw_basis:
+                actions.append(
+                    f"/expected_changes/{len(expected_changes)}/basis "
+                    f"normalized to {basis}"
+                )
             evidence_refs = _unique_text(change.get("evidence_refs"))
         else:
             path, intent, basis, evidence_refs = "", _text(change), "", []
+        if path in {".", "./"}:
+            actions.append(
+                f"/expected_changes/{len(expected_changes)} broad execution "
+                "context removed from the file mutation contract"
+            )
+            continue
         if path:
+            supports_tasks = normalized_supports(
+                change.get("supports_tasks")
+            )
+            if not intent and len(supports_tasks) == 1:
+                task_number = int(supports_tasks[0][1:]) - 1
+                if 0 <= task_number < len(tasks):
+                    intent = (
+                        _text(tasks[task_number].get("description"))
+                        or _text(tasks[task_number].get("title"))
+                    )
+                    if intent:
+                        actions.append(
+                            f"/expected_changes/{len(expected_changes)}/intent "
+                            "projected from its supported task"
+                        )
             expected_changes.append(
                 {
                     "path": path,
                     "intent": intent,
                     "basis": basis,
                     "evidence_refs": evidence_refs,
-                    "supports_tasks": normalized_supports(
-                        change.get("supports_tasks")
-                    ),
+                    "supports_tasks": supports_tasks,
                 }
             )
+    if not expected_changes:
+        path_pattern = re.compile(
+            r"(?<![\w./-])([A-Za-z0-9_.-]+\."
+            r"(?:html?|py|js|ts|tsx|jsx|css|json|md|txt|ya?ml|toml))\b",
+            re.IGNORECASE,
+        )
+        for task in tasks:
+            for intent in task.get("expected_changes", ()):
+                match = path_pattern.search(str(intent))
+                if not match:
+                    continue
+                expected_changes.append(
+                    {
+                        "path": match.group(1).replace("\\", "/"),
+                        "intent": str(intent).strip(),
+                        "basis": "repository_convention",
+                        "evidence_refs": [],
+                        "supports_tasks": [task["id"]],
+                    }
+                )
     for task in tasks:
         # Task-local prose is not a path claim.  Keep it out of the mutation
         # contract unless the model supplied an exact top-level path.
@@ -368,6 +464,7 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
             if isinstance(raw.get("semantic_goal"), Mapping)
             else {}
         ),
+        "semantic_fingerprint": _text(raw.get("semantic_fingerprint")),
         "summary": _text(raw.get("summary", raw.get("objective"))),
         "applicability_evidence": applicability,
         "execution_strategy": _text(raw.get("execution_strategy", raw.get("strategy"))),
@@ -379,11 +476,11 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
 
 def validate_normalized_plan(value: Mapping[str, Any]) -> None:
     issues: list[PlanValidationIssue] = []
-    if not isinstance(value.get("semantic_goal"), Mapping) or not value.get("semantic_goal"):
+    if value.get("semantic_goal") and not isinstance(value.get("semantic_goal"), Mapping):
         issues.append(
             PlanValidationIssue(
                 "/semantic_goal",
-                "a complete SemanticGoalV2 interpretation is required",
+                "must be an object when supplied",
             )
         )
     if not _text(value.get("summary")):
@@ -416,6 +513,31 @@ def validate_normalized_plan(value: Mapping[str, Any]) -> None:
                 issues.append(PlanValidationIssue(path + "/depends_on", f"dependency {dependency!r} must refer to an earlier task"))
         if _text(item.get("risk")) not in {"low", "medium", "high", "critical"}:
             issues.append(PlanValidationIssue(path + "/risk", "must be low, medium, high, or critical"))
+    for index, item in enumerate(value.get("expected_changes", ()) or ()):
+        path = f"/expected_changes/{index}"
+        if not isinstance(item, Mapping):
+            issues.append(
+                PlanValidationIssue(path, "expected change must be an object")
+            )
+            continue
+        if not _text(item.get("path")):
+            issues.append(
+                PlanValidationIssue(path + "/path", "non-empty path is required")
+            )
+        if not _text(item.get("intent")):
+            issues.append(
+                PlanValidationIssue(
+                    path + "/intent",
+                    "non-empty intent or one supported task is required",
+                )
+            )
+        if not item.get("supports_tasks"):
+            issues.append(
+                PlanValidationIssue(
+                    path + "/supports_tasks",
+                    "at least one supported task is required",
+                )
+            )
     if issues:
         raise PlanDraftError(issues)
 

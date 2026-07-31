@@ -17,10 +17,13 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
-from ..store import NotFoundError, StalePlanError
+from ..store import NotFoundError, StalePlanError, StateStoreError
 from .schemas import (
     ExplanationRequestPayload,
+    PlanApprovalPayload,
     PlanPayload,
+    QueuePromptPayload,
+    QueueReorderPayload,
     ReviewSubmissionPayload,
 )
 from .security import SessionSecurity
@@ -94,6 +97,10 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
             current = None
         return _error(str(exc), 409, current_revision=current)
 
+    @app.exception_handler(StateStoreError)
+    async def state_conflict(_request: Request, exc: StateStoreError):
+        return _error(str(exc), 409)
+
     @app.exception_handler(ValueError)
     async def bad_value(_request: Request, exc: ValueError):
         return _error(str(exc), 422)
@@ -109,6 +116,7 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
     async def shell(request: Request, session_id: str, view_name: str):
         if session_id != adapter.session_id or view_name not in VIEWS:
             raise HTTPException(status_code=404, detail="view not found")
+        adapter.request_view(view_name)
         token = request.query_params.get("token", "")
         if token:
             if not security.validate_handshake(token):
@@ -149,6 +157,11 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
         check_session(session_id)
         return adapter.plan_snapshot()
 
+    @app.get("/api/sessions/{session_id}/workspace")
+    async def get_workspace(session_id: str):
+        check_session(session_id)
+        return adapter.workspace_context()
+
     @app.post("/api/sessions/{session_id}/plan/draft")
     async def save_draft(session_id: str, payload: PlanPayload):
         check_session(session_id)
@@ -163,6 +176,31 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
     async def apply_plan(session_id: str, payload: PlanPayload):
         check_session(session_id)
         return adapter.apply_plan(payload)
+
+    @app.post("/api/sessions/{session_id}/plan/revision")
+    async def save_revision(session_id: str, payload: PlanPayload):
+        check_session(session_id)
+        return adapter.save_plan_revision(payload)
+
+    @app.post("/api/sessions/{session_id}/plan/approve")
+    async def approve_plan(session_id: str, payload: PlanApprovalPayload):
+        check_session(session_id)
+        return adapter.approve_plan(payload.revision)
+
+    @app.get("/api/sessions/{session_id}/queue")
+    async def get_queue(session_id: str):
+        check_session(session_id)
+        return adapter.queue_snapshot()
+
+    @app.post("/api/sessions/{session_id}/queue")
+    async def enqueue_prompt(session_id: str, payload: QueuePromptPayload):
+        check_session(session_id)
+        return adapter.enqueue_queue_prompt(payload.text, payload.mode)
+
+    @app.patch("/api/sessions/{session_id}/queue/order")
+    async def reorder_queue(session_id: str, payload: QueueReorderPayload):
+        check_session(session_id)
+        return adapter.reorder_queue(payload.ordered_ids)
 
     @app.get("/api/sessions/{session_id}/review")
     async def get_review(session_id: str, checkpoint: str | None = None):
@@ -279,6 +317,7 @@ class LocalWebServer:
         return base + ("?" + urlencode({"token": self.security.token}) if include_token else "")
 
     def open_view(self, view_name: str) -> dict[str, Any]:
+        self.adapter.request_view(view_name)
         url = self.url_for(view_name)
         opened = bool(webbrowser.open(url, new=2))
         self.adapter.events.publish(

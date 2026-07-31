@@ -3,6 +3,7 @@ import unittest
 import sqlite3
 from pathlib import Path
 
+from agent import tools
 from agent.config import InteractionMode, SessionPreferences
 from agent.quality import (
     ChangeSetStatus,
@@ -105,6 +106,7 @@ class PlanHarnessV4Tests(unittest.TestCase):
                         "description": " Create base ",
                         "acceptance_criteria": [" Base exists ", "Base exists"],
                         "verification": " Check base ",
+                        "risk": "Low risk, local file creation.",
                     },
                     {
                         "id": "anything",
@@ -115,12 +117,42 @@ class PlanHarnessV4Tests(unittest.TestCase):
                         "depends_on": [1, "1", "T001"],
                     },
                 ],
+                "expected_changes": [
+                    {
+                        "path": "src/base.py",
+                        "basis": "repository convention",
+                        "evidence_refs": ["inspection:I001"],
+                        "supports_tasks": ["1"],
+                    },
+                    {
+                        "path": "src/result.py",
+                        "intent": "Create the requested result.",
+                        "basis": "user:request",
+                        "evidence_refs": ["user:request"],
+                        "supports_tasks": ["2"],
+                    },
+                    {
+                        "path": "./",
+                        "basis": "Temporary working directory for execution.",
+                        "supports_tasks": ["2"],
+                    },
+                ],
             }
         )
         validate_normalized_plan(normalized)
         self.assertEqual([item["id"] for item in normalized["tasks"]], ["T001", "T002"])
         self.assertEqual(normalized["tasks"][1]["depends_on"], ["T001"])
         self.assertEqual(normalized["tasks"][0]["verification"], ["Check base"])
+        self.assertEqual(normalized["tasks"][0]["risk"], "low")
+        self.assertEqual(
+            [item["basis"] for item in normalized["expected_changes"]],
+            ["repository_convention", "explicit_user_requirement"],
+        )
+        self.assertEqual(len(normalized["expected_changes"]), 2)
+        self.assertEqual(
+            normalized["expected_changes"][0]["intent"],
+            "Create base",
+        )
         self.assertTrue(actions)
 
     def test_plan_normalization_derives_only_description_from_complete_task_contract(self):
@@ -145,6 +177,31 @@ class PlanHarnessV4Tests(unittest.TestCase):
         )
         with self.assertRaises(PlanDraftError):
             validate_normalized_plan(incomplete)
+
+    def test_plan_normalization_projects_only_an_explicit_verifier_command(self):
+        normalized, actions = normalize_plan_draft(
+            {
+                "summary": "Run the accepted verifier.",
+                "execution_strategy": (
+                    "Create the requested files, then run python -m pytest."
+                ),
+                "tasks": [
+                    {
+                        "title": "Verify the project",
+                        "description": "Execute the accepted test suite.",
+                        "acceptance_criteria": ["All pytest tests pass."],
+                    }
+                ],
+            }
+        )
+        validate_normalized_plan(normalized)
+        self.assertEqual(
+            normalized["tasks"][0]["verification"],
+            ["Run python -m pytest and require exit code 0."],
+        )
+        self.assertTrue(
+            any("verification projected" in item for item in actions)
+        )
 
     def test_ambiguous_dependency_has_exact_pointer(self):
         value, _ = normalize_plan_draft(
@@ -199,6 +256,7 @@ class PlanHarnessV4Tests(unittest.TestCase):
                         {"id": "start", "name": "update_task", "args": {"task_id": "T001", "status": "in_progress", "note": "creating", "evidence": []}},
                         {"id": "write", "name": "write_file", "args": {"path": "index.html", "content": html}},
                         {"id": "read", "name": "read_file", "args": {"path": "index.html"}},
+                        {"id": "preview", "name": "preview_html", "args": {"path": "index.html", "open_browser": False, "settle_ms": 0}},
                         {"id": "done", "name": "update_task", "args": {"task_id": "T001", "status": "done", "note": "file read back", "evidence": ["index.html exists and was read by the workspace tool"]}},
                     ]},
                     {"tool_calls": [{"id": "finish", "name": "finish_goal", "args": {"summary": "Page created and verified", "evidence": ["index.html tool evidence"]}}]},
@@ -219,13 +277,21 @@ class PlanHarnessV4Tests(unittest.TestCase):
                                  "extended-stability", "responsive-usability"} <= dimension_ids)
                 goal_id = runtime.active_goal().id
                 result = runtime.run_slice(steps=4)
-                self.assertFalse(result.completed)
-                self.assertEqual(runtime.active_goal().status.value, "paused")
-                self.assertEqual(runtime.active_goal().metadata["convergence_state"], "user_review_required")
+                self.assertTrue(result.completed)
+                completed = store.get_goal(goal_id)
+                self.assertEqual(completed.status.value, "completed")
+                self.assertEqual(
+                    completed.metadata["completion_disposition"],
+                    "completed_with_limitations",
+                )
+                self.assertTrue(completed.metadata["completion_limitations"])
                 self.assertEqual((workspace / "index.html").read_text(encoding="utf-8"), html)
                 actions = store.list_actions(goal_id)
                 self.assertTrue(any(item["tool_name"] == "write_file" and item["status"] == "completed" for item in actions))
                 self.assertTrue(any(item["tool_name"] == "read_file" and item["status"] == "completed" for item in actions))
+                runtime.close()
+                with tools.workspace_context(workspace):
+                    self.assertEqual(tools.web_preview.list_previews(), ())
             finally:
                 store.close()
 

@@ -18,7 +18,6 @@ class TaskPayload(BaseModel):
     id: str = Field(min_length=1, max_length=24, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,23}$")
     title: str = Field(min_length=1, max_length=180)
     description: str = Field(default="", max_length=4000)
-    status: str = "pending"
     parent_id: str | None = None
     dependencies: list[str] = Field(default_factory=list, max_length=80)
     agent_role: str = Field(default="coder", min_length=1, max_length=120)
@@ -34,8 +33,6 @@ class TaskPayload(BaseModel):
     approval_gate: bool = False
     constraints: list[str] = Field(default_factory=list, max_length=40)
     parallel: bool = False
-    paused: bool = False
-    disabled: bool = False
     comments: list[str] = Field(default_factory=list, max_length=40)
 
     @field_validator(
@@ -75,6 +72,33 @@ class PlanPayload(BaseModel):
         if any(len(item) > 1000 or "\x00" in item for item in cleaned):
             raise ValueError("plan values must be NUL-free and at most 1,000 characters")
         return list(dict.fromkeys(cleaned))
+
+
+class PlanApprovalPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    revision: int = Field(ge=1)
+
+
+class QueuePromptPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    text: str = Field(min_length=1, max_length=20_000)
+    mode: Literal["plan", "normal", "ultra"] | None = None
+
+
+class QueueReorderPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    ordered_ids: list[str] = Field(min_length=1, max_length=10)
+
+    @field_validator("ordered_ids")
+    @classmethod
+    def unique_ids(cls, value: list[str]) -> list[str]:
+        cleaned = [str(item).strip() for item in value if str(item).strip()]
+        if len(cleaned) != len(value) or len(set(cleaned)) != len(cleaned):
+            raise ValueError("ordered queue ids must be non-empty and unique")
+        return cleaned
 
 
 class ReviewDecisionPayload(BaseModel):

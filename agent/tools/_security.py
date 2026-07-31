@@ -412,6 +412,28 @@ def file_fingerprint(info: os.stat_result) -> tuple[int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
 
 
+def _invalidate_python_bytecode(path: Path) -> None:
+    """Discard derived bytecode after a Python source mutation.
+
+    CPython's timestamp cache can otherwise reuse stale bytecode when an agent
+    repairs a source file with the same byte length inside one filesystem
+    timestamp tick.  Cache files are derived data and failures to remove them
+    must not turn an already committed source write into a reported failure.
+    """
+
+    if path.suffix.casefold() != ".py":
+        return
+    candidates = [path.with_suffix(".pyc")]
+    cache_dir = path.parent / "__pycache__"
+    if cache_dir.is_dir():
+        candidates.extend(cache_dir.glob(f"{path.stem}.*.pyc"))
+    for candidate in candidates:
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
 def atomic_write_bytes(
     path: Path,
     data: bytes,
@@ -484,6 +506,7 @@ def atomic_write_bytes(
             os.link(temporary, path)
             os.unlink(temporary)
         temporary = None
+        _invalidate_python_bytecode(path)
     except ToolSecurityError:
         raise
     except FileExistsError as exc:

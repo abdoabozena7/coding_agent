@@ -403,6 +403,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             task_update("in_progress", note="creating weak candidate"),
             {"id": "weak-write", "name": "write_file", "args": {"path": "index.html", "content": weak_html}},
             {"id": "weak-read", "name": "read_file", "args": {"path": "index.html"}},
+            {"id": "weak-preview", "name": "preview_html", "args": {"path": "index.html", "open_browser": False, "settle_ms": 0}},
             task_update("done", ["candidate read back"], "weak candidate created"), finish_call(),
         ]}
         broken_turn = {"tool_calls": [
@@ -413,6 +414,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         repaired_turn = {"tool_calls": [
             {"id": "fixed-write", "name": "write_file", "args": {"path": "index.html", "content": final_html}},
             {"id": "fixed-check", "name": "run_bash", "args": {"command": "python -c \"import pathlib,sys;sys.exit(1 if 'BROKEN' in pathlib.Path('index.html').read_text() else 0)\""}},
+            {"id": "fixed-preview", "name": "preview_html", "args": {"path": "index.html", "open_browser": False, "settle_ms": 0}},
             {"id": "repair-done", "name": "update_task", "args": {"task_id": "T002", "status": "done", "note": "failure repaired", "evidence": ["fresh narrow check passed"]}},
             finish_call(),
         ]}
@@ -436,10 +438,24 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         runtime.run_slice(steps=1)
         final = runtime.run_slice(steps=1)
 
-        self.assertFalse(final.completed)
-        goal = runtime.active_goal()
+        goal = self.store.get_goal(goal_id)
+        self.assertTrue(
+            final.completed,
+            (
+                final,
+                goal.status,
+                goal.metadata.get("waiting_question"),
+                goal.metadata.get("convergence_state"),
+                provider.remaining,
+                [
+                    (item["tool_name"], item["status"], item["result_summary"])
+                    for item in self.store.list_actions(goal_id)
+                ],
+            ),
+        )
         self.assertEqual(goal.metadata["run_id"], run_id)
-        self.assertEqual(goal.metadata["convergence_state"], "refining")
+        self.assertEqual(goal.metadata["convergence_state"], "converged_with_limitations")
+        self.assertEqual(goal.metadata["completion_disposition"], "completed_with_limitations")
         self.assertTrue(goal.metadata["goal_change_sets"])
 
     def test_no_native_tools_uses_harness_generated_constrained_action(self):
@@ -491,30 +507,34 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         self.assertTrue(any(event.event_type == "goal_contract.projected" for event in events))
         self.assertTrue(any(event.event_type == "quality_target.created" for event in events))
 
-    def test_visual_goal_without_vision_evaluator_stops_at_user_review_required(self):
+    def test_visual_goal_without_vision_evaluator_completes_with_limitations(self):
         html_plan = plan_call()
         html_plan["tool_calls"][0]["args"]["expected_changes"][0]["path"] = "index.html"
         runtime, provider = self.runtime([
-            inspect_call(), html_plan, plan_pass(), {"tool_calls": [finish_call()]}, review_pass()
+            inspect_call(), html_plan, plan_pass(),
+            {"tool_calls": [
+                {"id": "preview", "name": "preview_html", "args": {"path": "index.html", "open_browser": False, "settle_ms": 0}},
+                finish_call(),
+            ]},
+            review_pass(),
         ])
         plan = runtime.start_goal("Create a polished visual page")
         runtime.approve_plan(plan.revision)
+        (self.workspace / "index.html").write_text(
+            "<!doctype html><html><body>verified</body></html>",
+            encoding="utf-8",
+        )
         runtime.update_task_from_user("T001", "done", "Structural and runtime checks passed")
 
         result = runtime.run_slice(steps=1)
 
-        self.assertFalse(result.completed)
-        goal = runtime.active_goal()
-        self.assertEqual(goal.status, GoalStatus.PAUSED)
-        self.assertEqual(goal.metadata["convergence_state"], "user_review_required")
-        self.assertIn("Review the latest visual artifact", goal.metadata["waiting_question"])
+        self.assertTrue(result.completed)
+        goal = self.store.get_goal(plan.goal_id)
+        self.assertEqual(goal.status, GoalStatus.COMPLETED)
+        self.assertEqual(goal.metadata["convergence_state"], "converged_with_limitations")
+        self.assertEqual(goal.metadata["completion_disposition"], "completed_with_limitations")
+        self.assertTrue(goal.metadata["completion_limitations"])
         self.assertTrue(goal.metadata["latest_evaluation"]["scores"])
-
-        runtime.add_guidance("accept")
-        completed = self.store.get_goal(goal.id)
-        self.assertEqual(completed.status, GoalStatus.COMPLETED)
-        self.assertEqual(completed.metadata["convergence_state"], "converged")
-        self.assertTrue(completed.metadata["latest_evaluation"]["user_visual_acceptance_evidence_id"])
 
     def test_mode_changes_preserve_one_durable_run_contract_and_quality_state(self):
         runtime, _provider = self.runtime([inspect_call(), plan_call(), plan_pass()])
@@ -718,7 +738,8 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             for event in self.store.list_recent_events(runtime.active_goal().id, limit=100)
             if event.event_type == "planning.checkpoint"
         ]
-        self.assertEqual(checkpoints[-1].payload["format_attempts"], 3)
+        self.assertEqual(checkpoints[-1].payload["format_attempts"], 0)
+        self.assertEqual(checkpoints[-1].payload["applicability_attempts"], 3)
         self.assertIn("tool:missing-inspection", checkpoints[-1].payload["technical_detail"])
         self.assertEqual(provider.remaining, 1)
 
@@ -884,7 +905,10 @@ class PlanningAndCompletionTests(RuntimeTestCase):
                 plan_call(),
                 plan_pass(),
                 fail_once,
-                {"tool_calls": [task_update("in_progress", note="retry recovered")]},
+                {"tool_calls": [
+                    {"id": "retry-verify", "name": "list_files", "args": {"path": "."}},
+                    task_update("done", ["retry recovered"], "retry recovered"),
+                ]},
             ]
         )
         runtime = AgentRuntime(
@@ -913,7 +937,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         self.assertEqual(second.status, GoalStatus.RUNNING.value)
         self.assertEqual(
             self.store.list_tasks(runtime.active_goal().id, plan.revision)[0].status,
-            TaskStatus.IN_PROGRESS,
+            TaskStatus.COMPLETED,
         )
         self.assertEqual(runtime.active_goal().metadata["consecutive_retries"], 0)
         provider.assert_exhausted()
@@ -985,7 +1009,10 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         provider.assert_exhausted()
 
     def test_repeated_no_progress_slices_self_reprompt_without_retry_limit(self):
-        provider = ScriptedProvider([inspect_call(), plan_call(), plan_pass(), "done", "still done"])
+        provider = ScriptedProvider([
+            inspect_call(), plan_call(), plan_pass(),
+            "done", "still done", "still no action",
+        ])
         runtime = AgentRuntime(
             provider,
             self.store,
@@ -1000,6 +1027,8 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         second = runtime.run_slice(steps=1)
         self.assertEqual(second.status, GoalStatus.RUNNING.value)
         self.assertFalse(second.needs_user)
+        third = runtime.run_slice(steps=1)
+        self.assertEqual(third.status, GoalStatus.RUNNING.value)
         goal = runtime.active_goal()
         self.assertEqual(goal.metadata["goal_attempt"], 2)
         self.assertTrue(goal.metadata["auto_retryable"])

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import BinaryIO
 
 from ._security import get_workspace, resolve_workspace_path, safe_os_error
@@ -77,6 +80,75 @@ def requires_approval(args: dict) -> bool:
 def _scrubbed_environment(source: dict[str, str] | None = None) -> dict[str, str]:
     source = os.environ if source is None else source
     return {key: value for key, value in source.items() if key.casefold() in _ENV_ALLOWLIST}
+
+
+def _execution_environment() -> dict[str, str]:
+    """Expose the agent's selected runtime without inheriting secret state."""
+
+    environment = _scrubbed_environment()
+    # Verification must not silently mutate an exact-scope workspace with
+    # interpreter caches.  This is a fixed harness value, never inherited from
+    # the caller, so it cannot be used as a Python startup injection vector.
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    executable_directory = str(Path(sys.executable).resolve().parent)
+    existing_path = next(
+        (
+            value
+            for key, value in environment.items()
+            if key.casefold() == "path"
+        ),
+        "",
+    )
+    environment["PATH"] = (
+        executable_directory
+        if not existing_path
+        else executable_directory + os.pathsep + existing_path
+    )
+    return environment
+
+
+def _normalize_python_entrypoint(command: str) -> str:
+    """Keep Python verifier commands isolated and free of cache artifacts."""
+
+    match = re.match(r"^(\s*)pytest(?=\s|$)(.*)$", command, re.IGNORECASE | re.DOTALL)
+    if match is not None:
+        executable = str(Path(sys.executable).resolve()).replace('"', r'\"')
+        command = f'{match.group(1)}"{executable}" -m pytest{match.group(2)}'
+    if (
+        re.match(
+            r'^\s*(?:"[^"]+"|[^\s&|<>]+)\s+-m\s+pytest(?=\s|$)',
+            command,
+            re.IGNORECASE,
+        )
+        and not re.search(r"[&|<>]", command)
+        and not re.search(r"(?:^|\s)-p\s+no:cacheprovider(?:\s|$)", command)
+    ):
+        command = command.rstrip() + " -p no:cacheprovider"
+    return command
+
+
+def _normalize_platform_command(command: str) -> str:
+    """Translate one common POSIX directory idiom without creating ``-p``.
+
+    ``cmd.exe`` treats ``mkdir -p tests`` as two directory operands and leaves
+    an unintended directory literally named ``-p``.  Restrict the translation
+    to a single, unchained relative operand; more complex shell text remains
+    approval-gated and unchanged.
+    """
+
+    if os.name != "nt":
+        return command
+    match = re.fullmatch(
+        r'\s*mkdir\s+-p\s+("[^"]+"|[A-Za-z0-9_.\\/-]+)\s*',
+        command,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return command
+    target = match.group(1).strip()
+    if not target or target in {".", ".."}:
+        return command
+    return f"if not exist {target} mkdir {target}"
 
 
 @dataclass
@@ -169,6 +241,7 @@ def run_with_timeout(command: str, timeout_seconds: int = TIMEOUT_SECONDS, cwd: 
         return "Error: command must not contain NUL bytes"
     if len(command) > MAX_COMMAND_CHARS:
         return f"Error: command exceeds the {MAX_COMMAND_CHARS}-character limit"
+    command = _normalize_platform_command(_normalize_python_entrypoint(command))
 
     workspace = get_workspace()
     try:
@@ -188,7 +261,7 @@ def run_with_timeout(command: str, timeout_seconds: int = TIMEOUT_SECONDS, cwd: 
             command,
             shell=True,
             cwd=str(working_directory),
-            env=_scrubbed_environment(),
+            env=_execution_environment(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             **process_options,

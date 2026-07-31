@@ -8,6 +8,7 @@ legacy master-plan approval, file hashes, and resource leases.
 
 from __future__ import annotations
 
+import ast
 import fnmatch
 import difflib
 import hashlib
@@ -16,6 +17,8 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
+import sys
 import threading
 from concurrent.futures import Future
 from dataclasses import asdict, replace
@@ -64,6 +67,7 @@ from .sandbox import AccessLevel, PermissionAdapter
 from .scheduler import ResourceLease as RuntimeLease
 from .scheduler import AdaptiveConcurrency, RateLimitError, ResourceLeaseManager, StaleWriteError
 from .store import NotFoundError, StateStore, StateStoreError
+from .tools._security import atomic_write_bytes
 from .swarm_coordinator import SwarmCoordinator
 from .swarm_protocol import SwarmMessageType, SwarmMessageV1
 from .ultra import (
@@ -144,6 +148,30 @@ from .version_control import GitProtectionManager
 _READ_TOOLS = tools.names(categories={"read"})
 _WRITE_TOOLS = tools.names(categories={"write", "command", "install"})
 _TOOL_RISK = tools.risk_map()
+_TESTER_VERIFICATION_COMMAND_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:(?:\"[^\"]+\"|'[^']+'|python(?:\.exe)?)\s+-m\s+)?pytest\b|"
+    r"(?:\"[^\"]+\"|'[^']+'|python(?:\.exe)?)\s+-m\s+(?:unittest|compileall)\b|"
+    r"npm\s+(?:test|run\s+(?:test|build|lint|check))\b|"
+    r"(?:pnpm|yarn)\s+(?:test|build|lint|check)\b|"
+    r"cargo\s+(?:test|check|clippy|build)\b|"
+    r"go\s+test\b|"
+    r"dotnet\s+(?:test|build)\b"
+    r")",
+    re.IGNORECASE,
+)
+_SHELL_COMPOSITION_RE = re.compile(r"[\r\n;&|<>`]|\$\(")
+
+
+def _tester_verification_command_allowed(command: str) -> bool:
+    """Allow one verifier invocation, never shell-composed workspace edits."""
+
+    text = str(command).strip()
+    return bool(
+        text
+        and not _SHELL_COMPOSITION_RE.search(text)
+        and _TESTER_VERIFICATION_COMMAND_RE.match(text)
+    )
 _STAGE_COMPONENT_FILE_TOOL = {
     "type": "function",
     "function": {
@@ -610,6 +638,181 @@ def _normalized_path(value: str) -> str:
     while text.startswith("./"):
         text = text[2:]
     return str(PurePosixPath(text or ".")).rstrip("/") or "."
+
+
+def _repair_double_escaped_python_source(
+    path: str, content: str
+) -> tuple[str, bool]:
+    """Repair a weak-model JSON escape only when syntax proves it is safe."""
+
+    if Path(path).suffix.casefold() != ".py" or '\\"' not in content:
+        return content, False
+    try:
+        ast.parse(content)
+    except SyntaxError:
+        repaired = content.replace('\\"', '"')
+        try:
+            ast.parse(repaired)
+        except SyntaxError:
+            return content, False
+        return repaired, True
+    return content, False
+
+
+def _validate_workspace_artifacts(
+    workspace: Path,
+    paths: Iterable[str],
+) -> Mapping[str, Any]:
+    """Return deterministic existence/hash/syntax evidence for approved paths."""
+
+    root = workspace.resolve()
+    findings: list[str] = []
+    evidence: list[Mapping[str, Any]] = []
+    checked: set[str] = set()
+    for raw in paths:
+        normalized = _normalized_path(raw)
+        if normalized in {".", "*", "**", "**/*"}:
+            continue
+        if ".." in PurePosixPath(normalized).parts:
+            findings.append(f"artifact path escapes the workspace: {raw}")
+            continue
+        candidates: tuple[Path, ...]
+        if any(character in normalized for character in "*?["):
+            candidates = tuple(
+                item
+                for item in root.glob(normalized)
+                if item.is_file()
+            )
+            if not candidates:
+                findings.append(f"approved artifact pattern produced no files: {raw}")
+                continue
+        else:
+            candidate = root.joinpath(*PurePosixPath(normalized).parts).resolve(
+                strict=False
+            )
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                findings.append(f"artifact path escapes the workspace: {raw}")
+                continue
+            if candidate.is_dir():
+                candidates = tuple(item for item in candidate.rglob("*") if item.is_file())
+                if not candidates:
+                    findings.append(f"approved artifact directory is empty: {raw}")
+                    continue
+            elif candidate.is_file():
+                candidates = (candidate,)
+            else:
+                findings.append(f"approved artifact is missing: {raw}")
+                continue
+        for candidate in candidates:
+            relative = candidate.resolve().relative_to(root).as_posix()
+            if relative in checked or ".coding-agent" in PurePosixPath(relative).parts:
+                continue
+            checked.add(relative)
+            digest = _hash_file(root, relative)
+            if digest is None:
+                findings.append(f"approved artifact could not be hashed: {relative}")
+                continue
+            record: dict[str, Any] = {
+                "kind": "artifact_hash",
+                "path": relative,
+                "sha256": digest,
+            }
+            if candidate.suffix.casefold() == ".py":
+                try:
+                    ast.parse(candidate.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, SyntaxError) as exc:
+                    findings.append(
+                        f"Python syntax validation failed for {relative}: {exc}"
+                    )
+                    continue
+                record["python_syntax"] = "passed"
+            evidence.append(record)
+    return {
+        "passed": not findings and bool(evidence),
+        "findings": findings,
+        "evidence": evidence,
+    }
+
+
+def _run_python_test_artifacts(
+    workspace: Path,
+    paths: Iterable[str],
+) -> Mapping[str, Any]:
+    targets = tuple(
+        dict.fromkeys(
+            _normalized_path(path)
+            for path in paths
+            if Path(_normalized_path(path)).suffix.casefold() == ".py"
+            and (
+                Path(_normalized_path(path)).name.casefold().startswith("test_")
+                or "tests" in {
+                    part.casefold()
+                    for part in PurePosixPath(_normalized_path(path)).parts
+                }
+            )
+        )
+    )
+    if not targets:
+        return {"passed": True, "findings": [], "evidence": []}
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        *targets,
+        "-q",
+        "-p",
+        "no:cacheprovider",
+    ]
+    environment = dict(os.environ)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=workspace,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+        output = (completed.stdout or "")[-8_000:]
+        passed = completed.returncode == 0
+        return {
+            "passed": passed,
+            "findings": (
+                []
+                if passed
+                else [
+                    "Executable pytest verification failed for "
+                    + ", ".join(targets)
+                    + ":\n"
+                    + output[-3_000:]
+                ]
+            ),
+            "evidence": [
+                {
+                    "kind": "executable_verification",
+                    "command": "python -m pytest "
+                    + " ".join(targets)
+                    + " -q -p no:cacheprovider",
+                    "returncode": completed.returncode,
+                    "passed": passed,
+                    "output": output,
+                }
+            ],
+        }
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "passed": False,
+            "findings": [f"Executable pytest verification could not complete: {exc}"],
+            "evidence": [],
+        }
 
 
 def _within_scope(path: str, scopes: Iterable[str]) -> bool:
@@ -1402,7 +1605,10 @@ class WorkspaceUltraAgent:
         }
         effective_effort = configured_effort
         if self.provider_name == "ollama" and (
-            component_leaf_quality_phase or component_quality_triage_phase
+            self.role in deterministic_roles
+            or request.phase in compact_foundation_phases
+            or component_leaf_quality_phase
+            or component_quality_triage_phase
         ):
             effective_effort = "off"
             setattr(self.provider, "reasoning_effort", effective_effort)
@@ -2053,6 +2259,13 @@ class WorkspaceUltraAgent:
         conversation: list[dict[str, Any]] = [
             {"role": "user", "content": _json(user_payload)}
         ]
+        metadata_only_publication = bool(
+            self.role is AgentRole.INTEGRATOR
+            and request.phase == InnerPhase.INTEGRATE.value
+            and request.task.get("publish_component_package")
+            and not request.task.get("final_assembler")
+            and not request.task.get("component_assembler")
+        )
         allowed_tools = self._allowed_tools()
         if component_publication_phase:
             if self.provider_name == "ollama":
@@ -2131,6 +2344,11 @@ class WorkspaceUltraAgent:
             # evidence the reviewer actually needs.
             allowed_tools = frozenset()
         elif component_quality_triage_phase:
+            allowed_tools = frozenset()
+        elif metadata_only_publication:
+            # Implementation bytes already passed independent review. This
+            # phase may publish package metadata, but must never mutate the
+            # reviewed candidate after its evidence gate.
             allowed_tools = frozenset()
         if self.role is AgentRole.TESTER and self._html_write_target(request):
             # HTML verification is platform-neutral through preview_html plus
@@ -2237,6 +2455,13 @@ class WorkspaceUltraAgent:
                         "You are a deterministic quality triager. Use only the supplied typed "
                         "verdicts, deduplicate their findings, and return exactly one JSON object "
                         "matching response_contract. Do not call tools or invent evidence."
+                    )
+                elif metadata_only_publication:
+                    system_prompt += (
+                        "\n\nMETADATA-ONLY PUBLICATION PHASE: the implementation has already "
+                        "passed independent review. Do not call tools or propose workspace "
+                        "writes. Publish only the typed component_package metadata that "
+                        "describes the accepted candidate."
                     )
                 if self.role is AgentRole.CODER and request.phase in {
                     InnerPhase.IMPLEMENT.value,
@@ -2348,12 +2573,96 @@ class WorkspaceUltraAgent:
                     )
                     continue
                 for call in turn.tool_calls:
+                    exposed_tools = {
+                        _schema_name(schema)
+                        for schema in schemas
+                        if _schema_name(schema)
+                    }
+                    if call.name not in exposed_tools:
+                        result = (
+                            f"Error: tool {call.name!r} is not allowed for "
+                            f"{self.role.value} during {request.phase}"
+                        )
+                        self.events.publish(
+                            "ultra.disallowed_tool_rejected",
+                            result,
+                            run_id=request.run_id,
+                            node_id=request.node_id,
+                            role=self.role.value,
+                            phase=request.phase,
+                            tool=call.name,
+                        )
+                        conversation.append(
+                            {
+                                "role": "tool",
+                                "id": call.id,
+                                "name": call.name,
+                                "content": result,
+                            }
+                        )
+                        continue
+                    if (
+                        self.role is AgentRole.TESTER
+                        and call.name in {"run_bash", "run_command"}
+                        and not _tester_verification_command_allowed(
+                            str(call.args.get("command", ""))
+                        )
+                    ):
+                        result = (
+                            "Error: tester shell access accepts one verification "
+                            "command only; shell composition and workspace mutation "
+                            "commands are not allowed"
+                        )
+                        self.events.publish(
+                            "ultra.disallowed_tool_rejected",
+                            result,
+                            run_id=request.run_id,
+                            node_id=request.node_id,
+                            role=self.role.value,
+                            phase=request.phase,
+                            tool=call.name,
+                        )
+                        conversation.append(
+                            {
+                                "role": "tool",
+                                "id": call.id,
+                                "name": call.name,
+                                "content": result,
+                            }
+                        )
+                        continue
                     unlocked_publication_now = False
                     effective_call = ToolCall(
                         id=call.id,
                         name=call.name,
                         args=normalize_generated_tool_args(call.name, call.args),
                     )
+                    if effective_call.name == "write_file":
+                        repaired_content, repaired_python_escaping = (
+                            _repair_double_escaped_python_source(
+                                str(effective_call.args.get("path", "")),
+                                str(effective_call.args.get("content", "")),
+                            )
+                        )
+                        if repaired_python_escaping:
+                            effective_call = ToolCall(
+                                id=effective_call.id,
+                                name=effective_call.name,
+                                args={
+                                    **dict(effective_call.args),
+                                    "content": repaired_content,
+                                },
+                            )
+                            self.events.publish(
+                                "ultra.write_tool_normalized",
+                                "Removed double JSON escaping after Python "
+                                "syntax validation",
+                                run_id=request.run_id,
+                                node_id=request.node_id,
+                                path=str(
+                                    effective_call.args.get("path", "")
+                                ),
+                            )
                     available_tool_names = {
                         _schema_name(schema) for schema in schemas
                     }
@@ -2967,6 +3276,12 @@ class WorkspaceUltraAgent:
                     if isinstance(proposed_write, Mapping):
                         proposed_path = str(proposed_write.get("path", "")).strip()
                         proposed_content = str(proposed_write.get("content", ""))
+                        proposed_content, repaired_python_escaping = (
+                            _repair_double_escaped_python_source(
+                                proposed_path,
+                                proposed_content,
+                            )
+                        )
                         approved_paths = {
                             str(path).strip()
                             for path in contract_payload.get("write_paths", ()) or ()
@@ -2985,6 +3300,15 @@ class WorkspaceUltraAgent:
                             )
                             if not write_result.startswith("Error:"):
                                 mutation_observed = True
+                                if repaired_python_escaping:
+                                    self.events.publish(
+                                        "ultra.proposed_write_normalized",
+                                        "Removed double JSON escaping after Python "
+                                        "syntax validation",
+                                        run_id=request.run_id,
+                                        node_id=request.node_id,
+                                        path=proposed_path,
+                                    )
                                 self.events.publish(
                                     "ultra.proposed_write_executed",
                                     "Validated and executed typed proposed_write fallback",
@@ -5569,36 +5893,223 @@ window.buildPreview=(context)=>{
             "findings": findings,
         }
 
+    def verify_node_artifacts(
+        self,
+        run_id: str,
+        node: EngineWorkNode,
+    ) -> Mapping[str, Any]:
+        del run_id
+        if self.workspace is None:
+            return {
+                "passed": False,
+                "findings": ["artifact validation requires a workspace"],
+                "evidence": [],
+            }
+        artifacts = dict(
+            _validate_workspace_artifacts(self.workspace, node.write_paths)
+        )
+        executable = dict(
+            _run_python_test_artifacts(self.workspace, node.write_paths)
+        )
+        return {
+            "passed": bool(artifacts.get("passed"))
+            and bool(executable.get("passed")),
+            "findings": [
+                *artifacts.get("findings", ()),
+                *executable.get("findings", ()),
+            ],
+            "evidence": [
+                *artifacts.get("evidence", ()),
+                *executable.get("evidence", ()),
+            ],
+        }
+
+    def restore_exact_child_artifacts(
+        self,
+        run_id: str,
+        node: EngineWorkNode,
+        packages: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        if self.workspace is None:
+            return {
+                "passed": False,
+                "findings": ["exact child restoration requires a workspace"],
+            }
+        expected: dict[str, str] = {}
+        for package in packages:
+            implementation = (
+                dict(package.get("implementation") or {})
+                if isinstance(package.get("implementation"), Mapping)
+                else {}
+            )
+            for artifact in implementation.get("artifacts", ()):
+                if not isinstance(artifact, Mapping):
+                    continue
+                path = _normalized_path(
+                    str(artifact.get("path") or artifact.get("uri") or "")
+                    .removeprefix("workspace:")
+                )
+                content_hash = str(
+                    artifact.get("content_hash")
+                    or artifact.get("sha256")
+                    or artifact.get("hash")
+                    or ""
+                )
+                if path and content_hash and _within_scope(path, node.write_paths):
+                    expected[path] = content_hash
+        parent_paths = tuple(
+            _normalized_path(path)
+            for path in node.write_paths
+            if _normalized_path(path) not in {".", "*", "**", "**/*"}
+            and not any(character in path for character in "*?[")
+        )
+        if not parent_paths or any(path not in expected for path in parent_paths):
+            return {
+                "passed": False,
+                "findings": [
+                    "accepted child packages do not cover every exact parent write path"
+                ],
+            }
+        actions = tuple(reversed(self.store.list_actions(self.goal_id)))
+        evidence: list[Mapping[str, Any]] = []
+        for path in parent_paths:
+            expected_hash = expected[path]
+            content: str | None = None
+            source_action = ""
+            if _hash_file(self.workspace, path) != expected_hash:
+                for action in actions:
+                    if (
+                        action.get("tool_name") != "write_file"
+                        or action.get("status") != "completed"
+                    ):
+                        continue
+                    try:
+                        envelope = json.loads(str(action.get("args_json") or "{}"))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    arguments = (
+                        dict(envelope.get("arguments") or {})
+                        if isinstance(envelope, Mapping)
+                        else {}
+                    )
+                    candidate_path = _normalized_path(
+                        str(arguments.get("path") or "")
+                    )
+                    candidate_content = arguments.get("content")
+                    if (
+                        candidate_path == path
+                        and isinstance(candidate_content, str)
+                        and hashlib.sha256(
+                            candidate_content.encode("utf-8")
+                        ).hexdigest()
+                        == expected_hash
+                    ):
+                        content = candidate_content
+                        source_action = str(action.get("id") or "")
+                        break
+                if content is None:
+                    return {
+                        "passed": False,
+                        "findings": [
+                            f"no durable write receipt matches accepted child hash for {path}"
+                        ],
+                    }
+                target = self.workspace.joinpath(
+                    *PurePosixPath(path).parts
+                ).resolve(strict=False)
+                try:
+                    target.relative_to(self.workspace.resolve())
+                except ValueError:
+                    return {
+                        "passed": False,
+                        "findings": [f"child artifact path escapes workspace: {path}"],
+                    }
+                with tools.workspace_context(self.workspace):
+                    atomic_write_bytes(
+                        target,
+                        content.encode("utf-8"),
+                        overwrite=True,
+                    )
+            evidence.append(
+                {
+                    "kind": "exact_child_artifact",
+                    "path": path,
+                    "sha256": expected_hash,
+                    "source_action_id": source_action,
+                    "restored": bool(content is not None),
+                }
+            )
+        self.store.append_event(
+            "ultra.exact_child_artifacts_restored",
+            goal_id=self.goal_id,
+            entity_type="work_node",
+            entity_id=node.id,
+            payload={
+                "run_id": run_id,
+                "paths": list(parent_paths),
+                "hashes": [expected[path] for path in parent_paths],
+            },
+        )
+        return {"passed": True, "findings": [], "evidence": evidence}
+
     def save_component_package(self, run_id: str, package: ComponentPackageV1) -> None:
         super().save_component_package(run_id, package)
+        existing_packages = self.store.list_component_packages(
+            run_id,
+            work_node_id=package.node_id,
+        )
+        next_storage_version = (
+            max(
+                (int(item.get("version") or 0) for item in existing_packages),
+                default=0,
+            )
+            + 1
+        )
         stored = self.store.put_component_package(
             {
                 **asdict(package),
                 "ultra_run_id": run_id,
                 "work_node_id": package.node_id,
+                # ComponentPackageV1.version is the wire-schema version, not
+                # the durable publication revision. A resumed node must append
+                # a new storage version instead of colliding with revision 1.
+                "version": next_storage_version,
             }
         )
         node = self.store.get_work_node(package.node_id)
-        self.store.post_swarm_message(
-            SwarmMessageV1(
-                ultra_run_id=run_id,
-                sender_agent_id=f"specialist:{package.node_id}",
-                recipient_agent_id=(
-                    f"specialist:{node.parent_id}" if node.parent_id else "final-assembler"
-                ),
-                message_type=SwarmMessageType.PACKAGE_PUBLISHED,
-                topic=f"component-package:{package.node_id}",
-                payload={
-                    "package_id": stored["id"],
-                    "node_id": package.node_id,
-                    "status": package.status,
-                    "content_hash": stored["content_hash"],
-                    "quality": dict(package.quality),
-                },
-                evidence=package.evidence,
-                correlation_id=package.node_id,
+        try:
+            self.store.post_swarm_message(
+                SwarmMessageV1(
+                    ultra_run_id=run_id,
+                    sender_agent_id=f"specialist:{package.node_id}",
+                    recipient_agent_id=(
+                        f"specialist:{node.parent_id}"
+                        if node.parent_id
+                        else "final-assembler"
+                    ),
+                    message_type=SwarmMessageType.PACKAGE_PUBLISHED,
+                    topic=f"component-package:{package.node_id}",
+                    payload={
+                        "package_id": stored["id"],
+                        "node_id": package.node_id,
+                        "status": package.status,
+                        "content_hash": stored["content_hash"],
+                        "quality": dict(package.quality),
+                    },
+                    evidence=package.evidence,
+                    correlation_id=package.node_id,
+                )
             )
-        )
+        except Exception as exc:
+            # The package itself is already durable. A secondary notification
+            # receipt is telemetry and must not invalidate accepted evidence.
+            self.events.publish(
+                "ultra.package_receipt_failed",
+                f"Package {stored['id']} persisted but its swarm receipt failed.",
+                run_id=run_id,
+                node_id=package.node_id,
+                error=redact_text(str(exc))[:500],
+            )
 
     def save_node_quality_target(self, run_id: str, target: NodeQualityTargetV1) -> None:
         super().save_node_quality_target(run_id, target)
@@ -6396,7 +6907,17 @@ window.buildPreview=(context)=>{
         task = next((item for item in self.store.get_plan(self.goal_id, self.plan.revision).tasks if item.id == task_id), None)
         if task is None:
             return
-        if node.status is NodeStatus.RUNNING and task.status in {TaskStatus.PENDING, TaskStatus.READY}:
+        resumable_task_states = {
+            TaskStatus.PENDING,
+            TaskStatus.READY,
+            TaskStatus.FAILED,
+            TaskStatus.BLOCKED,
+            TaskStatus.UNCERTAIN,
+        }
+        if (
+            node.status is NodeStatus.RUNNING
+            and task.status in resumable_task_states
+        ):
             self.store.transition_task(
                 self.goal_id,
                 self.plan.revision,
@@ -6405,6 +6926,24 @@ window.buildPreview=(context)=>{
                 actor="ultra-scheduler",
             )
         elif result and result.success and task.status != TaskStatus.COMPLETED:
+            if task.status in {
+                TaskStatus.FAILED,
+                TaskStatus.BLOCKED,
+                TaskStatus.UNCERTAIN,
+            }:
+                # A recoverable provider/harness failure may have persisted
+                # the legacy plan task as blocked even though the restored
+                # engine node can safely resume. Re-enter execution before
+                # recording completion so task transition invariants stay
+                # intact and the mutation is never replayed blindly.
+                task = self.store.transition_task(
+                    self.goal_id,
+                    self.plan.revision,
+                    task_id,
+                    TaskStatus.IN_PROGRESS,
+                    note="Resumed from the last durable ULTRA evidence gate.",
+                    actor="ultra-recovery",
+                )
             self.store.transition_task(
                 self.goal_id,
                 self.plan.revision,
@@ -6595,6 +7134,7 @@ window.buildPreview=(context)=>{
             return
         for change_set in self.store.list_change_sets(self.run_id):
             if change_set.parent_id != node_id or change_set.status not in {
+                ChangeSetStatus.OPEN,
                 ChangeSetStatus.CLOSED,
                 ChangeSetStatus.REVIEWING,
                 ChangeSetStatus.APPROVED,
@@ -6638,6 +7178,97 @@ window.buildPreview=(context)=>{
                     f"Fresh clean-code, security, and test-quality reviews passed for {len(change_set.changed_files)} file(s).",
                     data={"change_set_id": change_set.id, "review_status": reviews, "cycle_id": cycle.id},
                 )
+
+    def reconcile_verified_change_sets(
+        self,
+        run_id: str,
+    ) -> tuple[ChangeSetV1, ...]:
+        """Approve durable checkpoints already accepted by node consensus.
+
+        A transport failure can leave a mutation checkpoint OPEN/BLOCKED even
+        though the node's final package, independent consensus, workspace
+        hashes, and executable gate are all durable and successful. Reconcile
+        those projections without replaying the mutation or asking for a
+        second plan approval.
+        """
+
+        if self.workspace is None:
+            return self.store.list_change_sets(run_id)
+        nodes = {
+            item.id: item
+            for item in self.store.list_work_nodes(run_id)
+        }
+        reconciled: list[str] = []
+        for change_set in self.store.list_change_sets(run_id):
+            if change_set.status in {
+                ChangeSetStatus.APPROVED,
+                ChangeSetStatus.INTEGRATED,
+            }:
+                continue
+            node = nodes.get(str(change_set.parent_id or ""))
+            if node is None or not node.result or not node.result.metadata.get("success"):
+                continue
+            packages = self.store.list_component_packages(
+                run_id,
+                work_node_id=node.id,
+            )
+            if not packages:
+                continue
+            latest = packages[-1]
+            consensus = (
+                dict(latest.get("quality") or {}).get("consensus")
+                if isinstance(latest.get("quality"), Mapping)
+                else {}
+            )
+            consensus_status = (
+                str(dict(consensus or {}).get("status") or "").casefold()
+                if isinstance(consensus, Mapping)
+                else ""
+            )
+            if consensus_status != "accepted":
+                continue
+            scopes = tuple(node.contract.write_paths)
+            if not scopes or any(
+                not _within_scope(path, scopes)
+                for path in change_set.changed_files
+            ):
+                continue
+            artifact_gate = _validate_workspace_artifacts(
+                self.workspace,
+                scopes,
+            )
+            executable_gate = _run_python_test_artifacts(
+                self.workspace,
+                scopes,
+            )
+            if not artifact_gate.get("passed") or not executable_gate.get("passed"):
+                continue
+            reviews = {
+                **dict(change_set.review_status),
+                "accepted_consensus": "passed",
+                "workspace_artifacts": "passed",
+                "executable_gate": "passed",
+            }
+            self.store.save_change_set(
+                replace(
+                    change_set,
+                    status=ChangeSetStatus.APPROVED,
+                    review_status=reviews,
+                    updated_at=utc_now(),
+                )
+            )
+            reconciled.append(change_set.id)
+        if reconciled and self.events is not None:
+            self.events.publish(
+                "ultra.change_sets_reconciled",
+                (
+                    f"Reconciled {len(reconciled)} accepted checkpoint(s) "
+                    "from durable consensus and harness evidence."
+                ),
+                run_id=run_id,
+                change_set_ids=reconciled,
+            )
+        return self.store.list_change_sets(run_id)
 
     def record_quality_findings(
         self,
@@ -7549,15 +8180,47 @@ class UltraSession:
         return self.workspace / ".coding-agent" / "recovery" / safe_run_id
 
     def _capture_workspace_baseline(self, run_id: str) -> Mapping[str, Any]:
-        """Declare journal recovery; never copy the workspace."""
+        """Create a project-scoped recovery snapshot before approval."""
 
-        return {
-            "schema": "MutationJournalV1",
+        recovery_root = self._recovery_root(run_id)
+        baseline_root = recovery_root / "baseline"
+        manifest_path = recovery_root / "manifest.json"
+        if manifest_path.is_file():
+            try:
+                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                existing = None
+            if isinstance(existing, Mapping) and existing.get("files"):
+                return dict(existing)
+        files: dict[str, str] = {}
+        baseline_root.mkdir(parents=True, exist_ok=True)
+        for source in self.workspace.rglob("*"):
+            if not source.is_file() or source.is_symlink():
+                continue
+            relative = source.relative_to(self.workspace).as_posix()
+            if not self._recoverable_workspace_path(relative):
+                continue
+            try:
+                digest = hashlib.sha256(source.read_bytes()).hexdigest()
+                destination = baseline_root / PurePosixPath(relative)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+            except OSError:
+                continue
+            files[relative] = digest
+        manifest = {
+            "schema": "WorkspaceRecoveryBaselineV1",
             "run_id": str(run_id),
             "captured_at": utc_now().isoformat(),
-            "files": {},
-            "storage": "state.db:mutation_journal",
+            "files": files,
         }
+        temporary = manifest_path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temporary, manifest_path)
+        return manifest
 
     def _restore_workspace_baseline(
         self,
@@ -7570,18 +8233,11 @@ class UltraSession:
 
         goal_id = getattr(self, "goal_id", None)
         store = getattr(self, "store", None)
-        restored = (
+        journal_restored = (
             store.rollback_mutation_journal(goal_id)
             if goal_id and store is not None
             else ()
         )
-        return {
-            "schema": "MutationJournalRollbackV1",
-            "run_id": str(run_id),
-            "reason": str(reason),
-            "restored": list(restored),
-        }
-
         recovery_root = self._recovery_root(run_id)
         manifest_path = recovery_root / "manifest.json"
         if not manifest_path.is_file():
@@ -7594,7 +8250,7 @@ class UltraSession:
         baseline_root = recovery_root / "baseline"
         rollback_stamp = utc_now().isoformat().replace(":", "-")
         rejection_root = recovery_root / "rejected" / rollback_stamp
-        restored: list[str] = []
+        restored: list[str] = list(journal_restored)
         removed: list[str] = []
         preserved: list[str] = []
         for raw_path in sorted(set(str(item) for item in changed_paths if str(item).strip())):
@@ -8323,6 +8979,183 @@ class UltraSession:
 
         run = self.store.get_ultra_run(run_id)
         nodes = self.store.list_work_nodes(run_id)
+        reconciled_nodes = []
+        for item in nodes:
+            if item.status is WorkNodeStatus.COMPLETED:
+                artifact_paths = (
+                    tuple(item.result.changed_files)
+                    if item.result is not None and item.result.changed_files
+                    else tuple(item.contract.write_paths)
+                )
+                missing_paths = tuple(
+                    path
+                    for path in artifact_paths
+                    if path not in {"", "."}
+                    and not (self.workspace / PurePosixPath(path)).is_file()
+                )
+                if missing_paths:
+                    self.store.transition_work_node(
+                        item.id,
+                        WorkNodeStatus.READY,
+                        error=(
+                            "completed evidence invalidated because durable artifact(s) "
+                            f"are missing: {', '.join(missing_paths)}"
+                        ),
+                        checkpoint="recovery",
+                    )
+                    item = replace(
+                        item,
+                        status=WorkNodeStatus.READY,
+                        result=None,
+                        error=(
+                            "completed evidence invalidated because durable artifact(s) "
+                            f"are missing: {', '.join(missing_paths)}"
+                        ),
+                        checkpoint="recovery",
+                    )
+                    self.events.publish(
+                        "ultra.completed_evidence_invalidated",
+                        f"Reopened {item.id}; its completed artifact is missing.",
+                        run_id=run_id,
+                        node_id=item.id,
+                        missing_paths=list(missing_paths),
+                    )
+            reconciled_nodes.append(item)
+        nodes = tuple(reconciled_nodes)
+        node_map = {item.id: item for item in nodes}
+        root_nodes = tuple(
+            item for item in nodes if item.parent_id is None
+        )
+        invalid_child_ids: set[str] = set()
+        for item in nodes:
+            if not item.parent_id or item.parent_id not in node_map:
+                continue
+            parent = node_map[item.parent_id]
+            declared_targets = UltraOrchestrator._declared_write_targets(
+                item.title,
+                item.objective,
+            )
+            invalid_targets = tuple(
+                path
+                for path in declared_targets
+                if not any(
+                    UltraOrchestrator._contains_scope(scope, path)
+                    for scope in parent.contract.write_paths
+                )
+            )
+            child_terms = UltraOrchestrator._semantic_terms(item.objective)
+            parent_overlap = len(
+                child_terms
+                & UltraOrchestrator._semantic_terms(parent.objective)
+            )
+            sibling_matches = [
+                (
+                    len(
+                        child_terms
+                        & UltraOrchestrator._semantic_terms(candidate.objective)
+                    ),
+                    candidate,
+                )
+                for candidate in root_nodes
+                if candidate.id != parent.id
+            ]
+            sibling_overlap, semantic_owner = max(
+                sibling_matches,
+                key=lambda value: value[0],
+                default=(0, None),
+            )
+            semantic_drift = (
+                semantic_owner is not None
+                and sibling_overlap >= 2
+                and sibling_overlap > parent_overlap
+            )
+            if invalid_targets or semantic_drift:
+                self.store.transition_work_node(
+                    item.id,
+                    WorkNodeStatus.CANCELLED,
+                    error=(
+                        "restored child contract conflicts with its parent scope"
+                        + (
+                            f": {', '.join(invalid_targets)}"
+                            if invalid_targets
+                            else (
+                                f"; semantic owner is {semantic_owner.id}"
+                                if semantic_owner is not None
+                                else ""
+                            )
+                        )
+                    ),
+                    checkpoint="recovery",
+                )
+                invalid_child_ids.add(item.id)
+                self.events.publish(
+                    "ultra.child_contract_rejected",
+                    f"Cancelled restored child {item.id}; it writes outside parent scope.",
+                    run_id=run_id,
+                    node_id=item.parent_id,
+                    child_id=item.id,
+                    invalid_targets=list(invalid_targets),
+                    semantic_owner=(
+                        semantic_owner.id
+                        if semantic_drift and semantic_owner is not None
+                        else ""
+                    ),
+                )
+        retained_child_scopes: dict[
+            tuple[str, tuple[str, ...]],
+            WorkNode,
+        ] = {}
+        for item in nodes:
+            if (
+                item.id in invalid_child_ids
+                or not item.parent_id
+                or item.status is WorkNodeStatus.CANCELLED
+            ):
+                continue
+            scope_key = (
+                item.parent_id,
+                tuple(
+                    sorted(
+                        _normalized_path(path).casefold()
+                        for path in item.contract.write_paths
+                    )
+                ),
+            )
+            if not scope_key[1]:
+                continue
+            retained = retained_child_scopes.get(scope_key)
+            if retained is None:
+                retained_child_scopes[scope_key] = item
+                continue
+            semantic_overlap = (
+                UltraOrchestrator._semantic_terms(item.objective)
+                & UltraOrchestrator._semantic_terms(retained.objective)
+            )
+            if len(semantic_overlap) < 2:
+                continue
+            self.store.transition_work_node(
+                item.id,
+                WorkNodeStatus.CANCELLED,
+                error=(
+                    "duplicate restored child contract for the same parent "
+                    f"and write scope as {retained.id}"
+                ),
+                checkpoint="recovery",
+            )
+            invalid_child_ids.add(item.id)
+            self.events.publish(
+                "ultra.duplicate_child_cancelled",
+                f"Cancelled duplicate child {item.id}; {retained.id} owns its scope.",
+                run_id=run_id,
+                node_id=item.parent_id,
+                child_id=item.id,
+                retained_child_id=retained.id,
+                write_paths=list(scope_key[1]),
+            )
+        if invalid_child_ids:
+            nodes = tuple(
+                item for item in nodes if item.id not in invalid_child_ids
+            )
         uncertain_nodes = [item.id for item in nodes if item.status is WorkNodeStatus.UNCERTAIN]
         uncertain_agents = [
             item.id
@@ -8337,8 +9170,20 @@ class UltraSession:
             raise RuntimeError(
                 "reconcile uncertain ULTRA work before resume: " + ", ".join(values[:12])
             )
+        pending_questions = tuple(
+            item
+            for item in run.config.get("pending_questions", ())
+            if isinstance(item, Mapping)
+        )
+        question_boundary = bool(
+            run.goal_spec is not None
+            and run.architecture_spec is None
+            and pending_questions
+        )
         awaiting_approval = not run.master_approved or run.plan_revision is None
-        if awaiting_approval:
+        if question_boundary:
+            plan = None
+        elif awaiting_approval:
             if run.status is not UltraRunStatus.AWAITING_APPROVAL:
                 raise RuntimeError("the interrupted ULTRA run has no approved master plan")
             plan = self.store.get_latest_plan(run.goal_id)
@@ -8346,8 +9191,91 @@ class UltraSession:
                 raise RuntimeError("the interrupted ULTRA run has no pending master plan")
         else:
             plan = self.store.get_plan(run.goal_id, run.plan_revision)
+        if question_boundary:
+            # Restore the exact durable question boundary without asking the
+            # provider to repeat foundation work. Answering the remaining
+            # questions continues architecture and plan generation from here.
+            self.goal_id = run.goal_id
+            self.adapter = StateStoreUltraAdapter(
+                self.store,
+                run.goal_id,
+                self.descriptor,
+                self.permission_adapter.access_level,
+                self.config,
+                workspace=self.workspace,
+                events=self.events,
+            )
+            self.adapter.run_id = run.id
+            factory = WorkspaceUltraAgentFactory(
+                self.descriptor,
+                self._execute_tool,
+                self.events,
+                max_steps=self.agent_steps,
+                reasoning_effort=self.reasoning_effort,
+            )
+            self.orchestrator = UltraOrchestrator(
+                factory,
+                execution_class=self.descriptor.execution_class,
+                state=self.adapter,
+                events=self.events,
+                config=self.config,
+                context_builder=DurableContextBuilder(
+                    self.store,
+                    lambda: self.adapter.run_id if self.adapter else None,
+                    self.config.context_chars,
+                ),
+                leases=self.adapter.lease_manager(self.workspace),
+                model_snapshot=self.descriptor.to_dict(),
+            )
+            prompt = str(
+                run.config.get("prompt")
+                or self.store.get_goal(run.goal_id).objective
+            )
+            engine_run = UltraRunV1(
+                id=run.id,
+                prompt=prompt,
+                execution_class=self.descriptor.execution_class,
+                phase=EnginePhase.AWAITING_QUESTIONS,
+                concurrency=run.concurrency,
+                approved=False,
+                model_snapshot=self.descriptor.to_dict(),
+                config_snapshot=dict(run.config),
+                metadata={
+                    "restored": True,
+                    "pending_questions": list(pending_questions),
+                },
+                created_at=run.created_at,
+                updated_at=run.updated_at,
+            )
+            self.orchestrator.run_state = engine_run
+            self.orchestrator.goal_spec = EngineGoalSpec(
+                objective=run.goal_spec.objective,
+                success_criteria=run.goal_spec.success_criteria
+                or ("Complete the requested outcome with authoritative evidence.",),
+                constraints=run.goal_spec.constraints,
+                in_scope=run.goal_spec.scope,
+                out_of_scope=run.goal_spec.non_goals,
+                assumptions=tuple(
+                    f"{key}: {value}"
+                    for key, value in run.goal_spec.answered_questions.items()
+                ),
+                questions=pending_questions,
+            )
+            self.answers = dict(
+                self.store.get_goal(run.goal_id).metadata.get("plan_answers", {})
+            )
+            self.adapter.runs[run.id] = engine_run
+            self.events.publish(
+                "ultra.questions_restored",
+                "Restored the durable ULTRA question boundary.",
+                run_id=run.id,
+                questions=len(pending_questions),
+            )
+            return self.orchestrator.master_plan
         if run.goal_spec is None or run.architecture_spec is None:
-            raise RuntimeError("the interrupted ULTRA foundation is incomplete; use /replan")
+            raise RuntimeError(
+                "the interrupted ULTRA foundation has no recoverable question checkpoint; use /replan"
+            )
 
         self.goal_id = run.goal_id
         self.adapter = StateStoreUltraAdapter(
@@ -8428,7 +9356,11 @@ class UltraSession:
                 )
                 verification = legacy.verification if legacy else ("Inspect the durable evidence.",)
             contract = self._engine_contract(item, verification)
-            children = tuple(str(value) for value in item.metadata.get("children", ()))
+            children = tuple(
+                str(value)
+                for value in item.metadata.get("children", ())
+                if str(value) in stored_by_id
+            )
             if not children:
                 # Backward-compatible recovery for checkpoints written before
                 # parent structure updates were persisted. Parent links are
@@ -8439,18 +9371,86 @@ class UltraSession:
                     for candidate in nodes
                     if candidate.parent_id == item.id
                 )
-            dependencies = tuple(dict.fromkeys((*item.depends_on, *children)))
+            dependencies = tuple(
+                dict.fromkeys(
+                    (
+                        *(
+                            dependency
+                            for dependency in item.depends_on
+                            if dependency in stored_by_id
+                        ),
+                        *children,
+                    )
+                )
+            )
             try:
                 phase = InnerPhase(item.checkpoint) if item.checkpoint else None
             except ValueError:
                 phase = None
+            restored_status = self._engine_node_status(item.status)
+            stored_result_success = bool(
+                item.result
+                and item.result.metadata.get("success")
+            )
+            restored_artifact_check = (
+                _validate_workspace_artifacts(
+                    self.workspace,
+                    contract.write_paths,
+                )
+                if stored_result_success
+                else {"passed": False}
+            )
+            restored_executable_check = (
+                _run_python_test_artifacts(
+                    self.workspace,
+                    contract.write_paths,
+                )
+                if stored_result_success
+                and bool(restored_artifact_check.get("passed"))
+                else {"passed": False}
+            )
+            durable_artifacts_valid = bool(
+                stored_result_success
+                and restored_artifact_check.get("passed")
+                and restored_executable_check.get("passed")
+            )
+            if durable_artifacts_valid:
+                # A process can fail after the accepted ResultPackage and
+                # workspace artifact are durable (for example while emitting a
+                # secondary package receipt). Preserve that evidence boundary
+                # and never replay the successful mutation.
+                restored_status = NodeStatus.COMPLETED
+                self.events.publish(
+                    "ultra.post_evidence_completion_recovered",
+                    f"Recovered completed evidence for {item.id}.",
+                    run_id=run_id,
+                    node_id=item.id,
+                    previous_status=item.status.value,
+                )
+            elif (
+                not awaiting_approval
+                and restored_status
+                in {
+                    NodeStatus.FAILED,
+                    NodeStatus.BLOCKED,
+                    NodeStatus.REVISION_REQUIRED,
+                }
+            ):
+                restored_status = NodeStatus.READY
+                self.events.publish(
+                    "ultra.recoverable_node_reopened",
+                    f"Reopened {item.id} from its last durable evidence gate.",
+                    run_id=run_id,
+                    node_id=item.id,
+                    previous_status=item.status.value,
+                )
             engine = EngineWorkNode(
                 contract=contract,
                 parent_id=item.parent_id,
                 depth=item.depth or 1,
                 kind=NodeKind(item.kind.value),
                 order=item.position,
-                status=self._engine_node_status(item.status),
+                status=restored_status,
                 phase=phase,
                 children=children,
                 pre_write_hashes={},
@@ -8512,7 +9512,7 @@ class UltraSession:
         # legacy Plan and materializing durable WorkNodes.  Rebuild only the
         # top-level module contracts from that immutable pending plan; execution
         # still cannot begin until the user approves its fingerprint.
-        if not module_contracts and awaiting_approval:
+        if not module_contracts:
             from .ultra import TaskContractV1 as EngineTaskContract
 
             paths_by_task: dict[str, list[str]] = {}
@@ -8545,6 +9545,12 @@ class UltraSession:
                 node = EngineWorkNode(contract=contract, order=position)
                 module_contracts.append(contract)
                 engine_nodes[node.id] = node
+                # The process may stop after the approval-bound Plan is
+                # committed but before its top-level WorkNodes are materialized.
+                # Queue the reconstructed immutable nodes in the adapter now;
+                # approve_master() will flush them before specialist profiles,
+                # whose foreign keys require those WorkNodes to exist.
+                self.adapter.save_work_node(run.id, node)
 
         if not module_contracts:
             raise RuntimeError("the approved ULTRA run has no durable master modules")
@@ -8580,6 +9586,14 @@ class UltraSession:
         self.orchestrator._order = max((item.order for item in engine_nodes.values()), default=0)
         self.adapter.runs[run_id] = engine_run
         self.adapter.nodes[run_id] = dict(engine_nodes)
+        for node_id, result in self.adapter.results[run_id].items():
+            node = engine_nodes.get(node_id)
+            if node is not None and result.success:
+                # A process can stop after the durable result package and
+                # WorkNode are committed but before the legacy Plan task is
+                # advanced. Reconcile that projection before scheduling; the
+                # implementation itself is never replayed.
+                self.adapter._sync_master_task(node, result)
         if awaiting_approval:
             self.events.publish(
                 "ultra.awaiting_approval",
@@ -8908,14 +9922,21 @@ class UltraSession:
         try:
             result = self.orchestrator.run()
         except Exception as exc:
-            self._rollback_rejected_changes(
-                f"Ultra engine failed before acceptance: {redact_text(exc, 500)}"
+            self.events.publish(
+                "ultra.recovery_checkpoint_preserved",
+                "ULTRA stopped before acceptance; durable mutations were preserved "
+                "for crash-safe inspection and resume.",
+                run_id=self.run_id,
+                error=redact_text(exc, 500),
             )
             self._record_engine_failure(exc)
             raise
         if not result.successful:
-            self._rollback_rejected_changes(
-                "Ultra candidate did not pass component/global acceptance gates."
+            self.events.publish(
+                "ultra.recovery_checkpoint_preserved",
+                "ULTRA candidate has not passed yet; durable mutations were "
+                "preserved for bounded repair or resume.",
+                run_id=self.run_id,
             )
         self._finalize_result(result)
         return result
@@ -8957,7 +9978,11 @@ class UltraSession:
                         item for item in self.store.list_quality_findings(self.run_id)
                         if item.severity.blocks_completion and item.status.value != "resolved"
                     ]
-                    change_sets = self.store.list_change_sets(self.run_id)
+                    change_sets = (
+                        self.adapter.reconcile_verified_change_sets(self.run_id)
+                        if self.adapter is not None and not blocking_findings
+                        else self.store.list_change_sets(self.run_id)
+                    )
                     unreviewed = [
                         item for item in change_sets
                         if item.status not in {ChangeSetStatus.APPROVED, ChangeSetStatus.INTEGRATED}
