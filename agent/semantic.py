@@ -92,9 +92,9 @@ class SemanticGoalV2:
     version: int = 2
 
     def __post_init__(self) -> None:
-        original = str(self.original_request or "").strip()
+        original = str(self.original_request or "")
         outcome = str(self.interpreted_outcome or "").strip()
-        if not original or len(original) > 20_000:
+        if not original.strip() or len(original) > 200_000:
             raise SemanticContractError("semantic goal requires a bounded original request")
         if not outcome or len(outcome) > 20_000:
             raise SemanticContractError("semantic goal requires a bounded interpreted outcome")
@@ -135,7 +135,7 @@ class SemanticGoalV2:
     def pending(cls, request: str) -> "SemanticGoalV2":
         """Preserve the request exactly without guessing its meaning."""
 
-        value = str(request or "").strip()
+        value = str(request or "")
         return cls(
             original_request=value,
             interpreted_outcome=value,
@@ -149,8 +149,8 @@ class SemanticGoalV2:
         *,
         original_request: str,
     ) -> "SemanticGoalV2":
-        supplied_original = str(value.get("original_request") or original_request).strip()
-        if supplied_original != str(original_request).strip():
+        supplied_original = str(value.get("original_request") or original_request)
+        if supplied_original != str(original_request):
             raise SemanticContractError("semantic interpretation changed the original request")
         return cls(
             original_request=supplied_original,

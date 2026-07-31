@@ -21,7 +21,7 @@ from agent.commands import parse_command
 from agent.sandbox import AccessLevel
 from agent.sleep_profile import SleepActivationError, SleepController
 from agent.store import StateStore
-from agent.testing import ScriptedProvider
+from agent.testing import ScriptedProvider, semantic_turn
 from agent.typed_returns import TypedReturnFailure, TypedReturnProcessor
 from agent.ultra import (
     AgentResponse,
@@ -227,7 +227,13 @@ class PlanHarnessV4Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(directory)
             try:
-                runtime = AgentRuntime(ScriptedProvider(["The workspace is empty."]), store, directory)
+                runtime = AgentRuntime(ScriptedProvider([
+                    semantic_turn(
+                        "chat",
+                        original="What is in this workspace?",
+                        response="The workspace is empty.",
+                    )
+                ]), store, directory)
                 result = runtime.chat("What is in this workspace?")
                 self.assertEqual(result.status, "chat")
                 self.assertIn("empty", result.message)

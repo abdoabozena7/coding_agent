@@ -1780,8 +1780,8 @@ class StateStore:
         constraints: Iterable[str] = (),
         metadata: Mapping[str, Any] | None = None,
     ) -> Goal:
-        objective = str(objective).strip()
-        if not objective:
+        objective = str(objective)
+        if not objective.strip():
             raise ValueError("goal objective must not be empty")
         if "\x00" in objective:
             raise ValueError("goal objective must not contain NUL bytes")

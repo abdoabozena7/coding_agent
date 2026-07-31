@@ -27,11 +27,12 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from . import context, tools
 from .commands import CommandKind, UserCommand
 from .chat_runtime import (
-    ChatIntentV1,
+    RequestedEffectV2,
     RouteDecisionV1,
     RouteKind,
+    SEMANTIC_TURN_SCHEMA,
+    SemanticTurnDecisionV2,
     corrective_prompt,
-    route_input as decide_input_route,
 )
 from .config import RuntimeConfig
 from .control import (
@@ -78,6 +79,7 @@ from .prompts import (
     PLANNER_SYSTEM_PROMPT,
     PLAN_REVIEWER_SYSTEM_PROMPT,
     REVIEWER_SYSTEM_PROMPT,
+    SEMANTIC_ROUTER_SYSTEM_PROMPT,
     state_envelope,
     subagent_system_prompt,
 )
@@ -930,11 +932,13 @@ class AgentRuntime:
         *,
         requested_mode: str | RunMode = RunMode.NORMAL,
         entry_surface: str = "goal",
+        semantic_decision: SemanticTurnDecisionV2 | None = None,
+        semantic_turn_id: str = "",
     ) -> Any:
         """Run every new objective through the shared, durable intake gate."""
 
-        value = redact_text(text, 20_000).strip()
-        if not value:
+        value = str(text)
+        if not value.strip():
             return None
         pending = self.store.get_pending_intake(self.session_id)
         if pending is not None:
@@ -947,8 +951,18 @@ class AgentRuntime:
             return self.answer_intake_question(str(unanswered[0]["id"]), value)
         if self.active_goal() is not None:
             return self.add_guidance(value)
-        decision = self.intent_architect.analyze(
-            value,
+        if semantic_decision is None:
+            semantic_turn, semantic_decision = self._semantic_preflight(
+                value,
+                forced_route=RouteKind.GOAL,
+                requested_mode=requested_mode,
+            )
+            semantic_turn_id = str(semantic_turn["turn_id"])
+        if semantic_decision.route is not RouteKind.GOAL or semantic_decision.goal_intake is None:
+            raise RuntimeStateError("Goal dispatch requires an accepted model-authored goal intake")
+        decision = self.intent_architect.validate(
+            semantic_decision.goal_intake,
+            original_input=value,
             requested_mode=requested_mode,
             repository_facts=self._intake_repository_facts(value),
         )
@@ -991,33 +1005,77 @@ class AgentRuntime:
                     "intake_status": IntakeStatus.AWAITING_ANSWERS.value,
                 },
             )
-            return SliceResult(
+            result = SliceResult(
                 "awaiting_answers",
                 f"Intent Architect needs {len(decision.questions)} decision(s) before planning.",
                 needs_user=True,
             )
-        return self._route_intake(
+            if semantic_turn_id:
+                self._complete_semantic_turn(semantic_turn_id, result_status=result.status)
+            return result
+        result = self._route_intake(
             intake,
             decision.brief,
             entry_surface=entry_surface,
         )
+        if semantic_turn_id:
+            self._complete_semantic_turn(
+                semantic_turn_id,
+                result_status=str(getattr(getattr(result, "status", "planning"), "value", getattr(result, "status", "planning"))),
+            )
+        return result
 
     def route_input(self, text: str) -> tuple[RouteDecisionV1, Any]:
-        """Route idle plain text through Chat, bounded action, or Goal."""
+        """Route idle plain text using one durable model-authored preflight."""
 
-        decision = decide_input_route(text)
+        mode = self.store.get_workflow_session(self.session_id)["session_mode"]
+        semantic_turn, semantic = self._semantic_preflight(text, requested_mode=mode)
+        decision = RouteDecisionV1(
+            semantic.route,
+            semantic.interpretation,
+            False,
+            semantic,
+        )
         self.store.append_event(
             "input.routed",
             payload={
                 "route": decision.kind.value,
                 "reason": decision.reason,
-                "explicit": decision.explicit,
+                "explicit": False,
+                "semantic_version": 2,
+                "contract_fingerprint": semantic.fingerprint,
             },
         )
-        if decision.kind in {RouteKind.CHAT, RouteKind.ACTION}:
-            return decision, self.chat(text, _route_checked=True)
-        mode = self.store.get_workflow_session(self.session_id)["session_mode"]
-        return decision, self.submit_intent(text, requested_mode=mode)
+        semantic_turn["status"] = "dispatching"
+        self._save_pending_semantic_turn(semantic_turn)
+        if semantic.route is RouteKind.CHAT and not semantic.needs_workspace_tools:
+            compact_response, _created = self._artifactize_chat_text(semantic.direct_response)
+            assistant = {"role": "assistant", "content": compact_response}
+            self._chat_conversation.append(assistant)
+            self.store.append_chat_message(
+                self.session_id,
+                assistant,
+                event_key=f"semantic:{semantic_turn['turn_id']}:assistant",
+                run_id=str(semantic_turn["turn_id"]),
+            )
+            result = SliceResult("chat", semantic.direct_response)
+        elif semantic.route in {RouteKind.CHAT, RouteKind.ACTION}:
+            result = self.chat(
+                text,
+                _route_checked=True,
+                semantic_decision=semantic,
+                semantic_turn_id=str(semantic_turn["turn_id"]),
+            )
+        else:
+            result = self.submit_intent(
+                text,
+                requested_mode=mode,
+                entry_surface="chat",
+                semantic_decision=semantic,
+                semantic_turn_id=str(semantic_turn["turn_id"]),
+            )
+        self._complete_semantic_turn(str(semantic_turn["turn_id"]), result_status=str(getattr(result, "status", "routed")))
+        return decision, result
 
     def answer_intake_question(self, question_id: str, value: str) -> Any:
         pending = self.store.get_pending_intake(self.session_id)
@@ -1075,8 +1133,16 @@ class AgentRuntime:
             str(item["id"]): str(item.get("answer") or "")
             for item in updated.get("questions", ())
         }
-        decision = self.intent_architect.analyze(
+        semantic_turn, semantic = self._semantic_preflight(
             str(updated["original_input"]),
+            forced_route=RouteKind.GOAL,
+            requested_mode=str(updated["requested_mode"]),
+            answers=answers,
+        )
+        assert semantic.goal_intake is not None
+        decision = self.intent_architect.validate(
+            semantic.goal_intake,
+            original_input=str(updated["original_input"]),
             requested_mode=str(updated["requested_mode"]),
             answers=answers,
             repository_facts=self._intake_repository_facts(str(updated["original_input"])),
@@ -1085,7 +1151,9 @@ class AgentRuntime:
             str(updated["id"]),
             decision.completeness.to_dict(),
         )
-        return self._route_intake(updated, decision.brief)
+        result = self._route_intake(updated, decision.brief)
+        self._complete_semantic_turn(str(semantic_turn["turn_id"]), result_status="intake_routed")
+        return result
 
     def active_ultra_run(self) -> Any | None:
         goal = self.active_goal() or self.store.get_latest_goal(self.session_id)
@@ -1877,7 +1945,11 @@ class AgentRuntime:
         entry_surface: str = "goal",
     ) -> Plan | None:
         with self._lock:
-            safe_objective = redact_text(objective, 20_000)
+            # Durable objective state preserves the exact user request. Trace
+            # and tool records are redacted separately at their boundaries.
+            safe_objective = str(objective)
+            if not safe_objective.strip():
+                raise ValueError("goal objective must not be empty")
             selected_mode = RunMode.parse(execution_mode)
             prior_session = self.store.get_workflow_session(self.session_id)
             prior_state = dict(prior_session.get("state", {}))
@@ -2041,6 +2113,310 @@ class AgentRuntime:
             repository_evidence_refs=tuple(refs),
             status="interpreted",
         ).to_dict()
+
+    def _save_pending_semantic_turn(self, turn: Mapping[str, Any]) -> None:
+        session = self.store.get_workflow_session(self.session_id)
+        state = dict(session.get("state", {}))
+        state["pending_semantic_turn"] = dict(turn)
+        self.store.save_workflow_session(
+            self.session_id,
+            goal_id=session.get("goal_id"),
+            session_mode=str(session["session_mode"]),
+            plan_state=str(session["plan_state"]),
+            run_state=str(session["run_state"]),
+            ultra_profile=str(session.get("ultra_profile", "standard")),
+            sleep_state=str(session.get("sleep_state", "off")),
+            state=state,
+        )
+
+    def _complete_semantic_turn(self, turn_id: str, *, result_status: str) -> None:
+        session = self.store.get_workflow_session(self.session_id)
+        state = dict(session.get("state", {}))
+        pending = dict(state.get("pending_semantic_turn", {}))
+        if str(pending.get("turn_id")) != str(turn_id):
+            return
+        pending.update({"status": "completed", "result_status": str(result_status)})
+        state["last_semantic_turn"] = pending
+        state.pop("pending_semantic_turn", None)
+        self.store.save_workflow_session(
+            self.session_id,
+            goal_id=session.get("goal_id"),
+            session_mode=str(session["session_mode"]),
+            plan_state=str(session["plan_state"]),
+            run_state=str(session["run_state"]),
+            ultra_profile=str(session.get("ultra_profile", "standard")),
+            sleep_state=str(session.get("sleep_state", "off")),
+            state=state,
+        )
+
+    def _record_semantic_action(
+        self,
+        turn_id: str,
+        action_id: str,
+        *,
+        category: str,
+        mutating: bool,
+        status: str,
+        output: str = "",
+        changed_paths: Sequence[str] = (),
+    ) -> None:
+        if not turn_id:
+            return
+        session = self.store.get_workflow_session(self.session_id)
+        state = dict(session.get("state", {}))
+        pending = dict(state.get("pending_semantic_turn", {}))
+        if str(pending.get("turn_id")) != str(turn_id):
+            return
+        records = [dict(item) for item in pending.get("action_records", ()) if isinstance(item, Mapping)]
+        record = {
+            "action_id": action_id,
+            "category": str(category),
+            "mutating": bool(mutating),
+            "status": str(status),
+            "output": redact_text(output, 2_000),
+            "changed_paths": list(changed_paths),
+        }
+        replaced = False
+        for index, item in enumerate(records):
+            if str(item.get("action_id")) == action_id:
+                records[index] = record
+                replaced = True
+                break
+        if not replaced:
+            records.append(record)
+        pending["action_records"] = records
+        pending["status"] = "dispatching"
+        state["pending_semantic_turn"] = pending
+        self.store.save_workflow_session(
+            self.session_id,
+            goal_id=session.get("goal_id"),
+            session_mode=str(session["session_mode"]),
+            plan_state=str(session["plan_state"]),
+            run_state=str(session["run_state"]),
+            ultra_profile=str(session.get("ultra_profile", "standard")),
+            sleep_state=str(session.get("sleep_state", "off")),
+            state=state,
+        )
+
+    def _semantic_artifact_manifest(self) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            {
+                key: item.get(key)
+                for key in ("id", "language", "suggested_name", "content_hash", "byte_size")
+            }
+            for item in self.store.list_chat_artifacts(self.session_id)[-10:]
+        )
+
+    def _semantic_preflight(
+        self,
+        text: str | None = None,
+        *,
+        forced_route: RouteKind | None = None,
+        requested_mode: str | RunMode | None = None,
+        answers: Mapping[str, str] | None = None,
+        resume_pending: bool = False,
+    ) -> tuple[dict[str, Any], SemanticTurnDecisionV2]:
+        """Persist, obtain, and validate one model-owned semantic decision."""
+
+        session = self.store.get_workflow_session(self.session_id)
+        state = dict(session.get("state", {}))
+        existing = state.get("pending_semantic_turn")
+        if resume_pending:
+            if not isinstance(existing, Mapping):
+                raise RuntimeStateError("there is no pending semantic turn to resume")
+            pending = dict(existing)
+            original = str(pending.get("original_input") or "")
+            forced_value = str(pending.get("forced_route") or "")
+            forced_route = RouteKind(forced_value) if forced_value else None
+            requested_mode = str(pending.get("requested_mode") or session["session_mode"])
+            answers = dict(pending.get("answers", {}))
+        else:
+            original = str(text or "")
+            if not original.strip():
+                raise ValueError("semantic input must not be empty")
+            turn_id = "turn-" + hashlib.sha256(
+                f"{self.session_id}\0{time.time_ns()}\0{original}".encode("utf-8")
+            ).hexdigest()[:24]
+            pending = {
+                "turn_id": turn_id,
+                "original_input": original,
+                "request_fingerprint": hashlib.sha256(original.encode("utf-8")).hexdigest(),
+                "requested_mode": RunMode.parse(requested_mode or session["session_mode"]).value,
+                "forced_route": forced_route.value if forced_route else "",
+                "answers": dict(answers or {}),
+                "status": "routing",
+                "schema_attempts": 0,
+                "semantic_attempts": 0,
+                "decision": None,
+                "created_at_ns": time.time_ns(),
+            }
+            self._save_pending_semantic_turn(pending)
+            # The exact request is durable before the first provider call.
+            self.store.append_chat_message(
+                self.session_id,
+                {"role": "user", "content": original},
+                event_key=f"semantic:{turn_id}:user",
+                run_id=turn_id,
+            )
+            self._chat_conversation.append({"role": "user", "content": original})
+            self.store.append_event(
+                "semantic_turn.routing",
+                entity_type="semantic_turn",
+                entity_id=turn_id,
+                payload={
+                    "request_fingerprint": pending["request_fingerprint"],
+                    "requested_mode": pending["requested_mode"],
+                    "forced_route": pending["forced_route"],
+                    "provider": self.provider_name,
+                    "model": self.model_name,
+                },
+            )
+
+        accepted = pending.get("decision")
+        if isinstance(accepted, Mapping) and str(pending.get("status")) in {"routed", "dispatching"}:
+            return pending, SemanticTurnDecisionV2.from_mapping(
+                accepted, original_input=original, forced_route=forced_route
+            )
+
+        manifest = self._semantic_artifact_manifest()
+        recent = [
+            {"role": item.get("role"), "content": item.get("content")}
+            for item in self._chat_conversation[-12:]
+            if item.get("role") in {"user", "assistant"}
+        ]
+        envelope = {
+            "exact_latest_user_input": original,
+            "recent_conversation": recent,
+            "workflow_mode": str(pending.get("requested_mode")),
+            "artifact_manifest": manifest,
+            "repository_manifest": self._intake_repository_facts(original),
+            "answered_intake_decisions": dict(answers or {}),
+            "forced_route": forced_route.value if forced_route else None,
+        }
+        conversation: list[dict[str, Any]] = [
+            {
+                "role": "user",
+                "content": state_envelope(
+                    envelope,
+                    "SEMANTIC_TURN_INPUT",
+                    max_chars=max(18_000, len(original) * 2 + 12_000),
+                ),
+            }
+        ]
+        schema_repairs = int(pending.get("schema_attempts", 0))
+        semantic_repairs = int(pending.get("semantic_attempts", 0))
+        step = schema_repairs + semantic_repairs + 1
+        while True:
+            try:
+                turn = self._call_provider(
+                    conversation,
+                    [SEMANTIC_TURN_SCHEMA],
+                    SEMANTIC_ROUTER_SYSTEM_PROMPT,
+                    actor="semantic-router",
+                    step=step,
+                    stream_text=False,
+                )
+            except ProviderUnavailableError as exc:
+                pending.update({"status": "awaiting_provider", "last_error": redact_text(exc, 1_000)})
+                self._save_pending_semantic_turn(pending)
+                self.store.append_event(
+                    "semantic_turn.provider_boundary",
+                    entity_type="semantic_turn",
+                    entity_id=str(pending["turn_id"]),
+                    payload={"error": redact_text(exc, 500), "resumable": True},
+                )
+                raise
+            conversation.append(turn.to_message())
+            structural_error = ""
+            if len(turn.tool_calls) != 1:
+                structural_error = "submit_semantic_turn must be called exactly once"
+            elif turn.tool_calls[0].name != "submit_semantic_turn":
+                structural_error = "the only allowed call is submit_semantic_turn"
+            elif not isinstance(turn.tool_calls[0].args, Mapping):
+                structural_error = "submit_semantic_turn arguments must be an object"
+            if structural_error:
+                schema_repairs += 1
+                pending.update({"schema_attempts": schema_repairs, "status": "routing", "last_error": structural_error})
+                self._save_pending_semantic_turn(pending)
+                if schema_repairs > 2:
+                    break
+                conversation.append({"role": "user", "content": "SCHEMA VALIDATION ERROR: " + structural_error + ". Repair only the function-call shape."})
+                step += 1
+                continue
+            try:
+                decision = SemanticTurnDecisionV2.from_mapping(
+                    turn.tool_calls[0].args,
+                    original_input=original,
+                    forced_route=forced_route,
+                )
+                if (
+                    RunMode.parse(str(pending.get("requested_mode"))) is RunMode.PLAN
+                    and decision.route is RouteKind.ACTION
+                    and any(effect is not RequestedEffectV2.READ for effect in decision.requested_effects)
+                ):
+                    raise ValueError(
+                        "Plan mode forbids changing Action execution; return a Goal with goal_intake for planning only"
+                    )
+                if decision.route is RouteKind.GOAL and decision.goal_intake is not None:
+                    # Goal-intake shape and mode policy are part of semantic
+                    # consistency, so malformed model-authored questions use
+                    # the semantic repair budget instead of escaping dispatch.
+                    self.intent_architect.validate(
+                        decision.goal_intake,
+                        original_input=original,
+                        requested_mode=str(pending.get("requested_mode")),
+                        answers=answers,
+                        repository_facts=tuple(envelope["repository_manifest"]),
+                    )
+            except (TypeError, ValueError) as exc:
+                semantic_repairs += 1
+                message = str(exc)
+                pending.update({"semantic_attempts": semantic_repairs, "status": "routing", "last_error": message})
+                self._save_pending_semantic_turn(pending)
+                if semantic_repairs > 2:
+                    break
+                conversation.append({"role": "user", "content": "SEMANTIC CONSISTENCY ERROR: " + message + ". Preserve the exact request and repair only this inconsistency."})
+                step += 1
+                continue
+            pending.update({
+                "status": "routed", "decision": decision.to_dict(),
+                "schema_attempts": schema_repairs, "semantic_attempts": semantic_repairs,
+                "contract_fingerprint": decision.fingerprint, "last_error": "",
+            })
+            self._save_pending_semantic_turn(pending)
+            self.store.append_event(
+                "semantic_turn.routed",
+                entity_type="semantic_turn",
+                entity_id=str(pending["turn_id"]),
+                payload={
+                    "route": decision.route.value,
+                    "rationale": decision.interpretation,
+                    "contract_fingerprint": decision.fingerprint,
+                    "provider": self.provider_name,
+                    "model": self.model_name,
+                    "schema_attempts": schema_repairs,
+                    "semantic_attempts": semantic_repairs,
+                },
+            )
+            return pending, decision
+
+        pending.update({"status": "awaiting_provider", "last_error": str(pending.get("last_error") or "semantic decision validation exhausted")})
+        self._save_pending_semantic_turn(pending)
+        self.store.append_event(
+            "semantic_turn.validation_boundary",
+            entity_type="semantic_turn",
+            entity_id=str(pending["turn_id"]),
+            payload={
+                "stage": "schema" if schema_repairs > 2 else "semantic_consistency",
+                "schema_attempts": schema_repairs,
+                "semantic_attempts": semantic_repairs,
+                "error": pending["last_error"],
+                "resumable": True,
+            },
+        )
+        raise ProviderUnavailableError(
+            "semantic routing is saved but could not be validated: " + str(pending["last_error"])
+        )
 
     @staticmethod
     def _validate_semantic_stage(
@@ -2548,8 +2924,28 @@ class AgentRuntime:
                 item["source"] = canonical
         bound["applicability_evidence"] = evidence
         changes = [dict(item) for item in proposed.get("expected_changes", ())]
+        normalized_request = original_request.replace("\\", "/").casefold()
+        for item in changes:
+            raw_path = str(item.get("path") or "").replace("\\", "/")
+            if (
+                item.get("basis") == "explicit_user_requirement"
+                and raw_path
+                and raw_path.casefold() in normalized_request
+            ):
+                # `user:request` is the canonical harness citation for a path
+                # that the model has already classified as an explicit user
+                # requirement.  Adding the citation does not choose a path or
+                # infer product semantics; it binds the model-authored basis to
+                # the exact, persisted source text.
+                refs = [
+                    str(value)
+                    for value in item.get("evidence_refs", ())
+                    if str(value).strip()
+                ]
+                if "user:request" not in refs:
+                    refs.append("user:request")
+                item["evidence_refs"] = refs
         if only_reference is not None:
-            normalized_request = original_request.replace("\\", "/").casefold()
             generic_path_tokens = {
                 "app", "config", "core", "index", "init", "lib", "main",
                 "package", "py", "src", "setup", "test", "tests",
@@ -2696,14 +3092,14 @@ class AgentRuntime:
         item = questions[question_id]
         normalized_question = normalize_question(item)
         answer, _answer_source = answer_from_value(normalized_question, answer)
-        labels = {
-            str(option.get("label", "")).strip()
+        values = {
+            str(option.get("value", "")).strip()
             for option in item.get("options", ())
             if isinstance(option, Mapping)
         }
-        if labels and answer not in labels and not bool(item.get("allow_freeform", True)):
+        if values and answer not in values and not bool(item.get("allow_freeform", True)):
             raise ValueError(
-                f"answer must be one of: {', '.join(sorted(labels))}"
+                f"answer must be one of: {', '.join(sorted(values))}"
             )
         answers = dict(goal.metadata.get("plan_answers", {}))
         answers[question_id] = answer
@@ -2938,6 +3334,7 @@ class AgentRuntime:
             else None
         )
         semantic_stage_attempted = staged_semantic is not None
+        plan_stage_prompted = False
         successful_inspection_ids: set[str] = set()
         inspection_records: dict[str, dict[str, Any]] = {}
         inspection_cache: dict[str, str] = {}
@@ -2998,6 +3395,35 @@ class AgentRuntime:
                         },
                     }
                     planner_tools.append(staged_schema)
+                if not plan_stage_prompted:
+                    accepted_semantic = SemanticGoalV2.from_mapping(
+                        staged_semantic,
+                        original_request=goal.objective,
+                    )
+                    conversation = [{
+                        "role": "user",
+                        "content": state_envelope(
+                            {
+                                "objective": goal.objective,
+                                "accepted_semantic_goal": staged_semantic,
+                                "accepted_semantic_fingerprint": accepted_semantic.fingerprint,
+                                "successful_inspections": list(inspection_records.values()),
+                                "planning_answers": planning_answers,
+                                "previous_plan": None if previous_plan is None else {
+                                    "revision": previous_plan.revision,
+                                    "summary": previous_plan.summary,
+                                    "tasks": [_task_dict(task) for task in previous_plan.tasks],
+                                },
+                                "required_next_action": (
+                                    "Call propose_plan exactly once. The semantic stage is accepted; "
+                                    "do not repeat it and do not answer with prose."
+                                ),
+                            },
+                            "PLAN_GENERATION_STAGE",
+                            max_chars=120_000,
+                        ),
+                    }]
+                    plan_stage_prompted = True
             turn = self._call_provider(
                 conversation,
                 planner_tools,
@@ -4615,8 +5041,88 @@ class AgentRuntime:
         )
         return result
 
-    def resume(self) -> Goal:
+    def _resume_pending_semantic_turn(self) -> Any:
+        session = self.store.get_workflow_session(self.session_id)
+        pending = dict(session.get("state", {}).get("pending_semantic_turn", {}))
+        if not pending:
+            raise RuntimeStateError("there is no pending semantic turn to resume")
+        action_ids = {
+            str(item.get("action_id"))
+            for item in pending.get("action_records", ())
+            if isinstance(item, Mapping) and str(item.get("action_id") or "")
+        }
+        uncertain = [
+            item for item in self.store.list_session_actions(self.session_id)
+            if str(item.get("id")) in action_ids and str(item.get("status")) == "uncertain"
+        ]
+        if uncertain:
+            return SliceResult(
+                "uncertain",
+                "The prior process stopped during a mutating Action. Its real workspace state must be reconciled before continuing; the action was not replayed.",
+                needs_user=True,
+            )
+        semantic_turn, semantic = self._semantic_preflight(resume_pending=True)
+        semantic_turn["status"] = "dispatching"
+        self._save_pending_semantic_turn(semantic_turn)
+        original = str(semantic_turn["original_input"])
+        if semantic.route is RouteKind.CHAT and not semantic.needs_workspace_tools:
+            compact_response, _created = self._artifactize_chat_text(semantic.direct_response)
+            assistant = {"role": "assistant", "content": compact_response}
+            self._chat_conversation.append(assistant)
+            self.store.append_chat_message(
+                self.session_id,
+                assistant,
+                event_key=f"semantic:{semantic_turn['turn_id']}:assistant",
+                run_id=str(semantic_turn["turn_id"]),
+            )
+            result: Any = SliceResult("chat", semantic.direct_response)
+        elif semantic.route in {RouteKind.CHAT, RouteKind.ACTION}:
+            result = self.chat(
+                original,
+                _route_checked=True,
+                semantic_decision=semantic,
+                semantic_turn_id=str(semantic_turn["turn_id"]),
+            )
+        else:
+            result = self.submit_intent(
+                original,
+                requested_mode=str(semantic_turn.get("requested_mode") or session["session_mode"]),
+                semantic_decision=semantic,
+                semantic_turn_id=str(semantic_turn["turn_id"]),
+            )
+        self._complete_semantic_turn(str(semantic_turn["turn_id"]), result_status=str(getattr(result, "status", "routed")))
+        return result
+
+    def resume(self) -> Any:
         goal = self.active_goal()
+        if goal is None:
+            pending = self.store.get_workflow_session(self.session_id).get("state", {}).get(
+                "pending_semantic_turn"
+            )
+            if isinstance(pending, Mapping):
+                return self._resume_pending_semantic_turn()
+        if goal is not None and goal.status in {
+            GoalStatus.DISCOVERING,
+            GoalStatus.REVISING,
+        }:
+            # Planning provider calls do not perform workspace mutations, so
+            # there is no uncertain side effect to reconcile after a process
+            # dies between turns. Rebuild the bounded planning conversation
+            # from the exact goal, accepted semantic metadata, and fresh
+            # repository inspection instead of leaving the durable goal in an
+            # unresumable non-paused state.
+            self.store.append_event(
+                "planning.resumed",
+                goal_id=goal.id,
+                payload={
+                    "status": goal.status.value,
+                    "reason": "resume requested for an interrupted planning stage",
+                },
+            )
+            return self.generate_plan(
+                "Resume the interrupted planning stage from persisted semantic "
+                "state. Preserve the exact original request and accepted scope."
+            )
         ultra_run = self.active_ultra_run() if goal is not None else None
         resumable_failed_ultra = bool(
             goal is not None
@@ -5119,6 +5625,11 @@ class AgentRuntime:
         scoped_name = f"{actor}:{call.name}"
         journal_args = {
             "_harness_actor": actor,
+            # A denied call can be invalid for the current task's resource
+            # lease yet become valid when the scheduler advances to the task
+            # that owns that path.  Scope retry/no-progress identity to the
+            # durable task so an earlier denial cannot poison later work.
+            "_harness_task_id": task_id,
             "_harness_plan_revision": goal.active_plan_revision,
             "_harness_mutation_sequence": int(
                 goal.metadata.get("mutation_sequence", 0) or 0
@@ -5672,6 +6183,18 @@ class AgentRuntime:
                 and (item.verified or item.created_by == "user")
             ]
             if not task_evidence:
+                self._inherit_dependency_verification_evidence(
+                    goal, plan, args["task_id"]
+                )
+                task_evidence = [
+                    item
+                    for item in self.store.list_evidence(
+                        goal.id, task_id=args["task_id"]
+                    )
+                    if item.plan_revision == plan.revision
+                    and (item.verified or item.created_by == "user")
+                ]
+            if not task_evidence:
                 return (
                     "Error: done requires authoritative evidence bound to this task. "
                     "Keep it in_progress and run its required workspace verification first."
@@ -5693,6 +6216,123 @@ class AgentRuntime:
         except (StateStoreError, ValueError) as exc:
             return f"Error: checklist update rejected: {redact_text(exc, 1_000)}"
         return f"Checklist {task.id} -> {task.status.value}. Durable state updated."
+
+    def _inherit_dependency_verification_evidence(
+        self,
+        goal: Goal,
+        plan: Plan,
+        task_id: str,
+    ) -> None:
+        """Bind fresh prerequisite command evidence to a verification-only task.
+
+        Models sometimes run the final test command while finishing the last
+        implementation task. Requiring an identical rerun solely because the
+        scheduler advanced one task later wastes work and can trap weaker
+        models in bookkeeping loops. Reuse is deliberately narrow: the target
+        must have no expected mutation, the evidence must come from a direct
+        dependency, the exact command must occur in the target contract, and
+        no accepted workspace mutation may follow the command.
+        """
+
+        normalized_id = str(task_id).upper()
+        task = next((item for item in plan.tasks if item.id == normalized_id), None)
+        if task is None or not task.depends_on:
+            return
+        if any(
+            normalized_id
+            in {str(value).upper() for value in change.get("supports_tasks", ())}
+            for change in plan.expected_changes
+            if isinstance(change, Mapping)
+        ):
+            return
+        contract = " ".join(
+            (
+                task.title,
+                task.description,
+                *task.acceptance_criteria,
+                *task.verification,
+            )
+        ).casefold()
+        actions = list(self.store.list_actions(goal.id))
+        action_index = {
+            str(item.get("id") or ""): index
+            for index, item in enumerate(actions)
+        }
+        mutation_action_ids = {
+            str(action_id)
+            for change_set in goal.metadata.get("goal_change_sets", ())
+            if isinstance(change_set, Mapping)
+            for action_id in change_set.get("tool_action_ids", ())
+        }
+        last_mutation_index = max(
+            (action_index.get(action_id, -1) for action_id in mutation_action_ids),
+            default=-1,
+        )
+        by_action = {
+            str(item.get("id") or ""): item for item in actions
+        }
+        candidates = []
+        for dependency_id in task.depends_on:
+            candidates.extend(
+                item
+                for item in self.store.list_evidence(
+                    goal.id, task_id=dependency_id
+                )
+                if item.plan_revision == plan.revision and item.verified
+            )
+        for evidence in reversed(candidates):
+            data = dict(evidence.data)
+            if data.get("tool") not in {"run_command", "run_bash"}:
+                continue
+            command = str(dict(data.get("arguments") or {}).get("command") or "").strip()
+            normalized_command = " ".join(command.casefold().split())
+            if not normalized_command or normalized_command not in " ".join(contract.split()):
+                continue
+            action_id = str(data.get("action_id") or "")
+            action = by_action.get(action_id)
+            if (
+                action is None
+                or action.get("status") != "completed"
+                or action_index.get(action_id, -1) < last_mutation_index
+            ):
+                continue
+            result = str(data.get("result") or action.get("result_summary") or "")
+            if result.startswith("Error:") or not re.search(
+                r"(?im)^exit code:\s*0\b", result
+            ):
+                continue
+            inherited = self.store.add_evidence(
+                goal_id=goal.id,
+                plan_revision=plan.revision,
+                task_id=normalized_id,
+                kind="inherited_verification",
+                summary=(
+                    f"Fresh successful verification from dependency "
+                    f"{evidence.task_id}: {command}"
+                ),
+                data={
+                    "source_evidence_id": evidence.id,
+                    "source_task_id": evidence.task_id,
+                    "action_id": action_id,
+                    "command": command,
+                    "fresh_after_mutation_index": last_mutation_index,
+                },
+                created_by="harness",
+                verified=True,
+            )
+            self.store.append_event(
+                "verification_evidence.inherited",
+                goal_id=goal.id,
+                entity_type="evidence",
+                entity_id=inherited.id,
+                payload={
+                    "task_id": normalized_id,
+                    "source_task_id": evidence.task_id,
+                    "source_evidence_id": evidence.id,
+                    "action_id": action_id,
+                },
+            )
+            return
 
     def _record_memory(self, goal: Goal, plan: Plan, args: dict[str, Any]) -> str:
         item = self.store.add_evidence(
@@ -7064,12 +7704,19 @@ class AgentRuntime:
     def _execute_chat_tool(
         self,
         call: ToolCall,
-        intent: ChatIntentV1,
+        decision: SemanticTurnDecisionV2,
+        semantic_turn_id: str = "",
     ) -> tuple[tools.ToolExecutionResult, tuple[str, ...]]:
         spec = tools.get_spec(call.name)
         args = call.args if isinstance(call.args, dict) else {}
         if spec is None:
             return tools.ToolExecutionResult(False, f"Error: unknown chat tool {call.name!r}"), ()
+        if not decision.permits_tool_category(spec.category):
+            return tools.ToolExecutionResult(
+                False,
+                f"Error: tool category {spec.category!r} is outside the accepted semantic effect contract",
+                error_code="effect_contract",
+            ), ()
         risk = spec.risk
         normal_requirement = tools.requires_approval(call.name, args)
         needs_approval = (
@@ -7078,16 +7725,29 @@ class AgentRuntime:
         )
         if call.name == "open_path" or (call.name == "preview_html" and bool(args.get("open_browser", True))):
             needs_approval = True
-        if intent.authorizes(call.name):
-            needs_approval = False
         action_id = self.store.begin_session_action(
             self.session_id, call.name, redact_data(args), risk=risk,
             mutating=spec.mutates_workspace,
+        )
+        self._record_semantic_action(
+            semantic_turn_id,
+            action_id,
+            category=spec.category,
+            mutating=spec.mutates_workspace,
+            status="running",
         )
         self.events.publish("tool_call", call.name, args=redact_data(args), actor="chat", id=call.id)
         if needs_approval and not self._approval_allowed(call.name, dict(args), risk):
             result = tools.ToolExecutionResult(False, "Permission denied by the user.", error_code="permission")
             self.store.complete_session_action(action_id, result.output, status="denied")
+            self._record_semantic_action(
+                semantic_turn_id,
+                action_id,
+                category=spec.category,
+                mutating=spec.mutates_workspace,
+                status="denied",
+                output=result.output,
+            )
             return result, ()
 
         candidate_paths = [
@@ -7204,6 +7864,15 @@ class AgentRuntime:
             status="completed" if result.ok else "failed",
             changed_paths=changed,
         )
+        self._record_semantic_action(
+            semantic_turn_id,
+            action_id,
+            category=spec.category,
+            mutating=spec.mutates_workspace,
+            status="completed" if result.ok else "failed",
+            output=result.output,
+            changed_paths=changed,
+        )
         if result.ok and call.name in {
             "start_process", "poll_process", "stop_process",
             "preview_html", "inspect_preview", "stop_preview",
@@ -7246,43 +7915,25 @@ class AgentRuntime:
         *,
         steps: int = 12,
         _route_checked: bool = False,
+        semantic_decision: SemanticTurnDecisionV2 | None = None,
+        semantic_turn_id: str = "",
     ) -> Any:
         """Run bounded Chat with durable artifacts and action postcondition gates."""
 
-        prompt = str(text).strip()
-        if not prompt:
+        prompt = str(text)
+        if not prompt.strip():
             return SliceResult("idle", "", 0)
         if not _route_checked:
-            route = decide_input_route(prompt)
-            if route.kind is RouteKind.GOAL:
-                session_mode = self.store.get_workflow_session(self.session_id)[
-                    "session_mode"
-                ]
-                routed = self.submit_intent(
-                    prompt,
-                    requested_mode=session_mode,
-                    entry_surface="chat",
-                )
-                if isinstance(routed, SliceResult):
-                    return routed
-                status = getattr(routed, "status", "planning")
-                status_value = getattr(status, "value", str(status))
-                return SliceResult(
-                    str(status_value),
-                    (
-                        f"Project plan r{routed.revision} is ready for approval."
-                        if isinstance(routed, Plan)
-                        else "Project workflow started."
-                    ),
-                    needs_user=str(status_value)
-                    in {
-                        PlanStatus.PENDING_APPROVAL.value,
-                        GoalStatus.AWAITING_PLAN_APPROVAL.value,
-                    },
-                )
-        user_message = {"role": "user", "content": prompt}
-        self._chat_conversation.append(user_message)
-        self.store.append_chat_message(self.session_id, user_message)
+            _route, result = self.route_input(prompt)
+            return result
+        if semantic_decision is None:
+            raise RuntimeStateError("bounded Chat/Action requires an accepted semantic effect contract")
+        if semantic_decision.route not in {RouteKind.CHAT, RouteKind.ACTION}:
+            raise RuntimeStateError("Goal decisions cannot execute in the bounded Chat loop")
+        if not semantic_turn_id:
+            user_message = {"role": "user", "content": prompt}
+            self._chat_conversation.append(user_message)
+            self.store.append_chat_message(self.session_id, user_message)
         session = self.store.get_workflow_session(self.session_id)
         session_state = dict(session.get("state", {}))
         session_state.setdefault(
@@ -7296,25 +7947,7 @@ class AgentRuntime:
             prompt,
         ][-50:]
 
-        intent = ChatIntentV1.parse(prompt)
         known_artifacts = self.store.list_chat_artifacts(self.session_id)
-        latest_html = next(
-            (
-                item
-                for item in reversed(known_artifacts)
-                if item.get("language") == "html"
-            ),
-            None,
-        )
-        if intent.requires_run and latest_html is not None:
-            suggested = str(latest_html.get("suggested_name") or "index.html")
-            if not (self.workspace / suggested).exists():
-                intent = ChatIntentV1(
-                    prompt,
-                    requires_write=True,
-                    requires_run=True,
-                    requires_install=intent.requires_install,
-                )
 
         capability_rows = tools.capability_report()
         capabilities = json.dumps(capability_rows, ensure_ascii=False)
@@ -7332,6 +7965,11 @@ class AgentRuntime:
             for item in known_artifacts[-10:]
         ]
         system = CHAT_SYSTEM_PROMPT + "\n\nRUNTIME CAPABILITIES:\n" + capabilities
+        system += (
+            "\n\nACCEPTED SEMANTIC EFFECT CONTRACT:\n"
+            + json.dumps(semantic_decision.to_dict(), ensure_ascii=False, sort_keys=True)
+            + "\nUse no tool category outside this contract. The final response must be model-authored and evidence-based."
+        )
         if artifact_rows:
             system += (
                 "\n\nDURABLE CHAT ARTIFACTS:\n"
@@ -7340,21 +7978,46 @@ class AgentRuntime:
 
         executed = 0
         changed_paths: list[str] = []
-        successful_tools: list[str] = []
+        successful_categories: list[str] = []
         successful_outputs: list[tuple[str, str]] = []
+        if semantic_turn_id:
+            pending_state = dict(
+                self.store.get_workflow_session(self.session_id).get("state", {}).get(
+                    "pending_semantic_turn", {}
+                )
+            )
+            for record in pending_state.get("action_records", ()):
+                if isinstance(record, Mapping) and record.get("status") == "completed":
+                    successful_categories.append(str(record.get("category") or ""))
+                    successful_outputs.append((
+                        str(record.get("category") or "action"),
+                        str(record.get("output") or "completed"),
+                    ))
         failure_outputs: list[str] = []
         no_action_attempts = 0
         final_text = ""
 
         for step in range(1, max(1, steps) + 1):
-            turn = self._call_provider(
-                self._chat_conversation,
-                list(tools.TOOL_SCHEMAS),
-                system,
-                actor="chat",
-                step=step,
-                stream_text=False,
-            )
+            allowed_names = tools.names(categories=semantic_decision.allowed_categories)
+            allowed_schemas = [schema for schema in tools.TOOL_SCHEMAS if _tool_name(schema) in allowed_names]
+            try:
+                turn = self._call_provider(
+                    self._chat_conversation,
+                    allowed_schemas,
+                    system,
+                    actor="chat",
+                    step=step,
+                    stream_text=False,
+                )
+            except ProviderUnavailableError:
+                if not successful_outputs:
+                    raise
+                evidence = self._chat_evidence(successful_outputs)
+                final_text = (
+                    "The requested tool actions completed, but the provider could not compose the final response.\n\n"
+                    "Action receipt (tool evidence only):\n" + evidence
+                )
+                break
             message = turn.to_message()
             display_text = turn.text or ""
             if turn.text:
@@ -7374,7 +8037,9 @@ class AgentRuntime:
 
             if turn.tool_calls:
                 for call in turn.tool_calls:
-                    result, changed = self._execute_chat_tool(call, intent)
+                    result, changed = self._execute_chat_tool(
+                        call, semantic_decision, semantic_turn_id
+                    )
                     executed += 1
                     tool_message = {
                         "role": "tool",
@@ -7392,24 +8057,17 @@ class AgentRuntime:
                         id=call.id,
                     )
                     if result.ok:
-                        successful_tools.append(call.name)
+                        spec = tools.get_spec(call.name)
+                        if spec is not None:
+                            successful_categories.append(spec.category)
                         successful_outputs.append((call.name, result.output))
                         changed_paths.extend(changed)
                     else:
                         failure_outputs.append(result.output)
                 continue
 
-            missing = intent.missing(successful_tools)
+            missing = semantic_decision.missing_effects(successful_categories)
             if missing:
-                if intent.requires_run and "?" in display_text and latest_html is None:
-                    candidates = [
-                        path
-                        for path in self.workspace.rglob("*.htm*")
-                        if ".coding-agent" not in path.parts
-                    ]
-                    if len(candidates) != 1:
-                        final_text = display_text
-                        break
                 no_action_attempts += 1
                 if no_action_attempts >= self.config.no_action_limit:
                     detail = (
@@ -7421,21 +8079,32 @@ class AgentRuntime:
                     break
                 correction_message = {
                     "role": "user",
-                    "content": corrective_prompt(intent, missing, capabilities),
+                    "content": corrective_prompt(missing, capabilities),
                 }
                 self._chat_conversation.append(correction_message)
                 self.store.append_chat_message(self.session_id, correction_message)
                 continue
 
-            final_text = display_text or "Completed the requested action."
-            break
+            if display_text:
+                final_text = display_text
+                break
+            no_action_attempts += 1
+            if no_action_attempts >= self.config.no_action_limit:
+                if successful_outputs:
+                    final_text = (
+                        "The requested tool actions completed, but the provider did not compose a final response.\n\n"
+                        "Action receipt (tool evidence only):\n" + self._chat_evidence(successful_outputs)
+                    )
+                    break
+                raise ProviderUnavailableError("provider returned no natural Chat response")
+            self._chat_conversation.append({
+                "role": "user",
+                "content": "FINAL HANDOFF REQUIRED: Write a concise natural response grounded only in the tool evidence. Do not call another tool unless a requested effect is still unsatisfied.",
+            })
 
         if not final_text:
-            final_text = (
-                f"Chat turn checkpointed after {executed} tool action(s); "
-                "execution can continue in the same session."
-            )
-        if successful_outputs and intent.actionable:
+            raise ProviderUnavailableError("bounded turn ended without a model-authored response or action receipt")
+        if successful_outputs and semantic_decision.route is RouteKind.ACTION and "Action receipt" not in final_text:
             final_text = (
                 final_text.rstrip()
                 + "\n\nEvidence:\n"
@@ -7443,25 +8112,10 @@ class AgentRuntime:
             )
 
         artifacts = list(dict.fromkeys(changed_paths))
-        if artifacts:
-            session_state["below_target_continuation"] = {
-                "status": "below_target",
-                "objective": session_state["original_objective"],
-                "target": "evidence-backed convergence",
-                "weaknesses": ["candidate has not passed independent evaluation"],
-                "expected_refinement_scope": artifacts,
-                "artifacts": artifacts,
-                "recommended_action": "continue the same run in Goal mode",
-                "memory_preserved": True,
-            }
-            final_text += (
-                "\n\nQuality status: BELOW_TARGET (not independently evaluated). "
-                "The artifact and action evidence are preserved for Goal mode."
-            )
         self.store.save_workflow_session(
             self.session_id,
             goal_id=None,
-            session_mode=SessionMode.CHAT.value,
+            session_mode=str(session["session_mode"]),
             plan_state=PlanState.NONE.value,
             run_state=RunState.IDLE.value,
             state=session_state,

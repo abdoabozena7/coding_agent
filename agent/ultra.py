@@ -2498,74 +2498,25 @@ class UltraOrchestrator:
 
     @staticmethod
     def _validated_questions(raw: Iterable[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
+        """Validate model-authored questions without classifying their semantics."""
+
         questions: list[dict[str, Any]] = []
         seen: set[str] = set()
         for index, item in enumerate(raw, start=1):
-            question_id = str(item.get("id") or f"Q{index}").strip()
+            question_id = str(item.get("id") or "").strip()
             text = str(item.get("question", "")).strip()
-            options = tuple(
-                dict(option)
-                for option in item.get("options", ())
-                if isinstance(option, Mapping)
-            )
-            combined = " ".join(
-                (text, str(item.get("header", "")), str(item.get("reason", "")))
-            ).casefold()
-            verification_terms = (
-                "verify", "verification", "read-back", "read back", "metadata",
-                "test method", "check method", "successful write",
-            )
-            consequential_terms = (
-                "platform", "target user", "product behavior", "compatibility",
-                "deployment", "migration", "destructive", "irreversible",
-                "public api", "interface contract", "scope boundary",
-            )
-            implementation_terms = (
-                "enemy behavior", "enemy ai", "threat vector", "combat balance",
-                "asset complexity", "input priorit", "state machine depth",
-                "implementation complexity", "visual effect", "pacing",
-                "particle", "shader", "shaders", "muzzle flash", "explosion",
-                "environmental interactivity", "animated rails", "decorative",
-                "traversable", "collision geometry", "player pathing",
-                "scope creep", "physics integration",
-            )
-            if (
-                any(term in combined for term in (*verification_terms, *implementation_terms))
-                and not any(term in combined for term in consequential_terms)
-            ):
-                # Verification mechanics are harness policy, not product
-                # decisions. Reversible implementation trade-offs are owned by
-                # the architecture pass. Prefer the strongest safe local check
-                # or a concrete bounded implementation without pausing.
-                continue
-            if not any(term in combined for term in consequential_terms):
-                # Bounded, reversible product/implementation preferences are
-                # not blockers.  The architecture pass owns the recommended
-                # safe default so autonomous runs do not stall on optional
-                # audio, touch style, polish, or feature-depth questions.
-                continue
             if not question_id or question_id in seen or not text:
                 raise AgentProtocolError("ULTRA questions require unique ids and non-empty text")
-            if not options:
-                # Open-ended questions without bounded choices are almost
-                # always weak-model uncertainty, not a real user decision.
-                # The architecture and implementation passes should pick a
-                # safe default and continue autonomously.
-                continue
-            if len(options) == 1:
-                continue
             seen.add(question_id)
             try:
                 normalized = normalize_question(
                     {
                         "id": question_id,
-                        "header": str(item.get("header", question_id)).strip()[:40],
+                        "header": str(item.get("header") or "").strip()[:40],
                         "question": text[:1_000],
-                        "options": options,
-                        "allow_freeform": True,
-                        "reason": str(
-                            item.get("reason", "Required to finalize the master plan.")
-                        ).strip()[:1_000],
+                        "options": item.get("options", ()),
+                        "allow_freeform": item.get("allow_freeform", True),
+                        "reason": str(item.get("reason") or "").strip()[:1_000],
                     },
                     index=index,
                 )
@@ -3145,13 +3096,13 @@ class UltraOrchestrator:
             raise ApprovalRequiredError(f"answer every pending question first: {sorted(missing)}")
         for question_id, value in normalized.items():
             item = questions[question_id]
-            labels = {
-                str(option.get("label", "")).strip()
+            values = {
+                str(option.get("value", "")).strip()
                 for option in item.get("options", ())
             }
-            if labels and value not in labels and not item.get("allow_freeform", True):
+            if values and value not in values and not item.get("allow_freeform", True):
                 raise AgentProtocolError(
-                    f"answer for {question_id} must be one of: {', '.join(sorted(labels))}"
+                    f"answer for {question_id} must be one of: {', '.join(sorted(values))}"
                 )
         assumptions = tuple(
             dict.fromkeys(

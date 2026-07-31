@@ -12,7 +12,7 @@ from agent.chat_runtime import RouteKind
 from agent.models import GoalStatus, PlanStatus
 from agent.runtime import AgentRuntime
 from agent.store import StateStore
-from agent.testing import ScriptedProvider
+from agent.testing import ScriptedProvider, semantic_goal_intake, semantic_turn
 from tests.test_runtime import inspect_call, plan_call, plan_pass, review_pass
 from tests.test_store import plan_basis, task
 
@@ -67,7 +67,12 @@ def test_hybrid_router_keeps_explanation_in_chat_and_small_file_action_bounded()
             runtime = AgentRuntime(
                 ScriptedProvider(
                     [
-                        "The workflow persists state so interrupted work can resume.",
+                        semantic_turn(
+                            "chat",
+                            original="Why does the workflow persist state?",
+                            response="The workflow persists state so interrupted work can resume.",
+                        ),
+                        semantic_turn("action", original="create note.txt", effects=("write",)),
                         {
                             "tool_calls": [
                                 {
@@ -85,6 +90,7 @@ def test_hybrid_router_keeps_explanation_in_chat_and_small_file_action_bounded()
                 ),
                 store,
                 workspace,
+                approval=lambda *_: True,
             )
             explanation, chat_result = runtime.route_input(
                 "Why does the workflow persist state?"
@@ -109,8 +115,24 @@ def test_arabic_vague_input_checkpoints_consequential_intake_questions() -> None
         workspace = Path(directory)
         store = StateStore(workspace)
         try:
-            runtime = AgentRuntime(ScriptedProvider([]), store, workspace)
-            result = runtime.submit_intent("اعمل ده")
+            original = "اعمل ده"
+            intake = semantic_goal_intake(original)
+            intake["questions"] = [{
+                "id": "outcome", "header": "Outcome",
+                "question": "What outcome should be produced?",
+                "reason": "The requested result is consequentially ambiguous.",
+                "options": [
+                    {"value": "implement", "label": "Implement", "description": "Create a working result.", "recommended": True},
+                    {"value": "repair", "label": "Repair", "description": "Repair existing work.", "recommended": False},
+                    {"value": "analyze", "label": "Analyze", "description": "Report without changes.", "recommended": False},
+                ],
+            }]
+            runtime = AgentRuntime(
+                ScriptedProvider([semantic_turn("goal", original=original, goal_intake=intake)]),
+                store,
+                workspace,
+            )
+            result = runtime.submit_intent(original)
             assert result.status == "awaiting_answers"
             assert result.needs_user
             assert runtime.active_goal() is None

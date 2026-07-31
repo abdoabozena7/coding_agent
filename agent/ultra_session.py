@@ -900,7 +900,7 @@ _PHASE_CONTRACTS: dict[str, Mapping[str, Any]] = {
                     "header": "short label",
                     "question": "non-discoverable decision only",
                     "options": [
-                        {"label": "choice", "description": "impact", "recommended": True}
+                        {"value": "choice", "label": "choice", "description": "impact", "recommended": True}
                     ],
                     "allow_freeform": True,
                     "reason": "why this cannot be discovered",

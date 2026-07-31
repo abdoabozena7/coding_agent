@@ -19,6 +19,7 @@ from agent.runtime import AgentRuntime, RuntimeStateError
 from agent.sandbox import AccessLevel, DockerSandbox, PermissionAdapter
 from agent.store import StateStore
 from agent.ultra import (
+    AgentProtocolError,
     AgentRequest,
     AgentResponse,
     AgentRole,
@@ -350,17 +351,25 @@ class PhaseProvider:
                         "question": "Which target platform should own the first release?",
                         "options": [
                             {
+                                "value": "desktop",
                                 "label": "Desktop",
                                 "description": "Keyboard-first desktop build.",
                                 "recommended": True,
                             },
                             {
+                                "value": "web",
                                 "label": "Web",
                                 "description": "Browser-first deployment.",
                                 "recommended": False,
                             },
+                            {
+                                "value": "both",
+                                "label": "Both",
+                                "description": "Support desktop and browser.",
+                                "recommended": False,
+                            },
                         ],
-                        "allow_freeform": False,
+                        "allow_freeform": True,
                         "reason": "The product target is not encoded in the repository.",
                     }
                 ]
@@ -782,17 +791,25 @@ class PlanningQuestionProvider:
                                     "question": "Which platform owns the first release?",
                                     "options": [
                                         {
+                                            "value": "desktop",
                                             "label": "Desktop",
                                             "description": "Desktop application.",
                                             "recommended": True,
                                         },
                                         {
+                                            "value": "web",
                                             "label": "Web",
                                             "description": "Browser application.",
                                             "recommended": False,
                                         },
+                                        {
+                                            "value": "cross_platform",
+                                            "label": "Cross-platform",
+                                            "description": "Support desktop and browser releases.",
+                                            "recommended": False,
+                                        },
                                     ],
-                                    "allow_freeform": False,
+                                    "allow_freeform": True,
                                     "reason": "Product scope is not discoverable from this empty workspace.",
                                 }
                             ]
@@ -1552,42 +1569,28 @@ class UltraIntegrationTests(unittest.TestCase):
             "harness_html_browser_and_quality_gate",
         )
 
-    def test_ultra_drops_verification_mechanics_questions_but_keeps_product_decisions(self):
+    def test_ultra_preserves_valid_model_authored_question_without_keyword_filtering(self):
         questions = UltraOrchestrator._validated_questions(
             [
-                {
-                    "id": "verify",
-                    "header": "Verification Mechanism",
-                    "question": "Should read-back verify content or also file metadata?",
-                    "reason": "Choose the verification method.",
-                    "options": [],
-                },
-                {
-                    "id": "combat",
-                    "header": "Combat Complexity Balance",
-                    "question": "Should enemy behavior use ranged and melee threat vectors?",
-                    "reason": "This guides implementation complexity and AI state machine depth.",
-                    "options": [],
-                },
                 {
                     "id": "platform",
                     "header": "Platform",
                     "question": "Which target platform should own the first release?",
                     "reason": "This changes product behavior and deployment.",
                     "options": [
-                        {"label": "Web", "description": "Browser release."},
-                        {"label": "Desktop", "description": "Native release."},
+                        {"value": "web", "label": "Web", "description": "Browser release.", "recommended": True},
+                        {"value": "desktop", "label": "Desktop", "description": "Native release.", "recommended": False},
+                        {"value": "both", "label": "Both", "description": "Support both releases.", "recommended": False},
                     ],
+                    "allow_freeform": True,
                 },
             ]
         )
         self.assertEqual([item["id"] for item in questions], ["platform"])
-        self.assertEqual(
+        with self.assertRaises(AgentProtocolError):
             UltraOrchestrator._validated_questions(
                 [{"id": "one", "question": "Use the only viable fallback?", "options": [{"label": "Yes"}]}]
-            ),
-            (),
-        )
+            )
 
     def test_ultra_restores_missing_goal_objective_only_from_authoritative_prompt(self):
         payload, actions = UltraOrchestrator._normalize_typed_payload(
@@ -1733,8 +1736,9 @@ class UltraIntegrationTests(unittest.TestCase):
             )
         )
 
-    def test_ultra_drops_particle_and_environment_scope_questions_as_implementation_policy(self):
-        questions = UltraOrchestrator._validated_questions(
+    def test_ultra_rejects_malformed_questions_instead_of_guessing_policy(self):
+        with self.assertRaises(AgentProtocolError):
+            UltraOrchestrator._validated_questions(
             [
                 {
                     "id": "particle_system_scope",
@@ -1752,10 +1756,10 @@ class UltraIntegrationTests(unittest.TestCase):
                 },
             ]
         )
-        self.assertEqual(questions, ())
 
-    def test_ultra_drops_open_ended_questions_without_bounded_choices(self):
-        questions = UltraOrchestrator._validated_questions(
+    def test_ultra_rejects_open_ended_questions_without_bounded_choices(self):
+        with self.assertRaises(AgentProtocolError):
+            UltraOrchestrator._validated_questions(
             [
                 {
                     "id": "enemy_precision",
@@ -1766,10 +1770,10 @@ class UltraIntegrationTests(unittest.TestCase):
                 }
             ]
         )
-        self.assertEqual(questions, ())
 
-    def test_ultra_autoresolves_reversible_optional_preferences(self):
-        questions = UltraOrchestrator._validated_questions(
+    def test_ultra_does_not_autoresolve_model_authored_preferences_by_keywords(self):
+        with self.assertRaises(AgentProtocolError):
+            UltraOrchestrator._validated_questions(
             [
                 {
                     "id": "touch",
@@ -1787,7 +1791,6 @@ class UltraIntegrationTests(unittest.TestCase):
                 },
             ]
         )
-        self.assertEqual(questions, ())
 
     def test_ultra_edits_workspace_and_persists_every_quality_surface(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2269,7 +2272,7 @@ animate();
                     self.assertEqual(runtime.active_goal().status, GoalStatus.PAUSED)
                     master = runtime.answer_ultra_question("platform", "Desktop")
 
-                self.assertIn("Desktop", master.execution_strategy)
+                self.assertIn('"platform":"desktop"', master.execution_strategy)
                 self.assertEqual(
                     runtime.latest_plan().fingerprint,
                     store.get_latest_plan(runtime.active_goal().id).fingerprint,
@@ -2320,7 +2323,7 @@ animate();
                             "Desktop",
                         )
                         self.assertIsNotNone(master)
-                        self.assertIn("Desktop", master.execution_strategy)
+                        self.assertIn('"platform":"desktop"', master.execution_strategy)
                         self.assertEqual(second.active_goal().id, goal_id)
                         self.assertEqual(second.active_ultra_run().id, run_id)
                         self.assertEqual(
@@ -2628,7 +2631,7 @@ animate();
                 self.assertEqual(runtime.plan_questions()[0]["id"], "platform")
                 plan = runtime.answer_plan_question("platform", "Desktop")
                 self.assertIsNotNone(plan)
-                self.assertIn("Desktop", plan.execution_strategy)
+                self.assertIn('"platform":"desktop"', plan.execution_strategy)
                 self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
             finally:
                 runtime.close()
@@ -2650,7 +2653,7 @@ animate();
                 plan = runtime.apply_command(parse_command("Desktop"))
 
                 self.assertIsNotNone(plan)
-                self.assertIn("Desktop", plan.execution_strategy)
+                self.assertIn('"platform":"desktop"', plan.execution_strategy)
                 self.assertEqual(
                     runtime.active_goal().status,
                     GoalStatus.AWAITING_PLAN_APPROVAL,

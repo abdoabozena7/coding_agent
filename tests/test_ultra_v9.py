@@ -15,6 +15,7 @@ from agent.component_artifacts import (
 )
 from agent.events import NullEventBus
 from agent.intake import IntentArchitect, PromptSlotStatus
+from agent.testing import semantic_goal_intake
 from agent.local_provider import normalize_generated_tool_args
 from agent.providers.base import AssistantTurn, ToolCall
 from agent.store import StateStore
@@ -197,8 +198,9 @@ class SpecialistQualityBlueprintTests(unittest.TestCase):
 
 class PromptCompletenessV9Tests(unittest.TestCase):
     def test_short_complete_prompt_is_not_questioned_for_length(self) -> None:
-        decision = IntentArchitect().analyze(
-            "Fix parser.py on the existing platform and run tests."
+        original = "Fix parser.py on the existing platform and run tests."
+        decision = IntentArchitect().validate(
+            semantic_goal_intake(original), original_input=original
         )
         self.assertEqual(decision.questions, ())
         self.assertTrue(decision.completeness.complete)
@@ -209,7 +211,17 @@ class PromptCompletenessV9Tests(unittest.TestCase):
             "controls, collision, scoring, accessibility, performance checks, and a "
             "complete acceptance suite. Preserve compatibility and test every system. "
         ) * 4
-        decision = IntentArchitect().analyze(prompt)
+        intake = semantic_goal_intake(prompt)
+        intake["questions"] = [{
+            "id": "packaging", "header": "Packaging",
+            "question": "How should this be packaged?", "reason": "Packaging changes integration.",
+            "options": [
+                {"value": "modular", "label": "Modular", "description": "Use modules.", "recommended": True},
+                {"value": "single", "label": "Single", "description": "Use one artifact.", "recommended": False},
+                {"value": "existing", "label": "Existing", "description": "Follow the repository.", "recommended": False},
+            ],
+        }]
+        decision = IntentArchitect().validate(intake, original_input=prompt)
         self.assertIn("packaging", [item.id for item in decision.questions])
         self.assertIs(
             decision.completeness.slot("packaging").status,
@@ -217,11 +229,28 @@ class PromptCompletenessV9Tests(unittest.TestCase):
         )
 
     def test_simple_threejs_request_asks_platform_packaging_and_style(self) -> None:
-        decision = IntentArchitect().analyze(
-            "اعمل لي لعبة زي Crossy Road بـThree.js",
-            repository_facts=(
-                "Cross-run learned lesson: interactive HTML requires browser/runtime evidence.",
-            ),
+        original = "اعمل لي تجربة تفاعلية"
+        def q(identifier):
+            return {
+                "id": identifier, "header": "Decision", "question": f"Choose {identifier}.",
+                "reason": "The model found this consequential.",
+                "options": [
+                    {"value": "best", "label": "Best", "description": "Recommended.", "recommended": True},
+                    {"value": "balanced", "label": "Balanced", "description": "Balanced.", "recommended": False},
+                    {"value": "narrow", "label": "Narrow", "description": "Narrow.", "recommended": False},
+                ],
+            }
+        intake = semantic_goal_intake(original, recommended_mode="ultra", questions=(
+            {**q("execution_mode"), "options": [
+                {"value": "ultra", "label": "Ultra", "description": "Use specialists.", "recommended": True},
+                {"value": "normal", "label": "Normal", "description": "Use one workflow.", "recommended": False},
+                {"value": "edit_request", "label": "Edit", "description": "Edit request.", "recommended": False},
+            ]}, q("platform"), q("packaging"),
+        ))
+        decision = IntentArchitect().validate(
+            intake,
+            original_input=original,
+            repository_facts=("Cross-run learned lesson: evidence only.",),
         )
         self.assertEqual(
             [item.id for item in decision.questions],

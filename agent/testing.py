@@ -201,4 +201,79 @@ class ScriptedProvider:
             )
 
 
-__all__ = ["ProviderRequest", "ScriptedProvider", "ScriptedTurn"]
+def semantic_turn(
+    route: str,
+    *,
+    original: str,
+    response: str = "",
+    effects: Iterable[str] = (),
+    needs_workspace_tools: bool | None = None,
+    interpretation: str = "scripted semantic decision",
+    goal_intake: Mapping[str, Any] | None = None,
+    uncertainty: str = "clear",
+    clarification_question: str = "",
+) -> dict[str, Any]:
+    """Build a valid submit_semantic_turn call for provider-contract tests."""
+
+    effect_values = tuple(str(item) for item in effects)
+    mutating = {"write", "run", "install", "preview", "external_side_effect"}
+    spans = {
+        effect: ([str(original)] if effect in mutating else [])
+        for effect in effect_values
+    }
+    args: dict[str, Any] = {
+        "route": str(route),
+        "interpretation": interpretation,
+        "requested_effects": {
+            name: name in effect_values
+            for name in ("read", "write", "run", "install", "preview", "external_side_effect")
+        },
+        "authority_spans": {
+            name: list(spans.get(name, ()))
+            for name in ("read", "write", "run", "install", "preview", "external_side_effect")
+        },
+        "needs_workspace_tools": bool(effect_values) if needs_workspace_tools is None else bool(needs_workspace_tools),
+        "direct_response": str(response),
+        "uncertainty": str(uncertainty),
+        "clarification_question": str(clarification_question),
+    }
+    if goal_intake is not None:
+        args["goal_intake"] = dict(goal_intake)
+    return {
+        "tool_calls": [{
+            "id": "semantic-turn",
+            "name": "submit_semantic_turn",
+            "args": args,
+        }]
+    }
+
+
+def semantic_goal_intake(
+    original: str,
+    *,
+    recommended_mode: str = "normal",
+    questions: Iterable[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    question_values = tuple(questions)
+    return {
+        "objective": str(original),
+        "deliverables": ["Complete the requested outcome"],
+        "constraints": ["Preserve unrelated workspace content"],
+        "exclusions": [],
+        "acceptance_expectations": ["The requested behavior is implemented and verified"],
+        "assumptions": [],
+        "risks": [],
+        "breadth": "multi_component" if recommended_mode == "ultra" else "cohesive",
+        "coordination": "parallel" if recommended_mode == "ultra" else "sequential",
+        "uncertainty": "clear" if not question_values else "consequential choices remain",
+        "complexity_reasons": ["Model-assessed test objective"],
+        "recommended_mode": str(recommended_mode),
+        "recommendation_reason": "Scripted model recommendation",
+        "questions": [dict(item) for item in question_values],
+    }
+
+
+__all__ = [
+    "ProviderRequest", "ScriptedProvider", "ScriptedTurn", "semantic_goal_intake",
+    "semantic_turn",
+]

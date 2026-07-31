@@ -85,7 +85,7 @@ EXPECTED_CHANGE_SCHEMA: dict[str, Any] = {
 SEMANTIC_GOAL_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "original_request": {"type": "string", "minLength": 1, "maxLength": 20_000},
+        "original_request": {"type": "string", "minLength": 1, "maxLength": 200_000},
         "interpreted_outcome": {"type": "string", "minLength": 1, "maxLength": 20_000},
         "requested_effects": {
             "type": "array",
@@ -212,11 +212,12 @@ REQUEST_PLAN_INPUT = _fn(
                             "items": {
                                 "type": "object",
                                 "properties": {
+                                    "value": {"type": "string", "minLength": 1, "maxLength": 100},
                                     "label": {"type": "string", "minLength": 1, "maxLength": 80},
                                     "description": {"type": "string", "minLength": 3, "maxLength": 500},
                                     "recommended": {"type": "boolean"},
                                 },
-                                "required": ["label", "description", "recommended"],
+                                "required": ["value", "label", "description", "recommended"],
                                 "additionalProperties": False,
                             },
                         },

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import io
 import hashlib
+import json
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -14,10 +15,11 @@ from agent.cli import _run_auto
 from agent.hardware import HardwareProbeResult, probe_local_gpu
 from agent.model_catalog import ExecutionClass, ModelDescriptor
 from agent.models import DelegationStatus, GoalStatus, PlanStatus, TaskStatus
+from agent.providers.base import ToolCall
 from agent.runtime import AgentRuntime, RuntimeStateError
 from agent.sandbox import DockerSandbox, PermissionAdapter
 from agent.store import StateStore
-from agent.testing import ScriptedProvider
+from agent.testing import ScriptedProvider, semantic_goal_intake, semantic_turn
 from agent.local_provider import ModelCapabilityProfile
 from agent import tools as agent_tools
 from agent.ui import ConsoleUI
@@ -273,6 +275,32 @@ class RuntimeTestCase(unittest.TestCase):
 
 
 class PlanningAndCompletionTests(RuntimeTestCase):
+    def test_resume_rebuilds_an_interrupted_discovering_plan(self):
+        runtime, _provider = self.runtime([])
+        goal = self.store.create_goal(
+            "Resume the exact interrupted planning request.",
+            session_id=runtime.session_id,
+        )
+        self.store.transition_goal(
+            goal.id,
+            GoalStatus.DISCOVERING,
+            reason="planning began before process interruption",
+        )
+
+        with mock.patch.object(
+            runtime, "generate_plan", return_value="restored-plan"
+        ) as generate:
+            result = runtime.resume()
+
+        self.assertEqual(result, "restored-plan")
+        generate.assert_called_once()
+        feedback = generate.call_args.args[0]
+        self.assertIn("persisted semantic state", feedback)
+        events = self.store.list_recent_events(goal.id, limit=20)
+        self.assertTrue(
+            any(item.event_type == "planning.resumed" for item in events)
+        )
+
     def test_windows_gpu_probe_accepts_amd_display_adapter(self):
         def which(name):
             if name == "nvidia-smi":
@@ -479,7 +507,13 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             "args": {"path": "candidate.txt", "content": "first draft"},
         }]}
         runtime, _provider = self.runtime([
-            chat_write, "Candidate created.", inspect_call(), plan_call(), plan_pass()
+            semantic_turn(
+                "goal",
+                original="Create a polished candidate",
+                goal_intake=semantic_goal_intake("Create a polished candidate"),
+                effects=("write",),
+            ),
+            inspect_call(), plan_call(), plan_pass(),
         ])
 
         chat_result = runtime.chat("Create a polished candidate")
@@ -488,7 +522,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         self.assertEqual(goal.metadata["execution_policy"]["entry_surface"], "chat")
         self.assertEqual(goal.status, GoalStatus.AWAITING_PLAN_APPROVAL)
         self.assertFalse((self.workspace / "candidate.txt").exists())
-        self.assertNotIn("BELOW_TARGET", chat_result.message)
+        self.assertEqual(chat_result.status, PlanStatus.PENDING_APPROVAL)
 
     def test_goal_runtime_persists_policy_contract_projection_and_plan_quality_target(self):
         runtime, provider = self.runtime([inspect_call(), plan_call(), plan_pass()])
@@ -677,6 +711,181 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         selected = [item for item in events if item.event_type == "execution.task_selected"]
         self.assertTrue(selected)
         self.assertTrue(selected[-1].payload["activated"])
+        actions = self.store.list_actions(goal_id)
+        write_action = next(
+            item for item in actions if item["tool_name"] == "write_file"
+        )
+        self.assertEqual(
+            json.loads(write_action["args_json"])["_harness_task_id"],
+            "T001",
+        )
+
+    def test_denied_resource_call_does_not_poison_the_later_owning_task(self):
+        candidate = dependency_plan_call()
+        args = candidate["tool_calls"][0]["args"]
+        args["expected_changes"] = [
+            {
+                "path": "first.txt",
+                "intent": "Create the first task artifact.",
+                "basis": "repository_convention",
+                "evidence_refs": ["inspection:I001"],
+                "supports_tasks": ["T001"],
+            },
+            {
+                "path": "second.txt",
+                "intent": "Create the second task artifact.",
+                "basis": "repository_convention",
+                "evidence_refs": ["inspection:I001"],
+                "supports_tasks": ["T002"],
+            },
+        ]
+        runtime, _provider = self.runtime(
+            [inspect_call(), candidate, plan_pass()]
+        )
+        plan = runtime.start_goal("Build two dependency-ordered artifacts.")
+        goal = runtime.active_goal()
+        runtime.approve_plan(plan.revision)
+        active_plan, active = runtime._activate_ready_task(
+            self.store.get_goal(goal.id), runtime.latest_plan()
+        )
+        self.assertEqual(active.id, "T001")
+        call = ToolCall(
+            "write-second", "write_file",
+            {"path": "second.txt", "content": "owned by T002\n"},
+        )
+
+        first_denial = runtime._execute_workspace_tool(
+            self.store.get_goal(goal.id), call,
+            task_id="T001", actor="coordinator",
+        )
+        second_denial = runtime._execute_workspace_tool(
+            self.store.get_goal(goal.id), call,
+            task_id="T001", actor="coordinator",
+        )
+        self.assertIn("not covered", first_denial)
+        self.assertIn("not covered", second_denial)
+
+        self.store.transition_task(
+            goal.id, active_plan.revision, "T001", TaskStatus.COMPLETED,
+            note="User verified the first task.",
+            evidence=["User evidence: first task is complete."],
+            actor="user",
+        )
+        _plan, active = runtime._activate_ready_task(
+            self.store.get_goal(goal.id), runtime.latest_plan()
+        )
+        self.assertEqual(active.id, "T002")
+        result = runtime._execute_workspace_tool(
+            self.store.get_goal(goal.id), call,
+            task_id="T002", actor="coordinator",
+        )
+
+        self.assertIn("Wrote", result)
+        self.assertEqual(
+            (self.workspace / "second.txt").read_text(encoding="utf-8"),
+            "owned by T002\n",
+        )
+
+    def test_fresh_dependency_command_evidence_completes_verification_only_task(self):
+        candidate = dependency_plan_call()
+        args = candidate["tool_calls"][0]["args"]
+        args["semantic_goal"]["acceptance_criteria"].append(
+            "python -c \"print('verified')\" exits successfully."
+        )
+        args["applicability_evidence"][0]["supports_tasks"] = [
+            "T001", "T002", "T003"
+        ]
+        args["expected_changes"] = [
+            {
+                "path": "first.txt",
+                "intent": "Create the first implementation artifact.",
+                "basis": "repository_convention",
+                "evidence_refs": ["inspection:I001"],
+                "supports_tasks": ["T001"],
+            },
+            {
+                "path": "second.txt",
+                "intent": "Create the second implementation artifact.",
+                "basis": "repository_convention",
+                "evidence_refs": ["inspection:I001"],
+                "supports_tasks": ["T002"],
+            },
+        ]
+        args["tasks"].append(
+            {
+                "id": "T003",
+                "title": "Verify the integrated result",
+                "description": "Run python -c \"print('verified')\".",
+                "acceptance_criteria": [
+                    "python -c \"print('verified')\" exits successfully."
+                ],
+                "verification": [
+                    "Run python -c \"print('verified')\" and require exit code 0."
+                ],
+                "depends_on": ["T001", "T002"],
+                "risk": "low",
+            }
+        )
+        runtime, _provider = self.runtime(
+            [inspect_call(), candidate, plan_pass()]
+        )
+        plan = runtime.start_goal("Build and verify two ordered artifacts.")
+        goal = runtime.active_goal()
+        runtime.approve_plan(plan.revision)
+
+        active_plan, active = runtime._activate_ready_task(
+            self.store.get_goal(goal.id), runtime.latest_plan()
+        )
+        self.assertEqual(active.id, "T001")
+        self.store.transition_task(
+            goal.id, active_plan.revision, "T001", TaskStatus.COMPLETED,
+            note="User verified the first task.",
+            evidence=["User evidence: first task is complete."],
+            actor="user",
+        )
+        active_plan, active = runtime._activate_ready_task(
+            self.store.get_goal(goal.id), runtime.latest_plan()
+        )
+        self.assertEqual(active.id, "T002")
+        command = "python -c \"print('verified')\""
+        command_result = runtime._execute_workspace_tool(
+            self.store.get_goal(goal.id),
+            ToolCall("verify-early", "run_command", {"command": command}),
+            task_id="T002", actor="coordinator",
+        )
+        self.assertIn("exit code: 0", command_result)
+        self.assertIn(
+            "completed",
+            runtime._control_update_task(
+                self.store.get_goal(goal.id), runtime.latest_plan(),
+                {
+                    "task_id": "T002", "status": "done",
+                    "note": "Dependency verification passed.",
+                    "evidence": ["The command exited with code 0."],
+                },
+            ),
+        )
+        active_plan, active = runtime._activate_ready_task(
+            self.store.get_goal(goal.id), runtime.latest_plan()
+        )
+        self.assertEqual(active.id, "T003")
+
+        result = runtime._control_update_task(
+            self.store.get_goal(goal.id), active_plan,
+            {
+                "task_id": "T003", "status": "done",
+                "note": "The already-run exact verification is still fresh.",
+                "evidence": ["The exact required command exited with code 0."],
+            },
+        )
+
+        self.assertIn("completed", result)
+        evidence = self.store.list_evidence(goal.id, task_id="T003")
+        inherited = [
+            item for item in evidence if item.kind == "inherited_verification"
+        ]
+        self.assertEqual(len(inherited), 1)
+        self.assertEqual(inherited[0].data["source_task_id"], "T002")
 
     def test_model_cannot_complete_task_with_prose_before_bound_authoritative_evidence(self):
         done_without_tool = {"tool_calls": [task_update("done", ["I verified it"], "claim only")]}

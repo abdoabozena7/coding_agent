@@ -12,7 +12,7 @@ from agent.runtime import AgentRuntime
 from agent.config import RuntimeConfig
 from agent.semantic import RequestedEffect, SemanticGoalV2
 from agent.store import StateStore
-from agent.testing import ScriptedProvider
+from agent.testing import ScriptedProvider, semantic_goal_intake, semantic_turn
 from agent.verifiers import discover_verifier_plugins
 from agent.ultra import UltraOrchestrator
 
@@ -153,7 +153,11 @@ class SemanticCoreV14Tests(unittest.TestCase):
             "صلّح مصنف الألعاب، لا تبني لعبة.",
         )
         for request in examples:
-            decision = architect.analyze(request, requested_mode=RunMode.ULTRA)
+            intake = semantic_goal_intake(request)
+            intake.update({"deliverables": [], "exclusions": ["Do not build the mentioned example"]})
+            decision = architect.validate(
+                intake, original_input=request, requested_mode=RunMode.ULTRA
+            )
             self.assertEqual(decision.brief.original_input, request)
             self.assertEqual(decision.brief.objective, request)
             self.assertEqual(decision.brief.deliverables, ())
@@ -175,7 +179,9 @@ class SemanticCoreV14Tests(unittest.TestCase):
         )
         architect = IntentArchitect()
         for request in examples:
-            decision = architect.analyze(request)
+            intake = semantic_goal_intake(request)
+            intake["deliverables"] = []
+            decision = architect.validate(intake, original_input=request)
             self.assertEqual(decision.brief.objective, request)
             self.assertEqual(decision.brief.deliverables, ())
             self.assertEqual(decision.complexity.component_count, 1)
@@ -207,7 +213,14 @@ class SemanticCoreV14Tests(unittest.TestCase):
                 try:
                     runtime = AgentRuntime(
                         ScriptedProvider(
-                            [inspection(), semantic_plan(request), critic_pass()]
+                            [
+                                semantic_turn(
+                                    "goal", original=request,
+                                    goal_intake=semantic_goal_intake(request),
+                                    effects=("read", "write", "run"),
+                                ),
+                                inspection(), semantic_plan(request), critic_pass(),
+                            ]
                         ),
                         store,
                         workspace,
@@ -237,7 +250,14 @@ class SemanticCoreV14Tests(unittest.TestCase):
             try:
                 runtime = AgentRuntime(
                     ScriptedProvider(
-                        [inspection(), semantic_plan(request), critic_pass()]
+                        [
+                            semantic_turn(
+                                "goal", original=request,
+                                goal_intake=semantic_goal_intake(request),
+                                effects=("read", "write", "run"),
+                            ),
+                            inspection(), semantic_plan(request), critic_pass(),
+                        ]
                     ),
                     store,
                     workspace,
@@ -958,6 +978,65 @@ class SemanticCoreV14Tests(unittest.TestCase):
         self.assertEqual(change["path"], "calculator/__init__.py")
         self.assertEqual(change["basis"], "repository_convention")
         self.assertEqual(change["evidence_refs"], ["inspection:I001"])
+
+    def test_exact_explicit_user_path_gets_canonical_request_citation(self) -> None:
+        proposed = {
+            "tasks": [{"id": "T001"}],
+            "applicability_evidence": [],
+            "expected_changes": [
+                {
+                    "path": "calculator.py",
+                    "intent": "Create the requested calculator module.",
+                    "basis": "explicit_user_requirement",
+                    "evidence_refs": [],
+                    "supports_tasks": ["T001"],
+                }
+            ],
+        }
+        bound = AgentRuntime._bind_plan_inspection_sources(
+            proposed,
+            {
+                "I001": {
+                    "call_id": "inspect",
+                    "tool": "list_files",
+                    "result": "(no files)",
+                }
+            },
+            original_request="Create calculator.py and test it.",
+        )
+        change = bound["expected_changes"][0]
+        self.assertEqual(change["basis"], "explicit_user_requirement")
+        self.assertEqual(change["evidence_refs"], ["user:request"])
+
+    def test_missing_explicit_user_path_is_not_given_request_citation(self) -> None:
+        proposed = {
+            "tasks": [{"id": "T001"}],
+            "applicability_evidence": [],
+            "expected_changes": [
+                {
+                    "path": "invented/report.html",
+                    "intent": "Create a report.",
+                    "basis": "explicit_user_requirement",
+                    "evidence_refs": [],
+                    "supports_tasks": ["T001"],
+                }
+            ],
+        }
+        bound = AgentRuntime._bind_plan_inspection_sources(
+            proposed,
+            {
+                "I001": {
+                    "call_id": "inspect",
+                    "tool": "list_files",
+                    "result": "(no files)",
+                }
+            },
+            original_request="Create the requested report.",
+        )
+        self.assertNotIn(
+            "user:request",
+            bound["expected_changes"][0].get("evidence_refs", ()),
+        )
 
     def test_plan_critic_pass_advisories_do_not_force_scope_expansion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
