@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import shutil
 import subprocess
@@ -25,7 +26,8 @@ from . import tools
 from dotenv import load_dotenv
 
 from . import __version__
-from .commands import CommandKind, CommandParseError, UserCommand, parse_command
+from .commands import CommandKind, CommandParseError, UnknownCommandParseError, UserCommand, parse_command
+from .capability import InteractionModeV2
 from .config import (
     InteractionMode,
     RuntimeConfig,
@@ -753,40 +755,40 @@ def choose_interaction_mode(
         selected = select_choice(
             (
                 ChoiceItem(
+                    key=InteractionMode.NORMAL.value,
+                    label="Goal",
+                    description=(
+                        "Start a durable Goal. The harness chooses staged or recursive "
+                        "execution from the selected model's metadata and task demand."
+                    ),
+                    meta="Current" if selected_mode is InteractionMode.NORMAL else "Recommended",
+                    value=InteractionMode.NORMAL,
+                ),
+                ChoiceItem(
                     key=InteractionMode.PLAN.value,
                     label="Plan",
                     description=(
-                        "Inspect the project and prepare a durable editable plan only. "
-                        "Execution always requires switching mode and approving explicitly."
+                        "Prepare and review the next Goal before any workspace mutation. "
+                        "Approve & work continues that same Goal."
                     ),
-                    meta="Current" if selected_mode is InteractionMode.PLAN else "Read-only planning",
+                    meta="Current" if selected_mode is InteractionMode.PLAN else "Plan first",
                     value=InteractionMode.PLAN,
-                ),
-                ChoiceItem(
-                    key=InteractionMode.NORMAL.value,
-                    label="Normal",
-                    description=(
-                        "Intent intake, one durable goal, planning, review, and automatic execution. "
-                        "Large requests ask before switching to Ultra."
-                    ),
-                    meta="Current" if selected_mode is InteractionMode.NORMAL else "Basic",
-                    value=InteractionMode.NORMAL,
                 ),
                 ChoiceItem(
                     key=InteractionMode.ULTRA.value,
                     label="Ultra",
                     description=(
-                        "Use Project Brain, nested agents, and review/test/fix/integration loops. "
-                        "Best for large projects; uses more time and tokens."
+                        "Force recursive specialist depth for the next Goal. Local models may "
+                        "run those specialists sequentially."
                     ),
-                    meta="Current" if selected_mode is InteractionMode.ULTRA else "Deep workflow",
+                    meta="Current" if selected_mode is InteractionMode.ULTRA else "Deeper minimum",
                     value=InteractionMode.ULTRA,
                     disabled=bool(ultra_disabled_reason),
                     disabled_reason=ultra_disabled_reason,
                 ),
             ),
-            title="Choose how GA3BAD should work",
-            subtitle="You can switch workflow mode at a safe checkpoint with /mode.",
+            title="Choose the next workflow",
+            subtitle="Inside an active workflow the visible phase becomes Plan or Working and is locked.",
             initial_key=(
                 InteractionMode.NORMAL.value
                 if selected_mode is InteractionMode.ULTRA and ultra_disabled_reason
@@ -804,26 +806,24 @@ def choose_interaction_mode(
             raise PickerBack()
         return selected.value
     print("Mode", file=output)
-    print("  1. normal  intent intake, durable goal, plan, review, and automatic execution", file=output)
+    print("  1. goal   durable goal with automatic model-aware execution depth", file=output)
+    print("  2. plan   review the same goal before workspace mutation", file=output)
     print(
-        "  2. ultra   "
-        + (
-            f"unavailable: {ultra_disabled_reason}"
-            if ultra_disabled_reason
-            else "recursive specialists, component packages, and deeper quality gates"
-        ),
+        "  3. ultra  "
+        + (f"unavailable: {ultra_disabled_reason}" if ultra_disabled_reason else "force recursive specialist depth"),
         file=output,
     )
     while True:
         choice = input_func("mode> ").strip().lower()
-        aliases = {"1": "normal", "2": "ultra"}
+        aliases = {"1": "normal", "2": "plan", "3": "ultra"}
         choice = aliases.get(choice, choice)
+        choice = {"working": "normal", "work": "normal", "goal": "normal"}.get(choice, choice)
         if choice == "ultra" and ultra_disabled_reason:
             print(f"Ultra is unavailable: {ultra_disabled_reason}", file=output)
             continue
-        if choice in {"normal", "ultra", "chat", "plan", "goal"}:
+        if choice in {"normal", "chat", "plan", "ultra"}:
             return InteractionMode.parse(choice)
-        print("Choose normal or ultra.", file=output)
+        print("Choose goal, plan, or ultra.", file=output)
 
 
 def choose_concurrency(
@@ -930,7 +930,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workspace", help="Existing project directory. Interactive selection is used when omitted.")
     parser.add_argument(
         "--session",
-        help="Resume an existing session ID from --workspace without repeating model/mode/concurrency setup.",
+        help="Resume an existing session ID from --workspace without repeating model or concurrency setup.",
     )
     parser.add_argument("--create-workspace", action="store_true", help="Create the path passed to --workspace.")
     parser.add_argument("--projects-root", default=os.getenv("AGENT_PROJECTS_DIR", str(DEFAULT_PROJECTS_ROOT)))
@@ -939,8 +939,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         type=lambda value: InteractionMode.parse(value).value,
-        choices=(InteractionMode.PLAN.value, InteractionMode.NORMAL.value, InteractionMode.ULTRA.value),
-        help="Run mode: plan-only, normal (default), or recursive-specialist ultra.",
+        metavar="{goal,plan,ultra}",
+        help=(
+            "Compatibility override for scripts. Omit it for automatic semantic routing "
+            "and model-aware execution depth; use plan only for planning-first automation."
+        ),
     )
     parser.add_argument(
         "--permissions",
@@ -1093,7 +1096,15 @@ def _show_runtime_state(
         reasoning_effort=runtime.reasoning_effort,
         workspace=str(runtime.workspace),
     )
+    try:
+        console.set_runtime_snapshot(runtime.workflow_runtime_snapshot())
+    except Exception:
+        pass
     console.show_status(view, force=force)
+    try:
+        console.set_runtime_snapshot(runtime.workflow_runtime_snapshot())
+    except Exception:
+        pass
     # The durable plan event and review attention own plan readiness. A status
     # refresh must not create another transcript receipt.
 
@@ -1109,27 +1120,34 @@ def _set_interaction_mode(
     previous = preferences.mode
     selected = InteractionMode.parse(mode)
     if selected == InteractionMode.ULTRA:
-        issue = runtime.ultra_readiness_issue()
-        if issue:
-            raise ValueError(f"Ultra is unavailable: {issue}")
+        runtime.increase_execution_depth()
+        goal = runtime.active_goal()
+        if goal is None:
+            preferences.mode = InteractionMode.ULTRA
+            console.set_mode(InteractionMode.ULTRA)
+        else:
+            console.set_workflow_phase(runtime.interaction_mode.value)
+        if detailed:
+            console.write(
+                "ULTRA selected for the next Goal; recursive execution is now the minimum."
+            )
+        return False
     runtime.transition_mode(selected.value)
     preferences.mode = selected
     console.set_mode(selected)
     goal = runtime.active_goal()
     needs_ultra_foundation = False
+    changed = selected is not previous
     if not detailed:
-        console.write(f"Mode switched to {selected.value.upper()}.")
+        if changed:
+            console.write(
+                "Input set to PLAN." if selected is InteractionMode.PLAN else "Input set to WORKING."
+            )
         return needs_ultra_foundation
     if selected == InteractionMode.PLAN:
         console.write(
-            "PLAN mode active: inspect and prepare a durable plan only. Switch to /mode normal "
-            "or /mode ultra and approve explicitly before execution."
-        )
-        return needs_ultra_foundation
-    if selected == InteractionMode.ULTRA:
-        console.write(
-            "ULTRA mode active: the current durable goal keeps its accepted semantics "
-            "and uses deeper reasoning plus concurrency only for independently leased tasks."
+            "PLAN input active: the next request opens Plan Workspace. Nothing changes "
+            "until you choose Approve & work; the same Goal then continues in Working."
         )
         return needs_ultra_foundation
     suffix = (
@@ -1138,8 +1156,8 @@ def _set_interaction_mode(
         else ""
     )
     console.write(
-        "NORMAL mode active: every request uses the unified repository-grounded goal, "
-        f"plan, execution, verification, review, and refinement engine.{suffix}"
+        "GOAL workflow selected: routing and execution depth are selected automatically "
+        f"for the configured model.{suffix}"
     )
     return needs_ultra_foundation
 
@@ -1151,8 +1169,19 @@ def _show_settings(
     key: str | None = None,
 ) -> None:
     runtime_values = runtime_config_values(runtime.config)
+    pending = runtime.session_snapshot().get("pending_semantic_turn")
+    in_workflow = runtime.active_goal() is not None or (
+        isinstance(pending, Mapping) and str(pending.get("status")) != "completed"
+    )
+    public_mode = (
+        runtime.interaction_mode.value
+        if in_workflow
+        else "plan"
+        if preferences.mode is InteractionMode.PLAN
+        else "automatic"
+    )
     safe_values: dict[str, object] = {
-        "mode": preferences.mode.value,
+        "mode": public_mode,
         "color": console.color_mode,
         "provider": runtime.provider_name,
         "model": runtime.model_name,
@@ -1174,7 +1203,7 @@ def _show_settings(
         return
 
     console.write("Session settings (API keys and secrets are never shown)")
-    console.write(f"  mode       = {preferences.mode.value}")
+    console.write(f"  mode       = {public_mode}")
     console.write(f"  color      = {console.color_mode}")
     console.write(f"  provider   = {runtime.provider_name}")
     console.write(f"  model      = {runtime.model_name}")
@@ -1213,7 +1242,10 @@ def _execute_settings(
         if value is None:
             _show_settings(runtime, console, preferences, "mode")
         else:
-            _set_interaction_mode(runtime, console, preferences, value)
+            console.write(
+                "Mode is automatic and model-aware. Use /plan when you explicitly want "
+                "planning before workspace changes."
+            )
         return
     if key == "api_key":
         if value is None:
@@ -1354,11 +1386,11 @@ def _execute_model(runtime: AgentRuntime, console: ConsoleUI, value: str | None,
     )
     console.write(
         f"model = {descriptor.provider}/{descriptor.model} · "
-        f"{descriptor.execution_class.value} آ· reasoning {runtime.reasoning_effort} (session only)"
+        f"{descriptor.execution_class.value} · reasoning {runtime.reasoning_effort} (session only)"
     )
 
 
-def _run_auto(runtime: AgentRuntime, console: ConsoleUI) -> None:
+def _run_auto(runtime: AgentRuntime, console: ConsoleUI) -> SliceResult:
     console.write(
         "Durable goal mode is active. No-progress attempts self-reprompt until completion or real user input; "
         "the durable retry policy retries transient provider failures and pauses repeated failures for repair; "
@@ -1367,7 +1399,24 @@ def _run_auto(runtime: AgentRuntime, console: ConsoleUI) -> None:
     def checkpoint(_result: SliceResult) -> None:
         _show_runtime_state(runtime, console)
 
-    runtime.continue_until_boundary(on_checkpoint=checkpoint)
+    result = runtime.continue_until_boundary(on_checkpoint=checkpoint)
+    # Keep the terminal truthful at every boundary.  The old controller only
+    # rendered intermediate callbacks and silently discarded this final value,
+    # which made a paused process look idle or still awaiting approval.
+    if isinstance(result, SliceResult):
+        phase = result.phase or result.status
+        if result.completed:
+            console.write(f"Completed — {result.message}")
+        elif result.needs_user:
+            console.write(
+                f"Paused — {result.reason or result.message}"
+                + (f" Waiting on {result.waiting_on}." if result.waiting_on else "")
+            )
+        elif result.status == "running":
+            console.write(f"Working — {result.message}")
+        else:
+            console.write(f"Boundary — {phase}: {result.message}")
+    return result
 
 
 def _current_ultra_run(runtime: AgentRuntime) -> object | None:
@@ -1973,7 +2022,7 @@ def _project_brain_text(runtime: AgentRuntime, target: str | None = None) -> str
 def _ultra_details_text(runtime: AgentRuntime, console: ConsoleUI) -> str:
     run = _current_ultra_run(runtime)
     if run is None:
-        return "Ultra Details\n\nNo Ultra run exists in this session."
+        return "Execution details\n\nNo recursive specialist run exists in this session."
     snapshot = _swarm_inspector_snapshot(runtime, run)
     nodes = tuple(snapshot.get("nodes") or ())
     agents = tuple(snapshot.get("agents") or ())
@@ -1984,7 +2033,7 @@ def _ultra_details_text(runtime: AgentRuntime, console: ConsoleUI) -> str:
     ]
     goal = runtime.active_goal()
     lines = [
-        f"Ultra Details · run {run.id[-12:]}",
+        f"Recursive execution details · run {run.id[-12:]}",
         f"Phase · {getattr(getattr(run, 'phase', ''), 'value', getattr(run, 'phase', ''))}",
         f"Agents · {len(active_agents)} active / {len(agents)} materialized",
         "",
@@ -2476,6 +2525,29 @@ def execute_command(
     """Execute one parsed command. Return False when the session should exit."""
     if command.kind == CommandKind.QUIT:
         return False
+    if command.kind is CommandKind.CANCEL and not str(command.args.get("confirmation") or "").strip():
+        goal = runtime.active_goal()
+        if goal is None and not runtime.session_snapshot().get("pending_semantic_turn"):
+            console.write("There is no active workflow to cancel.")
+            return True
+        decision = runtime.store.request_attention(
+            AttentionRequest(
+                id=f"cancel:{time.monotonic_ns()}",
+                kind=AttentionKind.QUESTION,
+                title="Cancel workflow?",
+                message="The saved request and any unfinished work will stop at the next safe checkpoint.",
+                options=(
+                    AttentionOption("cancel", "Cancel workflow", "cancel", shortcut="c", primary=True, recommended=True),
+                    AttentionOption("keep", "Keep working", "keep", shortcut="k"),
+                ),
+                default_key="keep",
+                cancel_key="keep",
+            )
+        )
+        if decision.value == "cancel":
+            runtime.cancel("CANCEL")
+            console.write("Workflow cancelled at a safe checkpoint.")
+        return True
     if command.kind == CommandKind.MENU:
         selected_command = _open_command_palette(
             console,
@@ -2503,37 +2575,10 @@ def execute_command(
     if command.kind == CommandKind.MODE:
         selected = command.args.get("mode")
         if selected is None:
-            if rich_terminal_available(
-                input_func=console.input_func,
-                output=console.stream,
-            ) and not bool(getattr(console, "plain", False)):
-                try:
-                    with console.full_screen_modal():
-                        selected = choose_interaction_mode(
-                            input_func=console.input_func,
-                            output=console.stream,
-                            rich=True,
-                            initial=preferences.mode,
-                            step_label="Session · Mode",
-                            no_color=not console.color,
-                            reduced_motion=console.reduced_motion,
-                            ultra_disabled_reason=runtime.ultra_readiness_issue() or "",
-                        )
-                except PickerBack:
-                    return True
-                needs_ultra_foundation = _set_interaction_mode(
-                    runtime,
-                    console,
-                    preferences,
-                    selected,
-                    detailed=False,
-                )
-                if needs_ultra_foundation:
-                    runtime.prepare_ultra_from_existing_goal()
-            else:
-                console.write(
-                    f"mode = {preferences.mode.value}; choose /mode plan, /mode normal, or /mode ultra"
-                )
+            console.write(
+                "Workflow type and execution depth are selected automatically after your prompt. "
+                "Use /plan only when you explicitly want planning before workspace changes."
+            )
         else:
             needs_ultra_foundation = _set_interaction_mode(
                 runtime, console, preferences, selected
@@ -2608,8 +2653,10 @@ def execute_command(
     if command.kind == CommandKind.SLEEP:
         action = str(command.args["action"]).strip().lower()
         if action == "status":
+            enabled = bool(runtime.sleep_mode_enabled())
+            console.set_sleep_mode(enabled)
             console.write(
-                f"Sleep Mode {'on' if console.sleep_enabled else 'off'} · "
+                f"Sleep Mode {'on' if enabled else 'off'} · "
                 "safe recommended choices only; unsafe decisions stay manual"
             )
             if preferences.mode is InteractionMode.ULTRA:
@@ -2620,6 +2667,7 @@ def execute_command(
             return True
 
         enabled = action == "on"
+        runtime.set_sleep_mode(enabled)
         console.set_sleep_mode(enabled)
         if action == "off":
             runtime.sleep_profile("off", preferences.mode)
@@ -2692,6 +2740,10 @@ def execute_command(
         _show_metrics(runtime, console)
         return True
     if command.kind == CommandKind.PLAN:
+        if runtime.active_goal() is None:
+            _set_interaction_mode(
+                runtime, console, preferences, InteractionMode.PLAN, detailed=False
+            )
         _open_local_web_view(runtime, console, "plan")
         return True
     if command.kind == CommandKind.REVIEW:
@@ -2801,8 +2853,10 @@ def execute_command(
         console.write(f"Plan r{view.plan_revision} is ready. Opening Plan Studio…")
         _open_local_web_view(runtime, console, "plan")
     try:
-        actual_mode = InteractionMode.parse(
-            runtime.store.get_workflow_session(runtime.session_id)["session_mode"]
+        actual_mode = (
+            InteractionMode.PLAN
+            if runtime.interaction_mode.value == "plan"
+            else InteractionMode.NORMAL
         )
         if actual_mode is not preferences.mode:
             preferences.mode = actual_mode
@@ -2833,7 +2887,7 @@ def execute_command(
                 CommandKind.TEXT: "guidance received",
                 CommandKind.GOAL: "goal submitted",
             }[command.kind]
-            console.write(f"NORMAL mode: {reason}; continuing automatically.")
+            console.write(f"Working: {reason}; continuing automatically.")
             _run_auto(runtime, console)
     return True
 
@@ -2848,14 +2902,14 @@ def _question_attention(question: Mapping[str, Any], *, source: str) -> Attentio
             for index, raw in enumerate(raw_sequence, 1)
             if isinstance(raw, Mapping) and bool(raw.get("recommended"))
         ),
-        1,
+        None,
     )
     options: list[AttentionOption] = []
     for index, raw in enumerate(raw_sequence, 1):
         if not isinstance(raw, Mapping):
             continue
         label = str(raw.get("label") or f"Option {index}")
-        recommended = index == recommended_index
+        recommended = recommended_index is not None and index == recommended_index
         options.append(
             AttentionOption(
                 key=f"option-{index}",
@@ -2869,22 +2923,11 @@ def _question_attention(question: Mapping[str, Any], *, source: str) -> Attentio
             )
         )
     if not options:
-        options.append(
-            AttentionOption(
-                key="continue",
-                label="Continue with the suggested default",
-                value="1",
-                description="Use the planner's recommended answer for this decision.",
-                shortcut="1",
-                primary=True,
-                recommended=True,
-                auto_safe=True,
-            )
-        )
+        raise ValueError("a model-authored question must contain at least one valid option")
     default_key = (
         "option-2"
         if question_id == "execution_mode" and len(options) >= 2
-        else next((option.key for option in options if option.recommended), options[0].key)
+        else next((option.key for option in options if option.recommended), "")
     )
     return AttentionRequest(
         id=f"question:{source}:{question_id}:{time.monotonic_ns()}",
@@ -2895,7 +2938,9 @@ def _question_attention(question: Mapping[str, Any], *, source: str) -> Attentio
         allow_custom=True,
         source=source,
         default_key=default_key,
-        auto_resolve_safe=question_id != "execution_mode",
+        auto_resolve_safe=(
+            question_id != "execution_mode" and any(option.recommended for option in options)
+        ),
     )
 
 
@@ -2917,26 +2962,15 @@ def _plan_attention(
         options = [
             AttentionOption(
                 "open", "Open and review", "open",
-                description="Open the complete editable plan before choosing an execution mode.",
+                description="Open the complete editable plan before work begins.",
                 shortcut="o", recommended=True,
             ),
+            AttentionOption(
+                "approve", "Approve & work", "approve",
+                description="Approve this revision and continue the same Goal in Working.",
+                shortcut="a",
+            ),
         ]
-        if normal_available:
-            options.append(
-                AttentionOption(
-                    "normal", "Continue with Normal", "normal",
-                    description="Keep this plan, switch mode, then ask for explicit approval.",
-                    shortcut="n",
-                )
-            )
-        if ultra_available:
-            options.append(
-                AttentionOption(
-                    "ultra", "Continue with Ultra", "ultra",
-                    description="Keep this plan and apply Ultra reasoning depth.",
-                    shortcut="u",
-                )
-            )
         options.extend(
             (
                 AttentionOption(
@@ -2946,7 +2980,7 @@ def _plan_attention(
                 ),
                 AttentionOption(
                     "cancel", "Keep planning", "cancel",
-                    description="Keep this revision unapproved and remain in Plan Mode.",
+                    description="Keep this revision unapproved and remain in Plan.",
                     shortcut="k",
                 ),
             )
@@ -2957,7 +2991,7 @@ def _plan_attention(
             title="Plan is ready for review",
             message=message,
             options=tuple(options),
-            details="\n".join(reasons) or "Plan Mode cannot execute this revision.",
+            details="\n".join(reasons) or "Work begins only after explicit approval.",
             default_key="cancel",
             cancel_key="cancel",
             auto_resolve_safe=False,
@@ -3157,12 +3191,15 @@ def _persistent_interactive_loop(
         active_work: Thread | None = None
         work_done = Event()
         work_errors: list[BaseException] = []
-        work_results: list[bool] = []
+        work_results: list[Any] = []
+        work_boundaries: list[SliceResult] = []
         last_command: UserCommand | None = None
         last_action: UserCommand | Callable[[], None] | None = None
         shown_questions: set[str] = set()
         reviewed_plans: set[str] = set()
         completed_goals: set[str] = set()
+        shown_boundaries: set[str] = set()
+        continued_running_goals: set[str] = set()
         queued: list[str] = []
         deferred_observers: list[UserCommand] = []
         pending_controls: list[UserCommand] = []
@@ -3232,7 +3269,11 @@ def _persistent_interactive_loop(
                 permission_adapter=adapter,
                 session_id=target,
             )
-            preferences.mode = InteractionMode.parse(str(saved["session_mode"]))
+            preferences.mode = (
+                InteractionMode.PLAN
+                if str(state.get("interaction_mode") or saved["session_mode"]) == "plan"
+                else InteractionMode.NORMAL
+            )
             preferences.concurrency = concurrency
             console.set_mode(preferences.mode)
             console.set_runtime_identity(
@@ -3245,26 +3286,35 @@ def _persistent_interactive_loop(
             store.append_transcript(
                 "assistant",
                 f"Switched to session {target[-12:]} at its saved checkpoint · "
-                f"{descriptor.model} · {preferences.mode.value} · {concurrency} agent(s).",
+                f"{descriptor.model} · "
+                f"{'plan' if preferences.mode is InteractionMode.PLAN else 'working'} · "
+                f"{concurrency} agent(s).",
             )
 
         def sync_workflow_mode() -> None:
             try:
-                actual = InteractionMode.parse(
-                    runtime.store.get_workflow_session(runtime.session_id)["session_mode"]
-                )
+                interaction = runtime.interaction_mode.value
+                actual = InteractionMode.PLAN if interaction == "plan" else InteractionMode.NORMAL
             except (StateStoreError, ValueError, TypeError, KeyError, AttributeError):
                 return
             if actual is not preferences.mode:
                 preferences.mode = actual
                 console.set_mode(actual)
+            goal = runtime.active_goal()
+            pending = runtime.session_snapshot().get("pending_semantic_turn")
+            if goal is not None or (
+                isinstance(pending, Mapping) and str(pending.get("status")) != "completed"
+            ):
+                console.set_workflow_phase(interaction)
 
         def work(action: UserCommand | Callable[[], None]) -> None:
             try:
                 if isinstance(action, UserCommand):
                     work_results.append(execute_command(runtime, console, action, preferences))
                 else:
-                    action()
+                    result = action()
+                    if isinstance(result, SliceResult):
+                        work_boundaries.append(result)
             except BaseException as exc:
                 work_errors.append(exc)
             finally:
@@ -3280,6 +3330,10 @@ def _persistent_interactive_loop(
             last_action = action
             if isinstance(action, UserCommand):
                 last_command = action
+                if action.kind in {CommandKind.TEXT, CommandKind.GOAL}:
+                    console.set_workflow_phase(
+                        "plan" if preferences.mode is InteractionMode.PLAN else "working"
+                    )
             next_slow_notice = 60.0
             work_transcript_count = len(store.snapshot().transcript)
             store.reset_request_context()
@@ -3370,6 +3424,11 @@ def _persistent_interactive_loop(
                 return False
             active_goal = runtime.active_goal()
             if active_goal is not None:
+                return False
+            session_state = runtime.store.get_workflow_session(
+                runtime.session_id
+            ).get("state", {})
+            if isinstance(session_state.get("pending_semantic_turn"), Mapping):
                 return False
             item = runtime.store.claim_next_prompt(runtime.session_id)
             store.set_queued_count(
@@ -3478,7 +3537,7 @@ def _persistent_interactive_loop(
             if choice.value:
                 start(parse_command(f"/permissions {choice.value}"))
 
-        def handle_model() -> None:
+        def handle_model() -> bool:
             goal = runtime.active_goal()
             if goal is not None and goal.status in {
                 GoalStatus.RUNNING, GoalStatus.VERIFYING, GoalStatus.REVIEWING, GoalStatus.RECOVERING,
@@ -3487,7 +3546,7 @@ def _persistent_interactive_loop(
                     "assistant",
                     "Pause at a safe checkpoint before changing models.",
                 )
-                return
+                return False
             store.set_activity(ActivityStage.UNDERSTANDING, "Checking available models", running=True)
             catalog = ModelCatalog()
             models = catalog.discover()
@@ -3498,7 +3557,7 @@ def _persistent_interactive_loop(
                     "assistant",
                     "No tool-capable model is available." + (f" {detail}" if detail else ""),
                 )
-                return
+                return False
             by_key = {f"model-{index}": descriptor for index, descriptor in enumerate(models, 1)}
             options = tuple(
                 AttentionOption(
@@ -3528,7 +3587,7 @@ def _persistent_interactive_loop(
             descriptor = by_key.get(resolution.value)
             if descriptor is None:
                 store.set_activity(ActivityStage.PAUSED, "Model selection cancelled", running=False)
-                return
+                return False
             provider = descriptor.create_provider()
             setattr(provider, "reasoning_effort", runtime.reasoning_effort)
             runtime.replace_provider(provider, descriptor)
@@ -3545,61 +3604,41 @@ def _persistent_interactive_loop(
                 "assistant",
                 f"Model changed to {descriptor.provider}/{descriptor.model} ({descriptor.execution_class.value}).",
             )
+            return True
 
         def handle_workflow_mode(*, apply: bool = True) -> str | None:
-            issue = runtime.ultra_readiness_issue()
-            current_session = runtime.store.get_workflow_session(runtime.session_id)
-            current_state = dict(current_session.get("state", {}))
-            current_goal = runtime.active_goal()
-            ultra_lineage = bool(
-                preferences.mode is InteractionMode.ULTRA
-                or str(current_state.get("plan_return_mode") or "").casefold() == "ultra"
-                or (
-                    current_goal is not None
-                    and bool(current_goal.metadata.get("ultra_run_id"))
-                )
-            )
             options = [
                 AttentionOption(
-                    "plan", "Plan only", "plan",
-                    description="Inspect and prepare an editable plan without executing.",
+                    "normal", "Working", "normal",
+                    description=(
+                        "Send normally. Route and model-aware execution depth are selected after the request."
+                    ),
+                    shortcut="w", primary=preferences.mode is not InteractionMode.PLAN,
+                ),
+                AttentionOption(
+                    "plan", "Plan", "plan",
+                    description=(
+                        "Open a plan before mutation, then Approve & work continues the same Goal."
+                    ),
                     shortcut="p", primary=preferences.mode is InteractionMode.PLAN,
-                )
+                ),
             ]
-            if not ultra_lineage:
-                options.append(
-                    AttentionOption(
-                        "normal", "Normal", "normal",
-                        description="One durable goal with plan, review, and automatic execution.",
-                        shortcut="n", primary=preferences.mode is InteractionMode.NORMAL,
-                    )
-                )
-            if not issue:
-                options.append(
-                    AttentionOption(
-                        "ultra", "Ultra", "ultra",
-                        description="Recursive specialists and deeper integration gates.",
-                        shortcut="u", primary=preferences.mode is InteractionMode.ULTRA,
-                    )
-                )
             options.append(AttentionOption("cancel", "Cancel", "", shortcut="c"))
             resolution = store.request_attention(
                 AttentionRequest(
                     id=f"mode:{time.monotonic_ns()}",
                     kind=AttentionKind.QUESTION,
-                    title="Choose workflow mode",
+                    title="Choose how to send the next request",
                     message=(
-                        f"Ultra is unavailable: {issue}"
-                        if issue
-                        else (
-                            "This Ultra project may enter Plan to edit or inspect, then return to Ultra. "
-                            "Downgrading it to Normal is intentionally unavailable."
-                            if ultra_lineage
-                            else "This changes orchestration, not the Simple/Advanced display."
-                        )
+                        "Working lets the system choose Chat, Action, or Goal and the required "
+                        "execution depth. Plan prepares the same Goal before any mutation."
                     ),
                     options=tuple(options),
-                    default_key="cancel",
+                    default_key=(
+                        "plan"
+                        if preferences.mode is InteractionMode.PLAN
+                        else "normal"
+                    ),
                     cancel_key="cancel",
                 )
             )
@@ -3736,6 +3775,15 @@ def _persistent_interactive_loop(
                 _open_local_web_view(runtime, console, "agents")
                 return True
             if command.kind is CommandKind.PLAN:
+                if runtime.active_goal() is None:
+                    _set_interaction_mode(
+                        runtime,
+                        console,
+                        preferences,
+                        InteractionMode.PLAN,
+                        detailed=False,
+                    )
+                    store.update_workflow_mode("plan")
                 _open_local_web_view(runtime, console, "plan")
                 return True
             if command.kind is CommandKind.REVIEW:
@@ -3853,7 +3901,7 @@ def _persistent_interactive_loop(
                 return True
             if command.kind is CommandKind.ULTRA_DETAILS:
                 app.open_details(
-                    "Ultra Details",
+                    "Execution details",
                     _ultra_details_text(runtime, console),
                     kind="ultra_details",
                 )
@@ -3907,7 +3955,7 @@ def _persistent_interactive_loop(
                                 app.update_swarm(cached_swarm_snapshot)
                             elif app.overlay_kind == "ultra_details":
                                 app.open_details(
-                                    "Ultra Details",
+                                    "Execution details",
                                     _ultra_details_text(runtime, console),
                                     kind="ultra_details",
                                 )
@@ -3929,6 +3977,30 @@ def _persistent_interactive_loop(
                         _show_runtime_state(runtime, console, force=True)
                     except Exception as exc:
                         store.append_log(f"finalizer dashboard refresh: {exc}")
+                    if work_boundaries:
+                        boundary = work_boundaries.pop(0)
+                        # A boundary is durable state, not an exception.  Keep
+                        # it visible and present one actionable attention item
+                        # instead of falling through to the generic recovery
+                        # copy.
+                        if boundary.needs_user:
+                            store.set_activity(
+                                ActivityStage.PAUSED,
+                                f"Paused — {boundary.reason or boundary.message}",
+                                running=False,
+                            )
+                            store.append_transcript(
+                                "assistant",
+                                (
+                                    f"Paused — {boundary.reason or boundary.message}"
+                                    + (f" Waiting on {boundary.waiting_on}." if boundary.waiting_on else "")
+                                    + (f" Use /{str(boundary.resume_action).casefold()} when ready." if boundary.resume_action else "")
+                                ),
+                            )
+                        elif boundary.completed:
+                            store.set_activity(ActivityStage.DONE, "Completed", running=False)
+                        else:
+                            store.append_transcript("assistant", boundary.message)
                     if slow_request_id is not None:
                         active_attention = store.active_attention()
                         if active_attention is not None and active_attention.id == slow_request_id:
@@ -3954,6 +4026,7 @@ def _persistent_interactive_loop(
                             runtime.cancel("CANCEL")
                         work_errors.clear()
                         work_results.clear()
+                        work_boundaries.clear()
                         store.append_transcript(
                             "assistant",
                             "The previous task reached a checkpoint. Starting your new task now.",
@@ -3974,13 +4047,28 @@ def _persistent_interactive_loop(
                             6_000,
                         )
                         store.append_log(f"error: {diagnostic}")
+                        try:
+                            pending_semantic = runtime.store.get_workflow_session(
+                                runtime.session_id
+                            ).get("state", {}).get("pending_semantic_turn")
+                        except (StateStoreError, KeyError, TypeError, AttributeError):
+                            pending_semantic = None
+                        semantic_recovery = isinstance(pending_semantic, Mapping)
                         typed_provider_failure = _provider_request_failure(exc)
-                        provider_failure = typed_provider_failure is not None
+                        provider_failure = typed_provider_failure is not None or semantic_recovery
                         local_provider = (
                             str(getattr(runtime, "execution_class", "local")).casefold()
                             != "cloud"
                         )
+                        validation_error = (
+                            dict(pending_semantic.get("last_validation_error") or {})
+                            if semantic_recovery
+                            else {}
+                        )
                         provider_message = (
+                            str(validation_error.get("message") or pending_semantic.get("last_error") or exc)
+                            if semantic_recovery
+                            else
                             (
                                 "The local model runner could not complete its structured response."
                                 if local_provider
@@ -3989,7 +4077,15 @@ def _persistent_interactive_loop(
                             if provider_failure
                             else redact_text(str(exc), 800)
                         )
+                        semantic_stage = (
+                            str(pending_semantic.get("stage") or "route").replace("_", " ")
+                            if semantic_recovery
+                            else ""
+                        )
                         title = (
+                            f"{semantic_stage.title()} needs attention"
+                            if semantic_recovery
+                            else
                             (
                                 "Local model stopped unexpectedly"
                                 if local_provider
@@ -3998,7 +4094,25 @@ def _persistent_interactive_loop(
                             if provider_failure
                             else "That step did not finish"
                         )
+                        action_records = (
+                            tuple(pending_semantic.get("action_records") or ())
+                            if semantic_recovery
+                            else ()
+                        )
+                        effect_receipt = (
+                            "No workspace changes or commands were run."
+                            if semantic_recovery and not action_records
+                            else "Any completed workspace actions are recorded and will not be replayed."
+                            if semantic_recovery
+                            else ""
+                        )
                         message = (
+                            (
+                                f"The exact request is saved at the {semantic_stage} stage. "
+                                f"{effect_receipt} Retry continues the same turn."
+                            )
+                            if semantic_recovery
+                            else
                             (
                                 "Ollama stopped while preparing the current step. "
                                 "Saved intake and project state are still intact."
@@ -4009,7 +4123,9 @@ def _persistent_interactive_loop(
                             if provider_failure
                             else "The project state is saved. You can inspect the error or retry safely."
                         )
-                        retry_action: UserCommand | Callable[[], None] | None = last_action
+                        retry_action: UserCommand | Callable[[], None] | None = (
+                            parse_command("/resume") if semantic_recovery else last_action
+                        )
                         goal = runtime.active_goal()
                         if (
                             provider_failure
@@ -4036,10 +4152,25 @@ def _persistent_interactive_loop(
                                 kind=AttentionKind.RECOVERY,
                                 title=title,
                                 message=message,
-                                details=diagnostic,
+                                details=(
+                                    diagnostic
+                                    + (
+                                        "\nStructured validation: "
+                                        + json.dumps(validation_error, ensure_ascii=False)
+                                        if validation_error
+                                        else ""
+                                    )
+                                ),
                                 options=(
-                                    AttentionOption("wait", "Wait / retry later", "wait", shortcut="w"),
-                                    AttentionOption("retry", "Retry now", "retry", shortcut="r", recommended=True),
+                                    AttentionOption(
+                                        "retry", "Retry now", "retry", shortcut="r",
+                                        recommended=True, primary=True,
+                                        description="Continue the same saved stage without replaying accepted work.",
+                                    ),
+                                    AttentionOption(
+                                        "wait", "Keep saved and return later", "wait", shortcut="w",
+                                        description="Leave the request saved. Nothing retries automatically.",
+                                    ),
                                     AttentionOption(
                                         "local",
                                         "Switch to compatible local",
@@ -4050,7 +4181,7 @@ def _persistent_interactive_loop(
                                     AttentionOption("stop", "Stop safely", "stop", shortcut="s"),
                                     AttentionOption("details", "Details", "details", shortcut="d"),
                                 ),
-                                default_key="wait",
+                                default_key="retry",
                                 cancel_key="wait",
                                 auto_resolve_safe=False,
                             )
@@ -4063,10 +4194,20 @@ def _persistent_interactive_loop(
                                     "assistant",
                                     "Choose a compatible local model. The saved cloud model remains in session recovery history.",
                                 )
-                            start(handle_model, summary="Checking available models")
+                            if semantic_recovery:
+                                def change_model_and_resume() -> None:
+                                    if handle_model():
+                                        runtime.resume()
+
+                                start(
+                                    change_model_and_resume,
+                                    summary="Changing model and resuming the saved stage",
+                                )
+                            else:
+                                start(handle_model, summary="Checking available models")
                         elif resolution.value == "wait":
                             goal = runtime.active_goal()
-                            if goal is not None:
+                            if goal is not None and not semantic_recovery:
                                 stored_retry = goal.metadata.get("retry_not_before")
                                 try:
                                     retry_not_before = max(
@@ -4085,12 +4226,15 @@ def _persistent_interactive_loop(
                                 )
                             store.set_activity(
                                 ActivityStage.PAUSED,
-                                "Saved · waiting for the provider retry window",
+                                "Saved · use /resume when you want to retry",
                                 running=False,
                             )
                         elif resolution.value == "stop":
                             try:
-                                runtime.checkpoint_interrupt()
+                                if semantic_recovery:
+                                    runtime.cancel("CANCEL")
+                                else:
+                                    runtime.checkpoint_interrupt()
                             except Exception as stop_error:
                                 store.append_log(f"safe stop: {stop_error}")
                         elif resolution.value == "details":
@@ -4154,6 +4298,47 @@ def _persistent_interactive_loop(
                         )
 
                 if active_work is None:
+                    local_web = getattr(runtime, "local_web_server", None)
+                    take_execution_request = getattr(
+                        local_web,
+                        "take_execution_request",
+                        None,
+                    )
+                    web_execution_requested = bool(
+                        callable(take_execution_request) and take_execution_request()
+                    )
+                    approved_goal = runtime.active_goal()
+                    recover_running_goal = bool(
+                        approved_goal is not None
+                        and approved_goal.status is GoalStatus.RUNNING
+                        and approved_goal.active_plan_revision is not None
+                        and approved_goal.id not in continued_running_goals
+                    )
+                    if web_execution_requested or recover_running_goal:
+                        if approved_goal is not None and approved_goal.status is GoalStatus.RUNNING:
+                            continued_running_goals.add(approved_goal.id)
+                            console.set_workflow_phase(runtime.interaction_mode.value)
+                            console.set_runtime_snapshot(
+                                runtime.workflow_runtime_snapshot()
+                            )
+                            store.append_transcript(
+                                "assistant",
+                                (
+                                    "Plan approval received from Plan Studio. Starting the first ready task now."
+                                    if web_execution_requested
+                                    else "Recovered approved work. Continuing the first ready task automatically."
+                                ),
+                            )
+                            start(
+                                lambda: _run_auto(runtime, console),
+                                summary="Approval received · starting work",
+                            )
+                            store.set_activity(
+                                ActivityStage.BUILDING,
+                                "Starting the first ready task",
+                                running=True,
+                            )
+                            continue
                     waiting_goal = runtime.active_goal()
                     waiting_until = (
                         waiting_goal.metadata.get("retry_not_before")
@@ -4178,6 +4363,44 @@ def _persistent_interactive_loop(
                             summary="Retry window reached · resuming saved checkpoint",
                         )
                         continue
+
+                    # Durable pauses can be restored after a process restart
+                    # without a worker result in memory.  Surface the saved
+                    # question/reason once and make the recovery action
+                    # explicit; never render this as Idle.
+                    if (
+                        waiting_goal is not None
+                        and waiting_goal.status is GoalStatus.PAUSED
+                        and str(waiting_goal.metadata.get("waiting_question") or "").strip()
+                    ):
+                        boundary_key = f"{waiting_goal.id}:{waiting_goal.updated_at.isoformat()}"
+                        if boundary_key not in shown_boundaries:
+                            shown_boundaries.add(boundary_key)
+                            reason = str(waiting_goal.metadata.get("waiting_question") or waiting_goal.metadata.get("retry_reason") or "The saved workflow is paused.")
+                            store.set_activity(ActivityStage.PAUSED, f"Paused — {reason}", running=False)
+                            resolution = store.request_attention(
+                                AttentionRequest(
+                                    id=f"boundary:{time.monotonic_ns()}",
+                                    kind=AttentionKind.RECOVERY,
+                                    title="Workflow paused",
+                                    message=reason,
+                                    options=(
+                                        AttentionOption("retry", "Retry", "retry", shortcut="r", recommended=True, primary=True),
+                                        AttentionOption("inspect", "Inspect", "inspect", shortcut="i"),
+                                        AttentionOption("stop", "Pause safely", "stop", shortcut="s"),
+                                    ),
+                                    default_key="retry",
+                                    cancel_key="inspect",
+                                )
+                            )
+                            if resolution.value == "retry":
+                                start(parse_command("/resume"), summary="Resuming saved checkpoint")
+                            elif resolution.value == "stop":
+                                try:
+                                    runtime.cancel("CANCEL")
+                                except Exception as exc:
+                                    store.append_log(f"safe pause: {exc}")
+                            continue
                     session = question_session(runtime)
                     if session is not None and session.current is not None:
                         question = session.current
@@ -4358,20 +4581,93 @@ def _persistent_interactive_loop(
                                 "assistant",
                                 "Permission selection is queued for the next saved checkpoint.",
                             )
+                    elif item.kind == "mode":
+                        lock = runtime.workflow_mode_lock()
+                        if active_work is None and not lock.locked:
+                            handle_workflow_mode()
+                        else:
+                            store.append_transcript(
+                                "assistant",
+                                lock.reason
+                                or "Mode is locked until this workflow completes or is cancelled.",
+                            )
                     elif item.kind == "sleep_toggle":
                         console.toggle_sleep_mode()
                     continue
-                if text == "/" or item.kind == "actions":
+                if item.kind == "actions":
                     if active_work is None:
                         handle_actions()
                     else:
                         store.append_transcript("assistant", "I’m still working. Press Ctrl+C to stop safely, or send guidance here.")
                     continue
+                if active_work is None and text and not text.startswith("/"):
+                    session_state = runtime.store.get_workflow_session(
+                        runtime.session_id
+                    ).get("state", {})
+                    pending_turn = session_state.get("pending_semantic_turn")
+                    if isinstance(pending_turn, Mapping):
+                        saved_input = str(pending_turn.get("original_input") or "")
+                        if text == saved_input:
+                            store.append_transcript(
+                                "assistant",
+                                "That exact request is already saved. Resuming its current stage now.",
+                            )
+                            start(parse_command("/resume"), summary="Resuming the saved request")
+                            continue
+                        choice = store.request_attention(
+                            AttentionRequest(
+                                id=f"pending-request:{time.monotonic_ns()}",
+                                kind=AttentionKind.QUESTION,
+                                title="Another request is already saved",
+                                message=(
+                                    "The current request must be resumed or cancelled before a different "
+                                    "request can start. Nothing will be replaced silently."
+                                ),
+                                options=(
+                                    AttentionOption(
+                                        "queue", "Queue this request", "queue", shortcut="q",
+                                        recommended=True,
+                                        description="Run it after the saved workflow reaches a terminal state.",
+                                    ),
+                                    AttentionOption(
+                                        "replace", "Cancel current and start this", "replace", shortcut="c",
+                                        description="Explicitly cancel the saved request, then start this one.",
+                                    ),
+                                    AttentionOption(
+                                        "keep", "Keep current request", "keep", shortcut="k",
+                                        description="Discard this new submission and leave current state unchanged.",
+                                    ),
+                                ),
+                                default_key="queue",
+                                cancel_key="keep",
+                            )
+                        )
+                        if choice.value == "queue":
+                            queued_item = runtime.store.enqueue_prompt(
+                                runtime.session_id,
+                                text,
+                                store.snapshot().workflow_mode,
+                            )
+                            store.set_queued_count(
+                                runtime.store.count_queued_prompts(runtime.session_id)
+                            )
+                            store.append_transcript(
+                                "assistant",
+                                f"Queued {queued_item.id[-8:]}; the saved request was not changed.",
+                            )
+                        elif choice.value == "replace":
+                            runtime.cancel("CANCEL")
+                            store.observe_user_text(text)
+                            store.append_transcript("user", text)
+                            start(parse_command(text), summary="Starting the replacement request")
+                        continue
                 store.observe_user_text(text)
                 store.append_transcript("user", text)
                 if active_work is not None:
                     try:
                         active_command = parse_command(text)
+                    except UnknownCommandParseError:
+                        active_command = UserCommand(CommandKind.TEXT, {"text": text, "unknown_command": True}, raw=text)
                     except CommandParseError as exc:
                         store.append_transcript("assistant", f"I couldn’t understand that: {exc}")
                         continue
@@ -4387,6 +4683,8 @@ def _persistent_interactive_loop(
                         CommandKind.EFFECTIVE_PLAN, CommandKind.ULTRA_DETAILS,
                         CommandKind.SESSIONS,
                     }
+                    if active_command.kind is CommandKind.MENU and text == "/":
+                        active_command = UserCommand(CommandKind.TEXT, {"text": text}, raw=text)
                     if active_command.kind in {
                         CommandKind.MODE,
                         CommandKind.MODEL,
@@ -4495,6 +4793,16 @@ def _persistent_interactive_loop(
                     if active_command.kind is CommandKind.PAUSE:
                         interrupt()
                         continue
+                    if active_command.kind is CommandKind.CANCEL:
+                        # Ask for confirmation on the input thread; the worker
+                        # is only checkpointed, never replayed or force-killed.
+                        interrupt()
+                        pending_controls[:] = [active_command]
+                        store.append_transcript(
+                            "assistant",
+                            "Cancel request saved; I will ask for confirmation at the safe checkpoint.",
+                        )
+                        continue
                     if active_command.kind is CommandKind.QUIT:
                         exit_session()
                         continue
@@ -4504,7 +4812,7 @@ def _persistent_interactive_loop(
                             "That command needs the current action to reach a checkpoint first. Use Ctrl+C to request one.",
                         )
                         continue
-                    selected_mode = item.mode or store.snapshot().composer_mode
+                    selected_mode = item.mode or store.snapshot().workflow_mode
                     try:
                         queued_item = runtime.store.enqueue_prompt(
                             runtime.session_id,
@@ -4570,9 +4878,13 @@ def _persistent_interactive_loop(
                     continue
                 try:
                     command = parse_command(text)
+                except UnknownCommandParseError:
+                    command = UserCommand(CommandKind.TEXT, {"text": text, "unknown_command": True}, raw=text)
                 except CommandParseError as exc:
                     store.append_transcript("assistant", f"I couldn’t understand that: {exc}")
                     continue
+                if command.kind is CommandKind.MENU and text == "/":
+                    command = UserCommand(CommandKind.TEXT, {"text": text}, raw=text)
                 if command.kind is CommandKind.TEXT and item.mode:
                     try:
                         _set_interaction_mode(
@@ -4971,6 +5283,9 @@ def _interactive_setup(
     workspace: Path | None = None
     descriptor: ModelDescriptor | None = None
     requested_access: AccessLevel | None = None
+    # The interactive composer is route-neutral. The semantic gateway selects
+    # Chat, Action, or Goal only after seeing the request and model envelope.
+    # Explicit --mode remains a compatibility/automation override.
     selected_mode: InteractionMode | None = None
     selected_concurrency = 1
 
@@ -5004,7 +5319,6 @@ def _interactive_setup(
     steps.append(("concurrency", "4. Choose agent capacity"))
     if requested_access is None:
         steps.append(("permissions", "5. Set permissions"))
-    steps.append(("mode", "6. Choose workflow mode"))
 
     total = len(steps)
     index = 0
@@ -5066,17 +5380,6 @@ def _interactive_setup(
                     no_color=not console.color,
                     reduced_motion=console.reduced_motion,
                 )
-            elif stage == "mode":
-                selected_mode = choose_interaction_mode(
-                    input_func=console.input_func,
-                    output=console.stream,
-                    rich=rich,
-                    initial=selected_mode or InteractionMode.NORMAL,
-                    step_label=step_label,
-                    no_color=not console.color,
-                    reduced_motion=console.reduced_motion,
-                    ultra_disabled_reason="",
-                )
         except UserExitRequested:
             return None
         except PickerBack:
@@ -5126,7 +5429,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         ).strip().lower() in {"1", "true", "yes", "on"}
         selected_provider = _configure_provider_environment(args.provider, args.model)
         interactive_launch = bool(args.interactive or not args.command)
-        if interactive_launch and args.session:
+        if args.session:
             if not args.workspace:
                 raise ValueError("--session requires --workspace")
             workspace = _resolve_workspace(
@@ -5142,10 +5445,47 @@ def main(argv: Iterable[str] | None = None) -> int:
             state = dict(saved_session.get("state", {}))
             model_snapshot = state.get("model_snapshot")
             if not isinstance(model_snapshot, Mapping):
-                raise RuntimeError(
-                    "Recovery: this legacy session has no saved model snapshot. "
-                    "Reopen without --session and choose a model; the session data was not changed."
+                capability = state.get("model_capability_envelope")
+                if not isinstance(capability, Mapping) or not all(
+                    str(capability.get(key) or "").strip()
+                    for key in ("provider", "model")
+                ):
+                    raise RuntimeError(
+                        "Recovery: this legacy session has no saved model identity. "
+                        "Reopen without --session and choose a model; the session data was not changed."
+                    )
+                capabilities = tuple(
+                    name
+                    for name, field in (
+                        ("tools", "tool_calling"),
+                        ("structured_output", "structured_output"),
+                        ("thinking", "thinking"),
+                        ("vision", "vision"),
+                    )
+                    if bool(capability.get(field))
                 )
+                model_snapshot = {
+                    "provider": str(capability["provider"]),
+                    "model": str(capability["model"]),
+                    "execution_class": str(
+                        capability.get("execution_class") or "local"
+                    ),
+                    "capabilities": list(capabilities),
+                    "source": "session-capability-recovery",
+                    "metadata": {
+                        "parameter_count_billions": capability.get(
+                            "parameter_count_billions"
+                        ),
+                        "context_window_tokens": capability.get(
+                            "context_window_tokens"
+                        ),
+                        "maximum_output_tokens": capability.get(
+                            "maximum_output_tokens"
+                        ),
+                        "capability_band": capability.get("capability_band"),
+                        "model_fingerprint": capability.get("model_fingerprint"),
+                    },
+                }
             descriptor = ModelDescriptor(
                 provider=str(model_snapshot.get("provider", "")),
                 model=str(model_snapshot.get("model", "")),
@@ -5167,13 +5507,18 @@ def main(argv: Iterable[str] | None = None) -> int:
                     "the saved permission profile was not replaced."
                 )
             preferences = SessionPreferences(
-                mode=InteractionMode.parse(str(saved_session["session_mode"])),
+                mode=(
+                    InteractionMode.PLAN
+                    if str(state.get("interaction_mode") or saved_session["session_mode"]) == "plan"
+                    else InteractionMode.NORMAL
+                ),
                 concurrency=max(1, min(8, int(state.get("concurrency", 1)))),
             )
             console.show_brand()
             console.write(
                 f"Resuming {session_id[:12]} from its saved checkpoint · "
-                f"{descriptor.provider}/{descriptor.model} · {preferences.mode.value} · "
+                f"{descriptor.provider}/{descriptor.model} · "
+                f"{'plan' if preferences.mode is InteractionMode.PLAN else 'working'} · "
                 f"{preferences.concurrency} agent(s)"
             )
         elif interactive_launch:
@@ -5287,11 +5632,22 @@ def main(argv: Iterable[str] | None = None) -> int:
         console.write(
             f"Local Web Views ready on 127.0.0.1:{runtime.local_web_server.port}."
         )
-        # AgentRuntime must know the setup choice before the first intake. Its
-        # default workflow row is NORMAL for backward compatibility; leaving it
-        # unsynchronized makes an explicitly selected ULTRA session ask whether
-        # it should switch to Ultra again.
-        runtime.transition_mode(preferences.mode.value)
+        # Persist the selected next-workflow profile before semantic intake.
+        # Once a request starts, the visible in-workflow phase becomes Plan or
+        # Working while staged/recursive remains an internal strategy.
+        # A recovered session already owns its interaction phase and internal
+        # execution strategy. Re-applying a setup choice here can collide with
+        # the workflow lock (for example, a planning-only Goal stored with the
+        # normal execution engine) before /resume or /replan can run.
+        if not args.session and (interactive_launch or args.mode is not None):
+            runtime.transition_mode(preferences.mode.value)
+        elif not args.session:
+            preferences.mode = (
+                InteractionMode.PLAN
+                if runtime.interaction_mode is InteractionModeV2.PLAN
+                else InteractionMode.NORMAL
+            )
+        console.set_mode(preferences.mode)
         if not interactive_launch:
             console.write(
                 f"Ready · {runtime.provider_name}/{runtime.model_name} · "

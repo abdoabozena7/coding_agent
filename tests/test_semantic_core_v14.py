@@ -8,13 +8,14 @@ from pathlib import Path
 
 from agent.intake import IntentArchitect, RunMode
 from agent.models import GoalStatus, PlanStatus
-from agent.runtime import AgentRuntime
+from agent.runtime import AgentRuntime, RuntimeStateError
 from agent.config import RuntimeConfig
 from agent.semantic import RequestedEffect, SemanticGoalV2
 from agent.store import StateStore
 from agent.testing import ScriptedProvider, semantic_goal_intake, semantic_turn
 from agent.verifiers import discover_verifier_plugins
 from agent.ultra import UltraOrchestrator
+from agent.workflow import normalize_plan_draft, validate_normalized_plan
 
 
 def inspection() -> dict:
@@ -123,6 +124,144 @@ def critic_pass() -> dict:
 
 
 class SemanticCoreV14Tests(unittest.TestCase):
+    def test_plan_transport_omissions_bind_exact_paths_without_model_retry(self) -> None:
+        raw = {
+            "summary": "Create the requested calculator.",
+            "execution_strategy": "Create the files and verify them.",
+            "applicability_evidence": [{
+                "fact": "The repository root is empty.",
+                "source": "inspection:I001",
+            }],
+            "expected_changes": [
+                {"path": "index.html", "intent": "Create the page.", "basis": "user:request"},
+                {"path": "style.css", "intent": "Style the page.", "basis": "user:request"},
+                {"path": "calculator.js", "intent": "Implement the calculator.", "basis": "user:request"},
+                {"path": "README.md", "intent": "Document the project.", "basis": "user:request"},
+            ],
+            "tasks": [
+                {
+                    "title": "Create project scaffold",
+                    "description": "Add index.html, style.css, calculator.js, and README.md.",
+                    "acceptance_criteria": ["All four files exist."],
+                    "verification": ["Read back all four files."],
+                    "depends_on": [],
+                    "risk": "low",
+                },
+                {
+                    "title": "Implement calculator",
+                    "description": "Implement the arithmetic behavior in calculator.js.",
+                    "acceptance_criteria": ["Arithmetic works."],
+                    "verification": ["Exercise calculator.js in the browser."],
+                    "depends_on": ["1"],
+                    "risk": "medium",
+                },
+            ],
+        }
+
+        normalized, actions = normalize_plan_draft(raw)
+        validate_normalized_plan(normalized)
+
+        self.assertEqual(
+            [item["supports_tasks"] for item in normalized["expected_changes"]],
+            [["T001"], ["T001"], ["T001", "T002"], ["T001"]],
+        )
+        self.assertEqual(
+            normalized["applicability_evidence"][0]["supports_tasks"],
+            ["T001", "T002"],
+        )
+        self.assertTrue(any("supports_tasks bound" in item for item in actions))
+
+    def test_full_planner_accepts_missing_cross_references_with_two_inspections(self) -> None:
+        request = "Create a Three.js calculator and run it."
+        plan = {
+            "tool_calls": [{
+                "id": "plan",
+                "name": "propose_plan",
+                "args": {
+                    "semantic_goal": {
+                        "original_request": request,
+                        "interpreted_outcome": "Create and run the requested calculator.",
+                        "requested_effects": ["read_workspace", "mutate_workspace", "execute_code"],
+                        "required_outcomes": ["The calculator runs."],
+                        "constraints": [],
+                        "exclusions": [],
+                        "acceptance_criteria": ["The calculator loads and computes a result."],
+                        "unresolved_decisions": [],
+                        "repository_evidence_refs": ["inspection:I001", "inspection:I002"],
+                    },
+                    "summary": "Create and verify the calculator.",
+                    "applicability_evidence": [{
+                        "fact": "The inspected workspace contains no conflicting project files.",
+                        "source": "inspection:I001",
+                    }],
+                    "execution_strategy": "Create the page and script, then preview them.",
+                    "expected_changes": [
+                        {"path": "index.html", "intent": "Create the page.", "basis": "generated"},
+                        {"path": "app.js", "intent": "Implement behavior.", "basis": "generated"},
+                    ],
+                    "tasks": [
+                        {
+                            "title": "Create page",
+                            "description": "Create index.html and load app.js.",
+                            "acceptance_criteria": ["The page loads."],
+                            "verification": ["Preview index.html."],
+                            "depends_on": [],
+                            "risk": "low",
+                        },
+                        {
+                            "title": "Implement calculator",
+                            "description": "Implement arithmetic in app.js.",
+                            "acceptance_criteria": ["Arithmetic works."],
+                            "verification": ["Exercise app.js through the preview."],
+                            "depends_on": ["1"],
+                            "risk": "medium",
+                        },
+                    ],
+                },
+            }],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(directory)
+            provider = ScriptedProvider([
+                inspection(),
+                {"tool_calls": [{
+                    "id": "inspect-two",
+                    "name": "grep",
+                    "args": {"pattern": "three", "path": "."},
+                }]},
+                plan,
+                critic_pass(),
+            ])
+            runtime = AgentRuntime(provider, store, directory)
+            try:
+                accepted = runtime.start_goal(request)
+                self.assertIsNotNone(accepted)
+                self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
+                self.assertEqual(
+                    [item["basis"] for item in accepted.expected_changes],
+                    ["model_selected_new_layout", "model_selected_new_layout"],
+                )
+                self.assertFalse(
+                    any(
+                        event.event_type == "workflow.retry"
+                        for event in store.list_recent_events(accepted.goal_id, limit=100)
+                    )
+                )
+                provider.assert_exhausted()
+            finally:
+                runtime.close()
+                store.close()
+
+    def test_accepted_semantic_goal_does_not_require_duplicate_outcome_list(self) -> None:
+        semantic = SemanticGoalV2(
+            original_request="Create the application.",
+            interpreted_outcome="A working application.",
+            acceptance_criteria=("The application runs.",),
+            repository_evidence_refs=("inspection:I001",),
+            status="critic_accepted",
+        )
+        self.assertEqual(semantic.required_outcomes, ())
+
     def test_unified_semantic_modules_contain_no_domain_topology_defaults(self) -> None:
         package = Path(__file__).resolve().parents[1] / "agent"
         sources = "\n".join(
@@ -194,7 +333,10 @@ class SemanticCoreV14Tests(unittest.TestCase):
             "analyze dashboard naming only",
         )
         for request in examples:
-            self.assertEqual(UltraOrchestrator._task_family(request), "general")
+            self.assertEqual(
+                UltraOrchestrator._task_family(request),
+                "model_authored",
+            )
             self.assertFalse(
                 UltraOrchestrator._requires_visual_artifact(request)
             )
@@ -331,13 +473,11 @@ class SemanticCoreV14Tests(unittest.TestCase):
                 )
                 self.assertNotIn("ultra_run_id", goal.metadata)
 
-                self.assertEqual(runtime.transition_mode("normal"), "normal")
+                with self.assertRaisesRegex(RuntimeStateError, "locked"):
+                    runtime.transition_mode("normal")
                 goal = runtime.active_goal()
                 self.assertEqual(
-                    goal.metadata["execution_policy"]["mode"], RunMode.NORMAL.value
-                )
-                self.assertEqual(
-                    goal.metadata["execution_policy"]["concurrency"], 1
+                    goal.metadata["execution_policy"]["mode"], RunMode.ULTRA.value
                 )
             finally:
                 store.close()
@@ -356,7 +496,185 @@ class SemanticCoreV14Tests(unittest.TestCase):
                 original_request="Do not build a game",
             )
 
-    def test_three_invalid_semantic_outputs_create_resumable_capability_checkpoint(self) -> None:
+    def test_semantic_stage_records_observed_read_from_cited_inspection(self) -> None:
+        request = "Create and verify the requested application."
+        goal = type("GoalStub", (), {"objective": request})()
+        semantic = AgentRuntime._validate_semantic_stage(
+            goal,
+            {
+                "original_request": request,
+                "interpreted_outcome": "Create and verify the requested application.",
+                "requested_effects": ["mutate_workspace", "execute_code"],
+                "required_outcomes": ["The requested application exists."],
+                "constraints": [],
+                "exclusions": [],
+                "acceptance_criteria": ["The application runs successfully."],
+                "unresolved_decisions": [],
+                "repository_evidence_refs": ["inspection:I001"],
+            },
+            successful_inspection_ids=frozenset({"I001"}),
+        )
+
+        self.assertEqual(
+            semantic.requested_effects,
+            (
+                RequestedEffect.READ_WORKSPACE,
+                RequestedEffect.MUTATE_WORKSPACE,
+                RequestedEffect.EXECUTE_CODE,
+            ),
+        )
+
+    def test_semantic_effect_contract_aliases_normalize_but_unknown_is_rejected(self) -> None:
+        semantic = SemanticGoalV2.from_mapping(
+            {
+                "interpreted_outcome": "Create and preview the requested application.",
+                "requested_effects": [
+                    {"type": "read_workspace"},
+                    {"effect": "write", "path": "index.html"},
+                    "mutate",
+                    "execute",
+                    "install",
+                ],
+                "required_outcomes": ["The application exists."],
+                "acceptance_criteria": ["The application runs."],
+                "repository_evidence_refs": ["inspection:I001"],
+            },
+            original_request="Create and preview the requested application.",
+        )
+        self.assertEqual(
+            semantic.requested_effects,
+            (
+                RequestedEffect.READ_WORKSPACE,
+                RequestedEffect.MUTATE_WORKSPACE,
+                RequestedEffect.EXECUTE_CODE,
+                RequestedEffect.INSTALL_DEPENDENCIES,
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "not a valid RequestedEffect"):
+            SemanticGoalV2.from_mapping(
+                {
+                    "interpreted_outcome": "Create the application.",
+                    "requested_effects": ["invent_product_semantics"],
+                },
+                original_request="Create the application.",
+            )
+
+    def test_semantic_goal_accepts_provider_transport_wrapper_and_outcome_alias(self) -> None:
+        request = "Create and run the requested calculator."
+        semantic = SemanticGoalV2.from_mapping(
+            {
+                "semantic_goal": {
+                    "original_request": request,
+                    "requested_effects": ["mutate_workspace", "execute_code"],
+                    "required_outcomes": ["The calculator runs."],
+                    "acceptance_criteria": ["The calculator opens."],
+                    "repository_evidence_refs": ["inspection:I001"],
+                },
+                "interpretation": "Create and run the requested calculator.",
+            },
+            original_request=request,
+        )
+        self.assertEqual(
+            semantic.interpreted_outcome,
+            "Create and run the requested calculator.",
+        )
+
+    def test_accepted_route_effects_are_inherited_without_text_inference(self) -> None:
+        self.assertEqual(
+            AgentRuntime._route_effects_as_goal_effects(
+                {
+                    "read": True,
+                    "write": True,
+                    "run": True,
+                    "install": False,
+                    "preview": True,
+                    "external_side_effect": False,
+                }
+            ),
+            (
+                RequestedEffect.READ_WORKSPACE,
+                RequestedEffect.MUTATE_WORKSPACE,
+                RequestedEffect.EXECUTE_CODE,
+            ),
+        )
+        request = "Perform the accepted operation."
+        goal = type("GoalStub", (), {"objective": request})()
+        semantic = AgentRuntime._validate_semantic_stage(
+            goal,
+            {
+                "original_request": request,
+                "interpreted_outcome": request,
+                "requested_effects": ["read_workspace"],
+                "required_outcomes": ["The accepted operation is complete."],
+                "constraints": [],
+                "exclusions": [],
+                "acceptance_criteria": ["The result is verified."],
+                "unresolved_decisions": [],
+                "repository_evidence_refs": ["inspection:I001"],
+            },
+            successful_inspection_ids=frozenset({"I001"}),
+            accepted_requested_effects=(
+                RequestedEffect.MUTATE_WORKSPACE,
+                RequestedEffect.EXECUTE_CODE,
+            ),
+        )
+        self.assertEqual(
+            semantic.requested_effects,
+            (
+                RequestedEffect.READ_WORKSPACE,
+                RequestedEffect.MUTATE_WORKSPACE,
+                RequestedEffect.EXECUTE_CODE,
+            ),
+        )
+
+    def test_semantic_stage_does_not_infer_read_without_valid_inspection(self) -> None:
+        request = "Create the requested application."
+        goal = type("GoalStub", (), {"objective": request})()
+        with self.assertRaisesRegex(ValueError, "successful inspection"):
+            AgentRuntime._validate_semantic_stage(
+                goal,
+                {
+                    "original_request": request,
+                    "interpreted_outcome": request,
+                    "requested_effects": ["mutate_workspace"],
+                    "required_outcomes": ["The requested application exists."],
+                    "constraints": [],
+                    "exclusions": [],
+                    "acceptance_criteria": ["The application exists."],
+                    "unresolved_decisions": [],
+                    "repository_evidence_refs": ["inspection:I999"],
+                },
+                successful_inspection_ids=frozenset({"I001"}),
+            )
+
+    def test_semantic_stage_binds_only_unambiguous_observed_inspection(self) -> None:
+        request = "Create the requested application."
+        goal = type("GoalStub", (), {"objective": request})()
+        value = {
+            "original_request": request,
+            "interpreted_outcome": request,
+            "requested_effects": ["mutate_workspace"],
+            "required_outcomes": ["The requested application exists."],
+            "constraints": [],
+            "exclusions": [],
+            "acceptance_criteria": ["The application exists."],
+            "unresolved_decisions": [],
+            "repository_evidence_refs": [],
+        }
+        semantic = AgentRuntime._validate_semantic_stage(
+            goal,
+            value,
+            successful_inspection_ids=frozenset({"I001"}),
+        )
+        self.assertEqual(semantic.repository_evidence_refs, ("inspection:I001",))
+        with self.assertRaisesRegex(ValueError, "inspection references"):
+            AgentRuntime._validate_semantic_stage(
+                goal,
+                value,
+                successful_inspection_ids=frozenset({"I001", "I002"}),
+            )
+
+    def test_duplicate_invalid_plan_outputs_create_resumable_contract_checkpoint(self) -> None:
         invalid = {
             "tool_calls": [
                 {
@@ -387,10 +705,10 @@ class SemanticCoreV14Tests(unittest.TestCase):
                     for event in store.list_recent_events(goal.id, limit=100)
                     if event.event_type == "planning.checkpoint"
                 ]
-                self.assertEqual(checkpoints[-1].payload["format_attempts"], 3)
+                self.assertEqual(checkpoints[-1].payload["format_attempts"], 1)
                 self.assertEqual(
                     checkpoints[-1].payload["checkpoint_type"],
-                    "model_capability_exhausted",
+                    "contract_incompatibility",
                 )
                 self.assertTrue(checkpoints[-1].payload["resumable"])
             finally:
@@ -857,7 +1175,7 @@ class SemanticCoreV14Tests(unittest.TestCase):
                 all(item.evidence_path == "package.json" for item in plugins)
             )
 
-    def test_semantic_mapping_accepts_paraphrase_but_rejects_omission(self) -> None:
+    def test_semantic_mapping_accepts_paraphrase_and_critic_owns_omission(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(directory)
             try:
@@ -934,22 +1252,72 @@ class SemanticCoreV14Tests(unittest.TestCase):
                     tuple(semantic_criteria),
                 )
 
+                proposed["semantic_goal"]["acceptance_criteria"].append(
+                    "Local run instructions are documented for the calculator."
+                )
+                proposed["expected_changes"].append(
+                    {
+                        "path": "README.md",
+                        "intent": "Document local calculator run instructions.",
+                    }
+                )
+                accepted = AgentRuntime._validate_semantic_candidate(
+                    goal,
+                    proposed,
+                    successful_inspection_ids=frozenset({"I001"}),
+                )
+                self.assertIn(
+                    "Local run instructions are documented for the calculator.",
+                    accepted.acceptance_criteria,
+                )
+
                 proposed["tasks"][0]["acceptance_criteria"] = [
                     "The directory structure 'calculator/' must exist."
                 ]
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "do not cover every accepted semantic criterion",
-                ):
-                    AgentRuntime._validate_semantic_candidate(
-                        goal,
-                        proposed,
-                        successful_inspection_ids=frozenset({"I001"}),
-                    )
+                accepted = AgentRuntime._validate_semantic_candidate(
+                    goal,
+                    proposed,
+                    successful_inspection_ids=frozenset({"I001"}),
+                )
+                self.assertTrue(accepted.acceptance_criteria)
+
+                critic = ScriptedProvider(
+                    [
+                        {
+                            "tool_calls": [
+                                {
+                                    "id": "critic-omission",
+                                    "name": "submit_plan_review",
+                                    "args": {
+                                        "verdict": "revise",
+                                        "summary": "Accepted semantic criteria are omitted.",
+                                        "issues": [
+                                            {
+                                                "detail": "Restore every omitted semantic acceptance criterion.",
+                                                "severity": "blocking",
+                                                "blocking": True,
+                                                "criterion_refs": [
+                                                    "semantic_goal.acceptance_criteria"
+                                                ],
+                                                "evidence_refs": ["inspection:I001"],
+                                            }
+                                        ],
+                                    },
+                                }
+                            ]
+                        }
+                    ]
+                )
+                runtime = AgentRuntime(critic, store, directory)
+                review = runtime._review_plan_candidate(goal, proposed, {})
+                self.assertEqual(review["verdict"], "revise")
+                self.assertTrue(review["issues"])
+                critic.assert_exhausted()
+                runtime.close()
             finally:
                 store.close()
 
-    def test_derived_path_provenance_is_rebound_without_changing_the_path(self) -> None:
+    def test_incorrect_derived_path_basis_is_not_silently_rewritten(self) -> None:
         proposed = {
             "tasks": [{"id": "T001"}],
             "applicability_evidence": [],
@@ -976,8 +1344,119 @@ class SemanticCoreV14Tests(unittest.TestCase):
         )
         change = bound["expected_changes"][0]
         self.assertEqual(change["path"], "calculator/__init__.py")
-        self.assertEqual(change["basis"], "repository_convention")
+        self.assertEqual(change["basis"], "explicit_user_requirement")
+        self.assertEqual(change["evidence_refs"], ["user:request"])
+
+    def test_generated_basis_is_rebound_with_multiple_inspections(self) -> None:
+        proposed = {
+            "tasks": [{"id": "T001"}],
+            "applicability_evidence": [],
+            "expected_changes": [{
+                "path": "index.html",
+                "intent": "Create the model-authored page.",
+                "basis": "generated",
+                "evidence_refs": ["inspection:I002"],
+                "supports_tasks": ["T001"],
+            }],
+        }
+        bound = AgentRuntime._bind_plan_inspection_sources(
+            proposed,
+            {
+                "I001": {
+                    "call_id": "list-root",
+                    "tool": "list_files",
+                    "arguments": {"path": "."},
+                    "result": "(no files under '.')",
+                },
+                "I002": {
+                    "call_id": "grep-three",
+                    "tool": "grep",
+                    "arguments": {"query": "three"},
+                    "result": "No matches.",
+                },
+            },
+            original_request="Create a Three.js calculator and run it.",
+        )
+
+        change = bound["expected_changes"][0]
+        self.assertEqual(change["basis"], "generated")
+        self.assertEqual(change["evidence_refs"], ["inspection:I002"])
+
+    def test_repair_path_is_rebound_to_fresh_inspection_without_scope_change(self) -> None:
+        proposed = {
+            "tasks": [{"id": "T001"}],
+            "applicability_evidence": [],
+            "expected_changes": [
+                {
+                    "path": "calculator.js",
+                    "intent": "Repair the accepted calculator implementation.",
+                    "basis": "explicit_user_requirement",
+                    "evidence_refs": ["user:request"],
+                    "supports_tasks": ["T001"],
+                }
+            ],
+        }
+        bound = AgentRuntime._bind_plan_inspection_sources(
+            proposed,
+            {
+                "I001": {
+                    "call_id": "inspect",
+                    "tool": "list_files",
+                    "arguments": {"path": "."},
+                    "result": "calculator.js\nindex.html\nstyle.css",
+                }
+            },
+            original_request="Create and run the requested application.",
+        )
+        change = bound["expected_changes"][0]
+        self.assertEqual(change["path"], "calculator.js")
+        self.assertEqual(change["basis"], "existing_inspected_path")
         self.assertEqual(change["evidence_refs"], ["inspection:I001"])
+
+        proposed["expected_changes"][0].update(
+            {
+                "path": "test/calculator.test.js",
+                "basis": "existing_inspected_path",
+            }
+        )
+        rebound = AgentRuntime._bind_plan_inspection_sources(
+            proposed,
+            {
+                "I001": {
+                    "call_id": "inspect",
+                    "tool": "list_files",
+                    "arguments": {"path": "."},
+                    "result": "calculator.js\nindex.html\nstyle.css",
+                }
+            },
+            original_request="Create and run the requested application.",
+        )["expected_changes"][0]
+        self.assertEqual(rebound["path"], "test/calculator.test.js")
+        self.assertEqual(rebound["basis"], "existing_inspected_path")
+        self.assertEqual(rebound["evidence_refs"], ["user:request"])
+
+        proposed["expected_changes"][0].update(
+            {
+                "path": "package.json",
+                "basis": "model_selected_new_layout",
+                "evidence_refs": ["repo_convention:root"],
+            }
+        )
+        normalized = AgentRuntime._bind_plan_inspection_sources(
+            proposed,
+            {
+                "I001": {
+                    "call_id": "inspect",
+                    "tool": "list_files",
+                    "arguments": {"path": "."},
+                    "result": "calculator.js\nindex.html\nstyle.css",
+                }
+            },
+            original_request="Create and run the requested application.",
+        )["expected_changes"][0]
+        self.assertEqual(normalized["path"], "package.json")
+        self.assertEqual(normalized["basis"], "model_selected_new_layout")
+        self.assertEqual(normalized["evidence_refs"], ["inspection:I001"])
 
     def test_exact_explicit_user_path_gets_canonical_request_citation(self) -> None:
         proposed = {
@@ -1007,6 +1486,51 @@ class SemanticCoreV14Tests(unittest.TestCase):
         change = bound["expected_changes"][0]
         self.assertEqual(change["basis"], "explicit_user_requirement")
         self.assertEqual(change["evidence_refs"], ["user:request"])
+
+    def test_user_request_is_not_laundered_as_workspace_applicability_evidence(self) -> None:
+        proposed = {
+            "tasks": [{"id": "T001"}],
+            "applicability_evidence": [
+                {
+                    "fact": "The user requested a project.",
+                    "source": "user:request",
+                    "supports_tasks": ["T001"],
+                }
+            ],
+            "expected_changes": [],
+        }
+        bound = AgentRuntime._bind_plan_inspection_sources(
+            proposed,
+            {
+                "I001": {
+                    "call_id": "inspect",
+                    "tool": "list_files",
+                    "arguments": {"path": "."},
+                    "result": "calculator.js\nindex.html\nstyle.css",
+                }
+            },
+            original_request="Create the requested project.",
+        )
+        evidence = bound["applicability_evidence"][0]
+        self.assertEqual(evidence["source"], "inspection:I001")
+        self.assertIn("calculator.js", evidence["fact"])
+        self.assertNotIn("user requested", evidence["fact"].casefold())
+
+        proposed["applicability_evidence"][0]["source"] = "repo_convention:src"
+        rebound = AgentRuntime._bind_plan_inspection_sources(
+            proposed,
+            {
+                "I001": {
+                    "call_id": "inspect",
+                    "tool": "list_files",
+                    "arguments": {"path": "."},
+                    "result": "calculator.js\nindex.html\nstyle.css",
+                }
+            },
+            original_request="Create the requested project.",
+        )["applicability_evidence"][0]
+        self.assertEqual(rebound["source"], "inspection:I001")
+        self.assertIn("workspace was inspected", rebound["fact"].casefold())
 
     def test_missing_explicit_user_path_is_not_given_request_citation(self) -> None:
         proposed = {

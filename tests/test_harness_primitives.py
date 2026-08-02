@@ -232,6 +232,17 @@ class SafetyTests(unittest.TestCase):
         self.assertNotIn("sk-abcdefghijklmnopqrst", redact_text("key sk-abcdefghijklmnopqrst"))
         data = redact_data({"OPENAI_API_KEY": "secret", "nested": ["Bearer abcdefghijklmnop"]})
         self.assertEqual(data["OPENAI_API_KEY"], "[REDACTED]")
+
+        keyboard = redact_data({"action": "press", "key": "-"})
+        self.assertEqual(keyboard, {"action": "press", "key": "-"})
+        self.assertEqual(
+            redact_data({"action": "press", "key": "Enter"}),
+            {"action": "press", "key": "Enter"},
+        )
+        self.assertEqual(
+            redact_data({"action": "press", "key": "secret-access-token"}),
+            {"action": "press", "key": "[REDACTED]"},
+        )
         self.assertNotIn("abcdefghijklmnop", data["nested"][0])
 
     def test_generic_credentials_and_private_keys_are_redacted_before_persistence(self):
@@ -281,7 +292,7 @@ class DashboardTests(unittest.TestCase):
         )
         output.encode("ascii")
         self.assertIn("GA3BAD CODING AGENT", output)
-        self.assertIn("MODE NORMAL", output)
+        self.assertIn("MODE WORKING", output)
         self.assertIn("PLAN r3 / r3", output)
         self.assertIn("[x] T001", output)
         self.assertIn("task-specific advers", output)
@@ -483,7 +494,7 @@ class TerminalUITests(unittest.TestCase):
             activity._draw(0)
 
         rendered = output.getvalue()
-        self.assertIn("ULTRA MODULE WAVES", rendered)
+        self.assertIn("WORKING MODULE WAVES", rendered)
         self.assertIn("5/20", rendered)
         self.assertIn("25%", rendered)
         self.assertIn("ETA ~", rendered)
@@ -896,7 +907,7 @@ class TerminalUITests(unittest.TestCase):
         )
 
         self.assertEqual(console.prompt(), "/status")
-        self.assertEqual(prompts, ["GA3BAD [NORMAL]> "])
+        self.assertEqual(prompts, ["GA3BAD [READY]> "])
 
         console.set_mode("plan")
         self.assertEqual(console.prompt(), "/status")
@@ -918,7 +929,7 @@ class TerminalUITests(unittest.TestCase):
             active_agents=4,
         )
         self.assertNotIn("+---", rendered)
-        self.assertIn("MODE ULTRA / STATUS RUNNING", rendered)
+        self.assertIn("MODE WORKING / STATUS RUNNING", rendered)
         self.assertIn("Access FULL / CLOUD", rendered)
         self.assertIn("Agents 4", rendered)
 

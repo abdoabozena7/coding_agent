@@ -40,7 +40,7 @@ from ._security import (
     workspace_context,
 )
 from ._validation import ToolArgumentError, validate_tool_arguments
-from ._types import ToolExecutionResult, ToolSpec
+from ._types import MutationFootprintV1, ToolExecutionResult, ToolSpec
 
 def _spec(module: Any, risk: str, category: str, *, mutates: bool = False,
           paths: tuple[str, ...] = (), lifecycle: str = "one_shot",
@@ -55,6 +55,8 @@ def _spec(module: Any, risk: str, category: str, *, mutates: bool = False,
         path_fields=paths,
         lifecycle=lifecycle,
         capability=capability,
+        derived_mutation_paths=getattr(module, "derived_mutation_paths", None),
+        result_contract=dict(getattr(module, "RESULT_CONTRACT", {})),
     )
 
 
@@ -94,6 +96,48 @@ def get_spec(name: str) -> ToolSpec | None:
     return _BY_NAME.get(name)
 
 
+def applicability_issue(
+    name: str,
+    args: Mapping[str, Any],
+    workspace: str | Path,
+) -> str:
+    """Return a read-only applicability error before any approval is requested."""
+
+    if str(name) != "preview_html":
+        return ""
+    raw_path = str(args.get("path") or "").strip()
+    if not raw_path:
+        return "preview_html requires an existing .html or .htm file"
+    root = Path(workspace).resolve(strict=False)
+    target = Path(raw_path)
+    target = target.resolve(strict=False) if target.is_absolute() else (root / target).resolve(strict=False)
+    if not target.is_relative_to(root):
+        return "preview_html path must stay inside the configured workspace"
+    if target.suffix.casefold() not in {".html", ".htm"}:
+        return "preview_html requires an existing .html or .htm file"
+    if not target.is_file():
+        return f"preview_html path does not exist: {raw_path}"
+    return ""
+
+
+def mutation_footprint(
+    name: str,
+    args: Mapping[str, Any],
+    accepted_paths: Iterable[str],
+) -> MutationFootprintV1:
+    """Return the reviewed paths plus narrowly declared tool side effects."""
+
+    spec = _BY_NAME.get(name)
+    derived: Iterable[str] = ()
+    if spec is not None and spec.derived_mutation_paths is not None:
+        derived = spec.derived_mutation_paths(args)
+    return MutationFootprintV1.build(
+        name,
+        accepted_paths=accepted_paths,
+        derived_paths=derived,
+    )
+
+
 def names(*, categories: Iterable[str] | None = None, mutating: bool | None = None) -> frozenset[str]:
     wanted = set(categories or ())
     return frozenset(
@@ -108,9 +152,20 @@ def risk_map() -> dict[str, str]:
 
 
 def capability_report() -> tuple[dict[str, Any], ...]:
+    """Describe executable harness capabilities to planning and review passes.
+
+    Names alone were not enough for a model to design executable verification:
+    it knew that a browser/process tool existed but invented unsupported DOM or
+    process semantics.  The description and compact parameter contract come
+    directly from the registered tool schema, so this adds no product meaning,
+    permission, or capability that the harness does not actually expose.
+    """
+
     browser = web_preview.browser_capability()
     result = []
     for spec in TOOL_SPECS:
+        function = dict(spec.schema.get("function") or {})
+        parameters = dict(function.get("parameters") or {})
         available = True
         detail = ""
         if spec.capability == "browser":
@@ -125,6 +180,9 @@ def capability_report() -> tuple[dict[str, Any], ...]:
             "lifecycle": spec.lifecycle,
             "available": available,
             "detail": detail,
+            "description": str(function.get("description") or ""),
+            "parameters": parameters,
+            "result_contract": dict(spec.result_contract),
         })
     return tuple(result)
 
@@ -207,9 +265,9 @@ def run_tool_detailed(name: str, args: dict) -> ToolExecutionResult:
 
 
 __all__ = [
-    "TOOL_SCHEMAS", "TOOL_SPECS", "TOOLS", "ToolContext", "ToolExecutionResult",
+    "TOOL_SCHEMAS", "TOOL_SPECS", "TOOLS", "MutationFootprintV1", "ToolContext", "ToolExecutionResult",
     "ToolSecurityError", "ToolSpec", "capability_report", "configure_workspace",
-    "get_spec", "get_tool_context", "get_workspace", "names", "requires_approval",
+    "get_spec", "get_tool_context", "get_workspace", "mutation_footprint", "names", "requires_approval",
     "risk_map", "run_tool", "run_tool_detailed", "shutdown_workspace_resources",
     "workspace_context", "register_artifact_provider",
 ]

@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 
-from agent.intake import IntentArchitect, RunMode, answer_from_value
+from agent.intake import IntentArchitect, RunMode
 from agent.learning import GlobalLessonStore, LearnedLessonV1
 from agent.local_provider import repair_structured_json_object
 from agent.repository_index import HashingEmbeddingProvider, RepositoryIndex
@@ -57,10 +57,38 @@ class IntentArchitectTests(unittest.TestCase):
             self.assertFalse(item.options[2].recommended)
             self.assertTrue(item.allow_freeform)
 
+    def test_two_model_authored_options_are_valid_with_freeform_available(self) -> None:
+        decision = validated(
+            "Choose the product direction.",
+            questions=(question("direction", ("focused", "broad")),),
+        )
+        self.assertEqual(len(decision.questions[0].options), 2)
+        self.assertTrue(decision.questions[0].allow_freeform)
+
     def test_model_clear_cohesive_request_routes_normal_without_questions(self) -> None:
         decision = validated("Fix the parser bug and run focused unit tests.")
         self.assertEqual(decision.questions, ())
         self.assertIs(decision.brief.routed_mode, RunMode.NORMAL)
+
+    def test_empty_model_question_placeholder_is_not_replaced_with_canned_copy(self) -> None:
+        decision = validated(
+            "Implement the clear request.",
+            questions=({},),
+        )
+        self.assertEqual(decision.questions, ())
+
+    def test_conflicting_or_missing_recommendations_never_create_an_automatic_choice(self) -> None:
+        missing = question("scope")
+        for option in missing["options"]:
+            option["recommended"] = False
+        decision = validated("Choose scope.", questions=(missing,))
+        self.assertFalse(any(item.recommended for item in decision.questions[0].options))
+
+        conflicting = question("priority")
+        for option in conflicting["options"][:2]:
+            option["recommended"] = True
+        decision = validated("Choose priority.", questions=(conflicting,))
+        self.assertFalse(any(item.recommended for item in decision.questions[0].options))
 
     def test_ultra_recommendation_never_silently_promotes_normal(self) -> None:
         mode_question = question("execution_mode", ("ultra", "normal", "edit_request"))
@@ -70,10 +98,8 @@ class IntentArchitectTests(unittest.TestCase):
             questions=(mode_question,),
         )
         self.assertIs(decision.brief.routed_mode, RunMode.NORMAL)
-        self.assertEqual(decision.questions[0].id, "execution_mode")
-        self.assertIn("model_recommends_ultra", decision.complexity.hard_triggers)
-        self.assertEqual(answer_from_value(decision.questions[0], "1"), ("ultra", "suggested"))
-        self.assertEqual(answer_from_value(decision.questions[0], "4 Web kiosk"), ("Web kiosk", "freeform"))
+        self.assertEqual(decision.questions, ())
+        self.assertIn("high_model_authored_task_demand", decision.complexity.hard_triggers)
 
     def test_repository_facts_are_context_not_semantic_triggers(self) -> None:
         decision = validated(

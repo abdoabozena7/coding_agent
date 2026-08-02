@@ -1,0 +1,22 @@
+{
+  "name": "calculator-app",
+  "version": "1.0.0",
+  "description": "A simple calculator app",
+  "main": "index.js",
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "jest --coverage"
+  },
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@testing-library/react": "latest",
+    "@testing-library/jest-dom": "latest",
+    "jest": "latest",
+    "babel-jest": "latest",
+    "create-react-app": "latest"
+  }
+}

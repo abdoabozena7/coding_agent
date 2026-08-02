@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 import unittest
 
-from agent.tui_commands import COMMAND_SPECS, matching_commands
+from agent.tui_commands import COMMAND_SPECS, command_availability, matching_commands
 
 
 class CommandAvailabilityTests(unittest.TestCase):
@@ -20,6 +20,23 @@ class CommandAvailabilityTests(unittest.TestCase):
         self.assertIn("/resume", visible)
         self.assertIn("/undo", visible)
         self.assertNotIn("/pause", visible)
+
+    def test_idle_palette_is_route_neutral_and_keeps_plan_discoverable(self):
+        idle = SimpleNamespace(status="idle", running=False, undo_available=False)
+        matches = matching_commands("/", snapshot=idle)
+        self.assertEqual(
+            [item.name for item in matches[:4]],
+            ["/plan", "/model", "/settings", "/help"],
+        )
+        self.assertGreater(len(matches), 9)
+
+    def test_legacy_mode_command_is_hidden_from_interactive_palette(self):
+        running = SimpleNamespace(status="running", running=True, undo_available=False)
+        mode = next(item for item in COMMAND_SPECS if item.name == "/mode")
+        availability = command_availability(mode, running)
+        self.assertFalse(availability.visible)
+        self.assertFalse(availability.enabled)
+        self.assertIn("automatically", availability.reason.casefold())
 
 
 if __name__ == "__main__":

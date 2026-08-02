@@ -5,6 +5,7 @@ from pathlib import Path
 
 from agent import tools
 from agent.config import InteractionMode, SessionPreferences
+from agent.models import GoalStatus
 from agent.quality import (
     ChangeSetStatus,
     ChangeSetV1,
@@ -48,7 +49,112 @@ CASTLE = (
 )
 
 
+def castle_plan_args(*, summary: str, title: str, description: str, criterion: str, verification: str):
+    return {
+        "semantic_goal": {
+            "original_request": CASTLE,
+            "interpreted_outcome": "Create and verify the requested single-file castle siege animation.",
+            "requested_effects": ["read_workspace", "mutate_workspace", "execute_code"],
+            "required_outcomes": ["A runnable castle siege animation exists in index.html."],
+            "constraints": ["Keep the implementation self-contained in one HTML file."],
+            "exclusions": [],
+            "acceptance_criteria": [criterion],
+            "unresolved_decisions": [],
+            "repository_evidence_refs": ["inspection:I001"],
+        },
+        "summary": summary,
+        "applicability_evidence": [{
+            "fact": "The inspected workspace is empty and can host the requested new artifact.",
+            "source": "inspection:I001",
+            "supports_tasks": ["T001"],
+        }],
+        "execution_strategy": "Create index.html, run the available HTML preview checks, and independently review the evidence.",
+        "expected_changes": [{
+            "path": "index.html",
+            "intent": "Create the requested self-contained animation.",
+            "basis": "model_selected_new_layout",
+            "evidence_refs": ["inspection:I001"],
+            "supports_tasks": ["T001"],
+        }],
+        "tasks": [{
+            "id": "T001",
+            "title": title,
+            "description": description,
+            "acceptance_criteria": [criterion],
+            "verification": [verification],
+            "depends_on": [],
+            "risk": "low",
+        }],
+    }
+
+
+def passing_plan_review():
+    return {
+        "tool_calls": [{
+            "id": "critic",
+            "name": "submit_plan_review",
+            "args": {"verdict": "pass", "summary": "The plan is scoped and verifiable.", "issues": []},
+        }]
+    }
+
+
+def blocking_plan_review(summary: str):
+    return {
+        "tool_calls": [{
+            "id": "critic",
+            "name": "submit_plan_review",
+            "args": {
+                "verdict": "revise",
+                "summary": summary,
+                "issues": [{
+                    "detail": summary,
+                    "severity": "blocking",
+                    "blocking": True,
+                    "criterion_refs": ["T001"],
+                    "evidence_refs": ["inspection:I001"],
+                }],
+            },
+        }]
+    }
+
+
 class PlanHarnessV4Tests(unittest.TestCase):
+    def test_two_blocking_critic_revisions_are_available_after_initial_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            proposal = {
+                "tool_calls": [{
+                    "id": "plan",
+                    "name": "propose_plan",
+                    "args": castle_plan_args(
+                        summary="Create and verify the requested animation.",
+                        title="Create the animation",
+                        description="Create index.html with the requested animation.",
+                        criterion="The requested animation renders.",
+                        verification="Preview index.html with the available browser tool.",
+                    ),
+                }]
+            }
+            provider = ScriptedProvider([
+                {"tool_calls": [{"id": "inspect", "name": "list_files", "args": {}}]},
+                proposal,
+                blocking_plan_review("First blocking issue."),
+                proposal,
+                blocking_plan_review("Second blocking issue."),
+                proposal,
+                passing_plan_review(),
+            ])
+            try:
+                runtime = AgentRuntime(provider, store, workspace)
+                plan = runtime.start_goal(CASTLE)
+                self.assertIsNotNone(plan)
+                self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
+                provider.assert_exhausted()
+            finally:
+                runtime.close()
+                store.close()
+
     def test_castle_empty_workspace_is_inspected_once_and_plan_is_presented_without_write(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -61,24 +167,17 @@ class PlanHarnessV4Tests(unittest.TestCase):
                             {
                                 "id": "plan",
                                 "name": "propose_plan",
-                                "args": {
-                                    "summary": "Create and verify one detailed castle-siege HTML animation.",
-                                    "tasks": [
-                                        {
-                                            "title": "Create the castle siege animation",
-                                            "description": "Build the requested self-contained HTML scene and motion.",
-                                            "expected_changes": ["Create index.html with the full scene."],
-                                            "acceptance_criteria": [
-                                                "The scene visibly includes the castle, ram, tower, archers, arrows, and catapults."
-                                            ],
-                                            "verification": "Parse the HTML and render it in an available browser.",
-                                            "risk": "low",
-                                        }
-                                    ],
-                                },
+                                "args": castle_plan_args(
+                                    summary="Create and verify one detailed castle-siege HTML animation.",
+                                    title="Create the castle siege animation",
+                                    description="Build the requested self-contained HTML scene and motion.",
+                                    criterion="The scene visibly includes the castle, ram, tower, archers, arrows, and catapults.",
+                                    verification="Parse the HTML and render it in an available browser.",
+                                ),
                             }
                         ]
                     },
+                    passing_plan_review(),
                 ]
             )
             try:
@@ -91,7 +190,7 @@ class PlanHarnessV4Tests(unittest.TestCase):
                 self.assertEqual(runtime.active_goal().status.value, "awaiting_plan_approval")
                 self.assertEqual(len(store.list_actions(runtime.active_goal().id)), 1)
                 self.assertFalse((workspace / "index.html").exists())
-                self.assertEqual(len(provider.calls), 2)
+                self.assertEqual(len(provider.calls), 3)
             finally:
                 store.close()
 
@@ -249,15 +348,14 @@ class PlanHarnessV4Tests(unittest.TestCase):
             provider = ScriptedProvider(
                 [
                     {"tool_calls": [{"id": "inspect", "name": "list_files", "args": {}}]},
-                    {"tool_calls": [{"id": "plan", "name": "propose_plan", "args": {
-                        "summary": "Create one verified castle siege page.",
-                        "tasks": [{
-                            "title": "Create page", "description": "Create index.html castle siege animation",
-                            "expected_changes": ["Create index.html"],
-                            "acceptance_criteria": ["The castle siege page exists"],
-                            "verification": "Read index.html and confirm its structure", "risk": "low",
-                        }],
-                    }}]},
+                    {"tool_calls": [{"id": "plan", "name": "propose_plan", "args": castle_plan_args(
+                        summary="Create one verified castle siege page.",
+                        title="Create page",
+                        description="Create index.html castle siege animation",
+                        criterion="The castle siege page exists",
+                        verification="Read index.html and confirm its structure",
+                    )}]},
+                    passing_plan_review(),
                     {"tool_calls": [
                         {"id": "start", "name": "update_task", "args": {"task_id": "T001", "status": "in_progress", "note": "creating", "evidence": []}},
                         {"id": "write", "name": "write_file", "args": {"path": "index.html", "content": html}},
@@ -277,10 +375,15 @@ class PlanHarnessV4Tests(unittest.TestCase):
                 self.assertEqual(runtime.latest_plan().status.value, "pending_approval")
                 accepted = runtime.apply_command(parse_command("do it"))
                 self.assertEqual(accepted.status.value, "accepted")
-                dimension_ids = {item["id"] for item in runtime.active_goal().metadata["quality_target"]["dimensions"]}
-                self.assertTrue({"castle-recognizable", "main-gate-visible", "ram-motion", "siege-tower",
-                                 "moving-arrows", "catapult-projectiles", "scene-depth", "self-contained",
-                                 "extended-stability", "responsive-usability"} <= dimension_ids)
+                dimensions = runtime.active_goal().metadata["quality_target"]["dimensions"]
+                self.assertTrue(dimensions)
+                self.assertFalse(
+                    any(
+                        token in item["id"]
+                        for item in dimensions
+                        for token in ("castle", "catapult", "siege", "archer")
+                    )
+                )
                 goal_id = runtime.active_goal().id
                 result = runtime.run_slice(steps=4)
                 self.assertTrue(result.completed)

@@ -1,0 +1,25 @@
+/* Basic styling for the Three.js calculator page */
+body {
+  margin: 0;
+  padding: 0;
+  background-color: #111; /* dark background */
+  color: #eee;
+  font-family: Arial, Helvetica, sans-serif;
+  overflow: hidden; /* prevent scrollbars */
+}
+
+#three-canvas {
+  display: block;
+  width: 100vw;
+  height: 100vh;
+}
+
+/* Placeholder for future calculator UI styling */
+#calc-container {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  background: rgba(0,0,0,0.5);
+  padding: 10px;
+  border-radius: 8px;
+}

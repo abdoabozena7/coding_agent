@@ -1,0 +1,14 @@
+{
+  "name": "threejs-calculator",
+  "version": "1.0.0",
+  "description": "A 3D calculator built with Three.js",
+  "main": "src/calculator.js",
+  "scripts": {
+    "start": "http-server ."
+  },
+  "dependencies": {
+    "three": "^0.163.0"
+  },
+  "author": "",
+  "license": "MIT"
+}

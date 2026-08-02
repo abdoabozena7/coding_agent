@@ -31,6 +31,52 @@ class RequestedEffect(str, Enum):
     USE_NETWORK = "use_network"
     EXTERNAL_SIDE_EFFECT = "external_side_effect"
 
+    @classmethod
+    def parse(cls, value: Any) -> "RequestedEffect":
+        """Normalize only equivalent capability names used by our own contracts.
+
+        This is schema compatibility, not intent inference: an effect must still
+        be explicitly model-authored. Unknown values remain invalid.
+        """
+
+        if isinstance(value, Mapping):
+            authored = None
+            for key in ("effect", "type", "name", "value"):
+                if value.get(key) is not None:
+                    authored = value[key]
+                    break
+            value = authored
+        normalized = str(getattr(value, "value", value)).strip().casefold()
+        aliases = {
+            "read": cls.READ_WORKSPACE.value,
+            "read_file": cls.READ_WORKSPACE.value,
+            "list_files": cls.READ_WORKSPACE.value,
+            "grep": cls.READ_WORKSPACE.value,
+            "write": cls.MUTATE_WORKSPACE.value,
+            "mutate": cls.MUTATE_WORKSPACE.value,
+            "write_workspace": cls.MUTATE_WORKSPACE.value,
+            "write_file": cls.MUTATE_WORKSPACE.value,
+            "edit_file": cls.MUTATE_WORKSPACE.value,
+            "apply_patch": cls.MUTATE_WORKSPACE.value,
+            "materialize_artifact": cls.MUTATE_WORKSPACE.value,
+            "run": cls.EXECUTE_CODE.value,
+            "execute": cls.EXECUTE_CODE.value,
+            "run_command": cls.EXECUTE_CODE.value,
+            "execute_shell": cls.EXECUTE_CODE.value,
+            "run_shell": cls.EXECUTE_CODE.value,
+            "shell": cls.EXECUTE_CODE.value,
+            "preview": cls.EXECUTE_CODE.value,
+            "preview_html": cls.EXECUTE_CODE.value,
+            "inspect_preview": cls.EXECUTE_CODE.value,
+            "run_bash": cls.EXECUTE_CODE.value,
+            "start_process": cls.EXECUTE_CODE.value,
+            "install": cls.INSTALL_DEPENDENCIES.value,
+            "install_dependency": cls.INSTALL_DEPENDENCIES.value,
+            "network": cls.USE_NETWORK.value,
+            "external": cls.EXTERNAL_SIDE_EFFECT.value,
+        }
+        return cls(aliases.get(normalized, normalized))
+
 
 def _bounded_strings(
     values: Iterable[Any] | Any,
@@ -104,7 +150,7 @@ class SemanticGoalV2:
             raise SemanticContractError("semantic goal status is invalid")
         effects: list[RequestedEffect] = []
         for effect in self.requested_effects:
-            effects.append(effect if isinstance(effect, RequestedEffect) else RequestedEffect(str(effect)))
+            effects.append(RequestedEffect.parse(effect))
         object.__setattr__(self, "original_request", original)
         object.__setattr__(self, "interpreted_outcome", outcome)
         object.__setattr__(self, "requested_effects", tuple(dict.fromkeys(effects)))
@@ -122,9 +168,9 @@ class SemanticGoalV2:
                 _bounded_strings(getattr(self, name), field_name=name, limit=limit),
             )
         if self.status == "critic_accepted":
-            if not self.required_outcomes or not self.acceptance_criteria:
+            if not self.acceptance_criteria:
                 raise SemanticContractError(
-                    "an accepted semantic goal requires outcomes and acceptance criteria"
+                    "an accepted semantic goal requires acceptance criteria"
                 )
             if not self.repository_evidence_refs:
                 raise SemanticContractError(
@@ -149,20 +195,50 @@ class SemanticGoalV2:
         *,
         original_request: str,
     ) -> "SemanticGoalV2":
-        supplied_original = str(value.get("original_request") or original_request)
+        # Some tool-capable providers wrap the staged object in the legacy
+        # ``semantic_goal`` property, or use a nearby field name for the
+        # model-authored interpretation despite receiving the canonical
+        # schema.  Unwrap those transport shapes only; never manufacture an
+        # outcome from the user's request or infer any requested effect.
+        raw = dict(value or {})
+        nested = raw.get("semantic_goal")
+        if isinstance(nested, Mapping):
+            merged = dict(nested)
+            merged.update(
+                {
+                    key: item
+                    for key, item in raw.items()
+                    if key != "semantic_goal"
+                    and (key not in merged or item not in (None, "", (), [], {}))
+                }
+            )
+            raw = merged
+        if not str(raw.get("interpreted_outcome") or "").strip():
+            for alias in (
+                "interpretation",
+                "outcome",
+                "interpreted_objective",
+                "objective",
+                "summary",
+            ):
+                candidate = raw.get(alias)
+                if str(candidate or "").strip():
+                    raw["interpreted_outcome"] = candidate
+                    break
+        supplied_original = str(raw.get("original_request") or original_request)
         if supplied_original != str(original_request):
             raise SemanticContractError("semantic interpretation changed the original request")
         return cls(
             original_request=supplied_original,
-            interpreted_outcome=str(value.get("interpreted_outcome") or "").strip(),
-            requested_effects=tuple(value.get("requested_effects") or ()),
-            required_outcomes=tuple(value.get("required_outcomes") or ()),
-            constraints=tuple(value.get("constraints") or ()),
-            exclusions=tuple(value.get("exclusions") or ()),
-            acceptance_criteria=tuple(value.get("acceptance_criteria") or ()),
-            unresolved_decisions=tuple(value.get("unresolved_decisions") or ()),
-            repository_evidence_refs=tuple(value.get("repository_evidence_refs") or ()),
-            status=str(value.get("status") or "interpreted"),
+            interpreted_outcome=str(raw.get("interpreted_outcome") or "").strip(),
+            requested_effects=tuple(raw.get("requested_effects") or ()),
+            required_outcomes=tuple(raw.get("required_outcomes") or ()),
+            constraints=tuple(raw.get("constraints") or ()),
+            exclusions=tuple(raw.get("exclusions") or ()),
+            acceptance_criteria=tuple(raw.get("acceptance_criteria") or ()),
+            unresolved_decisions=tuple(raw.get("unresolved_decisions") or ()),
+            repository_evidence_refs=tuple(raw.get("repository_evidence_refs") or ()),
+            status=str(raw.get("status") or "interpreted"),
         )
 
     def to_dict(self) -> dict[str, Any]:

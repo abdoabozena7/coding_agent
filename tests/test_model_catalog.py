@@ -54,7 +54,13 @@ class ModelDescriptorTests(unittest.TestCase):
             execution_class="LOCAL",
             host="localhost:11434/",
             capabilities=("Completion", "TOOLS", "TOOLS"),
-            metadata={"digest": "abc", "api_key": "must-not-survive"},
+            metadata={
+                "digest": "abc",
+                "api_key": "must-not-survive",
+                "access_token": "also-secret",
+                "context_window_tokens": 32_768,
+                "maximum_output_tokens": 4_096,
+            },
         )
 
         self.assertEqual(descriptor.provider, "ollama")
@@ -64,6 +70,9 @@ class ModelDescriptorTests(unittest.TestCase):
         self.assertEqual(descriptor.capabilities, ("completion", "tools"))
         self.assertTrue(descriptor.supports_tools)
         self.assertNotIn("api_key", descriptor.metadata)
+        self.assertNotIn("access_token", descriptor.metadata)
+        self.assertEqual(descriptor.metadata["context_window_tokens"], 32_768)
+        self.assertEqual(descriptor.metadata["maximum_output_tokens"], 4_096)
         self.assertIn("ollama:qwen3@http://localhost:11434", descriptor.id)
 
     def test_provider_creation_is_independent_and_pinned(self):

@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from typing import Any, Mapping
 
 from ._security import get_workspace, resolve_workspace_path, safe_os_error
 from .run_bash import _scrubbed_environment
@@ -39,6 +40,31 @@ SCHEMA = {
         },
     },
 }
+
+
+def derived_mutation_paths(args: Mapping[str, Any]) -> tuple[str, ...]:
+    """Declare only deterministic, project-local dependency side effects.
+
+    Dependency trees and virtual environments are excluded from workspace
+    evidence snapshots. Lockfiles are durable source artifacts, so they must be
+    journaled and reviewed instead of being silently ignored.
+    """
+
+    raw_directory = str(args.get("directory") or ".").strip().replace("\\", "/")
+    directory = "" if raw_directory in {"", "."} else raw_directory.strip("/")
+    manager = str(args.get("manager") or "auto").strip().casefold()
+    filenames: list[str] = []
+    if manager in {"auto", "npm"}:
+        filenames.append("package-lock.json")
+    if manager == "pnpm":
+        filenames.append("pnpm-lock.yaml")
+    if manager == "yarn":
+        filenames.append("yarn.lock")
+    if manager == "uv":
+        filenames.append("uv.lock")
+    if manager == "poetry":
+        filenames.append("poetry.lock")
+    return tuple(f"{directory}/{name}" if directory else name for name in filenames)
 
 
 def _select(directory: Path, requested: str) -> tuple[str, list[str]]:

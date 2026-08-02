@@ -241,6 +241,16 @@ def run_with_timeout(command: str, timeout_seconds: int = TIMEOUT_SECONDS, cwd: 
         return "Error: command must not contain NUL bytes"
     if len(command) > MAX_COMMAND_CHARS:
         return f"Error: command exceeds the {MAX_COMMAND_CHARS}-character limit"
+    if os.name == "nt" and re.search(
+        r"(?:^|[\s;&|])<<-?\s*['\"]?[A-Za-z_]",
+        command,
+        re.MULTILINE,
+    ):
+        return (
+            "Error: POSIX heredoc syntax is not supported by the Windows cmd.exe "
+            "shell used by run_bash. Use python -c or create an accepted in-scope "
+            "verifier file, then run it."
+        )
     command = _normalize_platform_command(_normalize_python_entrypoint(command))
 
     workspace = get_workspace()

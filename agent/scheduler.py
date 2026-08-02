@@ -449,6 +449,11 @@ class DeterministicWaveScheduler:
                     str(item.id), ScheduleStatus.CANCELLED, error=str(exc), attempts=attempts
                 )
             except Exception as exc:  # Worker failures are data, not scheduler crashes.
+                # User-authority boundaries are control flow, not failed work.
+                # Propagate them to the workflow controller so it can present
+                # one actionable approval instead of spawning repair workers.
+                if bool(getattr(exc, "user_boundary", False)):
+                    raise
                 return ItemOutcome(
                     str(item.id),
                     ScheduleStatus.FAILED,

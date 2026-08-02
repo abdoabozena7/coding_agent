@@ -8,7 +8,77 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from dataclasses import asdict, dataclass
 from typing import Any
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewIssueV2:
+    detail: str
+    severity: str = "advisory"
+    blocking: bool = False
+    criterion_refs: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    classified: bool = True
+    version: int = 2
+
+    def to_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["criterion_refs"] = list(self.criterion_refs)
+        value["evidence_refs"] = list(self.evidence_refs)
+        return value
+
+    @classmethod
+    def from_value(cls, value: Any, *, verdict: str) -> "ReviewIssueV2":
+        if isinstance(value, str):
+            return cls(
+                detail=value.strip(),
+                classified=verdict != "revise",
+            )
+        if not isinstance(value, Mapping):
+            raise ControlValidationError("review issues must be text or objects")
+        detail = str(
+            value.get("detail")
+            or value.get("summary")
+            or value.get("message")
+            or value.get("issue")
+            or ""
+        ).strip()
+        if not detail:
+            raise ControlValidationError("review issues require a non-empty detail")
+        severity = str(value.get("severity") or value.get("type") or "advisory").strip().casefold()
+        severity_alias = {
+            "info": "advisory",
+            "warning": "advisory",
+            "minor": "advisory",
+            "major": "blocking",
+            "critical": "blocking",
+            "error": "blocking",
+        }
+        severity = severity_alias.get(severity, severity)
+        if severity not in {"advisory", "blocking"}:
+            raise ControlValidationError(
+                "review issue severity must be advisory or blocking"
+            )
+        explicitly_classified = "blocking" in value or "severity" in value or "type" in value
+        blocking = bool(value.get("blocking", severity == "blocking"))
+
+        def refs(key: str) -> tuple[str, ...]:
+            raw = value.get(key, ())
+            if isinstance(raw, str):
+                raw = (raw,)
+            if not isinstance(raw, (list, tuple)):
+                return ()
+            return tuple(str(item).strip() for item in raw if str(item).strip())
+
+        return cls(
+            detail=detail,
+            severity="blocking" if blocking else "advisory",
+            blocking=blocking,
+            criterion_refs=refs("criterion_refs"),
+            evidence_refs=refs("evidence_refs"),
+            classified=explicitly_classified or verdict != "revise",
+        )
 
 
 def _fn(name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:
@@ -28,7 +98,13 @@ TASK_SCHEMA: dict[str, Any] = {
         # Scalar/list variance and numeric dependencies are normalized by the
         # harness before validation; provider schemas intentionally stay loose
         # for those mechanically repairable fields.
-        "verification": {},
+        "verification": {
+            "description": (
+                "One concise verification string or an array of concise steps. "
+                "Each step must stay under 1,000 characters; never embed a full "
+                "test program or shell heredoc here."
+            )
+        },
         "depends_on": {},
         "expected_changes": {},
         "risk": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
@@ -67,9 +143,18 @@ EXPECTED_CHANGE_SCHEMA: dict[str, Any] = {
         },
         "basis": {
             "type": "string",
+            "description": (
+                "Use existing_inspected_path for a file found by inspection; "
+                "repository_convention for a path justified by an observed existing "
+                "repository convention; model_selected_new_layout for a concrete new "
+                "path selected after inspecting a new/empty workspace; and "
+                "explicit_user_requirement only when the exact relative path appears "
+                "verbatim in the original request."
+            ),
             "enum": [
                 "existing_inspected_path",
                 "repository_convention",
+                "model_selected_new_layout",
                 "explicit_user_requirement",
             ],
         },
@@ -90,12 +175,22 @@ SEMANTIC_GOAL_SCHEMA: dict[str, Any] = {
         "requested_effects": {
             "type": "array",
             "maxItems": 7,
+            "description": (
+                "Capability effects needed for the accepted outcome. Include "
+                "read_workspace after using repository inspection tools; the harness "
+                "also records that observed read from successful cited evidence."
+            ),
             "items": {
                 "type": "string",
                 "enum": [
                     "answer", "read_workspace", "mutate_workspace",
                     "execute_code", "install_dependencies", "use_network",
-                    "external_side_effect",
+                    "external_side_effect", "read", "write", "run", "execute",
+                    "execute_shell", "run_shell", "shell", "preview", "install",
+                    "network", "external", "read_file", "list_files", "grep",
+                    "write_file", "edit_file", "apply_patch",
+                    "materialize_artifact", "run_bash", "run_command",
+                    "start_process", "preview_html", "inspect_preview",
                 ],
             },
         },
@@ -139,7 +234,8 @@ PROPOSE_SEMANTIC_GOAL = _fn(
     (
         "Submit the repository-grounded semantic interpretation before constructing "
         "tasks. Preserve original_request exactly, cite successful inspection references, "
-        "and leave consequential unresolved decisions for request_plan_input."
+        "include the effects needed to deliver and verify the outcome, and leave "
+        "consequential unresolved decisions for request_plan_input."
     ),
     {
         **SEMANTIC_GOAL_SCHEMA,
@@ -207,25 +303,41 @@ REQUEST_PLAN_INPUT = _fn(
                         "question": {"type": "string", "minLength": 3, "maxLength": 1_000},
                         "options": {
                             "type": "array",
-                            "minItems": 3,
+                            "minItems": 2,
                             "maxItems": 3,
                             "items": {
-                                "type": "object",
-                                "properties": {
-                                    "value": {"type": "string", "minLength": 1, "maxLength": 100},
-                                    "label": {"type": "string", "minLength": 1, "maxLength": 80},
-                                    "description": {"type": "string", "minLength": 3, "maxLength": 500},
-                                    "recommended": {"type": "boolean"},
-                                },
-                                "required": ["value", "label", "description", "recommended"],
-                                "additionalProperties": False,
+                                # The portable validator does not implement
+                                # JSON-Schema oneOf.  Keep the provider-facing
+                                # object contract permissive here; the question
+                                # normalizer accepts compact strings and then
+                                # validates the canonical object shape below.
                             },
                         },
                         "allow_freeform": {"type": "boolean"},
+                        "allow_free_form": {"type": "boolean"},
                         "reason": {"type": "string", "minLength": 3, "maxLength": 1_000},
+                        "decision_need": {
+                            "type": "object",
+                            "properties": {
+                                "version": {"type": "integer"},
+                                "impact": {"type": "string", "minLength": 1},
+                                "affected_scope": {"type": "array", "items": {"type": "string"}},
+                                "affected_effects": {"type": "array", "items": {"type": "string"}},
+                                "reversible": {"type": "boolean"},
+                                "requires_user_authority": {"type": "boolean"},
+                                "reason": {"type": "string", "minLength": 1},
+                                "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": [
+                                "impact", "affected_scope", "affected_effects",
+                                "reversible", "requires_user_authority", "reason",
+                                "evidence_refs",
+                            ],
+                            "additionalProperties": False,
+                        },
                     },
-                    "required": ["id", "header", "question", "options", "allow_freeform", "reason"],
-                    "additionalProperties": False,
+                    "required": ["question", "options", "decision_need"],
+                    "additionalProperties": True,
                 },
             }
         },
@@ -245,7 +357,7 @@ SUBMIT_PLAN_REVIEW = _fn(
             "summary": {"type": "string", "minLength": 3, "maxLength": 2_000},
             "issues": {
                 "type": "array", "maxItems": 30,
-                "items": {"type": "string", "minLength": 3, "maxLength": 1_000},
+                "items": {},
             },
         },
         "required": ["verdict", "summary", "issues"],
@@ -557,6 +669,17 @@ def validate_control_call(name: str, args: Any) -> dict[str, Any]:
         if isinstance(evidence, list) and any(isinstance(item, Mapping) for item in evidence):
             normalized = dict(args)
             normalized["evidence"] = [_canonical_evidence_text(item) for item in evidence]
+    if name == "submit_plan_review" and isinstance(args, dict):
+        normalized = dict(args)
+        verdict = str(normalized.get("verdict") or "").strip().casefold()
+        raw_issues = normalized.get("issues", ())
+        if isinstance(raw_issues, (str, Mapping)):
+            raw_issues = [raw_issues]
+        if isinstance(raw_issues, (list, tuple)):
+            normalized["issues"] = [
+                ReviewIssueV2.from_value(item, verdict=verdict).to_dict()
+                for item in raw_issues
+            ]
     schema_error: ControlValidationError | None = None
     try:
         validate_schema(normalized, schema["function"]["parameters"])

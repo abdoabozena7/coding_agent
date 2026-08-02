@@ -130,7 +130,7 @@ class WorkspaceStoreTests(unittest.TestCase):
         )
         self.assertEqual(store.snapshot().workflow_mode, "ultra")
         store.update_workflow_mode("unsupported")
-        self.assertEqual(store.snapshot().workflow_mode, "normal")
+        self.assertEqual(store.snapshot().workflow_mode, "ready")
 
     def test_auto_locale_follows_the_first_user_language(self):
         store = WorkspaceUIStore()
@@ -380,6 +380,94 @@ class WorkspaceStoreTests(unittest.TestCase):
         after = store.snapshot().activity
         self.assertEqual(after.summary, before.summary)
         self.assertGreater(after.last_signal_at, before.last_signal_at)
+
+    def test_approval_received_releases_stale_approval_activity(self):
+        store = WorkspaceUIStore()
+        store.handle_event(
+            "approval.requested",
+            "Waiting for approval: install_dependencies",
+            {"waiting_on": "user", "phase": "waiting_for_approval"},
+        )
+        self.assertEqual(store.snapshot().activity.stage, ActivityStage.PAUSED)
+        self.assertEqual(store.snapshot().waiting_on, "user")
+
+        store.handle_event(
+            "approval.received",
+            "Approved — resuming the saved action.",
+            {"waiting_on": "tool", "phase": "starting"},
+        )
+        snapshot = store.snapshot()
+        self.assertEqual(snapshot.activity.stage, ActivityStage.BUILDING)
+        self.assertTrue(snapshot.running)
+        self.assertEqual(snapshot.runtime_phase, "starting")
+        self.assertEqual(snapshot.waiting_on, "tool")
+
+    def test_runtime_snapshot_clears_stale_boundary_fields(self):
+        store = WorkspaceUIStore()
+        store.update_runtime_context(
+            {
+                "session_mode": "working",
+                "route": "goal",
+                "execution_strategy": "staged",
+                "phase": "waiting_for_approval",
+                "waiting_on": "user",
+                "last_tool": "install_dependencies",
+                "resume_action": "Approve",
+            }
+        )
+        self.assertEqual(store.snapshot().status, "waiting_for_approval")
+
+        store.update_runtime_context(
+            {
+                "session_mode": "working",
+                "route": "goal",
+                "execution_strategy": "staged",
+                "phase": "working",
+                "waiting_on": "",
+                "last_tool": "",
+                "resume_action": "",
+            }
+        )
+        snapshot = store.snapshot()
+        self.assertEqual(snapshot.workflow_mode, "working")
+        self.assertEqual(snapshot.status, "running")
+        self.assertEqual(snapshot.waiting_on, "")
+        self.assertEqual(snapshot.last_tool, "")
+        self.assertEqual(snapshot.resume_action, "")
+
+    def test_planning_phase_does_not_relabel_working_session_as_plan(self):
+        store = WorkspaceUIStore()
+        store.update_runtime_context(
+            {
+                "session_mode": "working",
+                "route": "goal",
+                "execution_strategy": "recursive",
+                "phase": "planning",
+            }
+        )
+        snapshot = store.snapshot()
+        self.assertEqual(snapshot.workflow_mode, "working")
+        self.assertEqual(snapshot.runtime_phase, "planning")
+
+    def test_plan_studio_approval_event_enters_starting_state(self):
+        store = WorkspaceUIStore()
+        store.update_runtime_context(
+            {
+                "session_mode": "plan",
+                "route": "goal",
+                "execution_strategy": "staged",
+                "phase": "awaiting_approval",
+            }
+        )
+        store.handle_event(
+            "plan.approved.local_web",
+            "Approval accepted in Plan Studio; terminal execution is starting.",
+            {"phase": "starting", "waiting_on": "worker"},
+        )
+        snapshot = store.snapshot()
+        self.assertEqual(snapshot.status, "running")
+        self.assertEqual(snapshot.runtime_phase, "starting")
+        self.assertEqual(snapshot.waiting_on, "worker")
 
 
 if __name__ == "__main__":

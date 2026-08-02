@@ -161,6 +161,12 @@ class LocalWebViewsBrowserTests(unittest.TestCase):
         page.goto(self.server.url_for("plan"))
         page.get_by_role("heading", name="Plan", exact=True).wait_for()
         page.get_by_role("heading", name="Review the plan before work starts").wait_for()
+        page.get_by_role("heading", name="How the system will execute this plan").wait_for()
+        self.assertEqual(page.get_by_text("Staged coordinator", exact=True).count(), 1)
+        self.assertEqual(
+            page.get_by_text("Specialist agents are not created for this plan.").count(),
+            1,
+        )
         self.assertEqual(page.locator("select").count(), 0)
         self.assertEqual(page.locator("text=completed").count(), 0)
 
@@ -191,11 +197,13 @@ class LocalWebViewsBrowserTests(unittest.TestCase):
         self.assertIsNone(self.store.get_goal(self.goal.id).active_plan_revision)
 
         page.get_by_role("button", name="Approve & start").click()
-        page.get_by_role("button", name="Confirm and start").click()
         page.locator("#toastRegion").get_by_text(
-            "Plan r2 approved. Execution has started."
+            "Plan r2 approved. Execution is starting in the terminal."
         ).wait_for()
         self.assertEqual(self.store.get_goal(self.goal.id).active_plan_revision, 2)
+        self.assertTrue(self.server.take_execution_request())
+        self.assertFalse(self.server.take_execution_request())
+        page.get_by_role("heading", name="Work is running in the terminal").wait_for()
 
         page.wait_for_timeout(250)
         page.screenshot(path=self.artifacts / "workspace-unified-desktop.png", full_page=True)
@@ -203,6 +211,20 @@ class LocalWebViewsBrowserTests(unittest.TestCase):
         page.screenshot(path=self.artifacts / "workspace-unified-tablet.png", full_page=True)
         page.set_viewport_size({"width": 390, "height": 844})
         page.screenshot(path=self.artifacts / "workspace-unified-mobile.png", full_page=True)
+        self.assertEqual(self.console_errors, [])
+        self.assertEqual(self.page_errors, [])
+
+    def test_plan_polling_preserves_reader_scroll_position(self):
+        page = self.tracked_page()
+        page.set_viewport_size({"width": 768, "height": 420})
+        page.goto(self.server.url_for("plan"))
+        page.get_by_role("heading", name="Plan", exact=True).wait_for()
+        page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
+        before = page.evaluate("window.scrollY")
+        self.assertGreater(before, 0)
+        page.wait_for_timeout(4500)
+        after = page.evaluate("window.scrollY")
+        self.assertLessEqual(abs(after - before), 2)
         self.assertEqual(self.console_errors, [])
         self.assertEqual(self.page_errors, [])
 
@@ -217,6 +239,20 @@ class LocalWebViewsBrowserTests(unittest.TestCase):
         page.screenshot(path=self.artifacts / "workspace-unified-review.png")
         self.assertEqual(page.get_by_text("0 of 1 files reviewed").count(), 1)
         self.assertTrue(page.get_by_role("button", name="Submit review").is_disabled())
+
+        page.get_by_role("button", name="View changes", exact=True).click()
+        page.get_by_role("heading", name="Changes", exact=True).wait_for()
+        self.assertEqual(page.locator(".diff-line.added").count(), 2)
+        self.assertEqual(page.locator(".diff-line.deleted").count(), 1)
+        self.assertTrue(page.get_by_text("+    return 2", exact=True).is_visible())
+        self.assertTrue(page.get_by_text("-    return 1", exact=True).is_visible())
+        self.assertEqual(page.get_by_role("button", name="Hide changes").count(), 1)
+        self.assertFalse(page.get_by_text("Raw diff", exact=True).is_visible())
+        page.screenshot(path=self.artifacts / "workspace-review-diff-simple.png", full_page=True)
+
+        page.get_by_role("button", name="Advanced", exact=True).click()
+        page.get_by_text("Raw diff", exact=True).wait_for()
+        page.get_by_role("button", name="Simple", exact=True).click()
 
         page.get_by_role("button", name="Request changes").click()
         page.get_by_label("Required feedback").fill("Cover the invalid return path.")

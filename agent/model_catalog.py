@@ -265,7 +265,22 @@ class ModelCatalog:
                         "ollama_version": version,
                         "digest": raw_model.get("digest"),
                         "size_bytes": raw_model.get("size"),
-                        "parameter_size": _nested_value(raw_model, "details", "parameter_size"),
+                        "parameter_size": (
+                            _nested_value(shown, "details", "parameter_size")
+                            or _nested_value(raw_model, "details", "parameter_size")
+                        ),
+                        "active_parameter_size": _nested_value(
+                            shown, "details", "active_parameter_size"
+                        ),
+                        "context_window_tokens": _model_limit(
+                            shown, "context_length", "context_window", "num_ctx"
+                        ),
+                        "maximum_output_tokens": _model_limit(
+                            shown, "max_output_tokens", "num_predict"
+                        ),
+                        "capability_band": _nested_value(
+                            shown, "metadata", "capability_band"
+                        ),
                     },
                 )
             )
@@ -291,6 +306,7 @@ class ModelCatalog:
                     capabilities=("completion", "tools", "streaming"),
                     label="OpenAI · " + (self._environ.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL),
                     source="environment",
+                    metadata=_configured_capability_metadata(self._environ, "OPENAI"),
                 )
             )
         gemini_key = self._environ.get("GEMINI_API_KEY") or self._environ.get("GOOGLE_API_KEY")
@@ -303,6 +319,7 @@ class ModelCatalog:
                     capabilities=("completion", "tools", "streaming", "thinking"),
                     label="Gemini · " + (self._environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL),
                     source="environment",
+                    metadata=_configured_capability_metadata(self._environ, "GEMINI"),
                 )
             )
         return descriptors
@@ -435,15 +452,72 @@ def _nested_value(value: Mapping[str, Any], *keys: str) -> Any:
     return current
 
 
+def _model_limit(value: Mapping[str, Any], *suffixes: str) -> int | None:
+    """Read a positive model limit without relying on a model-family name."""
+
+    wanted = tuple(str(item).casefold() for item in suffixes)
+    stack: list[Mapping[str, Any]] = [value]
+    while stack:
+        current = stack.pop()
+        for key, item in current.items():
+            normalized = str(key).casefold().replace("-", "_")
+            if any(normalized == suffix or normalized.endswith("." + suffix) for suffix in wanted):
+                try:
+                    parsed = int(item)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if parsed > 0:
+                        return parsed
+            if isinstance(item, Mapping):
+                stack.append(item)
+    return None
+
+
+def _configured_capability_metadata(
+    environ: Mapping[str, str], prefix: str
+) -> dict[str, Any]:
+    """Read optional, explicit cloud metadata; missing values stay unknown."""
+
+    mapping = {
+        "parameter_size": f"{prefix}_PARAMETER_SIZE",
+        "active_parameter_size": f"{prefix}_ACTIVE_PARAMETER_SIZE",
+        "context_window_tokens": f"{prefix}_CONTEXT_WINDOW",
+        "maximum_output_tokens": f"{prefix}_MAX_OUTPUT_TOKENS",
+        "max_concurrency": f"{prefix}_MAX_CONCURRENCY",
+        "capability_band": f"{prefix}_CAPABILITY_BAND",
+    }
+    return {
+        field: environ[name]
+        for field, name in mapping.items()
+        if str(environ.get(name) or "").strip()
+    }
+
+
 def _configured(value: str | None) -> bool:
     return bool(value and str(value).strip())
 
 
 def _secret_free_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
+    safe_model_limit_fields = {
+        "context_window_tokens",
+        "maximum_output_tokens",
+        "max_output_tokens",
+        "context_length",
+        "context_size",
+        "num_ctx",
+        "num_predict",
+    }
     for key, item in dict(value).items():
         normalized = str(key).casefold()
-        if any(marker in normalized for marker in ("key", "token", "secret", "password", "authorization")):
+        if (
+            normalized not in safe_model_limit_fields
+            and any(
+                marker in normalized
+                for marker in ("key", "token", "secret", "password", "authorization")
+            )
+        ):
             continue
         if isinstance(item, Mapping):
             result[str(key)] = _secret_free_metadata(item)

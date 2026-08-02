@@ -1,0 +1,12 @@
+  ____    _    _____ ____    _    ____ 
+ / ___|  / \  |___ /| __ )  / \  |  _ \
+| |  _  / _ \   |_ \|  _ \ / _ \ | | | |
+| |_| |/ ___ \ ___) | |_) / ___ \| |_| |
+ \____/_/   \_\____/|____/_/   \_\____/ 
+              coding agent              
+
+Resuming workspace-se from its saved checkpoint · ollama/qwen2.5-coder:7b · working · 4 agent(s)
+Local Web Views ready on 127.0.0.1:49355.
+Ready · ollama/qwen2.5-coder:7b · local · normal · state .coding-agent/state.db
+Goal resumed in discovering.
+fatal: the interrupted ULTRA run has no approved master plan

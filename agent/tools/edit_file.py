@@ -24,7 +24,8 @@ from ._security import (
     resolve_workspace_path,
 )
 
-REQUIRES_APPROVAL = True  # writes to disk — ask the human first
+# In-scope workspace edits are governed by the accepted plan/action contract.
+REQUIRES_APPROVAL = False
 
 SCHEMA = {
     "type": "function",

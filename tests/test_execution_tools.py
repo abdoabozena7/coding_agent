@@ -23,6 +23,85 @@ class ExecutionToolTests(unittest.TestCase):
             self.assertFalse(result.startswith("Error:"), result)
             self.assertEqual(Path(directory, "a.txt").read_text(encoding="utf-8"), "one\nthree\n")
 
+    def test_apply_patch_accepts_codex_update_envelope_and_duplicate_end_marker(self):
+        with tempfile.TemporaryDirectory() as directory, tools.workspace_context(directory):
+            Path(directory, "style.css").write_text(
+                "#canvas {\n  display: block;\n}\n\n#panel {\n  color: white;\n}\n",
+                encoding="utf-8",
+            )
+            patch = """*** Begin Patch
+*** Update File: style.css
+@@
+ #canvas {
+   display: block;
++  position: absolute;
+ }
+@@
+ #panel {
+-  color: white;
++  color: lime;
+ }
+*** End Patch
+*** End Patch"""
+
+            result = tools.run_tool("apply_patch", {"patch": patch})
+
+            self.assertFalse(result.startswith("Error:"), result)
+            self.assertEqual(
+                Path(directory, "style.css").read_text(encoding="utf-8"),
+                "#canvas {\n  display: block;\n  position: absolute;\n}\n\n"
+                "#panel {\n  color: lime;\n}\n",
+            )
+
+    def test_apply_patch_rejects_ambiguous_codex_update_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory, tools.workspace_context(directory):
+            target = Path(directory, "repeated.txt")
+            target.write_text("same\nkeep\nsame\nkeep\n", encoding="utf-8")
+            patch = """*** Begin Patch
+*** Update File: repeated.txt
+@@
+-same
++changed
+*** End Patch"""
+
+            result = tools.run_tool("apply_patch", {"patch": patch})
+
+            self.assertIn("preimage is ambiguous", result)
+            self.assertEqual(target.read_text(encoding="utf-8"), "same\nkeep\nsame\nkeep\n")
+
+    def test_apply_patch_accepts_codex_delete_envelope(self):
+        with tempfile.TemporaryDirectory() as directory, tools.workspace_context(directory):
+            target = Path(directory, "obsolete.txt")
+            target.write_text("remove me\n", encoding="utf-8")
+
+            result = tools.run_tool("apply_patch", {"patch": """*** Begin Patch
+*** Delete File: obsolete.txt
+*** End Patch"""})
+
+            self.assertFalse(result.startswith("Error:"), result)
+            self.assertFalse(target.exists())
+
+    def test_apply_patch_accepts_multiple_codex_envelopes_in_one_call(self):
+        with tempfile.TemporaryDirectory() as directory, tools.workspace_context(directory):
+            patch = """*** Begin Patch
+*** Add File: first.txt
++first
+*** End Patch
+*** Begin Patch
+*** Add File: nested/second.txt
++second
+*** End Patch
+*** End Patch"""
+
+            result = tools.run_tool("apply_patch", {"patch": patch})
+
+            self.assertFalse(result.startswith("Error:"), result)
+            self.assertEqual(Path(directory, "first.txt").read_text(encoding="utf-8"), "first\n")
+            self.assertEqual(
+                Path(directory, "nested", "second.txt").read_text(encoding="utf-8"),
+                "second\n",
+            )
+
     def test_apply_patch_rejects_sensitive_and_traversal_paths_without_partial_writes(self):
         with tempfile.TemporaryDirectory() as directory, tools.workspace_context(directory):
             Path(directory, "safe.txt").write_text("before\n", encoding="utf-8")
@@ -94,6 +173,43 @@ class ExecutionToolTests(unittest.TestCase):
             self.assertEqual(
                 Path(payload["screenshot_path"]).parent,
                 Path(directory, "output", "playwright", "session-ui", "goal-web", "T009"),
+            )
+            tools.run_tool("stop_preview", {"preview_id": payload["preview_id"]})
+
+    def test_preview_runs_typed_interactions_and_records_observed_values(self):
+        capability = tools.web_preview.browser_capability()
+        if not capability["available"] or not capability["playwright"]:
+            self.skipTest("Playwright plus Chrome/Edge/Chromium is unavailable")
+        with tempfile.TemporaryDirectory() as directory, tools.workspace_context(directory):
+            Path(directory, "index.html").write_text(
+                """<!doctype html><button aria-label='Add one'>+</button>
+                <input aria-label='Result' readonly value='0'>
+                <script>document.querySelector('button').onclick=()=>{
+                document.querySelector('input').value='1'}</script>""",
+                encoding="utf-8",
+            )
+            payload = json.loads(tools.run_tool("preview_html", {
+                "path": "index.html",
+                "open_browser": False,
+                "verify": True,
+                "settle_ms": 0,
+                "interactions": [{
+                    "name": "increment",
+                    "steps": [{"action": "click", "role": "button", "name": "Add one"}],
+                    "assertions": [{
+                        "role": "textbox",
+                        "name": "Result",
+                        "property": "value",
+                        "equals": "1",
+                    }],
+                }],
+            }))
+            self.addCleanup(tools.web_preview.shutdown_workspace, directory)
+            self.assertEqual(payload["verification"], "passed")
+            self.assertTrue(payload["interaction_results"][0]["passed"])
+            self.assertEqual(
+                payload["interaction_results"][0]["assertions"][0]["observed"],
+                "1",
             )
             tools.run_tool("stop_preview", {"preview_id": payload["preview_id"]})
 

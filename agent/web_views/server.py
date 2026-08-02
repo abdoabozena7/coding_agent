@@ -22,6 +22,7 @@ from .schemas import (
     ExplanationRequestPayload,
     PlanApprovalPayload,
     PlanPayload,
+    PlanRequestPayload,
     QueuePromptPayload,
     QueueReorderPayload,
     ReviewSubmissionPayload,
@@ -187,6 +188,16 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
         check_session(session_id)
         return adapter.approve_plan(payload.revision)
 
+    @app.post("/api/sessions/{session_id}/plan/request")
+    async def submit_plan_request(session_id: str, payload: PlanRequestPayload):
+        check_session(session_id)
+        return adapter.submit_plan_request(payload.request)
+
+    @app.post("/api/sessions/{session_id}/plan/depth")
+    async def increase_plan_depth(session_id: str):
+        check_session(session_id)
+        return adapter.increase_execution_depth()
+
     @app.get("/api/sessions/{session_id}/queue")
     async def get_queue(session_id: str):
         check_session(session_id)
@@ -239,7 +250,11 @@ class LocalWebServer:
 
     def __init__(self, runtime: Any) -> None:
         self.runtime = runtime
-        self.adapter = CoreWebAdapter(runtime)
+        self._execution_requested = threading.Event()
+        self.adapter = CoreWebAdapter(
+            runtime,
+            on_execution_requested=self.request_execution,
+        )
         self.security = SessionSecurity(runtime.session_id)
         self.app = create_app(self.adapter, self.security)
         self._socket: socket.socket | None = None
@@ -248,6 +263,20 @@ class LocalWebServer:
         self._opened_artifacts: set[str] = set()
         self._unsubscribe = runtime.events.subscribe(self._on_runtime_event)
         self.port = 0
+
+    def request_execution(self) -> bool:
+        """Wake the owning terminal controller after a web approval."""
+
+        self._execution_requested.set()
+        return True
+
+    def take_execution_request(self) -> bool:
+        """Consume one coalesced execution wake-up without replaying approval."""
+
+        if not self._execution_requested.is_set():
+            return False
+        self._execution_requested.clear()
+        return True
 
     def _on_runtime_event(self, event: Any) -> None:
         """Auto-open only mandatory artifact gates; monitoring stays opt-in."""

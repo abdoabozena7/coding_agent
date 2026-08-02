@@ -1,0 +1,5 @@
+Local Web Views ready on 127.0.0.1:53467.
+Ready · ollama/qwen2.5-coder:7b · local · normal · state .coding-agent/state.db
+semantic-router provider request is active
+semantic-router provider request is active
+fatal: semantic routing is saved but could not be validated: authority span for write is not verbatim user input: 'exact_latest_user_input'

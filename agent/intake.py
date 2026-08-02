@@ -7,11 +7,12 @@ policy without deriving complexity or ambiguity from words in the request.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
+import hashlib
 from typing import Any, Mapping, Sequence
 
-from .chat_runtime import SemanticIntakeV2
+from .chat_runtime import DecisionNeedV1, SemanticIntakeV2
 
 
 class RunMode(str, Enum):
@@ -27,6 +28,7 @@ class RunMode(str, Enum):
         normalized = {
             "chat": "normal", "goal": "normal", "manual": "normal",
             "default": "normal", "auto": "normal", "agent": "normal",
+            "working": "normal", "work": "normal",
             "deep": "ultra", "max": "ultra",
         }.get(normalized, normalized)
         try:
@@ -103,8 +105,8 @@ class QuestionOptionV1:
     recommended: bool = False
 
     def __post_init__(self) -> None:
-        if not self.value.strip() or not self.label.strip() or not self.description.strip():
-            raise ValueError("question options require value, label, and description")
+        if not self.value.strip() or not self.label.strip():
+            raise ValueError("question options require value and label")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -118,25 +120,30 @@ class ClarificationQuestionV1:
     options: tuple[QuestionOptionV1, ...]
     reason: str
     allow_freeform: bool = True
+    decision_need: DecisionNeedV1 | None = None
 
     def __post_init__(self) -> None:
-        if not self.id.strip() or not self.header.strip() or not self.question.strip() or not self.reason.strip():
-            raise ValueError("clarification questions require id, header, question, and reason")
-        if len(self.options) != 3:
-            raise ValueError("clarification questions require exactly three suggested answers")
-        if len({item.value for item in self.options}) != 3:
+        if not self.id.strip() or not self.question.strip():
+            raise ValueError("clarification questions require id and question")
+        if len(self.options) not in {2, 3}:
+            raise ValueError("clarification questions require two or three suggested answers")
+        if len({item.value for item in self.options}) != len(self.options):
             raise ValueError("question option values must be unique")
-        if [index for index, item in enumerate(self.options) if item.recommended] != [0]:
-            raise ValueError("the first option must be the only recommended answer")
+        recommended = [index for index, item in enumerate(self.options) if item.recommended]
+        if len(recommended) > 1 or (recommended and recommended != [0]):
+            raise ValueError("a sole recommended option must be presented first")
         if not self.allow_freeform:
-            raise ValueError("clarification questions must allow a free-form fourth answer")
+            raise ValueError("clarification questions must allow a free-form answer")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "id": self.id, "header": self.header, "question": self.question,
             "options": [item.to_dict() for item in self.options],
             "allow_freeform": True, "reason": self.reason,
         }
+        if self.decision_need is not None:
+            value["decision_need"] = self.decision_need.to_dict()
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,28 +205,91 @@ class IntakeDecisionV1:
 
 
 def normalize_question(value: Mapping[str, Any], *, index: int = 1) -> ClarificationQuestionV1:
-    """Strictly validate model-authored content; never invent visible text."""
+    """Canonicalize harmless question transport variants before validation.
 
+    The configured model still owns every user-visible label.  Stable ids and
+    option values are transport identifiers only, so the harness may derive
+    them without inventing a product choice.  This deliberately accepts the
+    compact string-option shape emitted by JSON-only local/cloud adapters.
+    """
+
+    question_text = str(value.get("question") or "").strip()[:1000]
+    supplied_id = str(value.get("id") or "").strip()[:64]
+    stable_id = supplied_id or (
+        "decision_" + hashlib.sha256(question_text.encode("utf-8")).hexdigest()[:12]
+        if question_text
+        else ""
+    )
     raw_options = value.get("options")
     if not isinstance(raw_options, Sequence) or isinstance(raw_options, (str, bytes)):
         raise ValueError(f"question {index} options must be an array")
-    options = tuple(
-        QuestionOptionV1(
-            value=str(item.get("value") or "").strip()[:100],
-            label=str(item.get("label") or "").strip()[:80],
-            description=str(item.get("description") or "").strip()[:500],
-            recommended=bool(item.get("recommended", False)),
+    normalized_options: list[QuestionOptionV1] = []
+    for option_index, item in enumerate(raw_options, start=1):
+        if isinstance(item, Mapping):
+            label = str(item.get("label") or item.get("value") or "").strip()
+            description = str(item.get("description") or "").strip()
+            recommended = bool(item.get("recommended", False))
+            supplied_value = str(item.get("value") or "").strip()
+        elif isinstance(item, str):
+            label = item.strip()
+            description = ""
+            recommended = False
+            supplied_value = ""
+        else:
+            raise ValueError(
+                f"question {index} option {option_index} must be text or an object"
+            )
+        marker = "(recommended)"
+        if label.casefold().endswith(marker):
+            recommended = True
+            label = label[: -len(marker)].rstrip(" -\u2013\u2014")
+        if not label:
+            raise ValueError(
+                f"question {index} option {option_index} requires visible text"
+            )
+        opaque_value = supplied_value or (
+            f"option_{option_index}_"
+            + hashlib.sha256(
+                f"{question_text}\0{option_index}\0{label}".encode("utf-8")
+            ).hexdigest()[:10]
         )
-        for item in raw_options
-        if isinstance(item, Mapping)
+        normalized_options.append(
+            QuestionOptionV1(
+                value=opaque_value[:100],
+                label=label[:80],
+                description=description[:500],
+                recommended=recommended,
+            )
+        )
+    options = tuple(normalized_options)
+    recommended = [index for index, item in enumerate(options) if item.recommended]
+    if len(recommended) == 1 and recommended[0] != 0:
+        selected = options[recommended[0]]
+        options = (selected,) + tuple(
+            item for index, item in enumerate(options) if index != recommended[0]
+        )
+    elif len(recommended) > 1:
+        # Conflicting recommendations must never become an automatic choice.
+        options = tuple(replace(item, recommended=False) for item in options)
+    raw_need = value.get("decision_need")
+    decision_need = (
+        DecisionNeedV1.from_mapping(raw_need)
+        if isinstance(raw_need, Mapping)
+        else None
     )
     return ClarificationQuestionV1(
-        id=str(value.get("id") or "").strip()[:64],
+        id=stable_id,
         header=str(value.get("header") or "").strip()[:40],
-        question=str(value.get("question") or "").strip()[:1000],
+        question=question_text,
         options=options,
         reason=str(value.get("reason") or "").strip()[:1000],
-        allow_freeform=bool(value.get("allow_freeform", True)),
+        allow_freeform=bool(
+            value.get(
+                "allow_freeform",
+                value.get("allow_free_form", value.get("allowFreeform", True)),
+            )
+        ),
+        decision_need=decision_need,
     )
 
 
@@ -253,25 +323,17 @@ class IntentArchitect:
             str(key): str(value).strip() for key, value in dict(answers or {}).items()
             if str(value).strip()
         }
-        questions = normalize_questions(semantic.questions)
-        mode_answer = resolved_answers.get("execution_mode", "").casefold()
-        if mode_answer == "edit_request":
-            routed = RunMode.NORMAL
-        elif requested is RunMode.PLAN:
-            routed = RunMode.PLAN
-        elif requested is RunMode.ULTRA:
-            routed = RunMode.ULTRA
-        elif mode_answer == "ultra":
-            routed = RunMode.ULTRA
-        else:
-            routed = RunMode.NORMAL
-
-        if semantic.recommended_mode == "ultra" and requested is RunMode.NORMAL and not mode_answer:
-            mode_questions = [item for item in questions if item.id == "execution_mode"]
-            if len(mode_questions) != 1:
-                raise ValueError("an Ultra recommendation requires one execution_mode question")
-            if tuple(item.value for item in mode_questions[0].options) != ("ultra", "normal", "edit_request"):
-                raise ValueError("execution_mode option values must be ultra, normal, edit_request")
+        # Workflow mode is bound when the turn starts.  Intake may recommend a
+        # future mode, but it cannot silently switch or pause the active turn.
+        # Legacy execution_mode questions are ignored rather than creating an
+        # unusable choice whose answer cannot be applied safely.
+        questions = tuple(
+            item
+            for item in normalize_questions(semantic.questions)
+            if item.id != "execution_mode"
+            and (item.decision_need is None or item.decision_need.blocks_work)
+        )
+        routed = requested
 
         answered_ids = set(resolved_answers)
         active_questions = tuple(item for item in questions if item.id not in answered_ids)
@@ -290,18 +352,19 @@ class IntentArchitect:
             ),
         )
         completeness = PromptCompletenessV1(slots)
+        maximum_demand = semantic.task_demand.maximum_level
         complexity = TaskComplexityAssessmentV1(
-            score=0.75 if semantic.recommended_mode == "ultra" else 0.35,
-            hard_triggers=("model_recommends_ultra",) if semantic.recommended_mode == "ultra" else (),
-            component_count=2 if semantic.breadth == "multi_component" else 1,
-            reasons=semantic.complexity_reasons or (semantic.recommendation_reason,),
+            score=maximum_demand / 4.0,
+            hard_triggers=("high_model_authored_task_demand",) if maximum_demand >= 3 else (),
+            component_count=semantic.component_count,
+            reasons=semantic.task_demand.rationale,
             breadth=semantic.breadth,
             coordination=semantic.coordination,
         )
         route_reason = (
             "explicit Plan request" if requested is RunMode.PLAN else
-            "explicit Ultra request" if requested is RunMode.ULTRA else
-            semantic.recommendation_reason
+            "legacy explicit recursive request" if requested is RunMode.ULTRA else
+            "; ".join(semantic.task_demand.rationale)
         )
         brief = ExecutionBriefV1(
             original_input=original,

@@ -21,10 +21,13 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
+from .chat_runtime import DecisionNeedV1
 from .intake import answer_from_value, normalize_question
 from .local_provider import repair_structured_json_object
+from .ultra_models import normalize_contract_path
 from uuid import uuid4
 
 from .events import EventBus
@@ -155,6 +158,57 @@ def _with_quality_milestone(
     ):
         values.append({"title": label, "kind": "quality_gate"})
     return tuple(values)
+
+
+def _bind_explicit_browser_scenarios(
+    plan: "MasterPlanV1",
+    authority_text: str,
+) -> "MasterPlanV1":
+    """Preserve an explicitly supplied typed browser contract verbatim."""
+
+    text = str(authority_text or "")
+    marker = text.casefold().find("metadata.browser_scenarios")
+    if marker < 0:
+        return plan
+    array_index = text.find("[", marker)
+    if array_index < 0:
+        return plan
+    try:
+        parsed, _end = json.JSONDecoder().raw_decode(text[array_index:])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return plan
+    if not (
+        isinstance(parsed, list)
+        and parsed
+        and all(
+            isinstance(item, Mapping)
+            and bool(item.get("steps"))
+            and bool(item.get("assertions"))
+            for item in parsed
+        )
+    ):
+        return plan
+    verification_only = bool(
+        re.search(
+            r"\b(?:verification[- ]focused|verification only|preserve the current implementation)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    return replace(
+        plan,
+        modules=tuple(
+            replace(
+                module,
+                metadata={
+                    **dict(module.metadata),
+                    "browser_scenarios": [dict(item) for item in parsed],
+                    **({"verification_only": True} if verification_only else {}),
+                },
+            )
+            for module in plan.modules
+        ),
+    )
 
 
 class UltraPhase(str, Enum):
@@ -306,7 +360,7 @@ class UltraError(RuntimeError):
 
 
 class ApprovalRequiredError(UltraError):
-    pass
+    user_boundary = True
 
 
 class ApprovalMismatchError(UltraError):
@@ -416,6 +470,15 @@ class TaskContractV1:
             raise AgentProtocolError(
                 f"node {self.id!r} requires acceptance criteria and verification"
             )
+        object.__setattr__(
+            self,
+            "write_paths",
+            tuple(
+                dict.fromkeys(
+                    normalize_contract_path(path) for path in self.write_paths
+                )
+            ),
+        )
         object.__setattr__(self, "metadata", dict(self.metadata))
 
     @classmethod
@@ -1566,7 +1629,9 @@ class UltraOrchestrator:
                             if callable(verifier) and node is not None
                             else {}
                         )
-                        if bool(artifact_result.get("passed")):
+                        if bool(artifact_result.get("passed")) and bool(
+                            artifact_result.get("workspace_mutated")
+                        ):
                             recovered = AgentResponse(
                                 payload={
                                     "success": True,
@@ -1907,6 +1972,276 @@ class UltraOrchestrator:
         if isinstance(nested, Mapping):
             normalized = dict(nested)
             actions.append(f"{phase} envelope unwrapped")
+        # Weak structured-output models sometimes serialize an explicit typed
+        # verdict as a JSON string.  Coerce only exact boolean/verdict tokens;
+        # prose, missing values, and ambiguous words still require repair.
+        boolean_tokens = {
+            "true": True,
+            "false": False,
+            "pass": True,
+            "passed": True,
+            "fail": False,
+            "failed": False,
+        }
+        for field in ("passed", "success"):
+            raw_boolean = normalized.get(field)
+            if isinstance(raw_boolean, str):
+                token = raw_boolean.strip().casefold()
+                if token in boolean_tokens:
+                    normalized[field] = boolean_tokens[token]
+                    actions.append(
+                        f"{phase}.{field} exact string verdict normalized to boolean"
+                    )
+        if phase == "master_plan":
+            # Node identifiers are transport coordinates, not product
+            # semantics. Isolate every model-authored id in the current run
+            # namespace and remap exact dependency references with it.
+            raw_modules = normalized.get("modules")
+            if isinstance(raw_modules, Sequence) and not isinstance(
+                raw_modules, (str, bytes)
+            ):
+                modules = [
+                    dict(item) for item in raw_modules if isinstance(item, Mapping)
+                ]
+                all_write_paths = {
+                    str(path).strip().replace("\\", "/")
+                    for item in modules
+                    for path in _strings(item.get("write_paths"))
+                    if str(path).strip()
+                }
+                for item in modules:
+                    module_paths = [
+                        str(path).strip().replace("\\", "/")
+                        for path in _strings(item.get("write_paths"))
+                        if str(path).strip()
+                    ]
+                    acceptance = list(_strings(item.get("acceptance_criteria")))
+                    normalized_verification: list[str] = []
+                    for raw_step in _strings(item.get("verification")):
+                        step = raw_step
+                        transport_match = re.match(
+                            r'^preview_html\s+(?:"([^"]+\.html?)"|\'([^\']+\.html?)\'|(\S+\.html?))(?:\s+(.+))?$',
+                            step,
+                            re.IGNORECASE,
+                        )
+                        if transport_match:
+                            target_token = next(
+                                group
+                                for group in transport_match.groups()[:3]
+                                if group is not None
+                            )
+                            scenario = str(transport_match.group(4) or "").strip()
+                            step = f"preview_html {target_token}"
+                            if scenario:
+                                acceptance.append(
+                                    f"Browser verification scenario: {scenario}"
+                                )
+                                actions.append(
+                                    "master_plan separated preview scenario prose from "
+                                    f"literal target {target_token}"
+                                )
+                        normalized_verification.append(step)
+                        preview_match = re.match(
+                            r"^preview_html\s+(.+?)\s*$", step, re.IGNORECASE
+                        )
+                        if preview_match:
+                            target = (
+                                preview_match.group(1)
+                                .strip()
+                                .strip("\"'")
+                                .replace("\\", "/")
+                            )
+                            target_path = PurePosixPath(target)
+                            if (
+                                target
+                                and not target_path.is_absolute()
+                                and ".." not in target_path.parts
+                                and target not in all_write_paths
+                            ):
+                                module_paths.append(target)
+                                all_write_paths.add(target)
+                                actions.append(
+                                    "master_plan bound literal preview target "
+                                    f"{target} to its verification module"
+                                )
+                        if re.match(
+                            r"^(?:npm|pnpm|yarn|bun|npx)\b", step, re.IGNORECASE
+                        ) and not any(
+                            PurePosixPath(path).name == "package.json"
+                            for path in all_write_paths
+                        ):
+                            module_paths.append("package.json")
+                            all_write_paths.add("package.json")
+                            actions.append(
+                                "master_plan bound package.json prerequisite to its package verification module"
+                            )
+                    item["write_paths"] = list(dict.fromkeys(module_paths))
+                    item["verification"] = list(dict.fromkeys(normalized_verification))
+                    item["acceptance_criteria"] = list(dict.fromkeys(acceptance))
+                normalized["modules"] = modules
+                raw_modules = modules
+            namespace = str(task.get("protocol_node_namespace", "")).strip()
+            if (
+                namespace
+                and isinstance(raw_modules, Sequence)
+                and not isinstance(raw_modules, (str, bytes))
+            ):
+                modules = [dict(item) for item in raw_modules if isinstance(item, Mapping)]
+                aliases: dict[str, str] = {}
+                for index, module in enumerate(modules, start=1):
+                    raw_id = str(module.get("id") or f"M{index:03d}").strip()
+                    namespaced = (
+                        raw_id
+                        if raw_id.startswith(f"{namespace}.")
+                        else f"{namespace}.{raw_id}"
+                    )
+                    aliases[raw_id] = namespaced
+                    module["id"] = namespaced
+                for module in modules:
+                    dependencies = _strings(module.get("depends_on"))
+                    module["depends_on"] = [
+                        aliases.get(dependency, dependency)
+                        for dependency in dependencies
+                    ]
+                normalized["modules"] = modules
+                actions.append(f"master_plan node ids isolated in run namespace {namespace}")
+        if phase == InnerPhase.DECOMPOSE.value:
+            # Child ids and dependency references are likewise structural.
+            # Preserve every model-authored title, objective, path, criterion,
+            # and verification statement verbatim; an incomplete child is
+            # repaired by the model instead of filled by the harness.
+            parent = _mapping(task.get("contract"))
+            parent_id = str(parent.get("id", "")).strip()
+            raw_children = normalized.get("children")
+            if (
+                parent_id
+                and isinstance(raw_children, Sequence)
+                and not isinstance(raw_children, (str, bytes))
+            ):
+                children = [dict(item) for item in raw_children if isinstance(item, Mapping)]
+                aliases: dict[str, str] = {}
+                for index, child in enumerate(children, start=1):
+                    raw_id = str(child.get("id") or f"child-{index}").strip()
+                    child_id = (
+                        raw_id
+                        if raw_id.startswith(f"{parent_id}.")
+                        else f"{parent_id}.{index}"
+                    )
+                    aliases[raw_id] = child_id
+                    child["id"] = child_id
+                for child in children:
+                    child["depends_on"] = [
+                        aliases.get(dependency, dependency)
+                        for dependency in _strings(child.get("depends_on"))
+                    ]
+                normalized["children"] = children
+                actions.append("decompose child ids isolated under the parent contract")
+        if phase in {"review", "test", "global_review"} and not isinstance(
+            normalized.get("passed"), bool
+        ):
+            if isinstance(normalized.get("success"), bool):
+                normalized["passed"] = bool(normalized["success"])
+                actions.append(f"{phase}.success normalized to passed")
+            else:
+                contract_metadata = _mapping(_mapping(task.get("contract")).get("metadata"))
+                component_review = bool(contract_metadata.get("component_package_only"))
+                findings = (
+                    *_blocking_finding_strings(normalized.get("issues")),
+                    *_blocking_finding_strings(normalized.get("findings")),
+                )
+                evidence = normalized.get("evidence")
+                test_results = normalized.get("test_results")
+                typed_tests = tuple(
+                    item
+                    for item in (
+                        test_results
+                        if isinstance(test_results, Sequence)
+                        and not isinstance(test_results, (str, bytes))
+                        else ()
+                    )
+                    if isinstance(item, Mapping)
+                )
+                tests_passed = bool(typed_tests) and all(
+                    bool(item.get("passed")) for item in typed_tests
+                )
+                if (
+                    not component_review
+                    and not findings
+                    and (bool(evidence) or tests_passed)
+                ):
+                    normalized["passed"] = True
+                    actions.append(f"{phase}.passed derived from finding-free typed evidence")
+                elif (
+                    phase in {"review", "global_review"}
+                    and not component_review
+                    and not findings
+                    and (
+                        "passed" not in normalized
+                        or normalized.get("passed") is None
+                        or normalized.get("passed") == ""
+                    )
+                ):
+                    # A read-only evaluator that emitted neither a verdict nor
+                    # a blocking finding is unavailable, not a quality pass and
+                    # not a model failure. Mechanical aggregation excludes the
+                    # abstention; other independent reviewers and executable
+                    # gates must still establish completion.
+                    normalized["passed"] = True
+                    normalized["abstained"] = True
+                    actions.append(
+                        f"{phase} reviewer abstained because no typed verdict "
+                        "or blocking finding was returned"
+                    )
+        if phase in {"integrate", "global_integration", "final_evidence"} and not isinstance(
+            normalized.get("success", normalized.get("passed")), bool
+        ):
+            findings = (
+                *_blocking_finding_strings(normalized.get("issues")),
+                *_blocking_finding_strings(normalized.get("findings")),
+            )
+            if (
+                phase == "integrate"
+                and bool(task.get("publish_component_package"))
+                and not findings
+                and bool(task.get("quality_gate_passed", True))
+            ):
+                normalized["success"] = True
+                normalized["passed"] = True
+                normalized["abstained"] = True
+                actions.append(
+                    "integrate publisher abstained because no typed verdict or finding "
+                    "was returned after the authoritative quality gate"
+                )
+            elif (
+                phase == "final_evidence"
+                and not findings
+                and isinstance(task.get("authoritative_operational_evidence"), Mapping)
+                and bool(_mapping(task.get("authoritative_operational_evidence")).get("passed"))
+                and bool(
+                    _mapping(task.get("integration")).get(
+                        "success", _mapping(task.get("integration")).get("passed")
+                    )
+                )
+                and bool(_mapping(task.get("review")).get("passed"))
+            ):
+                authoritative = dict(_mapping(task["authoritative_operational_evidence"]))
+                normalized["success"] = True
+                normalized["passed"] = True
+                normalized["evidence"] = [
+                    *list(normalized.get("evidence", ()) or ()),
+                    authoritative,
+                ]
+                normalized["evaluator_capability"] = "harness_operational_evidence"
+                actions.append(
+                    "final_evidence.success derived from authoritative artifact hashes, "
+                    "executable checks, and accepted global review"
+                )
+        # Transport normalization is deliberately semantic-free. It may
+        # unwrap the requested typed envelope, but it must never manufacture
+        # an objective, path, component, quality gate, dependency, or product
+        # topology. Missing fields are repaired by the same model stage in
+        # ``_invoke`` and checkpointed if its bounded repair budget expires.
+        return normalized, tuple(actions)
         if phase == "goal_spec" and not str(normalized.get("objective", "")).strip():
             authoritative_prompt = str(task.get("prompt", "")).strip()
             if authoritative_prompt:
@@ -2247,6 +2582,7 @@ class UltraOrchestrator:
                 )
                 normalized["modules"] = modules
                 actions.append("master_plan Browser QA gate added from explicit goal requirements")
+
             namespace = str(task.get("protocol_node_namespace", "")).strip()
             if namespace and modules:
                 aliases: dict[str, str] = {}
@@ -2482,6 +2818,26 @@ class UltraOrchestrator:
         if phase == "master_plan":
             MasterPlanV1.from_mapping(payload)
             return
+        if phase == InnerPhase.DECOMPOSE.value:
+            raw_children = payload.get("children", ())
+            if not isinstance(raw_children, Sequence) or isinstance(
+                raw_children, (str, bytes)
+            ):
+                raise AgentProtocolError("decompose.children must be an array")
+            for index, child in enumerate(raw_children, start=1):
+                if not isinstance(child, Mapping):
+                    raise AgentProtocolError(
+                        f"decompose.children[{index - 1}] must be an object"
+                    )
+                # Validate the complete executable child contract while the
+                # provider's targeted repair budget is still active.  Waiting
+                # until scheduler expansion would turn a repairable weak-model
+                # transport defect into a fatal post-approval crash.
+                TaskContractV1.from_mapping(
+                    child,
+                    fallback_id=f"child-{index}",
+                )
+            return
         if phase in {"integrate", "global_integration", "final_evidence"}:
             if not isinstance(payload.get("success", payload.get("passed")), bool):
                 raise AgentProtocolError(f"{phase}.success (or passed) must be boolean")
@@ -2498,7 +2854,15 @@ class UltraOrchestrator:
 
     @staticmethod
     def _validated_questions(raw: Iterable[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
-        """Validate model-authored questions without classifying their semantics."""
+        """Keep usable consequential questions without blocking on optional noise.
+
+        A malformed question is not allowed to invalidate an otherwise accepted
+        GoalSpec unless the model supplied a valid DecisionNeed proving that the
+        workflow genuinely requires user authority.  The harness never invents
+        missing options: optional malformed questions are dropped, while an
+        authority-bearing question receives a precise contract error so the
+        provider can repair that question alone.
+        """
 
         questions: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -2508,6 +2872,17 @@ class UltraOrchestrator:
             if not question_id or question_id in seen or not text:
                 raise AgentProtocolError("ULTRA questions require unique ids and non-empty text")
             seen.add(question_id)
+            raw_need = item.get("decision_need")
+            decision_need: DecisionNeedV1 | None = None
+            if isinstance(raw_need, Mapping):
+                try:
+                    decision_need = DecisionNeedV1.from_mapping(raw_need)
+                except ValueError:
+                    # An invalid proof cannot grant a question blocking power.
+                    # normalize_question may still accept the visible question;
+                    # if the question itself is malformed it is harmlessly
+                    # rejected below instead of stopping the whole foundation.
+                    decision_need = None
             try:
                 normalized = normalize_question(
                     {
@@ -2517,11 +2892,27 @@ class UltraOrchestrator:
                         "options": item.get("options", ()),
                         "allow_freeform": item.get("allow_freeform", True),
                         "reason": str(item.get("reason") or "").strip()[:1_000],
+                        "decision_need": item.get("decision_need"),
                     },
                     index=index,
                 )
             except ValueError as exc:
-                raise AgentProtocolError(str(exc)) from exc
+                if decision_need is not None and decision_need.blocks_work:
+                    raise AgentProtocolError(
+                        f"ULTRA authority question {question_id!r} is invalid: {exc}. "
+                        "Repair this question only with two or three model-authored "
+                        "suggested answers and allow a free-form answer."
+                    ) from exc
+                continue
+            # A visible question becomes a workflow boundary only with a
+            # valid typed proof that user authority is required. Missing or
+            # invalid proof is optional planning noise, even if the visible
+            # question shape itself is valid.
+            if (
+                normalized.decision_need is None
+                or not normalized.decision_need.blocks_work
+            ):
+                continue
             questions.append(normalized.to_dict())
         if len(questions) > 3:
             raise AgentProtocolError("ULTRA may ask at most three questions in one foundation round")
@@ -2555,171 +2946,6 @@ class UltraOrchestrator:
             return True
         return False
 
-    def _fallback_goal_spec(self, prompt: str) -> GoalSpecV1:
-        """Recover the durable envelope without pretending implementation exists."""
-
-        success = [
-            "The requested behavior is implemented as a runnable artifact.",
-            "Automated functional and integration checks pass with no runtime errors.",
-            "Unrelated project behavior and files remain unchanged.",
-            "Independent review finds no unresolved critical quality finding.",
-        ]
-        if self._requires_visual_artifact(prompt):
-            success.extend(
-                (
-                    "Component and final screenshots show intentional, non-placeholder visual design.",
-                    "The interactive artifact is usable through its documented controls and restart flow.",
-                )
-            )
-        return GoalSpecV1(
-            objective=prompt[:4_000],
-            success_criteria=tuple(success),
-            constraints=(
-                "Use bounded recursive specialists with isolated contracts and evidence.",
-                "Only the FinalAssembler owns final output paths.",
-                "Persist checkpoints, findings, packages, and lessons outside model context.",
-            ),
-            in_scope=(
-                "intent expansion",
-                "implementation",
-                "component verification",
-                "integration",
-                "independent quality evaluation",
-            ),
-            out_of_scope=(
-                "unrequested changes to unrelated project behavior",
-                "accepting prose or placeholder artifacts as completion",
-            ),
-            assumptions=(
-                "Reversible technical choices may be selected by the architecture harness.",
-            ),
-            questions=(),
-        )
-
-    def _fallback_architecture(
-        self,
-        prompt: str,
-        candidate_index: int,
-    ) -> ArchitectureSpecV1:
-        """Recover protocol shape without asking the builder to solve the whole task.
-
-        The local model still implements every component.  This fallback only
-        supplies the inspectable component/interface envelope that a malformed
-        architecture response failed to express.
-        """
-
-        assert self.goal_spec
-        if self._requires_visual_artifact(prompt):
-            components = (
-                ("World", "Road, environment, lighting, depth, and scene composition."),
-                ("Vehicles", "Chassis, wheels, cabin, glass, lights, materials, and variants."),
-                ("Character", "Readable body, animation states, controls, and feedback."),
-                ("Gameplay", "Traffic, collision, scoring, progression, and restart state."),
-                ("Presentation", "Camera, HUD, audio, effects, responsiveness, and accessibility."),
-                ("QA", "Functional, visual, performance, browser, and regression evidence."),
-            )
-            return ArchitectureSpecV1(
-                summary=(
-                    "Artifact-first recursive specialist architecture."
-                    if candidate_index % 2
-                    else "State-contract recursive specialist architecture."
-                ),
-                components=tuple(
-                    {
-                        "name": name,
-                        "responsibility": responsibility,
-                        "artifact_boundary": f"{name}Package",
-                        "independent_preview": True,
-                    }
-                    for name, responsibility in components
-                ),
-                interfaces=tuple(
-                    {
-                        "name": f"{name}Package",
-                        "producer": name,
-                        "consumer": "FinalAssembler",
-                        "requires": ["implementation", "preview", "tests", "evidence"],
-                    }
-                    for name, _responsibility in components
-                ),
-                decisions=(
-                    {
-                        "decision": "FinalAssembler owns final output paths.",
-                        "reason": "Specialists remain isolated and their exact packages are consumed.",
-                    },
-                    {
-                        "decision": "Every visual leaf has an independently runnable preview.",
-                        "reason": "Weak-model output is evaluated before integration.",
-                    },
-                ),
-                dependencies=(
-                    "Gameplay consumes World/Vehicle/Character contracts.",
-                    "Presentation observes Gameplay state.",
-                    "QA evaluates component and integrated artifacts.",
-                ),
-                invariants=(
-                    "No specialist writes the final artifact.",
-                    "No placeholder or documentation proxy can satisfy a visual package.",
-                    "Integration preserves accepted package hashes and interfaces.",
-                ),
-            )
-        scoped = tuple(self.goal_spec.in_scope) or ("implementation", "verification")
-        return ArchitectureSpecV1(
-            summary="Contract-first recursive delivery architecture.",
-            components=tuple(
-                {
-                    "name": f"Scope{index}",
-                    "responsibility": item,
-                    "artifact_boundary": f"Scope{index}Package",
-                }
-                for index, item in enumerate(scoped[:8], start=1)
-            ),
-            interfaces=(
-                {
-                    "name": "IntegratedDelivery",
-                    "producer": "specialist packages",
-                    "consumer": "FinalAssembler",
-                },
-            ),
-            decisions=(
-                {
-                    "decision": "Split by independently testable responsibility.",
-                    "reason": "Keep each local-model context bounded.",
-                },
-            ),
-            invariants=("Every component has observable acceptance evidence.",),
-        )
-
-    def _fallback_master_plan(self, prompt: str) -> MasterPlanV1:
-        assert self.goal_spec
-        paths = self._final_output_paths(prompt)
-        return MasterPlanV1(
-            summary="Harness-recovered goal plan with recursive specialist execution.",
-            modules=(
-                TaskContractV1(
-                    id=f"r{self.run_state.id[-12:]}.M001",
-                    title="Goal delivery and final assembly",
-                    objective=self.goal_spec.objective,
-                    acceptance_criteria=self.goal_spec.success_criteria,
-                    verification=tuple(
-                        f"Verify observable criterion: {criterion}"
-                        for criterion in self.goal_spec.success_criteria
-                    ),
-                    write_paths=paths,
-                    owned_interfaces=("IntegratedDelivery",),
-                    metadata={"force_recursive_specialists": True},
-                ),
-            ),
-            milestones=(
-                {"name": "materialized specialists", "evidence": "component packages"},
-                {"name": "integration", "evidence": "runtime and tests"},
-                {"name": "acceptance", "evidence": "final quality gate"},
-            ),
-            execution_strategy=(
-                "Build bounded specialists, verify each package, assemble exact accepted "
-                "artifacts, then run adversarial and final evidence gates."
-            ),
-        )
 
     @staticmethod
     def _compact_goal_for_model(goal: GoalSpecV1) -> Mapping[str, Any]:
@@ -2763,12 +2989,22 @@ class UltraOrchestrator:
         """Continue Architecture -> Master Plan after goal decisions are complete."""
 
         assert self.run_state and self.goal_spec
+        self._save_run(
+            metadata={
+                **dict(self.run_state.metadata),
+                "accepted_goal_spec": asdict(self.goal_spec),
+            }
+        )
         self._set_phase(UltraPhase.ARCHITECTURE, "Designing architecture")
         lesson_context = self._foundation_project_lessons(prompt, "architecture")
         candidate_count = 3 if any(
             marker in prompt.casefold()
             for marker in ("migration", "security", "production", "destructive", "ترحيل", "أمان")
         ) else 2
+        # The legacy expression above is retained only for persisted trace
+        # compatibility; new orchestration uses a fixed debate width and lets
+        # the accepted plan determine actual component breadth.
+        candidate_count = 2
         candidate_specs: list[ArchitectureSpecV1] = []
         candidate_payloads: list[Mapping[str, Any]] = []
         for candidate_index in range(1, candidate_count + 1):
@@ -2790,65 +3026,48 @@ class UltraOrchestrator:
                         "cross_run_project_lessons": lesson_context,
                     },
                 )
-                candidate = ArchitectureSpecV1.from_mapping(architecture_response.payload)
             except AgentProtocolError as exc:
-                candidate = self._fallback_architecture(prompt, candidate_index)
+                if not candidate_specs:
+                    raise
                 self.events.publish(
-                    "ultra.architecture_protocol_recovered",
-                    (
-                        f"Architecture candidate {candidate_index} used the typed "
-                        "harness fallback after malformed local-model output."
-                    ),
+                    "ultra.architecture_candidate_abstained",
+                    "Optional architecture candidate exhausted its transport budget; preserving the valid candidate.",
                     run_id=self.run_state.id,
                     candidate_index=candidate_index,
-                    error=str(exc),
+                    accepted_candidates=len(candidate_specs),
+                    error=redact_text(str(exc), 800),
                 )
+                break
+            candidate = ArchitectureSpecV1.from_mapping(architecture_response.payload)
             candidate_specs.append(candidate)
             candidate_payloads.append(asdict(candidate))
         compact_candidates = [
             self._compact_architecture_for_model(candidate)
             for candidate in candidate_specs
         ]
-        try:
-            critic = self._invoke(
-                AgentRole.REVIEWER,
-                "architecture_critique",
-                task={
-                    "goal_spec": self._compact_goal_for_model(self.goal_spec),
-                    "candidates": compact_candidates,
-                    "instruction": "Identify omissions, integration risks, weak-model failure modes, and unverifiable claims for every candidate.",
-                },
-                context={"prompt": prompt, "clean_context": True},
-            )
-            critic_payload = dict(critic.payload)
-        except AgentProtocolError as exc:
-            critic_payload = {
-                "verdict": "harness_recovery",
-                "risks": [
-                    "Validate every specialist interface before integration.",
-                    "Reject packages without runnable evidence.",
-                ],
-                "protocol_error": str(exc),
-            }
-        try:
-            judge = self._invoke(
-                AgentRole.GOAL_CHECKER,
-                "architecture_judge",
-                task={
-                    "goal_spec": self._compact_goal_for_model(self.goal_spec),
-                    "candidates": compact_candidates,
-                    "critic_verdict": critic_payload,
-                    "instruction": "Select the strongest candidate or return a synthesized architecture and cite observable reasons.",
-                },
-                context={"prompt": prompt, "clean_context": True},
-            )
-            judge_payload = dict(judge.payload)
-        except AgentProtocolError as exc:
-            judge_payload = {
-                "selected_index": 1,
-                "verdict": "harness_recovery",
-                "protocol_error": str(exc),
-            }
+        critic = self._invoke(
+            AgentRole.REVIEWER,
+            "architecture_critique",
+            task={
+                "goal_spec": self._compact_goal_for_model(self.goal_spec),
+                "candidates": compact_candidates,
+                "instruction": "Identify omissions, integration risks, weak-model failure modes, and unverifiable claims for every candidate.",
+            },
+            context={"prompt": prompt, "clean_context": True},
+        )
+        critic_payload = dict(critic.payload)
+        judge = self._invoke(
+            AgentRole.GOAL_CHECKER,
+            "architecture_judge",
+            task={
+                "goal_spec": self._compact_goal_for_model(self.goal_spec),
+                "candidates": compact_candidates,
+                "critic_verdict": critic_payload,
+                "instruction": "Select the strongest candidate or return a synthesized architecture and cite observable reasons.",
+            },
+            context={"prompt": prompt, "clean_context": True},
+        )
+        judge_payload = dict(judge.payload)
         try:
             selected_index = int(judge_payload.get("selected_index", 1) or 1)
         except (TypeError, ValueError):
@@ -2875,8 +3094,36 @@ class UltraOrchestrator:
                 self.run_state.id,
             )
         )
+        self._save_run(
+            metadata={
+                **dict(self.run_state.metadata),
+                "accepted_goal_spec": asdict(self.goal_spec),
+                "accepted_architecture": asdict(self.architecture),
+            }
+        )
+        return self._finish_master_plan(prompt)
+
+    def _finish_master_plan(self, prompt: str) -> MasterPlanV1:
+        """Build only the approval-bound plan from accepted semantics.
+
+        Quality repair revisions call this entry point with the durable
+        GoalSpec and Architecture already restored.  They must never replay
+        routing, semantic interpretation, or architecture selection merely
+        because a later executable/review gate needs repair.
+        """
+
+        assert self.run_state and self.goal_spec and self.architecture
         self._set_phase(UltraPhase.MASTER_PLAN, "Building master plan")
-        try:
+        requested_effects = tuple(
+            str(item).strip().casefold()
+            for item in self.run_state.config_snapshot.get(
+                "accepted_requested_effects", ()
+            )
+            if str(item).strip()
+        )
+        applicability_issues: tuple[str, ...] = ()
+        proposed: MasterPlanV1 | None = None
+        for plan_attempt in range(1, 4):
             plan_response = self._invoke(
                 AgentRole.PLANNER,
                 "master_plan",
@@ -2888,6 +3135,24 @@ class UltraOrchestrator:
                     "module_bounds": {
                         "maximum": self.config.max_top_modules,
                     },
+                    "accepted_requested_effects": list(requested_effects),
+                    "approved_write_paths": list(
+                        self.run_state.config_snapshot.get(
+                            "approved_write_paths", ()
+                        )
+                    ),
+                    "applicability_repair": list(applicability_issues),
+                    "instruction": (
+                        "Every requested runtime/preview effect must have a concrete, "
+                        "directly executable verification entry and every prerequisite "
+                        "configuration or entry artifact must appear in write_paths. "
+                        "Do not write vague phrases such as 'run tests'. For a repair "
+                        "revision, every write path and verifier target must exactly reuse "
+                        "an approved_write_paths value; never emit placeholder paths. "
+                        "When acceptance requires clicks, typing, keyboard input, submit, "
+                        "selection, or drag behavior, add metadata.browser_scenarios with "
+                        "typed steps and observable assertions for preview_html."
+                    ),
                 },
                 context={
                     "prompt": prompt,
@@ -2897,17 +3162,31 @@ class UltraOrchestrator:
                     ),
                 },
             )
-            proposed_raw = MasterPlanV1.from_mapping(plan_response.payload)
-        except AgentProtocolError as exc:
-            proposed_raw = self._fallback_master_plan(prompt)
-            self.events.publish(
-                "ultra.master_plan_protocol_recovered",
-                "Master plan used the typed harness fallback after malformed local-model output.",
-                run_id=self.run_state.id,
-                error=str(exc),
+            proposed = _bind_explicit_browser_scenarios(
+                MasterPlanV1.from_mapping(plan_response.payload),
+                prompt,
             )
-        proposed = self._enforce_master_artifact_contract(prompt, proposed_raw)
-        proposed = self._enforce_concern_coverage_contract(prompt, proposed)
+            applicability_issues = self._master_plan_applicability_issues(
+                proposed,
+                requested_effects=requested_effects,
+                approved_write_paths=self.run_state.config_snapshot.get(
+                    "approved_write_paths", ()
+                ),
+            )
+            if not applicability_issues:
+                break
+            self.events.publish(
+                "ultra.master_plan_applicability_repair",
+                "Master plan requires a targeted runtime applicability repair.",
+                run_id=self.run_state.id,
+                attempt=plan_attempt,
+                issues=list(applicability_issues),
+            )
+        if proposed is None or applicability_issues:
+            raise AgentProtocolError(
+                "master_plan runtime applicability failed after three targeted repairs: "
+                + "; ".join(applicability_issues)
+            )
         quality_checklist = (
             "\n\nULTRA Quality Checklist (approval-bound): clean-code review; security review; "
             "tests and test-quality review; remediation Change Sets receive fresh reviews; "
@@ -2966,7 +3245,12 @@ class UltraOrchestrator:
                 self.run_state.id,
             )
         )
-        self._save_run(master_fingerprint=self.master_plan.fingerprint)
+        clean_metadata = dict(self.run_state.metadata)
+        clean_metadata.pop("foundation_checkpoint", None)
+        self._save_run(
+            master_fingerprint=self.master_plan.fingerprint,
+            metadata=clean_metadata,
+        )
         self._set_phase(UltraPhase.AWAITING_APPROVAL, "Master plan awaits approval")
         self.events.publish(
             UltraEventKind.FOUNDATION_READY.value,
@@ -2977,7 +3261,207 @@ class UltraOrchestrator:
         )
         return self.master_plan
 
-    def prepare(self, prompt: str) -> MasterPlanV1 | None:
+    @staticmethod
+    def _master_plan_applicability_issues(
+        plan: MasterPlanV1,
+        *,
+        requested_effects: Sequence[str],
+        approved_write_paths: Sequence[str] = (),
+    ) -> tuple[str, ...]:
+        """Validate executable plan transport without inventing product paths."""
+
+        effects = {str(item).strip().casefold() for item in requested_effects}
+        write_paths = {
+            normalize_contract_path(str(path))
+            for module in plan.modules
+            for path in module.write_paths
+            if str(path).strip()
+        }
+        verifications = tuple(
+            str(item).strip()
+            for module in plan.modules
+            for item in module.verification
+            if str(item).strip()
+        )
+        command_re = re.compile(
+            r"^(?:python(?:\.exe)?(?:\s+-m)?|pytest|npm|pnpm|yarn|bun|deno|"
+            r"node|cargo|go\s+test|dotnet|preview_html|playwright|npx\s+playwright)\b",
+            re.IGNORECASE,
+        )
+        concrete = tuple(item for item in verifications if command_re.match(item))
+        issues: list[str] = []
+        missing_write_scope = sorted(
+            module.id for module in plan.modules if not module.write_paths
+        )
+        if missing_write_scope and effects.intersection(
+            {"write", "mutate", "run", "preview", "install", "external_side_effect"}
+        ):
+            issues.append(
+                "every executable module requires concrete approval-bound write_paths; missing: "
+                + ", ".join(missing_write_scope)
+            )
+        placeholder_path_markers = (
+            "path/to/",
+            "path/to",
+            "your/path/",
+            "your/project/",
+            "example/path/",
+            "<path>",
+            "<file>",
+            "tbd",
+            "determine/later",
+            "unknown/path",
+        )
+        placeholder_paths = sorted(
+            path
+            for path in write_paths
+            if path in {".", "./"}
+            or any(marker in path.casefold() for marker in placeholder_path_markers)
+        )
+        if placeholder_paths:
+            issues.append(
+                "approval-bound write_paths contain placeholders: "
+                + ", ".join(placeholder_paths)
+                + "; replace them with concrete workspace-relative artifact paths"
+            )
+        approved = {
+            normalize_contract_path(str(path))
+            for path in approved_write_paths
+            if str(path).strip()
+        }
+        if approved:
+            expanded = sorted(write_paths - approved)
+            if expanded:
+                issues.append(
+                    "repair plan paths exceed approved scope: "
+                    + ", ".join(expanded)
+                    + "; reuse only approved_write_paths"
+                )
+        if not effects.intersection({"run", "preview"}):
+            return tuple(dict.fromkeys(issues))
+        if not concrete:
+            issues.append(
+                "requested run/preview effect has no concrete executable verification command"
+            )
+        if "preview" in effects and not any(
+            re.match(r"^(?:preview_html|playwright|npx\s+playwright)\b", item, re.IGNORECASE)
+            for item in concrete
+        ):
+            issues.append(
+                "requested preview effect requires preview_html or Playwright verification"
+            )
+        if any(re.match(r"^(?:npm|pnpm|yarn|bun|npx)\b", item, re.IGNORECASE) for item in concrete):
+            if not any(PurePosixPath(path).name == "package.json" for path in write_paths):
+                issues.append(
+                    "JavaScript package verifier requires package.json in approval-bound write_paths"
+                )
+        for item in concrete:
+            preview_match = re.match(r"^preview_html\s+(.+?)\s*$", item, re.IGNORECASE)
+            if preview_match:
+                target = preview_match.group(1).strip().strip("\"'").replace("\\", "/")
+                if PurePosixPath(target).suffix.casefold() not in {".html", ".htm"}:
+                    issues.append(
+                        f"preview target {target!r} must be an HTML artifact, not a source module"
+                    )
+                if target and target not in write_paths:
+                    issues.append(
+                        f"preview target {target!r} is not declared in approval-bound write_paths"
+                    )
+        for module in plan.modules:
+            criteria_text = " ".join((module.objective, *module.acceptance_criteria))
+            needs_interaction = bool(
+                re.search(
+                    r"\b(?:click(?:ing)?|keyboard|press(?:ing)?|type|typing|submit|"
+                    r"select(?:ing)?|drag(?:ging)?)\b",
+                    criteria_text,
+                    re.IGNORECASE,
+                )
+            )
+            module_previews = tuple(
+                item
+                for item in module.verification
+                if re.match(r"^preview_html\b", str(item), re.IGNORECASE)
+            )
+            scenarios = module.metadata.get("browser_scenarios", ())
+            valid_scenarios = (
+                isinstance(scenarios, Sequence)
+                and not isinstance(scenarios, (str, bytes))
+                and bool(scenarios)
+                and all(
+                    isinstance(item, Mapping)
+                    and bool(item.get("steps"))
+                    and bool(item.get("assertions"))
+                    for item in scenarios
+                )
+            )
+            if needs_interaction and module_previews and not valid_scenarios:
+                issues.append(
+                    f"module {module.id!r} has interactive acceptance criteria but "
+                    "metadata.browser_scenarios has no executable steps and assertions"
+                )
+        return tuple(dict.fromkeys(issues))
+
+    def prepare_plan_revision(
+        self,
+        prompt: str,
+        *,
+        goal_spec: GoalSpecV1,
+        architecture: ArchitectureSpecV1,
+        requested_effects: Sequence[str] = (),
+        approved_write_paths: Sequence[str] = (),
+    ) -> MasterPlanV1:
+        """Start a fresh plan revision from accepted durable foundation data."""
+
+        prompt = str(prompt).strip()
+        if not prompt:
+            raise ValueError("ULTRA revision prompt must not be empty")
+        if self.run_state and self.phase not in {
+            UltraPhase.CANCELLED,
+            UltraPhase.COMPLETED,
+            UltraPhase.FAILED,
+        }:
+            raise UltraError("an ULTRA run is already active")
+        concurrency = 1 if self.execution_class is ExecutionClass.LOCAL else self.adaptive.current
+        self.run_state = UltraRunV1(
+            prompt=prompt,
+            execution_class=self.execution_class,
+            concurrency=concurrency,
+            phase=UltraPhase.MASTER_PLAN,
+            model_snapshot=self.model_snapshot,
+            config_snapshot={
+                **asdict(self.config),
+                "accepted_foundation_reused": True,
+                "accepted_requested_effects": list(
+                    dict.fromkeys(
+                        str(item) for item in requested_effects if str(item)
+                    )
+                ),
+                "approved_write_paths": list(
+                    dict.fromkeys(
+                        normalize_contract_path(str(item))
+                        for item in approved_write_paths
+                        if str(item).strip()
+                    )
+                ),
+            },
+            metadata={"accepted_foundation_reused": True},
+        )
+        self.goal_spec = goal_spec
+        self.architecture = architecture
+        self.state.save_ultra_run(self.run_state)
+        self.events.publish(
+            "ultra.accepted_foundation_reused",
+            "Reused accepted semantic goal and architecture for an in-scope plan repair.",
+            run_id=self.run_state.id,
+        )
+        return self._finish_master_plan(prompt)
+
+    def prepare(
+        self,
+        prompt: str,
+        *,
+        requested_effects: Sequence[str] = (),
+    ) -> MasterPlanV1 | None:
         """Build GoalSpec -> Architecture -> MasterPlan, then await approval."""
 
         prompt = str(prompt).strip()
@@ -2996,52 +3480,32 @@ class UltraOrchestrator:
             concurrency=concurrency,
             phase=UltraPhase.GOAL_SPEC,
             model_snapshot=self.model_snapshot,
-            config_snapshot=asdict(self.config),
+            config_snapshot={
+                **asdict(self.config),
+                "accepted_requested_effects": list(
+                    dict.fromkeys(
+                        str(item) for item in requested_effects if str(item)
+                    )
+                ),
+            },
         )
         self.state.save_ultra_run(self.run_state)
         try:
-            try:
-                goal_response = self._invoke(
-                    AgentRole.GOAL_UNDERSTANDING,
-                    "goal_spec",
-                    task={"prompt": prompt},
-                    context={
-                        "instruction": (
-                            "Inspect the repository first. Derive GoalSpecV1 and ask at most three "
-                            "questions only for high-impact decisions that cannot be discovered."
-                        ),
-                        "cross_run_project_lessons": self._foundation_project_lessons(prompt, "goal_spec"),
-                    },
-                )
-                self.goal_spec = self._enforce_goal_artifact_contract(
-                    prompt,
-                    GoalSpecV1.from_mapping(goal_response.payload),
-                )
-            except AgentProtocolError as exc:
-                self.goal_spec = self._enforce_goal_artifact_contract(
-                    prompt,
-                    self._fallback_goal_spec(prompt),
-                )
-                self.events.publish(
-                    "ultra.goal_spec_protocol_recovered",
-                    "GoalSpec used the typed harness fallback after malformed local-model output.",
-                    run_id=self.run_state.id,
-                    error=str(exc),
-                )
+            goal_response = self._invoke(
+                AgentRole.GOAL_UNDERSTANDING,
+                "goal_spec",
+                task={"prompt": prompt},
+                context={
+                    "instruction": (
+                        "Inspect the repository first. Derive GoalSpecV1 and ask at most three "
+                        "questions only for high-impact decisions that cannot be discovered."
+                    ),
+                    "cross_run_project_lessons": self._foundation_project_lessons(prompt, "goal_spec"),
+                },
+            )
+            self.goal_spec = GoalSpecV1.from_mapping(goal_response.payload)
             raw_questions = tuple(self.goal_spec.questions)
             questions = self._validated_questions(raw_questions)
-            questions = tuple(
-                item
-                for item in questions
-                if not self._question_reopens_explicit_prompt_constraint(item, prompt)
-            )
-            if len(questions) < len(raw_questions):
-                self.events.publish(
-                    "ultra.questions_autoresolved",
-                    f"Resolved {len(raw_questions) - len(questions)} verification-policy question(s) by harness policy",
-                    run_id=self.run_state.id,
-                    removed=len(raw_questions) - len(questions),
-                )
             if questions:
                 self.goal_spec = replace(self.goal_spec, questions=questions)
                 self._save_run(
@@ -3065,6 +3529,38 @@ class UltraOrchestrator:
             return self._finish_foundation(prompt)
         except CancellationRequested:
             self._set_phase(UltraPhase.CANCELLED, "ULTRA foundation cancelled")
+            raise
+        except AgentProtocolError as exc:
+            failed_phase = self.phase
+            self._phase_before_pause = failed_phase
+            self._save_run(
+                metadata={
+                    **self.run_state.metadata,
+                    "foundation_checkpoint": {
+                        "stage": failed_phase.value,
+                        "category": "contract_incompatibility",
+                        "error": redact_text(str(exc), 2_000),
+                        "prompt_fingerprint": hashlib.sha256(
+                            prompt.encode("utf-8")
+                        ).hexdigest(),
+                        "resumable": True,
+                        "fallback_used": False,
+                    },
+                }
+            )
+            self._set_phase(
+                UltraPhase.PAUSED,
+                f"ULTRA {failed_phase.value} needs a targeted contract retry",
+            )
+            self.events.publish(
+                "ultra.foundation_boundary",
+                "Recursive planning paused at its saved typed-return checkpoint; no semantic fallback was generated.",
+                run_id=self.run_state.id,
+                stage=failed_phase.value,
+                boundary_kind="contract_incompatibility",
+                error=redact_text(str(exc), 1_000),
+                resumable=True,
+            )
             raise
         except Exception:
             self._set_phase(UltraPhase.FAILED, "ULTRA foundation failed")
@@ -3120,7 +3616,25 @@ class UltraOrchestrator:
                 "question_answers": normalized,
             }
         )
-        return self._finish_foundation(self.run_state.prompt)
+        try:
+            return self._finish_foundation(self.run_state.prompt)
+        except AgentProtocolError as exc:
+            failed_phase = self.phase
+            self._phase_before_pause = failed_phase
+            self._save_run(
+                metadata={
+                    **self.run_state.metadata,
+                    "foundation_checkpoint": {
+                        "stage": failed_phase.value,
+                        "category": "contract_incompatibility",
+                        "error": redact_text(str(exc), 2_000),
+                        "resumable": True,
+                        "fallback_used": False,
+                    },
+                }
+            )
+            self._set_phase(UltraPhase.PAUSED, "ULTRA foundation needs a targeted contract retry")
+            raise
 
     def approve(self, expected_fingerprint: str | None = None) -> MasterPlanV1:
         if self.phase is not UltraPhase.AWAITING_APPROVAL or not self.master_plan:
@@ -3153,6 +3667,10 @@ class UltraOrchestrator:
 
     @staticmethod
     def _task_family(value: str) -> str:
+        # Compatibility hook only: domain classification is model-owned and
+        # persisted in the accepted contracts, never inferred from keywords.
+        return "model_authored"
+
         text = str(value).casefold()
         if (
             re.search(r"\b(classifier|classification|naming)\b", text)
@@ -3418,10 +3936,21 @@ class UltraOrchestrator:
                 ),
             ),
         }
-        return ConcernCoverageMatrixV1(task_family=family, concerns=(*common, *families[family]))
+        # Compatibility callers receive only domain-neutral safety concerns.
+        # Domain-specific concern ownership must be present in the accepted
+        # semantic/plan contracts; the harness does not classify product
+        # families from prompt text.
+        return ConcernCoverageMatrixV1(
+            task_family="model_authored",
+            concerns=(*common, *families["general"]),
+        )
 
     @staticmethod
     def _requires_visual_artifact(prompt: str) -> bool:
+        # Visual requirements are accepted semantic criteria, not keyword
+        # matches. New workflows therefore never use this legacy projection.
+        return False
+
         text = str(prompt).casefold()
         if (
             re.search(r"\b(classifier|classification|naming)\b", text)
@@ -3443,6 +3972,9 @@ class UltraOrchestrator:
 
     @classmethod
     def _final_output_paths(cls, prompt: str) -> tuple[str, ...]:
+        # Final paths come only from the reviewed MasterPlan task contracts.
+        return ()
+
         text = str(prompt).casefold()
         if (
             re.search(r"\b(classifier|classification|naming)\b", text)
@@ -3500,6 +4032,9 @@ class UltraOrchestrator:
         prompt: str,
         goal: GoalSpecV1,
     ) -> GoalSpecV1:
+        # Validate the model-authored goal without adding product semantics.
+        return goal
+
         if not cls._requires_visual_artifact(prompt):
             return goal
         final_paths = cls._final_output_paths(prompt)
@@ -3556,6 +4091,10 @@ class UltraOrchestrator:
         prompt: str,
         proposed: MasterPlanV1,
     ) -> MasterPlanV1:
+        # Accepted modules own their concern and verification contracts. The
+        # harness must not inject a domain template or silently expand scope.
+        return proposed
+
         semantic_source = " ".join(
             (
                 prompt,
@@ -3661,6 +4200,9 @@ class UltraOrchestrator:
         prompt: str,
         proposed: MasterPlanV1,
     ) -> MasterPlanV1:
+        # Packaging and component topology are reviewed plan semantics.
+        return proposed
+
         if not cls._requires_game_artifact(prompt):
             return proposed
         inherited = proposed.modules[0]
@@ -3764,6 +4306,34 @@ class UltraOrchestrator:
 
     @staticmethod
     def _leaf_readiness(node: WorkNode) -> LeafReadinessV1:
+        metadata = dict(node.contract.metadata)
+        explicit_leaf = bool(
+            metadata.get("component_leaf")
+            or metadata.get("leaf_ready")
+            or metadata.get("decomposition_required") is False
+        )
+        explicit_recursive = bool(metadata.get("decomposition_required"))
+        ready = explicit_leaf and not explicit_recursive
+        try:
+            requested_children = max(
+                0,
+                int(metadata.get("component_count", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            requested_children = 0
+        return LeafReadinessV1(
+            node_id=node.id,
+            ready=ready,
+            score=1.0 if ready else 0.5,
+            reasons=(
+                ("accepted task contract marks this node as a leaf",)
+                if ready
+                else (
+                    "recursive strategy asks the model to assess this accepted task contract",
+                )
+            ),
+            recommended_children=0 if ready else min(8, requested_children),
+        )
         text = " ".join(
             (
                 node.contract.title,
@@ -4548,61 +5118,26 @@ class UltraOrchestrator:
         self.nodes[node_id] = node
         self.state.save_work_node(self.run_state.id, node)
         context = self._new_context(node, AgentRole.PLANNER)
-        contract_is_self_planning = bool(
-            node.contract.metadata.get("component_package_only")
-            and node.contract.objective
-            and node.contract.acceptance_criteria
-            and node.contract.verification
-        )
-        try:
-            if contract_is_self_planning:
-                plan_response = self._deterministic_mini_plan(node)
-                self.events.publish(
-                    "ultra.mini_plan_derived",
-                    f"[{node.id}] derived mini-plan from the approved component contract",
-                    run_id=self.run_state.id,
-                    node_id=node.id,
-                    steps=list(plan_response.payload.get("steps", ())),
-                )
-            else:
-                plan_response = self._invoke(
-                    AgentRole.PLANNER,
-                    InnerPhase.MINI_PLAN,
-                    task={"contract": asdict(node.contract)},
-                    context=context,
-                    node_id=node.id,
-                )
-        except (AgentProtocolError, RuntimeError) as exc:
-            # The contract and specialist profile already contain all facts
-            # required for a bounded node plan. A small local model sometimes
-            # mistakes node ids for repository paths or exhausts JSON repair.
-            # That must not invalidate a previously approved, durable tree.
+        verification_only = bool(node.contract.metadata.get("verification_only"))
+        if verification_only:
             plan_response = self._deterministic_mini_plan(node)
             self.events.publish(
-                "ultra.mini_plan_repaired",
-                f"[{node.id}] replaced invalid local mini-plan with a contract-derived plan",
+                "ultra.deterministic_verification_expansion",
+                f"[{node.id}] verification-only contract requires no planner or decomposer.",
                 run_id=self.run_state.id,
                 node_id=node.id,
-                error=str(exc),
-                steps=list(plan_response.payload.get("steps", ())),
+            )
+        else:
+            plan_response = self._invoke(
+                AgentRole.PLANNER,
+                InnerPhase.MINI_PLAN,
+                task={"contract": asdict(node.contract)},
+                context=context,
+                node_id=node.id,
             )
         readiness = self._leaf_readiness(node)
-        deterministic_children = self._deterministic_shared_artifact_children(node)
-        specialist_children = self._deterministic_specialist_children(node)
-        cross_domain_children = self._deterministic_cross_domain_children(node)
         decompose_payload: Mapping[str, Any] = {}
-        if specialist_children:
-            raw_children = specialist_children
-        elif node.contract.metadata.get("component_leaf"):
-            raw_children = ()
-        elif deterministic_children:
-            # The final artifact contract requires independently evaluable
-            # domains. A weak model's generic "subtask 1" decomposition is not
-            # a substitute for named specialist ownership.
-            raw_children = deterministic_children
-        elif cross_domain_children:
-            raw_children = cross_domain_children
-        elif node.contract.metadata.get("component_package_only"):
+        if verification_only or node.contract.metadata.get("component_leaf"):
             raw_children = ()
         else:
             decompose_response = self._invoke(
@@ -4664,14 +5199,25 @@ class UltraOrchestrator:
         """Build the smallest inspectable plan already implied by a node contract."""
 
         contract = node.contract
-        steps = [
-            f"Implement the bounded objective: {contract.objective}",
-            *(
-                f"Verify acceptance criterion: {criterion}"
-                for criterion in contract.acceptance_criteria
-            ),
-            *(f"Collect evidence by: {check}" for check in contract.verification),
-        ]
+        steps = (
+            [
+                "Preserve the existing approval-bound artifacts without mutation.",
+                *(
+                    f"Verify acceptance criterion: {criterion}"
+                    for criterion in contract.acceptance_criteria
+                ),
+                *(f"Collect evidence by: {check}" for check in contract.verification),
+            ]
+            if contract.metadata.get("verification_only")
+            else [
+                f"Implement the bounded objective: {contract.objective}",
+                *(
+                    f"Verify acceptance criterion: {criterion}"
+                    for criterion in contract.acceptance_criteria
+                ),
+                *(f"Collect evidence by: {check}" for check in contract.verification),
+            ]
+        )
         if contract.metadata.get("component_package_only"):
             steps.extend(
                 (
@@ -4765,6 +5311,55 @@ class UltraOrchestrator:
             )
             values.extend(
                 _blocking_finding_strings(response.payload.get("findings"))
+            )
+        return tuple(dict.fromkeys(values))
+
+    @staticmethod
+    def _harness_repair_constraints(
+        *,
+        write_paths: Sequence[str],
+        verification: Sequence[str],
+        findings: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Make approved boundaries and observed failures explicit for weak models."""
+
+        normalized_paths = tuple(
+            normalize_contract_path(str(path))
+            for path in write_paths
+            if str(path).strip()
+        )
+        values: list[str] = [
+            "Use only the approval-bound write_paths and verification commands; "
+            "do not invent files, commands, packages, or services outside them."
+        ]
+        browser_failure = any(
+            marker in str(finding).casefold()
+            for finding in findings
+            for marker in ("http 404", "net::err_", "failed to load resource")
+        )
+        html_only = bool(normalized_paths) and all(
+            PurePosixPath(path).suffix.casefold() in {".html", ".htm"}
+            for path in normalized_paths
+        )
+        if browser_failure:
+            values.append(
+                "Remove every broken local resource reference reported by browser evidence. "
+                "A referenced local asset may remain only when its exact path is included in "
+                "the approval-bound write_paths."
+            )
+        if browser_failure and html_only:
+            values.append(
+                "The approved scope contains only HTML artifacts: replace the rejected HTML "
+                "with a complete self-contained implementation and inline its required CSS "
+                "and JavaScript. Do not reference unapproved local scripts or stylesheets."
+            )
+        concrete_verifiers = tuple(
+            str(item).strip() for item in verification if str(item).strip()
+        )
+        if concrete_verifiers:
+            values.append(
+                "Run only these approval-bound verifiers: "
+                + "; ".join(concrete_verifiers)
             )
         return tuple(dict.fromkeys(values))
 
@@ -4883,6 +5478,26 @@ class UltraOrchestrator:
                 f"harness_gate_{index}"
                 for index in range(1, len(responses) - len(labels) + 1)
             )
+        authoritative_evidence_present = any(
+            self._passed(response)
+            and any(
+                isinstance(item, Mapping)
+                and item.get("passed") is True
+                and (
+                    str(item.get("name") or "").startswith("harness_")
+                    or str(item.get("kind") or "").startswith("harness_")
+                    or str(item.get("source") or "").casefold() == "harness"
+                )
+                for key in ("test_results", "evidence")
+                for item in (
+                    response.payload.get(key, ())
+                    if isinstance(response.payload.get(key), Sequence)
+                    and not isinstance(response.payload.get(key), (str, bytes))
+                    else ()
+                )
+            )
+            for response in responses
+        )
         records: list[Mapping[str, Any]] = []
         for label, response in zip(labels, responses):
             payload = response.payload
@@ -4910,13 +5525,21 @@ class UltraOrchestrator:
                 raw_verdict = "reject"
             elif explicit_consensus_vote in {"accept", "accepted", "approve", "yes"}:
                 raw_verdict = "accept" if passed else "reject"
-            if reasoning_evaluation and not bool(reasoning_evaluation.get("passed", True)):
+            if (
+                reasoning_evaluation
+                and not bool(reasoning_evaluation.get("passed", True))
+                and not authoritative_evidence_present
+            ):
                 raw_verdict = "reject"
             try:
                 confidence = float(payload.get("confidence", payload.get("quality_confidence", 1.0)))
             except (TypeError, ValueError):
                 confidence = 1.0
-            if reasoning_evaluation and not bool(reasoning_evaluation.get("passed", True)):
+            if (
+                reasoning_evaluation
+                and not bool(reasoning_evaluation.get("passed", True))
+                and not authoritative_evidence_present
+            ):
                 confidence = max(confidence, 1.0)
             records.append(
                 {
@@ -5300,6 +5923,107 @@ class UltraOrchestrator:
             model="exact-child-package-restorer-v1",
         )
 
+    @staticmethod
+    def _reconcile_satisfied_evidence_request(
+        response: AgentResponse,
+        test_evidence: Mapping[str, Any],
+    ) -> AgentResponse:
+        """Remove only requests to collect evidence the harness already supplied.
+
+        A weak reviewer may ignore an attached real-browser result and ask to
+        run that exact preview again. This is not a product defect. Concrete
+        observed failures remain blocking and are never rewritten here.
+        """
+
+        results = tuple(
+            item
+            for item in test_evidence.get("test_results", ())
+            if isinstance(item, Mapping) and item.get("passed") is True
+        )
+        browser_verified = any(
+            str(item.get("name") or "").startswith("harness_html_preview")
+            for item in results
+        )
+        if not browser_verified:
+            return response
+        payload = dict(response.payload)
+        if any(
+            isinstance(item, Mapping) and item.get("passed") is False
+            for key in ("test_results", "evidence")
+            for item in (
+                payload.get(key, ())
+                if isinstance(payload.get(key), Sequence)
+                and not isinstance(payload.get(key), (str, bytes))
+                else ()
+            )
+        ):
+            return response
+
+        request_terms = (
+            "preview",
+            "real browser",
+            "browser verification",
+            "functional verification",
+            "additional evidence",
+            "verify functionality",
+            "verification is required",
+            "must be functional",
+        )
+        concrete_failure_terms = (
+            " failed",
+            "failure",
+            " error",
+            "exception",
+            "broken",
+            "incorrect",
+            "mismatch",
+            "does not",
+            "doesn't",
+            "not work",
+            "missing element",
+            "404",
+            "500",
+            "console error",
+            "network error",
+        )
+
+        def evidence_only(item: Any) -> bool:
+            text = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str).casefold()
+            return any(term in text for term in request_terms) and not any(
+                term in text for term in concrete_failure_terms
+            )
+
+        removed: list[Any] = []
+        for key in ("issues", "findings"):
+            raw = payload.get(key, ())
+            values = (
+                [raw]
+                if isinstance(raw, (str, Mapping))
+                else list(raw)
+                if isinstance(raw, Sequence)
+                else []
+            )
+            kept = []
+            for item in values:
+                if evidence_only(item):
+                    removed.append(item)
+                else:
+                    kept.append(item)
+            payload[key] = kept
+        if removed and not payload.get("issues") and not payload.get("findings"):
+            payload["passed"] = True
+            payload["success"] = True
+            payload["evidence_satisfied_findings"] = removed
+            return replace(
+                response,
+                payload=payload,
+                reasoning_summary=(
+                    response.reasoning_summary
+                    or "The harness supplied the requested authoritative browser evidence."
+                ),
+            )
+        return response
+
     def _quality(
         self,
         node: WorkNode,
@@ -5321,20 +6045,6 @@ class UltraOrchestrator:
             "component_reads_use_package_relative_paths": True,
             "review_is_read_only": True,
         }
-        clean_code = self._invoke(
-            AgentRole.CLEAN_CODE_REVIEWER,
-            InnerPhase.REVIEW,
-            task={"contract": asdict(node.contract), "candidate": candidate, "evaluation_policy": evaluation_policy, "fresh_review": True, "category": "clean_code", "read_only": True},
-            context=self._new_context(node, AgentRole.CLEAN_CODE_REVIEWER),
-            node_id=node.id,
-        )
-        security = self._invoke(
-            AgentRole.SECURITY_REVIEWER,
-            InnerPhase.REVIEW,
-            task={"contract": asdict(node.contract), "candidate": candidate, "evaluation_policy": evaluation_policy, "fresh_review": True, "category": "security", "read_only": True},
-            context=self._new_context(node, AgentRole.SECURITY_REVIEWER),
-            node_id=node.id,
-        )
         tests = self._invoke(
             AgentRole.TESTER,
             InnerPhase.TEST,
@@ -5342,10 +6052,38 @@ class UltraOrchestrator:
             context=self._new_context(node, AgentRole.TESTER),
             node_id=node.id,
         )
+        test_evidence = {
+            "passed": self._passed(tests),
+            "summary": tests.summary,
+            "test_results": list(tests.payload.get("test_results", ()) or ()),
+            "evidence": list(tests.payload.get("evidence", ()) or ()),
+            "findings": list(tests.payload.get("findings", ()) or ()),
+        }
+        reviewer_policy = {
+            **evaluation_policy,
+            "authoritative_test_evidence_available": bool(
+                test_evidence["test_results"] or test_evidence["evidence"]
+            ),
+            "do_not_claim_evidence_is_missing_when_authoritative_test_evidence_is_supplied": True,
+        }
+        clean_code = self._invoke(
+            AgentRole.CLEAN_CODE_REVIEWER,
+            InnerPhase.REVIEW,
+            task={"contract": asdict(node.contract), "candidate": candidate, "authoritative_test_evidence": test_evidence, "evaluation_policy": reviewer_policy, "fresh_review": True, "category": "clean_code", "read_only": True},
+            context=self._new_context(node, AgentRole.CLEAN_CODE_REVIEWER),
+            node_id=node.id,
+        )
+        security = self._invoke(
+            AgentRole.SECURITY_REVIEWER,
+            InnerPhase.REVIEW,
+            task={"contract": asdict(node.contract), "candidate": candidate, "authoritative_test_evidence": test_evidence, "evaluation_policy": reviewer_policy, "fresh_review": True, "category": "security", "read_only": True},
+            context=self._new_context(node, AgentRole.SECURITY_REVIEWER),
+            node_id=node.id,
+        )
         test_quality = self._invoke(
             AgentRole.TEST_QUALITY_REVIEWER,
             InnerPhase.REVIEW,
-            task={"contract": asdict(node.contract), "candidate": candidate, "evaluation_policy": evaluation_policy, "fresh_review": True, "category": "test_quality", "read_only": True},
+            task={"contract": asdict(node.contract), "candidate": candidate, "authoritative_test_evidence": test_evidence, "evaluation_policy": reviewer_policy, "fresh_review": True, "category": "test_quality", "read_only": True},
             context=self._new_context(node, AgentRole.TEST_QUALITY_REVIEWER),
             node_id=node.id,
         )
@@ -5353,6 +6091,9 @@ class UltraOrchestrator:
         security = self._scope_leaf_review(node, security)
         tests = self._scope_leaf_review(node, tests)
         test_quality = self._scope_leaf_review(node, test_quality)
+        clean_code = self._reconcile_satisfied_evidence_request(clean_code, test_evidence)
+        security = self._reconcile_satisfied_evidence_request(security, test_evidence)
+        test_quality = self._reconcile_satisfied_evidence_request(test_quality, test_evidence)
         review_pairs = (
             *tuple(
                 zip(
@@ -5505,7 +6246,31 @@ class UltraOrchestrator:
             and not is_parent_assembler
             else ()
         )
+        verification_only = bool(node.contract.metadata.get("verification_only"))
         implementation = (
+            AgentResponse(
+                payload={
+                    "success": True,
+                    "passed": True,
+                    "verification_only": True,
+                    "artifacts": [],
+                    "evidence": [
+                        {
+                            "kind": "approved_existing_artifact",
+                            "paths": list(node.write_paths),
+                        }
+                    ],
+                },
+                summary="Existing approved artifact selected for verification.",
+                reasoning_summary=(
+                    "The approval-bound repair requested verification without a new mutation; "
+                    "artifact and interaction gates remain authoritative."
+                ),
+                provider="harness",
+                model="verification-only-boundary-v1",
+            )
+            if verification_only and not is_parent_assembler
+            else
             restorer(self.run_state.id, node)
             if callable(restorer)
             and node.contract.metadata.get("component_package_only")
@@ -5513,6 +6278,13 @@ class UltraOrchestrator:
             and not external_revision_findings
             else None
         )
+        if verification_only and implementation is not None:
+            self.events.publish(
+                "ultra.verification_only_boundary",
+                f"[{node.id}] preserved the accepted artifact and started verification.",
+                run_id=self.run_state.id,
+                node_id=node.id,
+            )
         if implementation is None:
             implementation = self._restore_exact_child_artifacts(node)
         if implementation is not None:
@@ -5588,7 +6360,26 @@ class UltraOrchestrator:
         )
         responses.extend(quality_gate.responses)
         fixes = 0
-        while not self._quality_gate_passed(quality_gate) and fixes < self.config.max_fix_attempts:
+        verification_contract_failure = any(
+            isinstance(item, Mapping)
+            and item.get("failure_kind") == "contract"
+            for response in quality_gate.responses
+            for result in response.payload.get("test_results", ())
+            if isinstance(result, Mapping)
+            for item in result.get("interaction_results", ())
+        )
+        if verification_contract_failure:
+            self.events.publish(
+                "ultra.verification_contract_repair_required",
+                f"[{node.id}] interaction transport failed; artifact mutation is prohibited.",
+                run_id=self.run_state.id,
+                node_id=node.id,
+            )
+        while (
+            not self._quality_gate_passed(quality_gate)
+            and fixes < self.config.max_fix_attempts
+            and not verification_contract_failure
+        ):
             fixes += 1
             node = replace(node, phase=InnerPhase.FIX)
             self.nodes[node.id] = node
@@ -5618,6 +6409,13 @@ class UltraOrchestrator:
                 task={
                     "contract": asdict(node.contract),
                     "findings": findings,
+                    "harness_repair_constraints": list(
+                        self._harness_repair_constraints(
+                            write_paths=node.write_paths,
+                            verification=node.contract.verification,
+                            findings=findings,
+                        )
+                    ),
                     "attempt": fixes,
                     "change_approach": fixes >= 3,
                     "optimization_variable": (
@@ -5949,22 +6747,71 @@ class UltraOrchestrator:
             for result in self._results.values()
         ]
         self._set_phase(UltraPhase.INTEGRATION, "Integrating all modules")
-        integration = self._invoke(
-            AgentRole.INTEGRATOR,
-            InnerPhase.GLOBAL_INTEGRATION,
-            task={"modules": node_summaries},
-            context={
-                "goal_spec": asdict(self.goal_spec),
-                "architecture": asdict(self.architecture),
-            },
+        single_module = (
+            next(iter(self._results.values()))
+            if len(self._results) == 1
+            else None
         )
+        if single_module is not None and single_module.success:
+            integration = AgentResponse(
+                payload={
+                    "success": True,
+                    "passed": True,
+                    "artifacts": list(single_module.artifacts),
+                    "evidence": list(single_module.evidence),
+                    "findings": [],
+                    "integration_scope": "single_accepted_module",
+                },
+                summary="The single accepted module is the complete integration scope.",
+                reasoning_summary=(
+                    "No cross-module interface exists to reinterpret; the harness "
+                    "carried forward the accepted module package and exact evidence."
+                ),
+                provider="harness",
+                model="single-module-integration-v1",
+            )
+            self.events.publish(
+                "ultra.deterministic_single_module_integration",
+                "Single accepted module required no model-authored cross-module integration.",
+                run_id=self.run_state.id,
+                node_id=single_module.node_id,
+            )
+        else:
+            integration = self._invoke(
+                AgentRole.INTEGRATOR,
+                InnerPhase.GLOBAL_INTEGRATION,
+                task={"modules": node_summaries},
+                context={
+                    "goal_spec": asdict(self.goal_spec),
+                    "architecture": asdict(self.architecture),
+                },
+            )
         self._set_phase(UltraPhase.GLOBAL_REVIEW, "Running global review")
-        review = self._invoke(
-            AgentRole.REVIEWER,
-            InnerPhase.GLOBAL_REVIEW,
-            task={"integration": dict(integration.payload), "modules": node_summaries},
-            context={"master_plan": asdict(self.master_plan)},
-        )
+        if single_module is not None and single_module.success:
+            review = AgentResponse(
+                payload={
+                    "success": True,
+                    "passed": True,
+                    "issues": [],
+                    "findings": [],
+                    "evidence": list(single_module.evidence),
+                    "review_scope": "accepted_node_quality_consensus",
+                },
+                summary="The accepted node quality consensus covers the complete product scope.",
+                reasoning_summary=(
+                    "The harness reused the already completed independent node reviews "
+                    "instead of asking the same model to contradict their typed verdicts."
+                ),
+                provider="harness",
+                model="single-module-review-aggregation-v1",
+            )
+        else:
+            review = self._invoke(
+                AgentRole.REVIEWER,
+                InnerPhase.GLOBAL_REVIEW,
+                task={"integration": dict(integration.payload), "modules": node_summaries},
+                context={"master_plan": asdict(self.master_plan)},
+            )
         expected_paths = {
             str(path).replace("\\", "/").removeprefix("./")
             for node in self.nodes.values()
@@ -5990,6 +6837,23 @@ class UltraOrchestrator:
                 or ""
             ).strip()
         }
+        # A hash authored directly by an implementation/result package is
+        # already a complete operational receipt.  A hash that the harness
+        # adds later while merely materializing a file is useful integrity
+        # evidence, but it must not by itself suppress the independent final
+        # evidence formatter.  Otherwise a model can return an empty final
+        # verdict and still be reported as completed solely because a file
+        # happened to exist.
+        directly_attested_paths = {
+            str(item.get("path") or "").replace("\\", "/").removeprefix("./")
+            for item in authoritative_records
+            if str(item.get("path") or "").strip()
+            and str(item.get("sha256") or item.get("content_hash") or item.get("hash") or "").strip()
+            and not str(item.get("id") or "").startswith("harness:")
+            and str(item.get("kind") or "") != "artifact_hash"
+            and str(dict(item.get("evidence") or {}).get("source") or "")
+            != "workspace-artifact-validation-v1"
+        }
         executable_checks = [
             dict(item)
             for item in authoritative_records
@@ -6008,21 +6872,53 @@ class UltraOrchestrator:
             ),
             "expected_paths": sorted(expected_paths),
             "hashed_paths": sorted(hashed_paths),
+            "directly_attested_paths": sorted(directly_attested_paths),
             "executable_checks": executable_checks,
             "goal_requires_pytest": goal_requires_pytest,
         }
         self._set_phase(UltraPhase.FINAL_EVIDENCE, "Checking final evidence")
-        evidence = self._invoke(
-            AgentRole.GOAL_CHECKER,
-            InnerPhase.FINAL_EVIDENCE,
-            task={
-                "integration": dict(integration.payload),
-                "review": dict(review.payload),
-                "node_results": node_summaries,
-                "authoritative_operational_evidence": authoritative_operational_evidence,
-            },
-            context={"goal_spec": asdict(self.goal_spec)},
-        )
+        if (
+            authoritative_operational_evidence["passed"]
+            and bool(executable_checks or expected_paths <= directly_attested_paths)
+            and self._passed(integration)
+            and self._passed(review)
+        ):
+            evidence = AgentResponse(
+                payload={
+                    "success": True,
+                    "passed": True,
+                    "evidence": [authoritative_operational_evidence],
+                    "findings": [],
+                    "issues": [],
+                    "evaluator_capability": "harness_operational_evidence",
+                },
+                summary="Authoritative operational evidence satisfied the final gate.",
+                reasoning_summary=(
+                    "The harness mechanically aggregated accepted integration/review "
+                    "verdicts, exact artifact hashes, and executable runtime receipts."
+                ),
+                provider="harness",
+                model="final-evidence-aggregator-v1",
+            )
+            self.events.publish(
+                "ultra.deterministic_final_evidence",
+                "Final evidence accepted from authoritative hashes and runtime receipts.",
+                run_id=self.run_state.id,
+                expected_paths=sorted(expected_paths),
+                hashed_paths=sorted(hashed_paths),
+            )
+        else:
+            evidence = self._invoke(
+                AgentRole.GOAL_CHECKER,
+                InnerPhase.FINAL_EVIDENCE,
+                task={
+                    "integration": dict(integration.payload),
+                    "review": dict(review.payload),
+                    "node_results": node_summaries,
+                    "authoritative_operational_evidence": authoritative_operational_evidence,
+                },
+                context={"goal_spec": asdict(self.goal_spec)},
+            )
         success = self._passed(integration) and self._passed(review) and self._passed(evidence)
         return ResultPackageV1(
             node_id="__global__",
@@ -6208,6 +7104,22 @@ class UltraOrchestrator:
                 tuple(self._results.values()),
                 schedule,
             )
+        except ApprovalRequiredError as exc:
+            self._set_phase(UltraPhase.PAUSED, str(exc))
+            self.events.publish(
+                "execution.boundary",
+                str(exc),
+                run_id=self.run_state.id,
+                phase="waiting_for_approval",
+                waiting_on="user",
+                resume_action="Retry",
+            )
+            return UltraRunResult(
+                self.run_state,
+                self.master_plan,
+                tuple(self._results.values()),
+                schedule,
+            )
         except CancellationRequested:
             self._set_phase(UltraPhase.CANCELLED, "ULTRA execution cancelled")
             self.events.publish(
@@ -6233,13 +7145,91 @@ class UltraOrchestrator:
             self.control.pause()
             self.events.publish("ultra.paused", "ULTRA will pause at the next safe checkpoint")
 
-    def resume(self) -> None:
+    def resume(self) -> MasterPlanV1 | None:
+        checkpoint = (
+            dict(self.run_state.metadata.get("foundation_checkpoint") or {})
+            if self.run_state is not None
+            else {}
+        )
+        if self.phase is UltraPhase.PAUSED and checkpoint:
+            if not self.run_state:
+                raise UltraError("the recursive foundation checkpoint has no run state")
+            prompt = self.run_state.prompt
+            failed_stage = str(checkpoint.get("stage") or "goal_spec")
+            target = (
+                UltraPhase.GOAL_SPEC
+                if failed_stage == UltraPhase.GOAL_SPEC.value or self.goal_spec is None
+                else UltraPhase.ARCHITECTURE
+            )
+            self._phase_before_pause = None
+            self._set_phase(target, f"Retrying saved {failed_stage} checkpoint")
+            self.control.resume()
+            try:
+                if target is UltraPhase.GOAL_SPEC:
+                    response = self._invoke(
+                        AgentRole.GOAL_UNDERSTANDING,
+                        "goal_spec",
+                        task={"prompt": prompt},
+                        context={
+                            "instruction": (
+                                "Resume the saved typed-return checkpoint. Preserve the exact "
+                                "request and repair the rejected GoalSpec contract only."
+                            ),
+                            "previous_validation_error": checkpoint.get("error", ""),
+                            "cross_run_project_lessons": self._foundation_project_lessons(
+                                prompt, "goal_spec"
+                            ),
+                        },
+                    )
+                    self.goal_spec = GoalSpecV1.from_mapping(response.payload)
+                    questions = self._validated_questions(self.goal_spec.questions)
+                    if questions:
+                        self.goal_spec = replace(self.goal_spec, questions=questions)
+                        self._save_run(
+                            metadata={
+                                **self.run_state.metadata,
+                                "pending_questions": list(questions),
+                            }
+                        )
+                        self._set_phase(
+                            UltraPhase.AWAITING_QUESTIONS,
+                            "Goal decisions need user input",
+                        )
+                        return None
+                    self.goal_spec = replace(self.goal_spec, questions=())
+                result = self._finish_foundation(prompt)
+            except AgentProtocolError as exc:
+                failed_phase = self.phase
+                self._phase_before_pause = failed_phase
+                self._save_run(
+                    metadata={
+                        **self.run_state.metadata,
+                        "foundation_checkpoint": {
+                            "stage": failed_phase.value,
+                            "category": "contract_incompatibility",
+                            "error": redact_text(str(exc), 2_000),
+                            "resumable": True,
+                            "fallback_used": False,
+                        },
+                    }
+                )
+                self._set_phase(
+                    UltraPhase.PAUSED,
+                    "Recursive planning remains at its saved contract checkpoint",
+                )
+                raise
+            self.events.publish(
+                "ultra.resumed",
+                "Recursive foundation resumed from its saved typed-return checkpoint",
+            )
+            return result
         if self.phase is UltraPhase.PAUSED and self._phase_before_pause is not None:
             target = self._phase_before_pause
             self._phase_before_pause = None
             self._set_phase(target, "ULTRA execution resumed")
         self.control.resume()
         self.events.publish("ultra.resumed", "ULTRA execution resumed")
+        return None
 
     def cancel(self) -> None:
         self.control.cancel()

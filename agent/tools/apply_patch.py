@@ -17,7 +17,9 @@ from ._security import (
 )
 
 
-REQUIRES_APPROVAL = True
+# Applying an in-scope patch is a normal workspace mutation. The harness still
+# enforces path, scope, footprint, journaling, and uncertain-mutation gates.
+REQUIRES_APPROVAL = False
 MAX_PATCH_CHARS = MAX_WRITE_BYTES
 
 SCHEMA = {
@@ -25,8 +27,11 @@ SCHEMA = {
     "function": {
         "name": "apply_patch",
         "description": (
-            "Apply a standard unified text diff atomically inside the workspace. "
-            "Paths must use ---/+++ headers; binary patches and paths outside the workspace are rejected."
+            "Apply a text patch atomically inside the workspace. Accepts a standard "
+            "unified diff with ---/+++ headers, or the common *** Begin Patch / "
+            "*** Add File / Update File / Delete File format. Update hunks must "
+            "contain an exact, unambiguous preimage. Binary patches and paths "
+            "outside the workspace are rejected."
         ),
         "parameters": {
             "type": "object",
@@ -58,6 +63,176 @@ class _FilePatch:
 
 
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _find_unique_preimage(
+    source: list[str],
+    expected: list[str],
+    *,
+    start: int,
+) -> int:
+    """Return the one exact authored preimage location at or after ``start``."""
+
+    if not expected:
+        raise ValueError(
+            "Update File insertion-only hunks are ambiguous; include unchanged "
+            "context or use a standard unified diff with line numbers"
+        )
+    matches = [
+        index
+        for index in range(max(0, start), len(source) - len(expected) + 1)
+        if source[index : index + len(expected)] == expected
+    ]
+    if not matches:
+        raise ValueError("Update File preimage does not match the current file")
+    if len(matches) != 1:
+        raise ValueError(
+            "Update File preimage is ambiguous; add more unchanged context"
+        )
+    return matches[0]
+
+
+def _normalize_patch_syntax(text: str, base_path: str) -> str:
+    """Convert a common ``*** Begin Patch`` envelope to a unified diff.
+
+    This is transport normalization only. Add/delete content is present in the
+    authored patch or current file, and update locations are derived only from
+    an exact unique preimage. No path, source text, or requested effect is
+    invented by the harness.
+    """
+
+    stripped = text.strip()
+    if not stripped.startswith("*** Begin Patch"):
+        return text
+    lines = stripped.splitlines()
+    if not lines or lines[0].strip() != "*** Begin Patch":
+        raise ValueError("invalid *** Begin Patch envelope")
+    output: list[str] = []
+    index = 1
+    saw_file = False
+    ended = False
+    while index < len(lines):
+        line = lines[index]
+        if line.strip() == "*** End Patch":
+            index += 1
+            ended = True
+            while index < len(lines) and lines[index].strip() == "*** End Patch":
+                index += 1
+            if index < len(lines) and lines[index].strip() == "*** Begin Patch":
+                index += 1
+                ended = False
+                continue
+            break
+        match = re.fullmatch(
+            r"\*\*\* (Add|Update|Delete) File:\s*(.+?)\s*",
+            line,
+        )
+        if match is None:
+            raise ValueError(
+                "invalid file section in *** Begin Patch envelope"
+            )
+        operation = match.group(1)
+        path = match.group(2).strip()
+        if not path:
+            raise ValueError(f"{operation} File requires a path")
+        index += 1
+        if operation == "Add":
+            body: list[str] = []
+            while index < len(lines) and not lines[index].startswith("*** "):
+                if not lines[index].startswith("+"):
+                    raise ValueError("every Add File content line must start with '+'")
+                body.append(lines[index])
+                index += 1
+            output.extend(
+                [
+                    "--- /dev/null",
+                    f"+++ b/{path}",
+                    f"@@ -0,0 +1,{len(body)} @@",
+                    *body,
+                ]
+            )
+        elif operation == "Delete":
+            if index < len(lines) and not lines[index].startswith("*** "):
+                raise ValueError("Delete File sections cannot contain patch body lines")
+            resolved = resolve_workspace_path(_clean_header_path(path, base_path), must_exist=True)
+            reject_sensitive_path(resolved)
+            source = resolved.read_text(encoding="utf-8").replace("\r\n", "\n").splitlines()
+            output.extend(
+                [
+                    f"--- a/{path}",
+                    "+++ /dev/null",
+                    f"@@ -1,{len(source)} +0,0 @@" if source else "@@ -0,0 +0,0 @@",
+                    *(f"-{value}" for value in source),
+                ]
+            )
+        else:
+            resolved = resolve_workspace_path(_clean_header_path(path, base_path), must_exist=True)
+            reject_sensitive_path(resolved)
+            source = resolved.read_text(encoding="utf-8").replace("\r\n", "\n").splitlines()
+            hunks: list[str] = []
+            search_from = 0
+            cumulative_delta = 0
+            saw_hunk = False
+            while index < len(lines) and not lines[index].startswith("*** "):
+                if not lines[index].startswith("@@"):
+                    raise ValueError("Update File body must begin with an @@ hunk")
+                saw_hunk = True
+                index += 1
+                body: list[str] = []
+                while (
+                    index < len(lines)
+                    and not lines[index].startswith("@@")
+                    and not lines[index].startswith("*** ")
+                ):
+                    if not lines[index].startswith((" ", "+", "-")):
+                        raise ValueError(
+                            "Update File hunk lines must start with space, '+', or '-'"
+                        )
+                    body.append(lines[index])
+                    index += 1
+                expected = [value[1:] for value in body if value.startswith((" ", "-"))]
+                start = _find_unique_preimage(source, expected, start=search_from)
+                old_count = len(expected)
+                new_count = sum(value.startswith((" ", "+")) for value in body)
+                old_start = start + 1
+                new_start = old_start + cumulative_delta
+                hunks.extend(
+                    [
+                        f"@@ -{old_start},{old_count} +{new_start},{new_count} @@",
+                        *body,
+                    ]
+                )
+                search_from = start + old_count
+                cumulative_delta += new_count - old_count
+            if not saw_hunk:
+                raise ValueError("Update File section contains no hunks")
+            output.extend([f"--- a/{path}", f"+++ b/{path}", *hunks])
+        saw_file = True
+    while index < len(lines) and lines[index].strip() == "*** End Patch":
+        index += 1
+    if index != len(lines) or not ended or not saw_file:
+        raise ValueError("invalid or empty *** Begin Patch envelope")
+    return "\n".join(output) + "\n"
+
+
+def patch_paths(text: str, base_path: str = ".") -> tuple[str, ...]:
+    """Extract authored patch targets for scope and mutation checks."""
+
+    paths: list[str] = []
+    base = "" if base_path in {"", "."} else base_path.rstrip("/\\") + "/"
+    for match in re.finditer(
+        r"(?m)^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$",
+        str(text or ""),
+    ):
+        paths.append((base + match.group(1).strip()).replace("\\", "/"))
+    for match in re.finditer(
+        r"(?m)^(?:---|\+\+\+)\s+(?:[ab]/)?([^\t\r\n]+)",
+        str(text or ""),
+    ):
+        value = match.group(1).strip()
+        if value != "/dev/null":
+            paths.append((base + value).replace("\\", "/").removeprefix("./"))
+    return tuple(dict.fromkeys(path for path in paths if path))
 
 
 def _clean_header_path(value: str, base_path: str) -> str | None:
@@ -149,6 +324,7 @@ def run(patch: str, base_path: str = ".") -> str:
     if not isinstance(patch, str) or not patch.strip():
         return "Error: patch must be a non-empty string"
     try:
+        patch = _normalize_patch_syntax(patch, base_path)
         parsed = _parse(patch, base_path)
         originals: dict[Path, bytes | None] = {}
         replacements: dict[Path, bytes | None] = {}

@@ -45,8 +45,25 @@ def redact_text(value: Any, limit: int | None = None) -> str:
 def redact_data(value: Any) -> Any:
     if isinstance(value, dict):
         result = {}
+        keyboard_press = str(value.get("action") or "").casefold() == "press"
         for key, item in value.items():
-            if re.search(r"(?i)(key|token|secret|password|authorization)", str(key)):
+            safe_keyboard_key = (
+                keyboard_press
+                and str(key).casefold() == "key"
+                and isinstance(item, str)
+                and bool(
+                    len(item) == 1
+                    or re.fullmatch(
+                        r"(?i)(?:Enter|Escape|Backspace|Tab|Space|Delete|Insert|"
+                        r"Home|End|PageUp|PageDown|Arrow(?:Up|Down|Left|Right)|"
+                        r"F(?:[1-9]|1[0-2]))",
+                        item,
+                    )
+                )
+            )
+            if not safe_keyboard_key and re.search(
+                r"(?i)(key|token|secret|password|authorization)", str(key)
+            ):
                 result[key] = "[REDACTED]"
             else:
                 result[key] = redact_data(item)

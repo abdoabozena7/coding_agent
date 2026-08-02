@@ -209,7 +209,9 @@ def semantic_turn(
     effects: Iterable[str] = (),
     needs_workspace_tools: bool | None = None,
     interpretation: str = "scripted semantic decision",
+    outcome_kind: str = "",
     goal_intake: Mapping[str, Any] | None = None,
+    task_demand: Mapping[str, Any] | None = None,
     uncertainty: str = "clear",
     clarification_question: str = "",
 ) -> dict[str, Any]:
@@ -223,6 +225,7 @@ def semantic_turn(
     }
     args: dict[str, Any] = {
         "route": str(route),
+        "outcome_kind": str(outcome_kind),
         "interpretation": interpretation,
         "requested_effects": {
             name: name in effect_values
@@ -236,6 +239,17 @@ def semantic_turn(
         "direct_response": str(response),
         "uncertainty": str(uncertainty),
         "clarification_question": str(clarification_question),
+        "task_demand": dict(task_demand or {
+            "reasoning": 1,
+            "implementation": 1,
+            "context_breadth": 1,
+            "coordination": 1,
+            "verification": 1,
+            "visual_runtime": 1,
+            "component_count": 1,
+            "independently_parallelizable": False,
+            "rationale": ["Scripted low-demand turn"],
+        }),
     }
     if goal_intake is not None:
         args["goal_intake"] = dict(goal_intake)
@@ -248,6 +262,25 @@ def semantic_turn(
     }
 
 
+def semantic_route(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Build the V3 route-only provider call."""
+
+    value = semantic_turn(*args, **kwargs)
+    value["tool_calls"][0]["name"] = "submit_semantic_route"
+    value["tool_calls"][0]["args"].pop("goal_intake", None)
+    return value
+
+
+def semantic_goal_intake_turn(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "tool_calls": [{
+            "id": "semantic-goal-intake",
+            "name": "submit_goal_intake",
+            "args": dict(value),
+        }]
+    }
+
+
 def semantic_goal_intake(
     original: str,
     *,
@@ -255,6 +288,8 @@ def semantic_goal_intake(
     questions: Iterable[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     question_values = tuple(questions)
+    deep = recommended_mode == "ultra"
+    level = 3 if deep else 1
     return {
         "objective": str(original),
         "deliverables": ["Complete the requested outcome"],
@@ -263,17 +298,30 @@ def semantic_goal_intake(
         "acceptance_expectations": ["The requested behavior is implemented and verified"],
         "assumptions": [],
         "risks": [],
-        "breadth": "multi_component" if recommended_mode == "ultra" else "cohesive",
-        "coordination": "parallel" if recommended_mode == "ultra" else "sequential",
+        "component_count": 2 if deep else 1,
+        "parallelism_required": deep,
+        "coordination_summary": (
+            "Parallel specialist coordination" if recommended_mode == "ultra"
+            else "One sequential workflow"
+        ),
         "uncertainty": "clear" if not question_values else "consequential choices remain",
         "complexity_reasons": ["Model-assessed test objective"],
-        "recommended_mode": str(recommended_mode),
-        "recommendation_reason": "Scripted model recommendation",
+        "task_demand": {
+            "reasoning": level,
+            "implementation": level,
+            "context_breadth": level,
+            "coordination": level,
+            "verification": level,
+            "visual_runtime": 1,
+            "component_count": 2 if deep else 1,
+            "independently_parallelizable": deep,
+            "rationale": ["Model-assessed test objective"],
+        },
         "questions": [dict(item) for item in question_values],
     }
 
 
 __all__ = [
     "ProviderRequest", "ScriptedProvider", "ScriptedTurn", "semantic_goal_intake",
-    "semantic_turn",
+    "semantic_goal_intake_turn", "semantic_route", "semantic_turn",
 ]

@@ -36,7 +36,8 @@ class SessionMode(str, Enum):
         normalized = {
             "chat": "normal", "goal": "normal",
             "manual": "normal", "default": "normal", "auto": "normal",
-            "agent": "normal", "deep": "ultra", "max": "ultra",
+            "agent": "normal", "working": "normal", "work": "normal",
+            "deep": "ultra", "max": "ultra",
         }.get(normalized, normalized)
         try:
             return cls(normalized)
@@ -122,6 +123,7 @@ class RetryKind(str, Enum):
     PROVIDER_TRANSPORT = "provider_transport"
     TYPED_PARSE_REPAIR = "typed_parse_repair"
     PLAN_FORMAT_REPAIR = "plan_format_repair"
+    PLAN_QUESTION_REPAIR = "plan_question_repair"
     PLAN_SEMANTIC_REPAIR = "plan_semantic_repair"
     CRITIC_REVISION = "critic_revision"
     WORKER_RETURN_REPAIR = "worker_return_repair"
@@ -148,6 +150,7 @@ class RetryLedger:
     """Separate retry counters with a structured audit trail."""
 
     counts: dict[RetryKind, int] = field(default_factory=dict)
+    stage_counts: dict[tuple[RetryKind, str], int] = field(default_factory=dict)
     records: list[RetryRecord] = field(default_factory=list)
 
     def record(
@@ -161,8 +164,10 @@ class RetryLedger:
         progress: bool = False,
         next_action: str = "stop",
     ) -> RetryRecord:
-        attempt = self.counts.get(kind, 0) + 1
-        self.counts[kind] = attempt
+        self.counts[kind] = self.counts.get(kind, 0) + 1
+        stage_key = (kind, str(stage))
+        attempt = self.stage_counts.get(stage_key, 0) + 1
+        self.stage_counts[stage_key] = attempt
         item = RetryRecord(
             kind=kind,
             stage=stage,
@@ -175,6 +180,54 @@ class RetryLedger:
         )
         self.records.append(item)
         return item
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowStageCheckpointV1:
+    """Durable, JSON-storable boundary for an independently repairable stage."""
+
+    stage: str
+    substage: str = ""
+    category: str = ""
+    field_path: str = ""
+    message: str = ""
+    received: Any = None
+    expected: tuple[str, ...] = ()
+    attempts: int = 0
+    rejected_fingerprint: str = ""
+    accepted_route_fingerprint: str = ""
+    semantic_fingerprint: str = ""
+    inspection_refs: tuple[str, ...] = ()
+    resumable: bool = True
+    version: int = 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "substage": self.substage,
+            "category": self.category,
+            "field_path": self.field_path,
+            "message": self.message,
+            "received": self.received,
+            "expected": list(self.expected),
+            "attempts": self.attempts,
+            "rejected_fingerprint": self.rejected_fingerprint,
+            "accepted_route_fingerprint": self.accepted_route_fingerprint,
+            "semantic_fingerprint": self.semantic_fingerprint,
+            "inspection_refs": list(self.inspection_refs),
+            "resumable": self.resumable,
+            "version": self.version,
+        }
+
+
+class WorkflowBoundaryKind(str, Enum):
+    CONTRACT_INCOMPATIBILITY = "contract_incompatibility"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    SEMANTIC_CONFLICT = "semantic_conflict"
+    QUALITY_BLOCKER = "quality_blocker"
+    PERMISSION_REQUIRED = "permission_required"
+    EXECUTION_UNCERTAIN = "execution_uncertain"
+    NO_PROGRESS = "no_progress"
 
 
 def fingerprint(value: Any) -> str:
@@ -252,9 +305,17 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
         tasks_raw = [tasks_raw]
         actions.append("/tasks converted to an array")
     legacy_ids: dict[str, int] = {}
+    title_positions: dict[str, list[int]] = {}
     for index, item in enumerate(tasks_raw, 1):
         if isinstance(item, Mapping) and _text(item.get("id")):
             legacy_ids[_text(item.get("id")).casefold()] = index
+        if isinstance(item, Mapping) and _text(item.get("title")):
+            title_positions.setdefault(
+                _text(item.get("title")).casefold(), []
+            ).append(index)
+    for title, positions in title_positions.items():
+        if len(positions) == 1:
+            legacy_ids[title] = positions[0]
 
     tasks: list[dict[str, Any]] = []
     for index, raw_task in enumerate(tasks_raw, 1):
@@ -299,6 +360,15 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
             if number is None:
                 unresolved.append(_text(raw_dependency))
                 continue
+            dependency_key = _text(raw_dependency).casefold()
+            if (
+                dependency_key in title_positions
+                and len(title_positions[dependency_key]) == 1
+            ):
+                actions.append(
+                    f"/tasks/{index - 1}/depends_on resolved exact task title "
+                    f"{raw_dependency!r} to T{number:03d}"
+                )
             dependencies.append(f"T{number:03d}")
         dependencies = list(dict.fromkeys(dependencies))
         risk = _text(item.get("risk", "medium")).lower()
@@ -373,6 +443,14 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
                 "existing_inspected_path": "existing_inspected_path",
                 "repository convention": "repository_convention",
                 "repository_convention": "repository_convention",
+                "model selected new layout": "model_selected_new_layout",
+                "model-selected new layout": "model_selected_new_layout",
+                "model_selected_new_layout": "model_selected_new_layout",
+                "new layout": "model_selected_new_layout",
+                "new file layout": "model_selected_new_layout",
+                "generated": "model_selected_new_layout",
+                "generated path": "model_selected_new_layout",
+                "new file": "model_selected_new_layout",
                 "explicit user requirement": "explicit_user_requirement",
                 "explicit user": "explicit_user_requirement",
                 "explicit_user_requirement": "explicit_user_requirement",
@@ -433,6 +511,44 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
                     "supports_tasks": supports_tasks,
                 }
             )
+    # ``supports_tasks`` is a redundant cross-reference, not product
+    # semantics. Weak tool-calling models often omit it even though the exact
+    # path is already repeated in one or more complete task contracts. Bind
+    # only those exact textual path mentions; ambiguous changes remain invalid.
+    for change_index, change in enumerate(expected_changes):
+        if change.get("supports_tasks"):
+            continue
+        path = _text(change.get("path")).replace("\\", "/").casefold()
+        if not path:
+            continue
+        matching_tasks: list[str] = []
+        for task in tasks:
+            contract_text = "\n".join(
+                (
+                    _text(task.get("title")),
+                    _text(task.get("description")),
+                    *(_unique_text(task.get("acceptance_criteria"))),
+                    *(_unique_text(task.get("verification"))),
+                )
+            ).replace("\\", "/").casefold()
+            if path in contract_text:
+                matching_tasks.append(str(task["id"]))
+        if not matching_tasks and len(tasks) == 1:
+            matching_tasks = [str(tasks[0]["id"])]
+        if matching_tasks:
+            change["supports_tasks"] = list(dict.fromkeys(matching_tasks))
+            actions.append(
+                f"/expected_changes/{change_index}/supports_tasks bound from exact task path mentions"
+            )
+
+    # One repository fact commonly applies to the whole proposed plan (for
+    # example, an empty-workspace inspection). Filling its omitted coverage is
+    # mechanical because no fact, task, path, or outcome is created here.
+    if len(applicability) == 1 and not applicability[0].get("supports_tasks") and all_ids:
+        applicability[0]["supports_tasks"] = list(all_ids)
+        actions.append(
+            "/applicability_evidence/0/supports_tasks bound to all tasks from the sole plan fact"
+        )
     if not expected_changes:
         path_pattern = re.compile(
             r"(?<![\w./-])([A-Za-z0-9_.-]+\."
@@ -448,7 +564,7 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
                     {
                         "path": match.group(1).replace("\\", "/"),
                         "intent": str(intent).strip(),
-                        "basis": "repository_convention",
+                        "basis": "model_selected_new_layout",
                         "evidence_refs": [],
                         "supports_tasks": [task["id"]],
                     }
@@ -501,8 +617,25 @@ def validate_normalized_plan(value: Mapping[str, Any]) -> None:
             issues.append(PlanValidationIssue(path + "/description", "non-empty objective is required"))
         if not item.get("acceptance_criteria"):
             issues.append(PlanValidationIssue(path + "/acceptance_criteria", "at least one observable criterion is required"))
+        for criterion_index, criterion in enumerate(item.get("acceptance_criteria", ())):
+            if not str(criterion).strip() or len(str(criterion)) > 1_000:
+                issues.append(
+                    PlanValidationIssue(
+                        path + f"/acceptance_criteria/{criterion_index}",
+                        "must contain 1 to 1,000 characters",
+                    )
+                )
         if not item.get("verification"):
             issues.append(PlanValidationIssue(path + "/verification", "at least one verification requirement is required"))
+        for verification_index, verification in enumerate(item.get("verification", ())):
+            if not str(verification).strip() or len(str(verification)) > 1_000:
+                issues.append(
+                    PlanValidationIssue(
+                        path + f"/verification/{verification_index}",
+                        "must contain 1 to 1,000 characters; name the check instead "
+                        "of embedding an implementation script",
+                    )
+                )
         unresolved = item.get("_unresolved_dependencies", ())
         if unresolved:
             issues.append(PlanValidationIssue(path + "/depends_on", f"ambiguous dependency reference(s): {list(unresolved)!r}"))

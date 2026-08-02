@@ -26,7 +26,7 @@ from .ui_state import (
     WorkspaceSnapshot,
     WorkspaceUIStore,
 )
-from .tui_commands import CommandSpec, matching_commands
+from .tui_commands import CommandSpec, command_availability, matching_commands
 from .plan_document import PlanDocumentError, parse_plan_document
 
 try:  # Optional at import time; line-mode callers must keep working without it.
@@ -1155,14 +1155,20 @@ def _contextual_footer_text(snapshot: WorkspaceSnapshot, width: int) -> str:
     """Return a short, context-sensitive set of currently useful controls."""
 
     if snapshot.attention is not None:
-        value = "Arrows Select | Enter Safe default | Esc Back | F6 Sleep | ? Help"
+        value = "Arrows Select | Enter Confirm | Esc Back | ? Help"
+    elif snapshot.runtime_phase == "waiting_for_approval":
+        value = "Approve in the prompt | F7 Diff | Mode locked | ? Help"
+    elif snapshot.runtime_phase == "waiting_for_process":
+        value = "Waiting for process | Ctrl+C Pause | F7 Diff | Mode locked | ? Help"
     elif snapshot.running:
-        value = "F5 Prompt mode | / Queue | Ctrl+C Pause | F7 Diff | ? Help"
+        value = "/ Queue | Ctrl+C Pause | F7 Diff | Mode locked | ? Help"
     elif str(snapshot.status).casefold() == "paused":
-        value = "/resume Continue | /plan Review | F7 Diff | F8 Folder | ? Help"
+        value = "/resume Continue | /plan Review | F7 Diff | Mode locked | ? Help"
+    elif str(snapshot.status).casefold() not in {"idle", "completed", "cancelled"}:
+        value = "/details Diagnose | /resume Retry | Mode locked | ? Help"
     else:
         target = "Simple" if snapshot.mode is ExperienceMode.ADVANCED else "Advanced"
-        value = f"/ Commands | F2 {target} | F5 Prompt mode | F8 Folder | ? Help"
+        value = f"/ Commands | F2 {target} | F8 Folder | ? Help"
     if snapshot.queued_count:
         value += f" | queued {snapshot.queued_count}"
     return _fit(value, width).rstrip()
@@ -1179,8 +1185,12 @@ def render_persistent_workspace(
 
     width, height = max(44, int(width)), max(16, int(height))
     mode = _workspace_copy(snapshot.locale, snapshot.mode.value)
-    header_left = f"GA3BAD  {mode.upper()}"
-    header_right = " · ".join(item for item in (snapshot.model, snapshot.status, snapshot.workspace) if item)
+    header_left = (
+        f"Session {snapshot.workflow_mode.upper()} · Route {str(snapshot.route or 'pending').upper()} "
+        f"· Execution {str(snapshot.execution_strategy or 'pending').upper()} · View {mode.upper()}"
+    )
+    status_label = str(snapshot.status).replace("_", " ").title()
+    header_right = " · ".join(item for item in (f"Status {status_label}", snapshot.model) if item)
     header = _fit(
         header_left + " " * max(1, width - len(header_left) - len(header_right)) + header_right,
         width,
@@ -1205,7 +1215,17 @@ def render_persistent_workspace(
         if snapshot.attention.message:
             lines.extend(textwrap.wrap(snapshot.attention.message, width=width)[:3])
         options = []
-        for index, option in enumerate(snapshot.attention.options):
+        page_size = 3
+        total_options = len(snapshot.attention.options)
+        start = max(
+            0,
+            min(snapshot.attention_index - page_size // 2, max(0, total_options - page_size)),
+        )
+        end = min(total_options, start + page_size)
+        if total_options > page_size:
+            lines.append(f"Options {start + 1}-{end} of {total_options} · use ↑↓ to see all")
+        for index in range(start, end):
+            option = snapshot.attention.options[index]
             marker = "[" if index == snapshot.attention_index else " "
             closer = "]" if index == snapshot.attention_index else " "
             description = f" — {option.description}" if option.description else ""
@@ -1451,7 +1471,7 @@ class PersistentWorkspaceApp:
             height=Dimension(
                 min=2,
                 max=11,
-                preferred=min(10, len(self._palette_matches) + 1),
+                preferred=min(10, min(4, len(self._palette_matches)) * 2 + 2),
             ),
             wrap_lines=False,
             always_hide_cursor=True,
@@ -1487,6 +1507,15 @@ class PersistentWorkspaceApp:
         if not self._palette_open or not self._palette_matches:
             return False
         spec = self._palette_matches[self._palette_index]
+        availability = command_availability(spec, self.store.snapshot())
+        if execute and not availability.enabled:
+            self._palette_open = False
+            self._buffer.reset()
+            self.store.append_transcript(
+                "assistant",
+                availability.reason or "That command is not available in the current state.",
+            )
+            return True
         current = self._buffer.text.strip()
         parts = current.split(maxsplit=1)
         has_arguments = len(parts) > 1 and bool(parts[1].strip())
@@ -1625,12 +1654,6 @@ class PersistentWorkspaceApp:
         @self._bindings.add("f4", eager=True)
         def _choose_permissions(event: Any) -> None:
             self.on_input(WorkspaceInput(kind="permissions"))
-
-        @self._bindings.add("f5", eager=True)
-        def _choose_prompt_mode(event: Any) -> None:
-            if not self._secret_provider and self._overlay_kind != "plan_edit":
-                self.store.cycle_composer_mode()
-                event.app.invalidate()
 
         @self._bindings.add("f6", eager=True)
         def _toggle_sleep(event: Any) -> None:
@@ -1875,10 +1898,8 @@ class PersistentWorkspaceApp:
                 event.app.invalidate()
                 return
             if value:
-                mode = self.store.snapshot().composer_mode
                 self._buffer.reset()
-                self.store.reset_composer_mode()
-                self.on_input(WorkspaceInput(text=value, mode=mode))
+                self.on_input(WorkspaceInput(text=value))
 
         @self._bindings.add("tab", eager=True)
         def _queue(event: Any) -> None:
@@ -1898,10 +1919,10 @@ class PersistentWorkspaceApp:
             snapshot = self.store.snapshot()
             value = self._buffer.text.strip()
             if snapshot.mode is ExperienceMode.ADVANCED and snapshot.running and value:
-                mode = snapshot.composer_mode
                 self._buffer.reset()
-                self.store.reset_composer_mode()
-                self.on_input(WorkspaceInput(text=value, queued=True, mode=mode))
+                self.on_input(
+                    WorkspaceInput(text=value, queued=True, mode=snapshot.workflow_mode)
+                )
                 return
             if value:
                 self._buffer.insert_text("\t")
@@ -1997,20 +2018,38 @@ class PersistentWorkspaceApp:
             self._bindings.add(key, eager=True)(_shortcut)
 
     def _palette_fragments(self) -> Any:
+        page_size = 4
+        total = len(self._palette_matches)
+        start = max(
+            0,
+            min(self._palette_index - page_size // 2, max(0, total - page_size)),
+        )
+        end = min(total, start + page_size)
+        position = f" · {start + 1}-{end} of {total}" if total else ""
         fragments: list[tuple[str, str]] = [
-            ("class:workspace.command.title", " Commands  ↑↓ select · Tab complete · Enter run · Esc close\n")
+            (
+                "class:workspace.command.title",
+                f" Commands{position}  ↑↓ select · Tab complete · Enter run · Esc close\n",
+            )
         ]
-        for index, spec in enumerate(self._palette_matches):
+        for index in range(start, end):
+            spec = self._palette_matches[index]
             selected = index == self._palette_index
+            availability = command_availability(spec, self.store.snapshot())
             style = (
                 "class:workspace.command.selected"
                 if selected
                 else "class:workspace.command"
+                if availability.enabled
+                else "class:workspace.muted"
             )
             suffix = f" {spec.arguments}" if spec.arguments else ""
             marker = "›" if selected and terminal_supports_unicode(self.output) else ">" if selected else " "
             fragments.append((style, f" {marker} {spec.name}{suffix}"))
-            fragments.append(("class:workspace.muted", f"  {spec.description}\n"))
+            description = spec.description
+            if not availability.enabled and availability.reason:
+                description += f" · Locked: {availability.reason}"
+            fragments.append(("class:workspace.muted", f"  {description}\n"))
         if not self._palette_matches:
             fragments.append(("class:workspace.muted", "  No matching command\n"))
         return FormattedText(fragments)
@@ -2050,7 +2089,7 @@ class PersistentWorkspaceApp:
             return FormattedText(fragments)
         if self._overlay_kind == "ultra_details":
             fragments = [
-                ("class:details.title", (self._overlay_title or "Ultra Details") + "\n"),
+                ("class:details.title", (self._overlay_title or "Execution details") + "\n"),
             ]
             for line in self._overlay_text.splitlines() or [""]:
                 stripped = line.strip()
@@ -2098,18 +2137,21 @@ class PersistentWorkspaceApp:
         snapshot = self.store.snapshot()
         mode = _workspace_copy(snapshot.locale, snapshot.mode.value).upper()
         workflow = snapshot.workflow_mode.upper()
+        route = str(snapshot.route or "pending").upper()
+        strategy = str(snapshot.execution_strategy or "pending").upper()
         project = os.path.basename(snapshot.workspace.rstrip("/\\")) or "GA3BAD"
         phase = (
             snapshot.progress.phase.replace("_", " ").title()
             if snapshot.progress.phase
             else snapshot.status
         )
-        right = " · ".join(item for item in (phase, snapshot.model) if item)
+        phase = str(phase).replace("_", " ").title()
+        right = " · ".join(item for item in (f"Status {phase}", snapshot.model) if item)
         try:
             width = max(24, get_app().output.get_size().columns)
         except (AttributeError, RuntimeError, ValueError):
             width = 100
-        left = f" {project}  {workflow} · {mode}"
+        left = f" {project}  Session {workflow} · Route {route} · Execution {strategy} · View {mode}"
         remaining = max(0, width - len(left) - 2)
         right = textwrap.shorten(right, width=max(1, remaining), placeholder="…") if right else ""
         gap = " " * max(1, width - len(left) - len(right))
@@ -2118,7 +2160,7 @@ class PersistentWorkspaceApp:
                 "class:workspace.ultra"
                 if snapshot.workflow_mode == "ultra"
                 else "class:workspace.project",
-                f" {project}  ",
+                f" {project}  Session ",
             ),
             (
                 "class:workspace.ultra"
@@ -2126,7 +2168,11 @@ class PersistentWorkspaceApp:
                 else "class:workspace.mode",
                 workflow,
             ),
-            ("class:workspace.muted", " · "),
+            ("class:workspace.muted", " · Route "),
+            ("class:workspace.queue", route),
+            ("class:workspace.muted", " · Execution "),
+            ("class:workspace.plan", strategy),
+            ("class:workspace.muted", " · View "),
             ("class:workspace.mode", mode),
             ("class:workspace.phase", gap + right),
         ])
@@ -2296,13 +2342,27 @@ class PersistentWorkspaceApp:
         if request.message:
             fragments.append(("class:workspace.assistant", f"   {request.message}\n\n"))
 
+        page_size = 3
+        total_options = len(request.options)
+        start = max(
+            0,
+            min(snapshot.attention_index - page_size // 2, max(0, total_options - page_size)),
+        )
+        end = min(total_options, start + page_size)
+        if total_options > page_size:
+            fragments.append((
+                "class:workspace.muted",
+                f"   Options {start + 1}-{end} of {total_options} · use ↑↓ to see all\n",
+            ))
+
         def handler_for(key: str) -> Callable[[Any], None]:
             def handler(mouse_event: Any) -> None:
                 if MouseEventType is not None and mouse_event.event_type == MouseEventType.MOUSE_UP:
                     self.store.resolve_attention(key)
             return handler
 
-        for index, option in enumerate(request.options):
+        for index in range(start, end):
+            option = request.options[index]
             selected = index == snapshot.attention_index
             style = "class:workspace.option.selected" if selected else "class:workspace.option"
             shortcut = option.shortcut.upper() if option.shortcut else str(index + 1)
@@ -2347,16 +2407,26 @@ class PersistentWorkspaceApp:
             label = _workspace_copy(snapshot.locale, "custom")
         mode_style = (
             "class:workspace.plan"
-            if snapshot.composer_mode == "plan"
+            if snapshot.workflow_mode == "plan"
             else "class:workspace.ultra"
-            if snapshot.composer_mode == "ultra"
+            if snapshot.workflow_mode == "ultra"
             else "class:workspace.queue"
         )
         return FormattedText(
             [
                 ("class:composer.prompt", " › "),
-                (mode_style, f"[{snapshot.composer_mode.upper()}] "),
-                ("class:workspace.muted", label + " · F5 prompt mode"),
+                (mode_style, f"[{snapshot.workflow_mode.upper()}] "),
+                (
+                    "class:workspace.muted",
+                    label
+                    + (
+                        " · Workflow strategy is locked while work is active"
+                        if snapshot.running
+                        or str(snapshot.status).casefold()
+                        not in {"idle", "completed", "cancelled"}
+                        else " · Route and execution depth are selected after you send"
+                    ),
+                ),
             ]
         )
 

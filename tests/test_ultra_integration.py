@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from agent.commands import parse_command
 from agent.events import EventBus
 from agent.model_catalog import ExecutionClass, ModelDescriptor
@@ -19,30 +21,229 @@ from agent.runtime import AgentRuntime, RuntimeStateError
 from agent.sandbox import AccessLevel, DockerSandbox, PermissionAdapter
 from agent.store import StateStore
 from agent.ultra import (
+    ApprovalRequiredError,
     AgentProtocolError,
     AgentRequest,
     AgentResponse,
     AgentRole,
+    InnerPhase,
     NodeStatus,
     UltraConfig,
     WorkNode,
+    ArchitectureSpecV1 as EngineArchitectureSpec,
+    ContextRequest,
+    GoalSpecV1 as EngineGoalSpec,
+    UltraRunV1 as EngineUltraRun,
 )
 from agent.ultra import MasterPlanV1, TaskContractV1, UltraOrchestrator, _with_quality_milestone
 from agent.ultra_models import BrainSection, UltraPhase, UltraRunStatus
 from agent.ultra_session import (
+    UltraSession,
     WorkspaceUltraAgent,
     WorkspaceUltraAgentFactory,
     StateStoreUltraAdapter,
+    DurableContextBuilder,
+    _bind_accepted_repair_feedback,
+    _bind_repair_architecture_authority,
+    _explicit_repair_scope_paths,
     _repair_double_escaped_python_source,
     _run_python_test_artifacts,
+    _normalize_tester_verification_call,
+    _tester_command_receipt,
     _store_node_status,
     _validate_workspace_artifacts,
 )
 from agent.ultra_models import WorkNodeStatus
+from agent.ui_state import ApprovalDecision
 
 
 def test_ultra_planning_is_not_persisted_as_execution_in_progress():
     assert _store_node_status(NodeStatus.PLANNING) is WorkNodeStatus.PENDING
+
+
+def test_accepted_repair_feedback_survives_lossy_small_model_plan_wording():
+    plan = MasterPlanV1(
+        summary="Verify the app.",
+        modules=(
+            TaskContractV1(
+                id="M001",
+                title="Final verification",
+                objective="Verify the current app.",
+                acceptance_criteria=("The app works.",),
+                verification=("preview_html src/index.html",),
+                write_paths=("src/index.html",),
+            ),
+        ),
+    )
+    feedback = "Remove the duplicate result and add keyboard focus states."
+
+    bound = _bind_accepted_repair_feedback(plan, feedback)
+
+    assert feedback in bound.modules[0].objective
+    assert bound.modules[0].metadata["accepted_repair_feedback"] == feedback
+    assert bound.modules[0].metadata["accepted_repair_feedback_bound"] is True
+
+
+def test_typed_browser_scenarios_survive_lossy_small_model_plan_wording():
+    plan = MasterPlanV1(
+        summary="Verify the app.",
+        modules=(
+            TaskContractV1(
+                id="M001",
+                title="Verify",
+                objective="Open the page.",
+                acceptance_criteria=("No console errors.",),
+                verification=("preview_html src/index.html",),
+                write_paths=("src/index.html",),
+            ),
+        ),
+    )
+    feedback = (
+        'Put this in metadata.browser_scenarios: [{"name":"addition",'
+        '"steps":[{"action":"click","role":"button","name":"7"}],'
+        '"assertions":[{"role":"textbox","name":"Display",'
+        '"property":"value","equals":"7"}]}].'
+    )
+
+    bound = _bind_accepted_repair_feedback(plan, feedback)
+
+    assert bound.modules[0].metadata["browser_scenarios"][0]["name"] == "addition"
+
+
+def test_plan_projection_preserves_approval_bound_module_metadata():
+    scenario = {
+        "name": "addition",
+        "steps": [{"action": "click", "role": "button", "name": "7"}],
+        "assertions": [
+            {"role": "textbox", "name": "Display", "property": "value", "equals": "7"}
+        ],
+    }
+    master = MasterPlanV1(
+        summary="Verify",
+        modules=(
+            TaskContractV1(
+                id="M001",
+                title="Verify",
+                objective="Verify interactions.",
+                acceptance_criteria=("Click 7 and display 7.",),
+                verification=("preview_html src/index.html",),
+                write_paths=("src/index.html",),
+                metadata={"browser_scenarios": [scenario]},
+            ),
+        ),
+    )
+    adapter = object.__new__(StateStoreUltraAdapter)
+
+    tasks, _changes = adapter._plan_payload(master)
+
+    assert tasks[0]["metadata"]["browser_scenarios"] == [scenario]
+
+
+def test_latest_repair_feedback_overrides_stale_architecture_detail():
+    from agent.ultra import ArchitectureSpecV1
+
+    architecture = ArchitectureSpecV1(
+        summary="Use React for the calculator UI.",
+        components=({"name": "calculator"},),
+        decisions=({"decision": "Use React."},),
+        invariants=("Keep the React component split.",),
+    )
+    feedback = "Use one self-contained vanilla JavaScript HTML file."
+
+    bound = _bind_repair_architecture_authority(architecture, feedback)
+
+    assert feedback in bound.summary
+    assert feedback in bound.invariants[-1]
+    assert bound.decisions[-1]["status"] == "accepted_revision_authority"
+
+
+def test_explicit_repair_scope_narrows_an_older_broader_plan_scope():
+    feedback = (
+        "Reject the broad revision. Keep exactly src/index.html. "
+        "No extra files or dependencies."
+    )
+
+    assert _explicit_repair_scope_paths(feedback) == ("src/index.html",)
+
+
+def test_repair_scope_parser_does_not_infer_paths_without_exact_authority():
+    feedback = "Inspect src/index.html and decide whether package.json also needs a change."
+
+    assert _explicit_repair_scope_paths(feedback) == ()
+
+
+def test_bounded_repair_context_omits_stale_cross_revision_memory():
+    contract = TaskContractV1(
+        id="M001",
+        title="Repair calculator",
+        objective=(
+            "Fix the current calculator.\n\nAccepted repair requirements:\n"
+            "Keep exactly src/index.html and make 7+5 equal 12."
+        ),
+        acceptance_criteria=("7+5=12",),
+        verification=("preview_html src/index.html",),
+        write_paths=("src/index.html",),
+    )
+    node = WorkNode(contract=contract)
+    goal = EngineGoalSpec("Repair calculator", ("7+5=12",))
+    architecture = EngineArchitectureSpec(
+        summary="Stale React architecture that must not override repair authority.",
+        components=({"name": "old-react-ui"},),
+    )
+    plan = MasterPlanV1(summary="Repair", modules=(contract,))
+    request = ContextRequest(
+        run=EngineUltraRun("Repair calculator", ExecutionClass.LOCAL),
+        node=node,
+        role=AgentRole.CODER,
+        goal=goal,
+        architecture=architecture,
+        plan=plan,
+        nodes={node.id: node},
+        brain=(),
+        dependency_results={},
+    )
+
+    context = DurableContextBuilder(mock.Mock(), lambda: "run-1", 43_000).build(request)
+
+    assert context["repair_contract"]["write_paths"] == ("src/index.html",)
+    assert "architecture_contract" not in context
+    assert "project_lessons" in context["_omitted"]
+    assert "React" not in json.dumps(context)
+
+
+def test_artifact_receipt_requires_a_real_hash_change_from_lease_baseline(tmp_path):
+    target = tmp_path / "src" / "index.html"
+    target.parent.mkdir(parents=True)
+    target.write_text("before", encoding="utf-8")
+    before = hashlib.sha256(b"before").hexdigest()
+    adapter = object.__new__(StateStoreUltraAdapter)
+    adapter.workspace = tmp_path
+    adapter._adapter_lock = threading.RLock()
+    adapter._lease_scopes = {"M001": ("src/index.html",)}
+    adapter._lease_initial_hashes = {"M001": {"src/index.html": before}}
+    node = mock.Mock(id="M001", write_paths=("src/index.html",))
+    passed = {"passed": True, "findings": [], "evidence": []}
+
+    with mock.patch("agent.ultra_session._validate_workspace_artifacts", return_value=passed), \
+         mock.patch("agent.ultra_session._run_python_test_artifacts", return_value=passed):
+        unchanged = adapter.verify_node_artifacts("run", node)
+        target.write_text("after", encoding="utf-8")
+        changed = adapter.verify_node_artifacts("run", node)
+
+    assert unchanged["passed"] is True
+    assert unchanged["workspace_mutated"] is False
+    assert changed["workspace_mutated"] is True
+    assert changed["mutation_evidence"][0]["before_sha256"] == before
+
+
+def test_ultra_restore_maps_every_durable_work_node_status():
+    mapped = {
+        status: UltraSession._engine_node_status(status)
+        for status in WorkNodeStatus
+    }
+
+    assert set(mapped) == set(WorkNodeStatus)
+    assert mapped[WorkNodeStatus.CONFLICT] is NodeStatus.CONFLICT
 
 
 def test_double_escaped_python_fallback_is_repaired_only_when_syntax_proves_it():
@@ -54,6 +255,29 @@ def test_double_escaped_python_fallback_is_repaired_only_when_syntax_proves_it()
     assert repaired == (
         'def format_sum(a, b):\n    """Add values."""\n    return f"{a + b}"\n'
     )
+
+
+def test_tester_cd_verifier_is_normalized_to_typed_cwd_without_shell_expansion():
+    normalized, receipt = _normalize_tester_verification_call(
+        ToolCall(
+            "verify",
+            "run_bash",
+            {"command": "cd workspace && npm test"},
+        )
+    )
+    assert normalized.name == "run_command"
+    assert normalized.args == {"cwd": "workspace", "command": "npm test"}
+    assert "normalized" in receipt
+
+    unsafe, unsafe_receipt = _normalize_tester_verification_call(
+        ToolCall(
+            "unsafe",
+            "run_bash",
+            {"command": "cd ../outside && npm test"},
+        )
+    )
+    assert unsafe.name == "run_bash"
+    assert unsafe_receipt == ""
 
     invalid, invalid_changed = _repair_double_escaped_python_source(
         "formatter.py",
@@ -70,6 +294,40 @@ def test_double_escaped_python_fallback_is_repaired_only_when_syntax_proves_it()
     assert javascript == 'const value = \\"literal\\";\n'
 
 
+def test_tester_command_receipt_uses_only_authoritative_exit_status():
+    passed = _tester_command_receipt(
+        ToolCall("verify", "run_command", {"cwd": "web", "command": "npm test"}),
+        "exit code: 0\nstdout:\n12 tests passed\n",
+        node_id="M001",
+    )
+    assert passed is not None
+    assert passed.provider == "harness"
+    assert passed.model == "command-receipt-v1"
+    assert passed.payload["passed"] is True
+    assert passed.payload["test_results"][0]["returncode"] == 0
+
+    failed = _tester_command_receipt(
+        ToolCall("verify", "run_bash", {"command": "python -m pytest -q"}),
+        "exit code: 1\nstdout:\n1 failed\n",
+    )
+    assert failed is not None
+    assert failed.payload["passed"] is False
+    assert "exit code 1" in failed.payload["findings"][0]
+
+    assert (
+        _tester_command_receipt(
+            ToolCall("verify", "run_bash", {"command": "python -m pytest -q"}),
+            "pytest probably passed",
+        )
+        is None
+    )
+    assert (
+        _tester_command_receipt(
+            ToolCall("read", "read_file", {"path": "test.py"}),
+            "exit code: 0",
+        )
+        is None
+    )
 def test_workspace_artifact_gate_hashes_files_and_rejects_python_syntax_errors():
     with tempfile.TemporaryDirectory() as directory:
         workspace = Path(directory)
@@ -119,7 +377,7 @@ def test_workspace_python_test_gate_executes_pytest_without_leaking_cache():
         assert not any(workspace.rglob("__pycache__"))
 
 
-def test_master_plan_restoration_covers_every_explicit_semantic_artifact():
+def test_missing_master_plan_is_rejected_without_harness_authored_modules():
     normalized, actions = UltraOrchestrator._normalize_typed_payload(
         "master_plan",
         {},
@@ -153,28 +411,10 @@ def test_master_plan_restoration_covers_every_explicit_semantic_artifact():
         },
     )
 
-    modules = normalized["modules"]
-    owned_paths = {
-        path
-        for module in modules
-        for path in module.get("write_paths", ())
-    }
-    assert owned_paths == {
-        "mathlib.py",
-        "formatter.py",
-        "tests/test_components.py",
-    }
-    test_module = next(
-        module
-        for module in modules
-        if "tests/test_components.py" in module.get("write_paths", ())
-    )
-    assert set(test_module["depends_on"]) == {
-        "run123.M001",
-        "run123.M002",
-    }
-    assert any("python -m pytest" in item for item in test_module["verification"])
-    assert any("missing explicitly required semantic artifacts" in item for item in actions)
+    assert normalized == {}
+    assert actions == ()
+    with pytest.raises(AgentProtocolError, match="summary and modules"):
+        UltraOrchestrator._validate_typed_response("master_plan", normalized)
 
 
 def test_final_evidence_missing_boolean_uses_only_authoritative_operational_gate():
@@ -212,8 +452,49 @@ def test_final_evidence_missing_boolean_uses_only_authoritative_operational_gate
             "authoritative_operational_evidence": {"passed": False},
         },
     )
-    assert not rejected["success"]
-    assert not rejected["passed"]
+    assert "success" not in rejected
+    assert "passed" not in rejected
+    with pytest.raises(AgentProtocolError, match="must be boolean"):
+        UltraOrchestrator._validate_typed_response("final_evidence", rejected)
+
+
+@pytest.mark.parametrize(
+    ("phase", "field", "raw", "expected"),
+    [
+        ("review", "passed", "true", True),
+        ("review", "passed", "FAILED", False),
+        ("global_review", "passed", "pass", True),
+        ("integrate", "success", "false", False),
+    ],
+)
+def test_exact_string_verdict_is_mechanically_normalized(
+    phase: str,
+    field: str,
+    raw: str,
+    expected: bool,
+):
+    normalized, actions = UltraOrchestrator._normalize_typed_payload(
+        phase,
+        {field: raw},
+        {},
+    )
+
+    assert normalized[field] is expected
+    assert any("exact string verdict normalized" in item for item in actions)
+    UltraOrchestrator._validate_typed_response(phase, normalized)
+
+
+def test_ambiguous_string_verdict_is_not_invented():
+    normalized, actions = UltraOrchestrator._normalize_typed_payload(
+        "review",
+        {"passed": "looks mostly fine"},
+        {},
+    )
+
+    assert normalized["passed"] == "looks mostly fine"
+    assert not any("string verdict normalized" in item for item in actions)
+    with pytest.raises(AgentProtocolError, match="passed must be boolean"):
+        UltraOrchestrator._validate_typed_response("review", normalized)
 
 
 def test_exact_child_artifact_restoration_replays_matching_durable_write():
@@ -325,9 +606,15 @@ class PhaseProvider:
 
     model = "offline-ultra"
 
-    def __init__(self, *, ask_question: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        ask_question: bool = False,
+        malformed_optional_question: bool = False,
+    ) -> None:
         self.calls = 0
         self.ask_question = ask_question
+        self.malformed_optional_question = malformed_optional_question
 
     @staticmethod
     def _phase(system: str) -> str:
@@ -371,10 +658,32 @@ class PhaseProvider:
                         ],
                         "allow_freeform": True,
                         "reason": "The product target is not encoded in the repository.",
+                        "decision_need": {
+                            "impact": "Selects the external release target and deployment authority.",
+                            "affected_scope": ["release target"],
+                            "affected_effects": ["external_side_effect"],
+                            "reversible": False,
+                            "requires_user_authority": True,
+                            "reason": "The original request does not authorize a release target.",
+                            "evidence_refs": ["goal:original_request"],
+                        },
                     }
                 ]
                 if self.ask_question
-                else []
+                else (
+                    [
+                        {
+                            "id": "optional_style",
+                            "header": "Style",
+                            "question": "Use the model's suggested visual style?",
+                            "options": [{"label": "Use it"}],
+                            "allow_freeform": True,
+                            "reason": "This is optional presentation polish.",
+                        }
+                    ]
+                    if self.malformed_optional_question
+                    else []
+                )
             )
             payload = {
                 "objective": "Build the demo",
@@ -811,6 +1120,15 @@ class PlanningQuestionProvider:
                                     ],
                                     "allow_freeform": True,
                                     "reason": "Product scope is not discoverable from this empty workspace.",
+                                    "decision_need": {
+                                        "impact": "Selects the product platform and artifact type.",
+                                        "affected_scope": ["release platform"],
+                                        "affected_effects": ["workspace artifacts"],
+                                        "reversible": False,
+                                        "requires_user_authority": True,
+                                        "reason": "The empty workspace cannot establish the intended release platform.",
+                                        "evidence_refs": ["inspection:I001"],
+                                    },
                                 }
                             ]
                         },
@@ -823,6 +1141,17 @@ class PlanningQuestionProvider:
                     "plan",
                     "propose_plan",
                     {
+                        "semantic_goal": {
+                            "original_request": "Create an application",
+                            "interpreted_outcome": "Create the user-selected application target.",
+                            "requested_effects": ["read_workspace", "mutate_workspace"],
+                            "required_outcomes": ["The selected application entry point exists."],
+                            "constraints": ["Preserve the selected platform decision."],
+                            "exclusions": [],
+                            "acceptance_criteria": ["app.py exists"],
+                            "unresolved_decisions": [],
+                            "repository_evidence_refs": ["inspection:I001"],
+                        },
                         "summary": "Create the selected platform entry point",
                         "applicability_evidence": [
                             {
@@ -836,6 +1165,8 @@ class PlanningQuestionProvider:
                             {
                                 "path": "app.py",
                                 "intent": "Add the selected platform entry point.",
+                                "basis": "model_selected_new_layout",
+                                "evidence_refs": ["inspection:I001"],
                                 "supports_tasks": ["T001"],
                             }
                         ],
@@ -1033,7 +1364,17 @@ class UltraIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(abstained["passed"])
         self.assertTrue(abstained["abstained"])
-        self.assertTrue(any("abstained" in item for item in abstention_actions))
+        self.assertTrue(any("reviewer abstained" in item for item in abstention_actions))
+        UltraOrchestrator._validate_typed_response("review", abstained)
+
+        missing_test_verdict, _ = UltraOrchestrator._normalize_typed_payload(
+            "test",
+            {"findings": [], "issues": [], "evidence": []},
+            {"contract": {"metadata": {}}},
+        )
+        self.assertNotIn("passed", missing_test_verdict)
+        with self.assertRaisesRegex(AgentProtocolError, "passed must be boolean"):
+            UltraOrchestrator._validate_typed_response("test", missing_test_verdict)
 
     def test_local_integrator_missing_boolean_abstains_after_quality_gate(self):
         normalized, actions = UltraOrchestrator._normalize_typed_payload(
@@ -1056,9 +1397,11 @@ class UltraIntegrationTests(unittest.TestCase):
             {"findings": ["formatter.py imports an unapproved dependency"]},
             {"publish_component_package": True},
         )
-        self.assertFalse(blocked["success"])
+        self.assertNotIn("success", blocked)
         self.assertFalse(blocked.get("abstained", False))
-        self.assertTrue(any("safe remediation" in item for item in blocked_actions))
+        self.assertEqual(blocked_actions, ())
+        with self.assertRaisesRegex(AgentProtocolError, "must be boolean"):
+            UltraOrchestrator._validate_typed_response("integrate", blocked)
 
     def test_informational_structured_findings_do_not_trigger_repairs(self):
         response = AgentResponse(
@@ -1102,6 +1445,36 @@ class UltraIntegrationTests(unittest.TestCase):
             capabilities=("tools",),
         )
 
+    def test_workspace_hashes_use_relative_ignore_rules_and_prune_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "run-artifacts" / "project"
+            workspace.mkdir(parents=True)
+            (workspace / "artifact.txt").write_text("accepted", encoding="utf-8")
+            dependencies = workspace / "node_modules" / "package"
+            dependencies.mkdir(parents=True)
+            (dependencies / "ignored.js").write_text("ignored", encoding="utf-8")
+            store = StateStore(workspace)
+            session = UltraSession(
+                store=store,
+                workspace=workspace,
+                descriptor=self._descriptor(),
+                permission_adapter=PermissionAdapter("normal", DockerSandbox()),
+                approval=lambda *_args: True,
+                events=EventBus(),
+                config=UltraConfig(),
+                agent_steps=2,
+            )
+            try:
+                hashes = session._workspace_hashes()
+                self.assertEqual(set(hashes), {"artifact.txt"})
+                self.assertEqual(
+                    hashes["artifact.txt"],
+                    hashlib.sha256(b"accepted").hexdigest(),
+                )
+            finally:
+                session.close()
+                store.close()
+
     def _runtime(self, workspace: Path, store: StateStore, *, ask_question: bool = False):
         descriptor = self._descriptor()
         provider = PhaseProvider(ask_question=ask_question)
@@ -1114,6 +1487,222 @@ class UltraIntegrationTests(unittest.TestCase):
             approval=lambda *_args: True,
             events=EventBus(),
         )
+
+    def test_ultra_rejects_inapplicable_preview_before_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "component.js").write_text(
+                "export const value = 1;", encoding="utf-8"
+            )
+            store = StateStore(workspace)
+            approvals: list[tuple[str, dict, str]] = []
+            session = UltraSession(
+                store=store,
+                workspace=workspace,
+                descriptor=self._descriptor(),
+                permission_adapter=PermissionAdapter("normal", DockerSandbox()),
+                approval=lambda name, args, risk: approvals.append(
+                    (name, args, risk)
+                ) or True,
+                events=EventBus(),
+                config=UltraConfig(),
+                agent_steps=2,
+            )
+            try:
+                result = session._execute_tool(
+                    ToolCall(
+                        "invalid-preview",
+                        "preview_html",
+                        {"path": "component.js", "open_browser": False},
+                    ),
+                    AgentRequest(
+                        run_id="run",
+                        role=AgentRole.TESTER,
+                        phase="test",
+                        system_prompt="Verify the accepted artifact.",
+                        context={},
+                        task={},
+                        node_id=None,
+                    ),
+                )
+                self.assertIn("requires an existing .html or .htm file", result)
+                self.assertEqual(approvals, [])
+                self.assertEqual(store.list_session_actions("workspace-session"), ())
+            finally:
+                session.close()
+                store.close()
+
+    def test_ultra_replays_completed_identical_mutation_receipt_without_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            goal = store.create_goal("Write one approved artifact")
+            approvals: list[str] = []
+            session = UltraSession(
+                store=store,
+                workspace=workspace,
+                descriptor=self._descriptor(),
+                permission_adapter=PermissionAdapter("normal", DockerSandbox()),
+                approval=lambda name, _args, _risk: approvals.append(name) or True,
+                events=EventBus(),
+                config=UltraConfig(),
+                agent_steps=2,
+            )
+            adapter = mock.Mock()
+            adapter.run_id = None
+            adapter.master_task_for_node.return_value = None
+            adapter.lease_hash.return_value = (False, None)
+            session.goal_id = goal.id
+            session.adapter = adapter
+            node = mock.Mock(write_paths=("artifact.txt",), pre_write_hashes={})
+            request = AgentRequest(
+                run_id="run",
+                role=AgentRole.CODER,
+                phase="implement",
+                system_prompt="Implement the accepted artifact.",
+                context={},
+                task={},
+                node_id="node",
+            )
+            try:
+                with mock.patch.object(session, "_node", return_value=node):
+                    first = session._execute_tool(
+                        ToolCall(
+                            "write-first",
+                            "write_file",
+                            {"path": "artifact.txt", "content": "accepted\n"},
+                        ),
+                        request,
+                    )
+                    second = session._execute_tool(
+                        ToolCall(
+                            "write-repeat",
+                            "write_file",
+                            {"path": "artifact.txt", "content": "accepted\n"},
+                        ),
+                        request,
+                    )
+
+                self.assertIn("Wrote", first)
+                self.assertEqual(second, first)
+                self.assertEqual(len(store.list_actions(goal.id)), 1)
+                self.assertEqual(approvals, [])
+                self.assertTrue(
+                    any(
+                        event.event_type == "mutation.replay_prevented"
+                        for event in store.list_recent_events(goal.id, limit=100)
+                    )
+                )
+            finally:
+                session.close()
+                store.close()
+
+    def test_ultra_rejects_unplanned_shell_command_without_user_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            goal = store.create_goal("Verify one approved artifact")
+            approvals: list[str] = []
+            session = UltraSession(
+                store=store,
+                workspace=workspace,
+                descriptor=self._descriptor(),
+                permission_adapter=PermissionAdapter("normal", DockerSandbox()),
+                approval=lambda name, _args, _risk: approvals.append(name) or True,
+                events=EventBus(),
+                config=UltraConfig(),
+                agent_steps=2,
+            )
+            session.goal_id = goal.id
+            node = mock.Mock()
+            node.contract.verification = ("preview_html index.html",)
+            request = AgentRequest(
+                run_id="run",
+                role=AgentRole.CODER,
+                phase="fix",
+                system_prompt="Repair using the approval-bound verifier.",
+                context={},
+                task={},
+                node_id="node",
+            )
+            try:
+                with mock.patch.object(session, "_node", return_value=node):
+                    result = session._execute_tool(
+                        ToolCall(
+                            "unplanned-command",
+                            "run_command",
+                            {"command": "npm start", "cwd": "."},
+                        ),
+                        request,
+                    )
+
+                self.assertIn("not an approval-bound verification command", result)
+                self.assertEqual(approvals, [])
+                self.assertEqual(store.list_actions(goal.id), ())
+                self.assertTrue(
+                    any(
+                        event.event_type == "tool_contract.rejected"
+                        and event.payload.get("stage") == "ultra_execution_command_scope"
+                        for event in store.list_recent_events(goal.id, limit=20)
+                    )
+                )
+            finally:
+                session.close()
+                store.close()
+
+    def test_ultra_explicit_denial_is_not_truthy_and_leaves_no_running_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            goal = store.create_goal("Verify the approved project")
+            session = UltraSession(
+                store=store,
+                workspace=workspace,
+                descriptor=self._descriptor(),
+                permission_adapter=PermissionAdapter("normal", DockerSandbox()),
+                approval=lambda *_args: ApprovalDecision.DENY,
+                events=EventBus(),
+                config=UltraConfig(),
+                agent_steps=2,
+            )
+            adapter = mock.Mock()
+            adapter.master_task_for_node.return_value = None
+            session.goal_id = goal.id
+            session.adapter = adapter
+            try:
+                with self.assertRaisesRegex(
+                    ApprovalRequiredError,
+                    "Approval for run_command is required",
+                ):
+                    session._execute_tool(
+                        ToolCall(
+                            "denied-command",
+                            "run_command",
+                            {"command": "echo must-not-run", "cwd": "."},
+                        ),
+                        AgentRequest(
+                            run_id="run",
+                            role=AgentRole.CODER,
+                            phase="implement",
+                            system_prompt="Verify the accepted artifact.",
+                            context={},
+                            task={},
+                            node_id=None,
+                        ),
+                    )
+
+                actions = store.list_actions(goal.id)
+                self.assertEqual(len(actions), 1)
+                self.assertEqual(actions[0]["status"], "denied")
+                paused = store.get_goal(goal.id)
+                self.assertEqual(paused.metadata["waiting_on"], "approval")
+                self.assertEqual(
+                    paused.metadata["pending_tool_approval"]["tool"],
+                    "run_command",
+                )
+            finally:
+                session.close()
+                store.close()
 
     def test_ultra_factory_propagates_session_reasoning_effort_to_every_role_provider(self):
         descriptor = self._descriptor()
@@ -1208,6 +1797,44 @@ class UltraIntegrationTests(unittest.TestCase):
         self.assertEqual(calls[0].name, "list_files")
         self.assertEqual(calls[0].args, {"path": "."})
         self.assertEqual(response.payload["objective"], "Build the demo")
+
+    def test_memory_writeback_compacts_accepted_receipts_without_model_call(self):
+        provider = mock.Mock()
+        provider.call.side_effect = AssertionError("memory must not call the provider")
+        events = EventBus()
+        captured = []
+        events.subscribe(captured.append)
+        agent = WorkspaceUltraAgent(
+            provider,
+            role=AgentRole.MEMORY,
+            provider_name="offline",
+            model="unused",
+            executor=lambda _call, _request: "unexpected",
+            events=events,
+            max_steps=2,
+        )
+
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.MEMORY,
+                phase=InnerPhase.MEMORY_WRITEBACK.value,
+                system_prompt="Write memory.",
+                context={},
+                task={"result_summaries": ["Artifact hash and browser receipt accepted."]},
+                node_id="M001",
+            )
+        )
+
+        provider.call.assert_not_called()
+        self.assertTrue(response.payload["success"])
+        self.assertEqual(
+            response.payload["insights"][0]["summary"],
+            "Artifact hash and browser receipt accepted.",
+        )
+        self.assertTrue(
+            any(item.kind == "ultra.deterministic_memory_writeback" for item in captured)
+        )
 
     def test_post_review_component_publication_is_metadata_only(self):
         class PublicationProvider:
@@ -1478,6 +2105,204 @@ class UltraIntegrationTests(unittest.TestCase):
         self.assertEqual([call.name for call in executed], ["run_bash"])
         self.assertTrue(response.payload["passed"])
 
+    def test_tester_cd_verifier_returns_harness_receipt_without_second_inference(self):
+        class CdVerifierProvider:
+            def __init__(self):
+                self.calls = 0
+
+            def call(self, conversation, tools, system, **_kwargs):
+                del conversation, tools, system
+                self.calls += 1
+                if self.calls > 1:
+                    raise AssertionError("executor receipt must end the tester turn")
+                return AssistantTurn(
+                    tool_calls=[
+                        ToolCall(
+                            "allowed-npm-test",
+                            "run_bash",
+                            {"command": "cd web && npm test"},
+                        )
+                    ]
+                )
+
+        provider = CdVerifierProvider()
+        executed = []
+        events = EventBus()
+        deterministic_gates = []
+        events.subscribe(
+            lambda event: (
+                deterministic_gates.append(event)
+                if event.kind == "ultra.deterministic_test_gate"
+                else None
+            )
+        )
+        agent = WorkspaceUltraAgent(
+            provider,
+            role=AgentRole.TESTER,
+            provider_name="offline",
+            model="tester",
+            executor=lambda call, _request: (
+                executed.append(call) or "exit code: 0\nstdout:\nall tests passed\n"
+            ),
+            events=events,
+            max_steps=3,
+        )
+
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.TESTER,
+                phase="test",
+                system_prompt="Run verification.",
+                context={},
+                task={"contract": {"write_paths": ["web/app.js"]}},
+                node_id="M001",
+            )
+        )
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(len(executed), 1)
+        self.assertEqual(executed[0].name, "run_command")
+        self.assertEqual(executed[0].args, {"cwd": "web", "command": "npm test"})
+        self.assertTrue(response.payload["passed"])
+        self.assertEqual(response.provider, "harness")
+        self.assertEqual(len(deterministic_gates), 1)
+
+    def test_reviewer_inspection_budget_forces_structured_verdict(self):
+        class ReadingReviewerProvider:
+            def __init__(self):
+                self.calls = 0
+                self.tool_counts = []
+
+            def call(self, conversation, tools, system, **_kwargs):
+                del conversation, system
+                self.calls += 1
+                self.tool_counts.append(len(tools))
+                if tools:
+                    return AssistantTurn(
+                        tool_calls=[
+                            ToolCall(
+                                f"read-{self.calls}",
+                                "read_file",
+                                {"path": "module.py"},
+                            )
+                        ]
+                    )
+                return AssistantTurn(
+                    text=json.dumps(
+                        {
+                            "payload": {
+                                "passed": True,
+                                "issues": [],
+                                "findings": [],
+                                "evidence": [
+                                    {"kind": "bounded_read_review", "path": "module.py"}
+                                ],
+                            },
+                            "summary": "Bounded review passed.",
+                        }
+                    )
+                )
+
+        provider = ReadingReviewerProvider()
+        executed = []
+        agent = WorkspaceUltraAgent(
+            provider,
+            role=AgentRole.CLEAN_CODE_REVIEWER,
+            provider_name="offline",
+            model="reviewer",
+            executor=lambda call, _request: (
+                executed.append(call) or "def implementation():\n    return True\n"
+            ),
+            events=EventBus(),
+            max_steps=16,
+        )
+
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.CLEAN_CODE_REVIEWER,
+                phase="review",
+                system_prompt="Review the implementation.",
+                context={},
+                task={"contract": {"write_paths": ["module.py"]}},
+                node_id="M001",
+            )
+        )
+
+        self.assertEqual(len(executed), 4)
+        self.assertEqual(provider.calls, 5)
+        self.assertEqual(provider.tool_counts[-1], 0)
+        self.assertTrue(response.payload["passed"])
+
+    def test_duplicate_coder_mutation_closes_tools_and_forces_handoff(self):
+        class RepeatingWriterProvider:
+            def __init__(self):
+                self.calls = 0
+                self.tool_counts = []
+
+            def call(self, conversation, tools, system, **_kwargs):
+                del conversation, system
+                self.calls += 1
+                self.tool_counts.append(len(tools))
+                if tools:
+                    return AssistantTurn(
+                        tool_calls=[
+                            ToolCall(
+                                f"write-{self.calls}",
+                                "write_file",
+                                {"path": "module.py", "content": "VALUE = 1\n"},
+                            )
+                        ]
+                    )
+                return AssistantTurn(
+                    text=json.dumps(
+                        {
+                            "payload": {
+                                "success": True,
+                                "artifacts": [{"path": "module.py"}],
+                                "evidence": [{"kind": "mutation_receipt"}],
+                                "findings": [],
+                            },
+                            "summary": "Mutation handoff complete.",
+                        }
+                    )
+                )
+
+        provider = RepeatingWriterProvider()
+        executed = []
+        agent = WorkspaceUltraAgent(
+            provider,
+            role=AgentRole.CODER,
+            provider_name="offline",
+            model="coder",
+            executor=lambda call, _request: (
+                executed.append(call) or "Wrote 10 characters to module.py"
+            ),
+            events=EventBus(),
+            max_steps=8,
+        )
+
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.CODER,
+                phase="implement",
+                system_prompt="Implement the module.",
+                context={},
+                task={"contract": {"write_paths": ["module.py"]}},
+                node_id="M001",
+            )
+        )
+
+        self.assertEqual(
+            [call.name for call in executed].count("write_file"),
+            2,
+        )
+        self.assertEqual(provider.calls, 3)
+        self.assertEqual(provider.tool_counts[-1], 0)
+        self.assertTrue(response.payload["success"])
+
     def test_ultra_injects_harness_reasoning_scaffold_without_hidden_cot(self):
         provider = CapturingGoalProvider()
         agent = WorkspaceUltraAgent(
@@ -1569,6 +2394,80 @@ class UltraIntegrationTests(unittest.TestCase):
             "harness_html_browser_and_quality_gate",
         )
 
+    def test_ultra_tester_returns_passed_browser_receipt_without_model_handoff(self):
+        class ProviderMustNotRun:
+            def call(self, *_args, **_kwargs):
+                raise AssertionError("passed deterministic preview must end tester turn")
+
+        calls = []
+
+        def executor(call, _request):
+            calls.append(call)
+            if call.name == "preview_html":
+                return json.dumps(
+                    {
+                        "status": "running",
+                        "verification": "passed",
+                        "http_status": 200,
+                        "console_errors": [],
+                        "page_errors": [],
+                        "network_errors": [],
+                        "screenshot_path": "preview.png",
+                    }
+                )
+            return "ok"
+
+        agent = WorkspaceUltraAgent(
+            ProviderMustNotRun(),
+            role=AgentRole.TESTER,
+            provider_name="offline",
+            model="tester",
+            executor=executor,
+            events=EventBus(),
+            max_steps=2,
+        )
+
+        scenario = {
+            "name": "addition",
+            "steps": [{"action": "click", "role": "button", "name": "7"}],
+            "assertions": [
+                {
+                    "role": "textbox",
+                    "name": "Display",
+                    "property": "value",
+                    "equals": "7",
+                }
+            ],
+        }
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.TESTER,
+                phase="test",
+                system_prompt="Run tests.",
+                context={},
+                task={
+                    "contract": {
+                        "id": "M001",
+                        "title": "HTML Build",
+                        "objective": "Build index.html",
+                        "write_paths": ["index.html"],
+                        "metadata": {"browser_scenarios": [scenario]},
+                    }
+                },
+                node_id="M001",
+            )
+        )
+
+        self.assertEqual(calls[0].name, "preview_html")
+        self.assertEqual(calls[0].args["interactions"], [scenario])
+        self.assertTrue(response.payload["passed"])
+        self.assertEqual(response.provider, "harness")
+        self.assertEqual(
+            response.payload["test_results"][0]["name"],
+            "harness_html_preview",
+        )
+
     def test_ultra_preserves_valid_model_authored_question_without_keyword_filtering(self):
         questions = UltraOrchestrator._validated_questions(
             [
@@ -1583,23 +2482,36 @@ class UltraIntegrationTests(unittest.TestCase):
                         {"value": "both", "label": "Both", "description": "Support both releases.", "recommended": False},
                     ],
                     "allow_freeform": True,
+                    "decision_need": {
+                        "impact": "Selects the external release target and deployment authority.",
+                        "affected_scope": ["release target"],
+                        "affected_effects": ["external_side_effect"],
+                        "reversible": False,
+                        "requires_user_authority": True,
+                        "reason": "The original request does not authorize a release target.",
+                        "evidence_refs": ["goal:original_request"],
+                    },
                 },
             ]
         )
         self.assertEqual([item["id"] for item in questions], ["platform"])
-        with self.assertRaises(AgentProtocolError):
+        self.assertEqual(
             UltraOrchestrator._validated_questions(
                 [{"id": "one", "question": "Use the only viable fallback?", "options": [{"label": "Yes"}]}]
-            )
+            ),
+            (),
+        )
 
-    def test_ultra_restores_missing_goal_objective_only_from_authoritative_prompt(self):
+    def test_ultra_does_not_fill_missing_goal_objective_from_context(self):
         payload, actions = UltraOrchestrator._normalize_typed_payload(
             "goal_spec",
             {"objective": "", "success_criteria": ["Playable game exists"]},
             {"prompt": "Build the requested game"},
         )
-        self.assertEqual(payload["objective"], "Build the requested game")
-        self.assertTrue(actions)
+        self.assertEqual(payload["objective"], "")
+        self.assertEqual(actions, ())
+        with self.assertRaises(AgentProtocolError):
+            UltraOrchestrator._validate_typed_response("goal_spec", payload)
 
         untouched, no_actions = UltraOrchestrator._normalize_typed_payload(
             "goal_spec",
@@ -1609,7 +2521,7 @@ class UltraIntegrationTests(unittest.TestCase):
         self.assertEqual(untouched["objective"], "")
         self.assertEqual(no_actions, ())
 
-    def test_ultra_restores_empty_master_plan_from_architecture_and_adds_browser_qa_gate(self):
+    def test_ultra_does_not_restore_empty_master_plan_or_add_product_qa(self):
         payload, actions = UltraOrchestrator._normalize_typed_payload(
             "master_plan",
             {"summary": "", "modules": []},
@@ -1624,12 +2536,12 @@ class UltraIntegrationTests(unittest.TestCase):
                 },
             },
         )
-        self.assertEqual(payload["summary"], "Game architecture")
-        self.assertEqual(payload["modules"][-1]["title"], "Browser QA and Visual Refinement Gate")
-        self.assertIn("1280x720", payload["modules"][-1]["acceptance_criteria"][0])
-        self.assertTrue(actions)
+        self.assertEqual(payload, {"summary": "", "modules": []})
+        self.assertEqual(actions, ())
+        with self.assertRaises(AgentProtocolError):
+            UltraOrchestrator._validate_typed_response("master_plan", payload)
 
-    def test_ultra_does_not_treat_screenshot_inside_build_module_as_browser_qa_gate(self):
+    def test_ultra_does_not_inject_browser_qa_from_screenshot_keywords(self):
         payload, actions = UltraOrchestrator._normalize_typed_payload(
             "master_plan",
             {
@@ -1648,11 +2560,11 @@ class UltraIntegrationTests(unittest.TestCase):
             },
             {"goal_spec": {"objective": "Build a browser game with screenshot visual quality review"}},
         )
-        self.assertEqual(len(payload["modules"]), 2)
-        self.assertEqual(payload["modules"][-1]["title"], "Browser QA and Visual Refinement Gate")
-        self.assertIn("Browser QA gate added", " ".join(actions))
+        self.assertEqual(len(payload["modules"]), 1)
+        self.assertEqual(payload["modules"][0]["title"], "Game State and Visual Polish")
+        self.assertEqual(actions, ())
 
-    def test_ultra_single_file_goal_rewrites_split_module_paths_to_index(self):
+    def test_ultra_does_not_rewrite_model_authored_paths_from_keywords(self):
         payload, actions = UltraOrchestrator._normalize_typed_payload(
             "master_plan",
             {
@@ -1678,12 +2590,50 @@ class UltraIntegrationTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(payload["modules"][0]["write_paths"], ["index.html"])
-        self.assertTrue(any("All implementation remains inside index.html" in item for item in payload["modules"][0]["acceptance_criteria"]))
-        self.assertTrue(any("only external runtime dependency" in item for item in payload["modules"][0]["acceptance_criteria"]))
-        self.assertIn("single index.html", " ".join(actions))
+        self.assertEqual(payload["modules"][0]["write_paths"], ["index.html", "js/game.js"])
+        self.assertEqual(payload["modules"][0]["acceptance_criteria"], ["Game runs"])
+        self.assertEqual(actions, ())
 
-    def test_ultra_finds_browser_qa_requirement_outside_terse_objective(self):
+    def test_ultra_binds_literal_verifier_prerequisites_without_guessing_paths(self):
+        payload, actions = UltraOrchestrator._normalize_typed_payload(
+            "master_plan",
+            {
+                "summary": "Build and verify the local calculator",
+                "modules": [
+                    {
+                        "id": "M001",
+                        "title": "Calculator",
+                        "objective": "Implement the approved calculator",
+                        "acceptance_criteria": ["Calculator works"],
+                        "verification": [
+                            "npm test",
+                            "preview_html index.html",
+                        ],
+                        "depends_on": [],
+                        "write_paths": ["src/calculator.js"],
+                    }
+                ],
+            },
+            {
+                "goal_spec": {"objective": "Build the approved calculator"},
+                "architecture": {},
+            },
+        )
+
+        self.assertEqual(
+            payload["modules"][0]["write_paths"],
+            ["src/calculator.js", "package.json", "index.html"],
+        )
+        self.assertIn(
+            "master_plan bound package.json prerequisite to its package verification module",
+            actions,
+        )
+        self.assertIn(
+            "master_plan bound literal preview target index.html to its verification module",
+            actions,
+        )
+
+    def test_ultra_does_not_create_browser_qa_module_from_goal_text(self):
         payload, _ = UltraOrchestrator._normalize_typed_payload(
             "master_plan",
             {
@@ -1697,9 +2647,9 @@ class UltraIntegrationTests(unittest.TestCase):
                 }
             },
         )
-        self.assertEqual(payload["modules"][-1]["title"], "Browser QA and Visual Refinement Gate")
+        self.assertEqual([item["title"] for item in payload["modules"]], ["Build"])
 
-    def test_ultra_restores_sparse_decompose_refinement_child_contract(self):
+    def test_ultra_namespaces_sparse_child_without_inventing_its_contract(self):
         payload, actions = UltraOrchestrator._normalize_typed_payload(
             "decompose",
             {"children": [{"id": "M001_Refinement", "finding": "Improve canyon depth and lighting contrast"}]},
@@ -1707,12 +2657,47 @@ class UltraIntegrationTests(unittest.TestCase):
         )
         child = payload["children"][0]
         self.assertEqual(child["id"], "M001.1")
-        self.assertTrue(any("namespaced" in action for action in actions))
-        self.assertIn("Environment Generation & Visual Effects", child["title"])
-        self.assertIn("Improve canyon depth", child["objective"])
-        self.assertTrue(child["acceptance_criteria"])
-        self.assertTrue(child["verification"])
-        self.assertTrue(actions)
+        self.assertEqual(child["finding"], "Improve canyon depth and lighting contrast")
+        self.assertNotIn("title", child)
+        self.assertNotIn("objective", child)
+        self.assertNotIn("acceptance_criteria", child)
+        self.assertNotIn("verification", child)
+        self.assertEqual(actions, ("decompose child ids isolated under the parent contract",))
+
+    def test_ultra_rejects_sparse_child_inside_typed_repair_boundary(self):
+        payload, _ = UltraOrchestrator._normalize_typed_payload(
+            "decompose",
+            {
+                "children": [
+                    {
+                        "id": "M001_Refinement",
+                        "finding": "Read the component source before integration",
+                    }
+                ]
+            },
+            {"contract": {"id": "M001", "title": "Integration"}},
+        )
+
+        with self.assertRaisesRegex(
+            AgentProtocolError,
+            "requires a title and objective",
+        ):
+            UltraOrchestrator._validate_typed_response("decompose", payload)
+
+        UltraOrchestrator._validate_typed_response(
+            "decompose",
+            {
+                "children": [
+                    {
+                        "id": "M001.1",
+                        "title": "Inspect component contracts",
+                        "objective": "Inspect both approved component contracts",
+                        "acceptance_criteria": ["Both contracts are understood"],
+                        "verification": ["Compare both approved interfaces"],
+                    }
+                ]
+            },
+        )
 
     def test_ultra_drops_question_that_reopens_explicit_no_placeholder_constraint(self):
         question = {
@@ -1736,8 +2721,8 @@ class UltraIntegrationTests(unittest.TestCase):
             )
         )
 
-    def test_ultra_rejects_malformed_questions_instead_of_guessing_policy(self):
-        with self.assertRaises(AgentProtocolError):
+    def test_ultra_drops_malformed_optional_questions_instead_of_stopping_goal(self):
+        self.assertEqual(
             UltraOrchestrator._validated_questions(
             [
                 {
@@ -1755,10 +2740,12 @@ class UltraIntegrationTests(unittest.TestCase):
                     "options": [],
                 },
             ]
+            ),
+            (),
         )
 
-    def test_ultra_rejects_open_ended_questions_without_bounded_choices(self):
-        with self.assertRaises(AgentProtocolError):
+    def test_ultra_requires_targeted_repair_for_malformed_authority_question(self):
+        with self.assertRaisesRegex(AgentProtocolError, "Repair this question only"):
             UltraOrchestrator._validated_questions(
             [
                 {
@@ -1767,13 +2754,21 @@ class UltraIntegrationTests(unittest.TestCase):
                     "question": "Must the melee enemy use exact hitbox timing or is proximity collision sufficient?",
                     "reason": "Clarify implementation detail.",
                     "options": [],
+                    "decision_need": {
+                        "impact": "The collision contract changes observable game behavior.",
+                        "affected_scope": ["collision behavior"],
+                        "affected_effects": ["workspace artifacts"],
+                        "reversible": False,
+                        "requires_user_authority": True,
+                        "reason": "The requested behavior does not choose either contract.",
+                        "evidence_refs": ["goal:original_request"],
+                    },
                 }
             ]
         )
 
-    def test_ultra_does_not_autoresolve_model_authored_preferences_by_keywords(self):
-        with self.assertRaises(AgentProtocolError):
-            UltraOrchestrator._validated_questions(
+    def test_ultra_drops_preferences_without_typed_authority_proof(self):
+        questions = UltraOrchestrator._validated_questions(
             [
                 {
                     "id": "touch",
@@ -1791,6 +2786,7 @@ class UltraIntegrationTests(unittest.TestCase):
                 },
             ]
         )
+        self.assertEqual(questions, ())
 
     def test_ultra_edits_workspace_and_persists_every_quality_surface(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1929,7 +2925,7 @@ class UltraIntegrationTests(unittest.TestCase):
                 self.assertFalse(result.successful)
                 self.assertEqual(
                     store.get_ultra_run(run.id).status,
-                    UltraRunStatus.BLOCKED,
+                    UltraRunStatus.REVISION_REQUIRED,
                 )
                 html_benchmarks = store.list_benchmark_results(
                     suite_name="weak-model-html",
@@ -2012,7 +3008,7 @@ animate();
                 self.assertFalse(result.successful)
                 self.assertEqual(
                     store.get_ultra_run(run.id).status,
-                    UltraRunStatus.BLOCKED,
+                    UltraRunStatus.REVISION_REQUIRED,
                 )
                 html_benchmarks = store.list_benchmark_results(
                     suite_name="weak-model-html",
@@ -2247,7 +3243,10 @@ animate();
                     runtime.replace_provider(replacement, cloud)
                     stored = runtime.active_ultra_run()
                     self.assertEqual(stored.execution_class, ExecutionClass.CLOUD)
-                    self.assertEqual(stored.concurrency, 4)
+                    # Cloud is a location, not a capability claim. This
+                    # descriptor has no documented provider/hardware
+                    # concurrency, so the conservative worker limit remains 1.
+                    self.assertEqual(stored.concurrency, 1)
                     runtime.resume()
                     self.assertTrue(runtime.ultra_session.future.result(timeout=10).successful)
             finally:
@@ -2278,6 +3277,32 @@ animate();
                     store.get_latest_plan(runtime.active_goal().id).fingerprint,
                 )
                 self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
+            finally:
+                if runtime:
+                    runtime.close()
+                store.close()
+
+    def test_ultra_malformed_optional_question_does_not_pause_foundation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            runtime = None
+            provider = PhaseProvider(malformed_optional_question=True)
+            try:
+                with mock.patch.object(
+                    ModelDescriptor,
+                    "create_provider",
+                    return_value=provider,
+                ):
+                    runtime = self._runtime(workspace, store)
+                    plan = runtime.start_ultra("Build the demo")
+
+                self.assertIsNotNone(plan)
+                self.assertEqual(
+                    runtime.active_goal().status,
+                    GoalStatus.AWAITING_PLAN_APPROVAL,
+                )
+                self.assertEqual(runtime.ultra_session.orchestrator.goal_spec.questions, ())
             finally:
                 if runtime:
                     runtime.close()
@@ -2484,6 +3509,17 @@ animate();
                 new_run = runtime.active_ultra_run()
                 self.assertNotEqual(old_run.id, new_run.id)
                 self.assertEqual(store.get_ultra_run(old_run.id).status, UltraRunStatus.BLOCKED)
+                self.assertEqual(
+                    new_run.goal_spec.to_dict(),
+                    old_run.goal_spec.to_dict(),
+                )
+                self.assertEqual(
+                    new_run.architecture_spec.to_dict(),
+                    old_run.architecture_spec.to_dict(),
+                )
+                self.assertTrue(
+                    bool(new_run.config.get("accepted_foundation_reused"))
+                )
                 self.assertEqual(runtime.latest_plan().revision, 2)
                 self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
                 self.assertIsNotNone(revised)

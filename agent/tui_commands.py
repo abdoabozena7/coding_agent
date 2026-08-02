@@ -49,7 +49,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         arguments="[SESSION_ID]",
         live_safe=True,
     ),
-    CommandSpec("/plan", "open Plan Studio in the local web workspace", "Inspect", live_safe=True),
+    CommandSpec("/plan", "open Plan Workspace; create or review a plan", "Inspect", live_safe=True),
     CommandSpec("/review", "open Change Review in the local web workspace", "Inspect", live_safe=True),
     CommandSpec("/chat", "open the durable workspace conversation", "Inspect", live_safe=True),
     CommandSpec("/trace", "inspect redacted prompts and run trace", "Inspect", arguments="[TARGET]", live_safe=True),
@@ -71,7 +71,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/run", "run one bounded work slice", "Workflow", arguments="[STEPS]", checkpoint_required=True),
     CommandSpec("/auto", "continue until the next checkpoint", "Workflow", checkpoint_required=True),
     CommandSpec("/cancel", "explicitly abandon the active goal", "Workflow", checkpoint_required=True),
-    CommandSpec("/mode", "switch PLAN / NORMAL / ULTRA orchestration", "Session", arguments="plan|normal|ultra", checkpoint_required=True),
+    CommandSpec("/mode", "legacy alias for choosing Working or Plan", "Session", arguments="[normal|plan]", checkpoint_required=True),
     CommandSpec("/model", "choose model and reasoning effort", "Session", arguments="[MODEL] [EFFORT]", checkpoint_required=True),
     CommandSpec("/permissions", "choose NORMAL / FULL access", "Session", aliases=("/permission", "/access"), arguments="[normal|full]", checkpoint_required=True),
     CommandSpec("/sleep", "control safe unattended choices", "Session", arguments="[on|off|status]", live_safe=True),
@@ -92,8 +92,11 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
 )
 
 
+_HIDDEN_COMPAT_NAMES = {"/mode", "/goal"}
 ALL_SLASH_COMMANDS: tuple[tuple[str, str], ...] = tuple(
-    (spec.name, spec.description) for spec in COMMAND_SPECS
+    (spec.name, spec.description)
+    for spec in COMMAND_SPECS
+    if spec.name not in _HIDDEN_COMPAT_NAMES
 )
 
 # Compatibility exports retained for the plain slash menu and embedders.
@@ -122,8 +125,8 @@ COMMAND_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = tuple(
 
 _DESCRIPTIONS = dict(ALL_SLASH_COMMANDS)
 _CONTEXT_COMMANDS: dict[str, tuple[str, ...]] = {
-    "idle": ("/goal", "/mode", "/model", "/settings"),
-    "new": ("/goal", "/mode", "/model", "/settings"),
+    "idle": ("/plan", "/model", "/settings", "/help"),
+    "new": ("/plan", "/model", "/settings", "/help"),
     "discovering": ("/status", "/pause", "/agents", "/thinking"),
     "revising": ("/status", "/pause", "/plan", "/thinking"),
     "awaiting_plan_approval": ("/plan", "/questions"),
@@ -143,6 +146,10 @@ def contextual_commands(status: str) -> tuple[tuple[str, str], ...]:
 
 
 def command_availability(spec: CommandSpec, snapshot: Any | None) -> CommandAvailability:
+    if spec.name in {"/mode", "/goal"}:
+        # Runtime/parser support remains for automation and old sessions, but
+        # the interactive product no longer asks users to classify requests.
+        return CommandAvailability(False, False, "Selected automatically after the prompt")
     if snapshot is None:
         return CommandAvailability()
     status = str(getattr(snapshot, "status", "")).casefold()
@@ -153,22 +160,44 @@ def command_availability(spec: CommandSpec, snapshot: Any | None) -> CommandAvai
         return CommandAvailability(False, False, "Available while work is running")
     if spec.name == "/undo" and not bool(getattr(snapshot, "undo_available", False)):
         return CommandAvailability(False, False, "Available after a completed checkpoint")
+    if spec.name == "/mode" and status not in {"idle", "completed", "cancelled"}:
+        return CommandAvailability(
+            True,
+            False,
+            "Mode is locked until this workflow completes or is cancelled",
+        )
     return CommandAvailability()
 
 
 def matching_commands(
     query: str,
     *,
-    limit: int = 9,
+    limit: int | None = None,
     snapshot: Any | None = None,
 ) -> tuple[CommandSpec, ...]:
     needle = str(query).strip().casefold()
     if needle and not needle.startswith("/"):
         needle = "/" + needle
+    if needle == "/":
+        needle = ""
     matches = tuple(
         spec
         for spec in COMMAND_SPECS
         if command_availability(spec, snapshot).visible
         and (not needle or spec.name.startswith(needle) or needle in spec.search_text)
     )
+    if not needle and snapshot is not None:
+        status = str(getattr(snapshot, "status", "idle")).casefold()
+        preferred = dict.fromkeys(_CONTEXT_COMMANDS.get(status, _CONTEXT_COMMANDS["idle"]))
+        matches = tuple(sorted(
+            matches,
+            key=lambda spec: (
+                0 if spec.name in preferred else 1,
+                tuple(preferred).index(spec.name) if spec.name in preferred else 0,
+                spec.category,
+                spec.name,
+            ),
+        ))
+    if limit is None:
+        return matches
     return matches[: max(1, int(limit))]

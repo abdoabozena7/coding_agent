@@ -15,7 +15,10 @@ from ._security import (
     resolve_workspace_path,
 )
 
-REQUIRES_APPROVAL = True  # writes to disk — ask the human first
+# Workspace writes are already bounded by the accepted task/effect contract,
+# canonical path isolation, mutation footprint, and journal. They are not a
+# second human boundary after plan approval.
+REQUIRES_APPROVAL = False
 
 SCHEMA = {
     "type": "function",

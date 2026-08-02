@@ -1,0 +1,28 @@
+/* style.css */
+html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    background-color: #111;
+    color: #fff;
+    font-family: Arial, sans-serif;
+}
+#calcCanvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    display: block;
+}
+#expression {
+    position: absolute;
+    top: 20px;
+    left: 20px;
+    font-size: 2rem;
+    color: #0f0;
+    text-shadow: 0 0 5px #0f0;
+    pointer-events: none;
+    user-select: none;
+}

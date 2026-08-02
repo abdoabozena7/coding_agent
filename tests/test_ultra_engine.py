@@ -18,16 +18,280 @@ from agent.scheduler import (
 )
 from agent.reasoning import evaluate_reasoning_artifact, repair_reasoning_artifact_graph, reasoning_debate_protocol_for
 from agent.ultra import (
+    AgentProtocolError,
     AgentRequest,
     AgentResponse,
     AgentRole,
     InMemoryUltraState,
     InnerPhase,
+    MasterPlanV1,
     TaskContractV1,
     UltraConfig,
     UltraOrchestrator,
     UltraPhase,
+    _bind_explicit_browser_scenarios,
 )
+
+
+def test_runtime_effect_plan_requires_concrete_applicable_verification() -> None:
+    vague = MasterPlanV1(
+        summary="Build the app.",
+        modules=(
+            TaskContractV1(
+                id="M001",
+                title="App",
+                objective="Build it.",
+                acceptance_criteria=("The app runs.",),
+                verification=("Run tests on the app",),
+                write_paths=("src/app.js",),
+            ),
+        ),
+    )
+    issues = UltraOrchestrator._master_plan_applicability_issues(
+        vague,
+        requested_effects=("run", "preview"),
+    )
+    assert any("concrete executable" in item for item in issues)
+    assert any("preview_html" in item for item in issues)
+
+    executable = MasterPlanV1(
+        summary="Build and verify the app.",
+        modules=(
+            TaskContractV1(
+                id="M001",
+                title="Runnable app",
+                objective="Build it.",
+                acceptance_criteria=("The app runs.",),
+                verification=("npm test", "preview_html index.html"),
+                write_paths=("package.json", "index.html", "tests/app.test.js"),
+            ),
+        ),
+    )
+    assert UltraOrchestrator._master_plan_applicability_issues(
+        executable,
+        requested_effects=("run", "preview"),
+    ) == ()
+    scope_issues = UltraOrchestrator._master_plan_applicability_issues(
+        executable,
+        requested_effects=("run", "preview"),
+        approved_write_paths=("package.json", "index.html"),
+    )
+    assert any("tests/app.test.js" in item for item in scope_issues)
+
+    placeholder = MasterPlanV1(
+        summary="Build with placeholder paths.",
+        modules=(
+            TaskContractV1(
+                id="M001",
+                title="App",
+                objective="Build it.",
+                acceptance_criteria=("The app runs.",),
+                verification=("npm test",),
+                write_paths=("path/to/App/index.js", "package.json"),
+            ),
+        ),
+    )
+    placeholder_issues = UltraOrchestrator._master_plan_applicability_issues(
+        placeholder,
+        requested_effects=("run",),
+    )
+    assert any("contain placeholders" in item for item in placeholder_issues)
+
+    broad_root = MasterPlanV1(
+        summary="Broad workspace root plan.",
+        modules=(
+            TaskContractV1(
+                id="M001",
+                title="Integration",
+                objective="Integrate the approved artifacts.",
+                acceptance_criteria=("Integration passes.",),
+                verification=("pytest -q",),
+                write_paths=(".",),
+            ),
+        ),
+    )
+    root_issues = UltraOrchestrator._master_plan_applicability_issues(
+        broad_root,
+        requested_effects=("run",),
+    )
+    assert any("contain placeholders" in item and "." in item for item in root_issues)
+
+    non_html_preview = MasterPlanV1(
+        summary="Invalid JavaScript preview target.",
+        modules=(
+            TaskContractV1(
+                id="M001",
+                title="UI source",
+                objective="Create the UI source module.",
+                acceptance_criteria=("The UI source exists.",),
+                verification=("preview_html src/index.js",),
+                write_paths=("src/index.js",),
+            ),
+        ),
+    )
+    preview_issues = UltraOrchestrator._master_plan_applicability_issues(
+        non_html_preview,
+        requested_effects=("preview",),
+    )
+    assert any("must be an HTML artifact" in item for item in preview_issues)
+
+    missing_scope = MasterPlanV1(
+        summary="Module without a write lease.",
+        modules=(
+            TaskContractV1(
+                id="M001",
+                title="Integration",
+                objective="Integrate the runnable application.",
+                acceptance_criteria=("Integration passes.",),
+                verification=("pytest -q",),
+                write_paths=(),
+            ),
+        ),
+    )
+    missing_scope_issues = UltraOrchestrator._master_plan_applicability_issues(
+        missing_scope,
+        requested_effects=("run", "write"),
+    )
+    assert any("requires concrete approval-bound write_paths" in item for item in missing_scope_issues)
+
+
+def test_master_plan_normalizes_conceptual_workspace_root() -> None:
+    contract = TaskContractV1(
+        id="M001",
+        title="Repair app",
+        objective="Repair the approved app.",
+        acceptance_criteria=("The repair passes.",),
+        verification=("npm test",),
+        write_paths=("workspace/src/App.js", "workspace/package.json"),
+    )
+    assert contract.write_paths == ("src/App.js", "package.json")
+
+
+def test_interactive_html_acceptance_requires_typed_browser_scenarios() -> None:
+    base = TaskContractV1(
+        id="M001",
+        title="Calculator",
+        objective="Repair calculator behavior.",
+        acceptance_criteria=("Click 7 + 5 and display 12; keyboard Enter works.",),
+        verification=("preview_html src/index.html",),
+        write_paths=("src/index.html",),
+    )
+    missing = MasterPlanV1(summary="Repair", modules=(base,))
+
+    issues = UltraOrchestrator._master_plan_applicability_issues(
+        missing,
+        requested_effects=("preview",),
+    )
+    assert any("browser_scenarios" in item for item in issues)
+
+    scenario = {
+        "name": "addition",
+        "steps": [
+            {"action": "click", "role": "button", "name": "7"},
+            {"action": "click", "role": "button", "name": "Add"},
+            {"action": "click", "role": "button", "name": "5"},
+            {"action": "click", "role": "button", "name": "Equals"},
+        ],
+        "assertions": [
+            {
+                "role": "textbox",
+                "name": "Calculator display",
+                "property": "value",
+                "equals": "12",
+            }
+        ],
+    }
+    bound = MasterPlanV1(
+        summary="Repair with executable interaction evidence.",
+        modules=(replace(base, metadata={"browser_scenarios": [scenario]}),),
+    )
+    assert UltraOrchestrator._master_plan_applicability_issues(
+        bound,
+        requested_effects=("preview",),
+    ) == ()
+
+
+def test_explicit_browser_scenarios_are_bound_before_plan_applicability_review() -> None:
+    plan = MasterPlanV1(
+        summary="Lossy small-model plan",
+        modules=(
+            TaskContractV1(
+                id="M001",
+                title="Verify",
+                objective="Open the page.",
+                acceptance_criteria=("No errors.",),
+                verification=("preview_html src/index.html",),
+                write_paths=("src/index.html",),
+            ),
+        ),
+    )
+    authority = (
+        'metadata.browser_scenarios: [{"name":"addition",'
+        '"steps":[{"action":"click","role":"button","name":"7"}],'
+        '"assertions":[{"role":"textbox","name":"Display",'
+        '"property":"value","equals":"7"}]}]'
+    )
+
+    bound = _bind_explicit_browser_scenarios(plan, authority)
+
+    assert bound.modules[0].metadata["browser_scenarios"][0]["name"] == "addition"
+
+    verification_bound = _bind_explicit_browser_scenarios(
+        plan,
+        authority + " Preserve the current implementation; this is verification-focused.",
+    )
+    assert verification_bound.modules[0].metadata["verification_only"] is True
+
+
+def test_master_plan_separates_preview_scenario_from_literal_html_target() -> None:
+    payload, actions = UltraOrchestrator._normalize_typed_payload(
+        "master_plan",
+        {
+            "summary": "Build and verify.",
+            "modules": [
+                {
+                    "id": "M001",
+                    "title": "Calculator",
+                    "objective": "Build it.",
+                    "acceptance_criteria": ["Calculator works."],
+                    "verification": [
+                        "preview_html src/index.html plus 7+5=12",
+                        "preview_html src/index.html divide-by-zero check",
+                    ],
+                    "write_paths": ["src/index.html"],
+                }
+            ],
+        },
+        {"protocol_node_namespace": "rtest"},
+    )
+
+    module_payload = payload["modules"][0]
+    assert module_payload["verification"] == ["preview_html src/index.html"]
+    assert module_payload["write_paths"] == ["src/index.html"]
+    assert "Browser verification scenario: plus 7+5=12" in module_payload[
+        "acceptance_criteria"
+    ]
+    assert "Browser verification scenario: divide-by-zero check" in module_payload[
+        "acceptance_criteria"
+    ]
+    assert any("separated preview scenario prose" in item for item in actions)
+
+
+def test_browser_404_repair_constraints_are_scope_preserving_for_small_models() -> None:
+    constraints = UltraOrchestrator._harness_repair_constraints(
+        write_paths=("index.html",),
+        verification=("preview_html index.html",),
+        findings=(
+            "HTTP 404 http://127.0.0.1:1234/styles.css",
+            "GET http://127.0.0.1:1234/app.js: net::ERR_ABORTED",
+        ),
+    )
+
+    rendered = " ".join(constraints)
+    assert "complete self-contained implementation" in rendered
+    assert "inline its required CSS and JavaScript" in rendered
+    assert "preview_html index.html" in rendered
+    assert "do not invent files" in rendered
 
 
 @dataclass(frozen=True)
@@ -184,7 +448,7 @@ def prepared_engine(
 
 
 class SchedulerTests(unittest.TestCase):
-    def test_malformed_architecture_candidate_recovers_to_typed_harness_topology(self):
+    def test_malformed_architecture_candidate_stops_after_targeted_repairs_without_fallback(self):
         def handler(request: AgentRequest) -> AgentResponse:
             response = standard_handler(request)
             if request.phase == "architecture":
@@ -206,13 +470,16 @@ class SchedulerTests(unittest.TestCase):
                 provider_retries=1,
             ),
         )
-        plan = engine.prepare("Build a polished Three.js browser game")
-        self.assertIsNotNone(plan)
-        self.assertIn("recursive", engine.architecture.summary.casefold())
-        self.assertEqual(
-            {item["name"] for item in engine.architecture.components},
-            {"World", "Vehicles", "Character", "Gameplay", "Presentation", "QA"},
-        )
+        with self.assertRaisesRegex(
+            AgentProtocolError,
+            "architecture failed after three targeted typed-return repairs",
+        ):
+            engine.prepare("Build a polished Three.js browser game")
+        architecture_calls = [
+            request for request in factory.requests if request.phase == "architecture"
+        ]
+        self.assertEqual(len(architecture_calls), 4)
+        self.assertIsNone(engine.architecture)
 
     def test_cross_run_lessons_are_injected_into_foundation_planning(self):
         state = ProjectMemoryState()
@@ -252,6 +519,20 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(report.outcomes, ())
         self.assertEqual(report.waves, ())
         self.assertTrue(report.successful)
+
+    def test_user_authority_boundary_is_not_converted_to_worker_failure(self):
+        class UserBoundary(RuntimeError):
+            user_boundary = True
+
+        scheduler = DeterministicWaveScheduler(ExecutionClass.LOCAL)
+
+        with self.assertRaisesRegex(UserBoundary, "approval required"):
+            scheduler.run(
+                [Item("A", write_paths=("src/a.py",))],
+                lambda _item: (_ for _ in ()).throw(
+                    UserBoundary("approval required")
+                ),
+            )
 
     def test_prewrite_hash_conflict_blocks_before_worker(self):
         called: list[str] = []
@@ -298,6 +579,65 @@ class SchedulerTests(unittest.TestCase):
 
 
 class UltraEngineTests(unittest.TestCase):
+    def test_authoritative_hashes_skip_model_authored_final_evidence_formatter(self):
+        modules = [module("M1", "src/app.py")]
+
+        def handler(request: AgentRequest) -> AgentResponse:
+            if request.phase == InnerPhase.FINAL_EVIDENCE.value:
+                self.fail(
+                    "authoritative operational evidence must not be handed back to "
+                    "the model for schema formatting"
+                )
+            response = standard_handler(request, modules=modules)
+            if request.phase == InnerPhase.IMPLEMENT.value:
+                return replace(
+                    response,
+                    payload={
+                        "artifacts": [
+                            {
+                                "path": "src/app.py",
+                                "sha256": "a" * 64,
+                            }
+                        ]
+                    },
+                )
+            return response
+
+        events = EventBus()
+        captured = []
+        events.subscribe(captured.append)
+        factory = FakeFactory(handler)
+        engine = UltraOrchestrator(
+            factory,
+            execution_class=ExecutionClass.LOCAL,
+            events=events,
+            config=UltraConfig(min_top_modules=1, max_top_modules=4),
+        )
+        plan = engine.prepare("build the whole product")
+        engine.approve(plan.fingerprint)
+
+        result = engine.run()
+
+        self.assertTrue(result.successful)
+        self.assertEqual(
+            result.global_result.evidence[0]["kind"],
+            "authoritative_operational_evidence",
+        )
+        self.assertTrue(
+            any(item.kind == "ultra.deterministic_final_evidence" for item in captured)
+        )
+        self.assertFalse(
+            any(
+                request.phase
+                in {
+                    InnerPhase.GLOBAL_INTEGRATION.value,
+                    InnerPhase.GLOBAL_REVIEW.value,
+                    InnerPhase.FINAL_EVIDENCE.value,
+                }
+                for request in factory.requests
+            )
+        )
+
     def test_live_progress_events_include_real_graph_counts_and_current_assignment(self):
         events = EventBus()
         captured = []
@@ -352,6 +692,81 @@ class UltraEngineTests(unittest.TestCase):
         self.assertEqual(records[0]["evidence"]["declared_verdict"], "reject")
         self.assertEqual(records[1]["verdict"], "reject")
         self.assertEqual(records[1]["evidence"]["declared_verdict"], "accept")
+
+    def test_authoritative_runtime_evidence_prevents_reasoning_shape_false_rejection(self):
+        engine, _factory, _plan = prepared_engine()
+        node = next(iter(engine.nodes.values()))
+        missing_reasoning = {
+            "passed": False,
+            "missing_fields": ["reasoning_artifact"],
+        }
+        records = engine._quality_vote_records(
+            node,
+            (
+                AgentResponse(
+                    payload={
+                        "passed": True,
+                        "harness_reasoning_evaluation": missing_reasoning,
+                    },
+                    summary="Typed reviewer passed without optional prose.",
+                ),
+                AgentResponse(
+                    payload={
+                        "passed": True,
+                        "test_results": [
+                            {"name": "harness_html_preview", "passed": True}
+                        ],
+                        "harness_reasoning_evaluation": missing_reasoning,
+                    },
+                    summary="Authoritative preview passed.",
+                ),
+            ),
+        )
+
+        self.assertEqual([item["verdict"] for item in records], ["accept", "accept"])
+        self.assertFalse(
+            records[0]["evidence"]["harness_reasoning_evaluation"]["passed"]
+        )
+
+    def test_passed_browser_evidence_satisfies_duplicate_preview_request_only(self):
+        response = AgentResponse(
+            payload={
+                "passed": False,
+                "issues": [
+                    {
+                        "summary": "The application must be functional in a real browser.",
+                        "description": "Preview the HTML file to verify functionality.",
+                    }
+                ],
+                "findings": [],
+            },
+            summary="Browser verification is required.",
+        )
+        evidence = {
+            "test_results": [
+                {"name": "harness_html_preview", "passed": True, "http_status": 200}
+            ]
+        }
+
+        reconciled = UltraOrchestrator._reconcile_satisfied_evidence_request(
+            response, evidence
+        )
+
+        self.assertTrue(reconciled.payload["passed"])
+        self.assertFalse(reconciled.payload["issues"])
+
+        concrete = replace(
+            response,
+            payload={
+                **response.payload,
+                "issues": ["Browser preview failed with console error 404."],
+            },
+        )
+        unresolved = UltraOrchestrator._reconcile_satisfied_evidence_request(
+            concrete, evidence
+        )
+        self.assertFalse(unresolved.payload["passed"])
+        self.assertTrue(unresolved.payload["issues"])
 
     def test_agent_response_preserves_typed_envelope_reasoning_artifact(self):
         artifact = {
@@ -419,7 +834,7 @@ class UltraEngineTests(unittest.TestCase):
         )
         self.assertEqual(combined.payload["evidence"], [{"id": "fix"}])
 
-    def test_single_html_artifact_uses_recursive_specialists_and_parent_packages(self):
+    def test_single_html_artifact_does_not_invent_recursive_specialists(self):
         state = InMemoryUltraState()
         html_module = module("GAME", "index.html")
         html_module.update(
@@ -438,37 +853,25 @@ class UltraEngineTests(unittest.TestCase):
         self.assertTrue(result.successful)
         root = next(node for node in engine.nodes.values() if node.parent_id is None)
         children = [node for node in engine.nodes.values() if node.parent_id]
-        direct_children = [node for node in children if node.parent_id == root.id]
-        recursive_leaves = [node for node in children if node.parent_id != root.id]
-        self.assertGreaterEqual(len(children), 6)
-        self.assertEqual(len(direct_children), 6)
-        self.assertGreaterEqual(len(recursive_leaves), 18)
-        self.assertTrue(all(node.contract.metadata.get("component_leaf") for node in recursive_leaves))
-        self.assertTrue(all(not node.contract.write_paths for node in children))
-        self.assertTrue(
-            all(node.contract.metadata.get("component_package_only") for node in children)
-        )
+        self.assertEqual(children, [])
         run_id = engine.run_state.id
-        self.assertGreaterEqual(len(state.specialists[run_id]), len(children) + 1)
-        self.assertTrue(all(child.id in state.component_packages[run_id] for child in children))
+        self.assertGreaterEqual(len(state.specialists[run_id]), 1)
+        self.assertIn(root.id, state.component_packages[run_id])
         assembler_requests = [
             request
             for request in factory.requests
             if request.phase == InnerPhase.INTEGRATE.value
-            and request.task.get("final_assembler")
+            and request.task.get("publish_component_package")
         ]
         self.assertEqual(len(assembler_requests), 1)
-        self.assertEqual(
-            set(assembler_requests[0].task["child_component_packages"]),
-            {child.id for child in direct_children},
-        )
+        self.assertFalse(assembler_requests[0].task.get("final_assembler", False))
         component_assemblers = [
             request
             for request in factory.requests
             if request.phase == InnerPhase.INTEGRATE.value
             and request.task.get("component_assembler")
         ]
-        self.assertGreaterEqual(len(component_assemblers), len(direct_children))
+        self.assertEqual(component_assemblers, [])
         self.assertTrue(all(not request.task.get("final_assembler") for request in component_assemblers))
         review_requests = [
             request

@@ -1,0 +1,26 @@
+/* style.css */
+html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background-color: #111;
+    color: #fff;
+    font-family: Arial, sans-serif;
+}
+#calcCanvas {
+    display: block; /* removes inline gaps */
+    width: 100vw;
+    height: 100vh;
+}
+#display {
+    position: absolute;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 2rem;
+    background: rgba(0,0,0,0.5);
+    padding: 10px 20px;
+    border-radius: 8px;
+    pointer-events: none;
+    user-select: none;
+}

@@ -14,6 +14,36 @@ import urllib.request
 from .models import utc_now
 
 
+@dataclass(frozen=True, slots=True)
+class NormalizationReceiptV1:
+    """Audit record for semantic-preserving model transport normalization."""
+
+    tool: str
+    input_fingerprint: str
+    output_fingerprint: str
+    actions: tuple[str, ...] = ()
+    version: int = 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tool": self.tool,
+            "input_fingerprint": self.input_fingerprint,
+            "output_fingerprint": self.output_fingerprint,
+            "actions": list(self.actions),
+            "version": self.version,
+        }
+
+
+def _payload_fingerprint(value: Mapping[str, Any]) -> str:
+    import hashlib
+
+    encoded = json.dumps(
+        dict(value), ensure_ascii=False, sort_keys=True, default=str,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def extract_first_json_object(text: str) -> Mapping[str, Any] | None:
     """Extract one balanced JSON object without trusting surrounding prose."""
     source = str(text or "")
@@ -198,6 +228,194 @@ def normalize_generated_tool_args(name: str, args: Mapping[str, Any]) -> dict[st
         index += 1
     normalized[field] = "".join(output)
     return normalized
+
+
+def normalize_generated_tool_payload(
+    name: str,
+    args: Mapping[str, Any],
+    *,
+    context: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], NormalizationReceiptV1]:
+    """Normalize provider wire variance without supplying product semantics."""
+
+    original = dict(args)
+    normalized = normalize_generated_tool_args(name, original)
+    actions: list[str] = []
+    if name == "submit_semantic_route":
+        exact_input = str(dict(context or {}).get("exact_latest_user_input") or "")
+        raw_spans = normalized.get("authority_spans")
+        if exact_input and isinstance(raw_spans, Mapping):
+            reference_tokens = {
+                "exact_latest_user_input",
+                "$exact_latest_user_input",
+                "${exact_latest_user_input}",
+            }
+            canonical_spans: dict[str, Any] = {}
+            for effect, raw_values in raw_spans.items():
+                values = [raw_values] if isinstance(raw_values, str) else raw_values
+                if not isinstance(values, (list, tuple)):
+                    canonical_spans[str(effect)] = raw_values
+                    continue
+                repaired: list[Any] = []
+                for span_index, span in enumerate(values):
+                    if isinstance(span, str) and span.strip() in reference_tokens:
+                        repaired.append(exact_input)
+                        actions.append(
+                            f"/authority_spans/{effect}/{span_index} resolved from "
+                            "the exact_latest_user_input transport reference"
+                        )
+                    else:
+                        repaired.append(span)
+                canonical_spans[str(effect)] = repaired
+            route = str(normalized.get("route") or "").strip().casefold()
+            raw_effects = normalized.get("requested_effects", ())
+            if isinstance(raw_effects, Mapping):
+                requested_effects = {
+                    str(effect).strip().casefold()
+                    for effect, enabled in raw_effects.items()
+                    if bool(enabled)
+                }
+            elif isinstance(raw_effects, str):
+                requested_effects = {raw_effects.strip().casefold()}
+            elif isinstance(raw_effects, (list, tuple)):
+                requested_effects = {
+                    str(effect).strip().casefold() for effect in raw_effects
+                }
+            else:
+                requested_effects = set()
+            # A Goal cannot mutate before a separate plan approval.  When a
+            # weak model selected an internal project effect but omitted only
+            # its transport citation, bind that already-authored effect to the
+            # exact request as a whole.  Never do this for bounded Actions or
+            # external side effects, where a missing explicit citation remains
+            # a semantic contract error.
+            goal_internal_effects = {"write", "run", "install", "preview"}
+            if route == "goal":
+                for effect in sorted(requested_effects & goal_internal_effects):
+                    current = canonical_spans.get(effect)
+                    if not isinstance(current, (list, tuple)) or not any(
+                        str(item) for item in current
+                    ):
+                        canonical_spans[effect] = [exact_input]
+                        actions.append(
+                            f"/authority_spans/{effect} bound to the complete exact "
+                            "request for an approval-gated Goal"
+                        )
+            normalized["authority_spans"] = canonical_spans
+    elif name == "request_plan_input":
+        questions = normalized.get("questions", ())
+        if isinstance(questions, Mapping):
+            normalized["questions"] = [dict(questions)]
+            actions.append("/questions wrapped as an array")
+        elif isinstance(questions, tuple):
+            normalized["questions"] = list(questions)
+            actions.append("/questions tuple converted to an array")
+        normalized_questions: list[Any] = []
+        for question_index, question in enumerate(
+            normalized.get("questions", ()) or ()
+        ):
+            if not isinstance(question, Mapping):
+                normalized_questions.append(question)
+                continue
+            item = dict(question)
+            if "allow_freeform" not in item:
+                for alias in ("allow_free_form", "allowFreeform"):
+                    if alias in item:
+                        item["allow_freeform"] = item.pop(alias)
+                        actions.append(
+                            f"/questions/{question_index}/{alias} normalized to allow_freeform"
+                        )
+                        break
+            normalized_questions.append(item)
+        if normalized_questions:
+            normalized["questions"] = normalized_questions
+    elif name == "propose_semantic_goal":
+        raw_effects = normalized.get("requested_effects", ())
+        if isinstance(raw_effects, Mapping):
+            raw_effects = [
+                key for key, enabled in raw_effects.items() if bool(enabled)
+            ]
+            actions.append("/requested_effects boolean object converted to an array")
+        elif isinstance(raw_effects, str):
+            raw_effects = [raw_effects]
+            actions.append("/requested_effects scalar converted to an array")
+        if isinstance(raw_effects, (list, tuple)):
+            from .semantic import RequestedEffect
+
+            canonical: list[Any] = []
+            for effect_index, effect in enumerate(raw_effects):
+                try:
+                    value = RequestedEffect.parse(effect).value
+                except (TypeError, ValueError):
+                    value = effect
+                if value != effect:
+                    actions.append(
+                        f"/requested_effects/{effect_index} normalized to {value}"
+                    )
+                if value not in canonical:
+                    canonical.append(value)
+            normalized["requested_effects"] = canonical
+    elif name == "submit_plan_review":
+        issues = normalized.get("issues", ())
+        if isinstance(issues, Mapping):
+            normalized["issues"] = [dict(issues)]
+            actions.append("/issues wrapped as an array")
+        elif isinstance(issues, str):
+            normalized["issues"] = [issues]
+            actions.append("/issues scalar converted to an array")
+    elif name == "propose_plan_change":
+        # A plan revision describes future work; task lifecycle is owned by the
+        # harness and is never model-editable.  Removing these fields is a
+        # mechanical authority-boundary normalization: no title, requirement,
+        # path, effect, criterion, dependency, or verification is supplied or
+        # changed here.
+        lifecycle_fields = {
+            "status", "attempt", "attempts", "evidence", "note",
+            "blocked_reason", "last_error", "started_at", "completed_at",
+            "ready_at", "updated_at", "worker_id",
+        }
+        raw_tasks = normalized.get("tasks", ())
+        if isinstance(raw_tasks, tuple):
+            raw_tasks = list(raw_tasks)
+            normalized["tasks"] = raw_tasks
+            actions.append("/tasks tuple converted to an array")
+        if isinstance(raw_tasks, list):
+            clean_tasks: list[Any] = []
+            for task_index, task in enumerate(raw_tasks):
+                if not isinstance(task, Mapping):
+                    clean_tasks.append(task)
+                    continue
+                clean = dict(task)
+                if "id" not in clean and "task_id" in clean:
+                    clean["id"] = clean.pop("task_id")
+                    actions.append(
+                        f"/tasks/{task_index}/task_id normalized to id"
+                    )
+                for field in sorted(lifecycle_fields):
+                    if field in clean:
+                        clean.pop(field)
+                        actions.append(
+                            f"/tasks/{task_index}/{field} removed "
+                            "(harness-owned lifecycle field)"
+                        )
+                clean_tasks.append(clean)
+            normalized["tasks"] = clean_tasks
+    elif name == "apply_patch":
+        if "base_path" in normalized and not str(
+            normalized.get("base_path") or ""
+        ).strip():
+            normalized["base_path"] = "."
+            actions.append("/base_path empty optional value normalized to default '.'")
+    before = _payload_fingerprint(original)
+    after = _payload_fingerprint(normalized)
+    if before != after and not actions:
+        actions.append("provider argument layout normalized")
+    return normalized, NormalizationReceiptV1(
+        tool=str(name),
+        input_fingerprint=before,
+        output_fingerprint=after,
+        actions=tuple(actions),
+    )
 
 
 class ProviderFailureKind(str, Enum):

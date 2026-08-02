@@ -1,0 +1,53 @@
+  ____    _    _____ ____    _    ____ 
+ / ___|  / \  |___ /| __ )  / \  |  _ \
+| |  _  / _ \   |_ \|  _ \ / _ \ | | | |
+| |_| |/ ___ \ ___) | |_) / ___ \| |_| |
+ \____/_/   \_\____/|____/_/   \_\____/ 
+              coding agent              
+
+Resuming workspace-se from its saved checkpoint · ollama/gpt-oss:120b-cloud · working · 4 agent(s)
+Local Web Views ready on 127.0.0.1:62020.
+Ready · ollama/gpt-oss:120b-cloud · cloud · normal · state .coding-agent/state.db
+Goal resumed in running.
+GA3BAD CODING AGENT MODE WORKING / STATUS RUNNING ollama/gpt-oss:120b-cloud
+----------------------------------------------------------------------------------------------------------------
+GOAL                                                                     |  CONTEXT
+create a three js calculator with impressive design and run it           |  D:\projects\Ai\coding_agent\run-a...
+                                                                         |  
+NOW                                                                      |  Plan r1
+Running - 0/2 tasks                                                      |  Progress 0/2 tasks
+                                                                         |  Access NORMAL / CLOUD
+RECENT                                                                   |  Agents 0
+goal.metadata_updated: goal_434ac23d688142dda322c68a8b2861f6             |  Route GOAL
+goal.metadata_updated: goal_434ac23d688142dda322c68a8b2861f6             |  Execution STAGED
+goal.status_changed: resumed by user                                     |  
+
+----------------------------------------------------------------------------------------------------------------
+> Work is running; type guidance to queue it
+Working: goal resumed; continuing automatically.
+Durable goal mode is active. No-progress attempts self-reprompt until completion or real user input; the durable retry policy retries transient provider failures and pauses repeated failures for repair; press Ctrl-C to checkpoint.
+Provider-aware context rotation suspended 1 transient messages.
+Provider access failed repeatedly. Check the selected model, credentials, network, or local service, then use /model or /resume.
+error provider unavailable after retries: ProviderRequestError: Ollama request rejected HTTP 429: {"error":"you (boodyabozena) have reached your session usage limit, upgrade for higher limits: https://ollama.com/upgrade (ref: 4e5bd564-c50d-42f3-a586-550512409749)"}
+GA3BAD CODING AGENT MODE WORKING / STATUS PAUSED ollama/gpt-oss:120b-cloud
+----------------------------------------------------------------------------------------------------------------
+GOAL                                                                     |  CONTEXT
+create a three js calculator with impressive design and run it           |  D:\projects\Ai\coding_agent\run-a...
+                                                                         |  
+NOW                                                                      |  Plan r1
+Paused - 0/2 tasks                                                       |  Progress 0/2 tasks
+                                                                         |  Access NORMAL / CLOUD
+INPUT NEEDED                                                             |  Agents 0
+Provider access failed repeatedly. Check the selected model,             |  Route GOAL
+credentials, network, or local service, then use /model or /resume.      |  Execution STAGED
+                                                                         |  
+RECENT                                                                   |  
+goal.retry_scheduled: provider unavailable after bounded transport r...  |  
+goal.metadata_updated: goal_434ac23d688142dda322c68a8b2861f6             |  
+goal.status_changed: repeated provider failures require user action      |  
+
+----------------------------------------------------------------------------------------------------------------
+> Choose an answer to continue
+Paused — provider unavailable after bounded transport retries: provider unavailable after retries: ProviderRequestError: Ollama request rejected HTTP 429: {"error":"you (boodyabozena) have reached your session usage limit, upgrade for higher limits: https://ollama.com/upgrade (ref: 4e5bd564-c50d-42f3-a586-550512409749)"} Waiting on provider.
+Durable goal mode is active. No-progress attempts self-reprompt until completion or real user input; the durable retry policy retries transient provider failures and pauses repeated failures for repair; press Ctrl-C to checkpoint.
+Boundary — paused: Goal is paused.

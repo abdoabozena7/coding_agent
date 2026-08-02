@@ -263,10 +263,18 @@ class DashboardView:
     model: str = "-"
     # Standalone view construction retains the legacy PLAN rendering default;
     # live sessions explicitly inject the chat-first preference.
-    interaction_mode: str = InteractionMode.NORMAL.value
+    interaction_mode: str = "working"
     workspace: str = "."
     waiting_question: str = ""
     activity: list[str] = field(default_factory=list)
+    route: str = "pending"
+    execution_strategy_name: str = "pending"
+    runtime_phase: str = "ready"
+    waiting_on: str = ""
+    last_tool: str = ""
+    resume_action: str = ""
+    heartbeat_at: float | None = None
+    workspace_mutated: bool = False
 
 
 def _ansi(code: str, enabled: bool) -> str:
@@ -299,6 +307,15 @@ def _fit(text: Any, width: int) -> str:
     if width <= 3:
         return value[:width]
     return (value[: width - 3] + "...").ljust(width)
+
+
+def _public_interaction_mode(value: Any) -> str:
+    """Hide legacy execution-engine names from the user-facing surface."""
+
+    normalized = str(getattr(value, "value", value) or "goal").strip().casefold()
+    if normalized in {"plan", "working", "ultra", "ready"}:
+        return normalized
+    return "ready"
 
 
 def _wrap(text: Any, width: int, max_lines: int = 3) -> list[str]:
@@ -390,8 +407,12 @@ def render_workspace(
     if objective.casefold().startswith("prompt:"):
         objective = objective.partition(":")[2].lstrip()
     status_label = str(view.status or "idle").replace("_", " ").upper()
+    public_mode = _public_interaction_mode(view.interaction_mode)
+    if str(view.status or "idle").strip().casefold() not in {"idle", "ready", "no_goal"}:
+        if public_mode in {"ready", "goal", "ultra"}:
+            public_mode = "working"
     header = _fit(
-        f"GA3BAD CODING AGENT  MODE {view.interaction_mode.upper()} / STATUS {status_label}",
+        f"GA3BAD CODING AGENT  MODE {public_mode.upper()} / STATUS {status_label}",
         max(18, width - len(f"{view.provider}/{view.model}") - 2),
     ).rstrip()
     model = f"{view.provider}/{view.model}"
@@ -400,6 +421,7 @@ def render_workspace(
     progress = f"{completed}/{len(view.tasks)} tasks" if view.tasks else "No checklist yet"
     context = (
         f"plan r{view.plan_revision}  |  {progress}  |  "
+        f"route {view.route.upper()}  |  execution {view.execution_strategy_name.upper()}  |  "
         f"{access_level.upper()} {execution_class.upper()}  |  agents {active_agents}"
     )
 
@@ -442,6 +464,8 @@ def render_workspace(
         f"Progress   {progress}",
         f"Access     {access_level.upper()} / {execution_class.upper()}",
         f"Agents     {active_agents}",
+        f"Route      {view.route.upper()}",
+        f"Execution  {view.execution_strategy_name.upper()}",
     ]
     rows = max(len(left), len(right))
     body = [
@@ -821,7 +845,7 @@ def render_dashboard(view: DashboardView, width: int | None = None) -> str:
     filled = round(bar_width * completed / total) if total else 0
     progress = "[" + "#" * filled + "-" * (bar_width - filled) + f"] {completed}/{total}"
     meta = (
-        f" MODE {str(view.interaction_mode).upper()} | STATUS {str(view.status).upper()} "
+        f" MODE {_public_interaction_mode(view.interaction_mode).upper()} | STATUS {str(view.status).upper()} "
         f"| PLAN r{view.plan_revision} / {approved} "
         f"| {progress} | {view.provider}/{view.model} "
     )
@@ -1103,7 +1127,7 @@ Execution
   /diff [NUMBER|COMMIT]      show current changes or one redacted checkpoint patch
   /explorer                  open the exact selected project folder
   /undo [STEPS]              safely revert accepted checkpoints after explicit approval
-  /tree [NODE]               inspect the ULTRA module/submodule/task hierarchy
+  /tree [NODE]               inspect the specialist module/submodule/task hierarchy
   /agents [--all|AGENT]      read-only live swarm list/topology
   /agent NUMBER|ID           inspect one specialist and its redacted prompt
   /memory [SECTION]          inspect/search Project Brain entries
@@ -1492,7 +1516,7 @@ class _LiveActivity:
             else f"mapping specialist graph · {eta}"
         )
         rows = [
-            f"{pulse} ULTRA {phase_label} · elapsed {self._duration(elapsed)} · {signal}",
+            f"{pulse} WORKING {phase_label} · elapsed {self._duration(elapsed)} · {signal}",
             f"  {progress_label}",
             f"  now   {_fit(current or 'Preparing the next step', max(8, content_width - 6)).rstrip()}",
             f"  done  {_fit((last_completed or 'No specialist completed yet') + ' · next ' + (next_work or 'scheduler deciding'), max(8, content_width - 6)).rstrip()}",
@@ -1604,6 +1628,10 @@ class ConsoleUI:
         self._buffered_events: list[UIEvent] = []
         self.activity: list[str] = []
         self.interaction_mode = InteractionMode.parse(interaction_mode)
+        # A mode is not a running workflow.  Until the first request is
+        # submitted the public session state is Ready, even though the
+        # internal preference defaults to the working strategy.
+        self._public_workflow_phase = "ready"
         self.access_level = "normal"
         self.execution_class = "local"
         self.active_agents = 0
@@ -1648,8 +1676,22 @@ class ConsoleUI:
 
     def set_mode(self, mode: str | InteractionMode) -> None:
         self.interaction_mode = InteractionMode.parse(mode)
+        self._public_workflow_phase = _public_interaction_mode(self.interaction_mode)
         if self._workspace_store is not None:
-            self._workspace_store.update_workflow_mode(self.interaction_mode.value)
+            self._workspace_store.update_workflow_mode(self._public_workflow_phase)
+
+    def set_workflow_phase(self, phase: str) -> None:
+        """Update Plan/Working presentation without changing execution policy."""
+
+        self._public_workflow_phase = _public_interaction_mode(phase)
+        if self._workspace_store is not None:
+            self._workspace_store.update_workflow_mode(self._public_workflow_phase)
+
+    def set_runtime_snapshot(self, snapshot: Any) -> None:
+        """Push durable route/strategy/phase context into the UI reducer."""
+
+        if self._workspace_store is not None:
+            self._workspace_store.update_runtime_context(snapshot)
 
     def prefill_prompt(self, text: str) -> None:
         """Seed the next composer turn after a palette command needs arguments."""
@@ -1669,7 +1711,7 @@ class ConsoleUI:
                 workspace=self.workspace_label,
                 model=self.active_model,
                 status=self._current_status,
-                workflow_mode=self.interaction_mode.value,
+                workflow_mode="ready",
             )
             store.set_context_window(self.context_window_tokens)
             store.update_runtime_profile(execution_class=self.execution_class)
@@ -1952,7 +1994,7 @@ class ConsoleUI:
     def show_dashboard(self, view: DashboardView) -> None:
         self._current_status = str(view.status or "idle")
         view.activity = view.activity or self.activity[-4:]
-        view.interaction_mode = self.interaction_mode.value
+        view.interaction_mode = self._public_workflow_phase
         self.write(render_dashboard(view))
 
     def _style_workspace(self, rendered: str) -> str:
@@ -1977,11 +2019,32 @@ class ConsoleUI:
     def show_status(self, view: DashboardView, *, force: bool = False) -> None:
         self._current_status = str(view.status or "idle")
         view.activity = view.activity or self.activity[-4:]
-        view.interaction_mode = self.interaction_mode.value
+        view.interaction_mode = self._public_workflow_phase
         completed = sum(task.status in {"done", "skipped"} for task in view.tasks)
         if self._workspace_store is not None:
             status = self._current_status.casefold()
-            if status in {"idle", "new"}:
+            # ``DashboardView.status`` is a durable goal status, while the
+            # runtime snapshot is the authoritative phase for the live
+            # worker.  A stale dashboard (especially one rendered just after
+            # web approval) must not put the reducer back into an old
+            # "awaiting approval" activity after execution has started.
+            runtime_phase = str(self._workspace_store.snapshot().runtime_phase or "").casefold()
+            phase_activity = {
+                "waiting_for_approval": ("paused", "Waiting for your approval", False),
+                "waiting_for_process": ("building", "Waiting for process", True),
+                "starting": ("building", "Starting execution", True),
+                "working": ("building", "Working on the project", True),
+                "retrying": ("paused", "Retry required", False),
+                "paused": ("paused", "Workflow paused", False),
+                "reviewing": ("checking", "Checking the result", True),
+                "completed": ("done", "Done", False),
+            }
+            if runtime_phase in phase_activity and not (
+                runtime_phase == "waiting_for_approval"
+                and status == "awaiting_plan_approval"
+            ):
+                stage, summary, running = phase_activity[runtime_phase]
+            elif status in {"idle", "new"}:
                 stage, summary, running = "idle", "Ready", False
             elif status in {"discovering"}:
                 stage, summary, running = "understanding", "Understanding your request", True
@@ -2533,18 +2596,43 @@ class ConsoleUI:
         risk: str = "risky",
     ) -> ApprovalDecision:
 
-        if self._workspace_store is None:
-            return (
-                ApprovalDecision.ALLOW_ONCE
-                if self._confirm_action(name, args, risk)
-                else ApprovalDecision.DENY
-            )
         policy = classify_action(
             name,
             args,
             workspace=self.workspace_label or ".",
             sandboxed=self.access_level == "full",
         )
+        sleep_safe = (
+            policy.requirement is ApprovalRequirement.AUTO
+            or (
+                policy.requirement is ApprovalRequirement.SESSION
+                and policy.group in {"project_checks", "project_preview"}
+            )
+            or (str(name) == "stop_preview" and policy.group == "host_action")
+        )
+        if self.sleep_enabled and sleep_safe:
+            if policy.requirement is ApprovalRequirement.SESSION:
+                self._session_approval_groups.add(policy.group)
+            message = (
+                f"Sleep auto-approved {str(name).replace('_', ' ')} "
+                f"({policy.reason.lower()})."
+            )
+            if self._workspace_store is not None:
+                self._workspace_store.append_log(f"sleep.auto_approval: {message}")
+            else:
+                self.write(message)
+            return (
+                ApprovalDecision.ALLOW_SESSION
+                if policy.requirement is ApprovalRequirement.SESSION
+                else ApprovalDecision.ALLOW_ONCE
+            )
+
+        if self._workspace_store is None:
+            return (
+                ApprovalDecision.ALLOW_ONCE
+                if self._confirm_action(name, args, risk)
+                else ApprovalDecision.DENY
+            )
         if policy.requirement is ApprovalRequirement.AUTO:
             return ApprovalDecision.ALLOW_ONCE
         if (
@@ -2651,8 +2739,12 @@ class ConsoleUI:
                 f"{self.bold}Allow this action once? [y/N]{self.reset} "
             ).strip().lower()
         except EOFError:
-            self.write("Approval denied: no interactive confirmation was received.")
-            return False
+            self.write(
+                "Approval is still required: no interactive confirmation was available."
+            )
+            raise RuntimeError(
+                "the approval interface is unavailable in this non-interactive process"
+            )
         except KeyboardInterrupt:
             self.write("\nApproval interrupted; checkpointing active work.")
             raise
@@ -2707,7 +2799,7 @@ class ConsoleUI:
         accent = self.gold if self.interaction_mode is InteractionMode.ULTRA else self.green
         label = (
             f"{self.bold}{accent}GA3BAD{self.reset} "
-            f"{self.dim}[{self.interaction_mode.value.upper()}]{self.reset}> "
+            f"{self.dim}[{self._public_workflow_phase.upper()}]{self.reset}> "
         )
         rich_prompt = (
             not self.plain

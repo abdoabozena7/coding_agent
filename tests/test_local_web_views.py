@@ -161,8 +161,46 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
             json={"revision": 2},
         )
         self.assertEqual(approved.status_code, 200, approved.text)
-        self.assertEqual(self.store.get_goal(self.goal.id).active_plan_revision, 2)
-        self.assertEqual(self.store.get_goal(self.goal.id).status, GoalStatus.RUNNING)
+        accepted_goal = self.store.get_goal(self.goal.id)
+        self.assertEqual(accepted_goal.active_plan_revision, 2)
+        self.assertEqual(accepted_goal.status, GoalStatus.RUNNING)
+        self.assertTrue(accepted_goal.metadata["strategy_locked"])
+        self.assertEqual(accepted_goal.metadata["interaction_mode"], "working")
+        self.assertEqual(accepted_goal.metadata["execution_strategy"], "staged")
+
+    def test_plan_snapshot_exposes_model_aware_diagnostics_only_as_data(self):
+        self.store.update_goal_metadata(
+            self.goal.id,
+            semantic_goal={
+                "required_outcomes": ["Render the requested interactive artifact."],
+                "acceptance_criteria": ["The artifact runs without browser errors."],
+                "constraints": ["Keep the implementation inside the workspace."],
+                "exclusions": [],
+            },
+            strategy_decision={
+                "strategy": "staged",
+                "reasons": ["task demand fits the selected model capability envelope"],
+                "capability_fingerprint": "capability",
+                "demand_fingerprint": "demand",
+                "max_concurrency": 1,
+                "locked": False,
+                "version": 1,
+            },
+        )
+        snapshot = self.client.get(
+            f"/api/sessions/{self.runtime.session_id}/plan"
+        ).json()
+        self.assertEqual(snapshot["interaction_mode"], "working")
+        self.assertEqual(snapshot["execution_strategy"], "staged")
+        self.assertFalse(snapshot["strategy_locked"])
+        self.assertIn("capability_envelope", snapshot)
+        self.assertIn("task_demand", snapshot)
+        self.assertEqual(
+            snapshot["semantic_goal"]["required_outcomes"],
+            ["Render the requested interactive artifact."],
+        )
+        self.assertEqual(snapshot["strategy_decision"]["strategy"], "staged")
+        self.assertEqual(snapshot["execution_nodes"], [])
 
     def test_rejects_stale_plan_revision_without_overwriting_latest(self):
         first = self.client.post(
@@ -458,6 +496,17 @@ class ReviewAndAgentIntegrationTests(LocalWebViewTestCase):
                 metadata={"reason": "Implement the approved login flow."},
             )
         )
+
+    def test_review_snapshot_includes_the_recorded_diff_and_hunks(self):
+        response = self.client.get(
+            f"/api/sessions/{self.runtime.session_id}/review"
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        file = response.json()["files"][0]
+        self.assertEqual(file["path"], "agent/auth.py")
+        self.assertIn("+    return True", file["diff"])
+        self.assertEqual(file["hunks"][0]["id"], "agent/auth.py:h1")
+        self.assertIn("-    return False", file["hunks"][0]["content"])
 
     def test_submit_change_review_persists_decisions_and_starts_fixer(self):
         response = self.client.post(

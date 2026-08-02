@@ -216,6 +216,15 @@ class ArchitectureSpecV1:
 def normalize_contract_path(value: str) -> str:
     """Return a portable workspace-relative path suitable for scope checks."""
     text = str(value).strip().replace("\\", "/")
+    # Model transports sometimes spell the conceptual repository root as a
+    # literal ``workspace/`` prefix (an older contract example even encouraged
+    # that form).  Contract paths are already defined relative to the selected
+    # workspace, so retaining the transport wrapper silently turns an in-scope
+    # repair such as ``workspace/src/app.js`` into a new top-level directory.
+    # Removing only this exact root marker is a semantic-preserving path repair;
+    # arbitrary directory names and all traversal checks remain authoritative.
+    if text.casefold().startswith("workspace/"):
+        text = text[len("workspace/") :]
     if not text or text == ".":
         return "."
     if text.startswith("/") or re_drive_prefix(text):

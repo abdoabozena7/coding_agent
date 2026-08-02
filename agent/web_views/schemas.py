@@ -80,11 +80,45 @@ class PlanApprovalPayload(BaseModel):
     revision: int = Field(ge=1)
 
 
+class PlanRequestPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    request: str = Field(min_length=1, max_length=20_000)
+
+
+class WorkspaceContextPayload(BaseModel):
+    """Stable navigation/attention contract for the unified local workspace."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    session_short: str
+    requested_view: Literal["plan", "review", "agents"]
+    required_view: Literal["plan", "review", "agents"] | None = None
+    current_view: Literal["plan", "review", "agents"]
+    checkpoint_id: str | None = None
+    goal: dict[str, Any] | None = None
+    mode: Literal["working", "plan"]
+    attention: dict[str, Any]
+    navigation: dict[str, dict[str, Any]]
+    capabilities: dict[str, bool]
+    queue: dict[str, Any]
+    updated_at: str
+    # Additive runtime truth used by the TUI and browser workspace.  Defaults
+    # keep older clients and saved sessions compatible.
+    runtime: dict[str, Any] = Field(default_factory=dict)
+    route: str = "pending"
+    execution_strategy: str = "pending"
+    phase: str = "ready"
+    waiting_on: str = ""
+    resume_action: str = ""
+
+
 class QueuePromptPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     text: str = Field(min_length=1, max_length=20_000)
-    mode: Literal["plan", "normal", "ultra"] | None = None
+    mode: Literal["working", "plan", "normal", "ultra"] | None = None
 
 
 class QueueReorderPayload(BaseModel):

@@ -256,8 +256,17 @@ class WorkspaceSnapshot:
     swarm: SwarmSummarySnapshot
     changes: FileChangeSnapshot = FileChangeSnapshot()
     undo_available: bool = False
-    workflow_mode: str = "normal"
-    composer_mode: str = "normal"
+    workflow_mode: str = "ready"
+    composer_mode: str = "goal"
+    route: str = "pending"
+    execution_strategy: str = "pending"
+    runtime_phase: str = "ready"
+    current_task: str = ""
+    last_tool: str = ""
+    waiting_on: str = ""
+    resume_action: str = ""
+    heartbeat_at: float | None = None
+    workspace_mutated: bool = False
 
 
 _ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
@@ -321,8 +330,17 @@ class WorkspaceUIStore:
         self._workspace = ""
         self._model = ""
         self._status = "idle"
-        self._workflow_mode = "normal"
-        self._composer_mode = "normal"
+        self._workflow_mode = "ready"
+        self._composer_mode = "goal"
+        self._route = "pending"
+        self._execution_strategy = "pending"
+        self._runtime_phase = "ready"
+        self._current_task = ""
+        self._last_tool = ""
+        self._waiting_on = ""
+        self._resume_action = ""
+        self._heartbeat_at: float | None = None
+        self._workspace_mutated = False
         self._running = False
         self._queued_count = 0
         self._should_exit = False
@@ -686,6 +704,14 @@ class WorkspaceUIStore:
                 total_low_seconds=None if eta_low is None else elapsed + eta_low,
                 total_high_seconds=None if eta_high is None else elapsed + eta_high,
             )
+            self._route = str(getattr(view, "route", self._route) or self._route or "pending")
+            self._execution_strategy = str(getattr(view, "execution_strategy_name", self._execution_strategy) or self._execution_strategy or "pending")
+            self._runtime_phase = str(getattr(view, "runtime_phase", phase) or phase)
+            self._waiting_on = str(getattr(view, "waiting_on", self._waiting_on) or self._waiting_on)
+            self._last_tool = str(getattr(view, "last_tool", self._last_tool) or self._last_tool)
+            self._resume_action = str(getattr(view, "resume_action", self._resume_action) or self._resume_action)
+            self._heartbeat_at = getattr(view, "heartbeat_at", self._heartbeat_at)
+            self._workspace_mutated = bool(getattr(view, "workspace_mutated", self._workspace_mutated))
         self._notify()
 
     def _project_elapsed_locked(self, now: float) -> int:
@@ -775,34 +801,112 @@ class WorkspaceUIStore:
             self._status = str(status)
             if workflow_mode is not None:
                 value = str(getattr(workflow_mode, "value", workflow_mode)).casefold()
-                self._workflow_mode = value if value in {"plan", "normal", "ultra"} else "normal"
+                self._workflow_mode = self._normalize_workflow_label(value)
                 self._composer_mode = self._workflow_mode
         self._notify()
 
     def update_workflow_mode(self, value: str) -> None:
         with self._lock:
             normalized = str(getattr(value, "value", value)).casefold()
-            self._workflow_mode = normalized if normalized in {"plan", "normal", "ultra"} else "normal"
+            self._workflow_mode = self._normalize_workflow_label(normalized)
+            self._composer_mode = self._workflow_mode
+        self._notify()
+
+    def update_runtime_context(self, snapshot: Mapping[str, Any] | Any) -> None:
+        """Apply the durable runtime snapshot to presentation-only state."""
+
+        if hasattr(snapshot, "to_dict"):
+            snapshot = snapshot.to_dict()
+        data = dict(snapshot or {})
+        with self._lock:
+            has_session_mode = "session_mode" in data
+            if has_session_mode:
+                self._workflow_mode = self._normalize_workflow_label(
+                    str(data.get("session_mode") or "ready").casefold()
+                )
+            if "route" in data:
+                self._route = str(data.get("route") or "pending")
+            if "execution_strategy" in data:
+                self._execution_strategy = str(
+                    data.get("execution_strategy") or "pending"
+                )
+            if "phase" in data:
+                self._runtime_phase = str(data.get("phase") or "ready")
+            if "current_task" in data:
+                self._current_task = str(data.get("current_task") or "")
+            if "last_tool" in data:
+                self._last_tool = str(data.get("last_tool") or "")
+            if "waiting_on" in data:
+                self._waiting_on = str(data.get("waiting_on") or "")
+            if "resume_action" in data:
+                self._resume_action = str(data.get("resume_action") or "")
+            heartbeat = data.get("heartbeat_at")
+            if heartbeat is not None:
+                try:
+                    self._heartbeat_at = float(heartbeat)
+                except (TypeError, ValueError):
+                    pass
+            self._workspace_mutated = bool(data.get("workspace_mutated", self._workspace_mutated))
+            phase = self._runtime_phase.casefold()
+            # Keep the compact header derived from the same durable phase as
+            # the activity strip.  This prevents a stale DashboardView status
+            # such as ``awaiting_plan_approval`` from surviving after the
+            # goal has already entered execution.
+            phase_status = {
+                "routing": ("routing", True),
+                "planning": ("planning", True),
+                "awaiting_approval": ("awaiting_plan_approval", False),
+                "waiting_for_approval": ("waiting_for_approval", False),
+                "starting": ("running", True),
+                "working": ("running", True),
+                "waiting_for_process": ("running", True),
+                "retrying": ("recovering", False),
+                "paused": ("paused", False),
+                "reviewing": ("reviewing", True),
+                "completed": ("completed", False),
+            }
+            if phase in phase_status:
+                self._status, self._running = phase_status[phase]
+            if phase == "ready" and not self._transcript:
+                self._workflow_mode = "ready"
+                self._status = "idle"
+                self._running = False
+            elif not has_session_mode:
+                # Compatibility for legacy event producers. New snapshots
+                # carry the interaction mode explicitly; a planning phase in
+                # an ordinary Goal must never relabel the session as Plan.
+                if phase == "completed":
+                    self._workflow_mode = "working"
+                elif phase == "plan":
+                    self._workflow_mode = "plan"
+                elif phase not in {"ready", "idle"}:
+                    self._workflow_mode = "working"
             self._composer_mode = self._workflow_mode
         self._notify()
 
     def set_composer_mode(self, value: str) -> str:
         with self._lock:
             normalized = str(getattr(value, "value", value)).casefold()
-            if normalized not in {"plan", "normal", "ultra"}:
-                raise ValueError("composer mode must be plan, normal, or ultra")
+            normalized = self._normalize_workflow_label(normalized)
             self._composer_mode = normalized
         self._notify()
         return normalized
 
     def cycle_composer_mode(self) -> str:
-        values = ("plan", "normal", "ultra")
         with self._lock:
-            index = values.index(self._composer_mode)
-            self._composer_mode = values[(index + 1) % len(values)]
-            selected = self._composer_mode
+            self._composer_mode = "ready"
+            selected = "ready"
         self._notify()
         return selected
+
+    @staticmethod
+    def _normalize_workflow_label(value: str) -> str:
+        normalized = str(value).strip().casefold()
+        if normalized in {"plan", "working", "ultra", "goal", "ready"}:
+            return normalized
+        if normalized in {"normal", "chat", "default"}:
+            return "ready"
+        return "ready"
 
     def reset_composer_mode(self) -> None:
         with self._lock:
@@ -996,12 +1100,82 @@ class WorkspaceUIStore:
             self.append_log("model_thought: reasoning update; use /thinking for details")
         else:
             self.append_log(f"{kind}: {message}" if message else kind)
+        if normalized == "workflow.state":
+            if "phase" not in data and data.get("stage"):
+                data["phase"] = data.get("stage")
+            self.update_runtime_context(data)
+            return
         if normalized == "heartbeat":
             with self._lock:
                 self._activity = replace(
                     self._activity,
                     last_signal_at=time.monotonic(),
                 )
+                if data.get("phase"):
+                    self._runtime_phase = str(data.get("phase"))
+                if data.get("waiting_on"):
+                    self._waiting_on = str(data.get("waiting_on"))
+                if data.get("last_tool") or data.get("tool"):
+                    self._last_tool = str(data.get("last_tool") or data.get("tool"))
+                if data.get("heartbeat_at") is not None:
+                    try:
+                        self._heartbeat_at = float(data.get("heartbeat_at"))
+                    except (TypeError, ValueError):
+                        pass
+            self._notify()
+            return
+        if normalized in {"approval.requested", "approval.received", "plan.approved.local_web", "execution.started", "execution.boundary", "process.waiting", "recovery.presented", "execution.reconciled"}:
+            with self._lock:
+                self._runtime_phase = str(data.get("phase") or self._runtime_phase or "working")
+                self._waiting_on = str(data.get("waiting_on") or self._waiting_on or ("user" if normalized == "approval.requested" else ""))
+                self._last_tool = str(data.get("tool") or data.get("last_tool") or self._last_tool or "")
+                self._resume_action = str(data.get("resume_action") or self._resume_action or "")
+                if data.get("heartbeat_at") is not None:
+                    try:
+                        self._heartbeat_at = float(data.get("heartbeat_at"))
+                    except (TypeError, ValueError):
+                        pass
+                if data.get("workspace_mutated") is not None:
+                    self._workspace_mutated = bool(data.get("workspace_mutated"))
+            if normalized == "approval.requested":
+                self.set_activity(
+                    ActivityStage.PAUSED,
+                    message or "Waiting for your approval",
+                    running=False,
+                )
+            elif normalized in {"approval.received", "plan.approved.local_web"}:
+                # The approval event is the durable hand-off from a paused
+                # permission gate back to the worker.  Clear the stale
+                # ``waiting_on=user`` presentation immediately; otherwise a
+                # terminal can keep showing an old approval banner while the
+                # approved action is already executing.
+                with self._lock:
+                    self._waiting_on = str(data.get("waiting_on") or "")
+                    self._runtime_phase = str(data.get("phase") or "starting")
+                    self._status = "running"
+                    self._running = True
+                self.set_activity(
+                    ActivityStage.BUILDING,
+                    message or "Approved — resuming the saved action",
+                    running=True,
+                )
+            elif normalized == "execution.started":
+                with self._lock:
+                    self._waiting_on = str(data.get("waiting_on") or "")
+                    self._runtime_phase = str(data.get("phase") or "starting")
+                    self._status = "running"
+                    self._running = True
+                self.set_activity(
+                    ActivityStage.BUILDING,
+                    message or "Execution started",
+                    running=True,
+                )
+            elif normalized == "process.waiting":
+                self.set_activity(ActivityStage.BUILDING, message or "Waiting for process", running=True)
+            elif normalized == "execution.boundary":
+                self.set_activity(ActivityStage.PAUSED, message or "Workflow boundary", running=False)
+            elif normalized == "recovery.presented":
+                self.set_activity(ActivityStage.PAUSED, message or "Action required to continue", running=False)
             self._notify()
             return
         if normalized == "model_text":
@@ -1305,6 +1479,15 @@ class WorkspaceUIStore:
                 undo_available=self._undo_available,
                 workflow_mode=self._workflow_mode,
                 composer_mode=self._composer_mode,
+                route=self._route,
+                execution_strategy=self._execution_strategy,
+                runtime_phase=self._runtime_phase,
+                current_task=self._current_task,
+                last_tool=self._last_tool,
+                waiting_on=self._waiting_on,
+                resume_action=self._resume_action,
+                heartbeat_at=self._heartbeat_at,
+                workspace_mutated=self._workspace_mutated,
             )
 
 
@@ -1402,7 +1585,7 @@ def answer_question(
 
 
 def answer_recommended_remaining(runtime: Any) -> tuple[Any, ...]:
-    """Accept option one for every question in the current interview.
+    """Accept each explicit model recommendation in the current interview.
 
     The final answer is allowed to transition the runtime into plan generation,
     so the session is refreshed after every answer rather than iterating stale
@@ -1419,7 +1602,18 @@ def answer_recommended_remaining(runtime: Any) -> tuple[Any, ...]:
         question_id = str(session.current.get("id", "")).strip()
         if not question_id:
             break
-        results.append(answer_question(runtime, session, question_id, "1"))
+        options = tuple(
+            item for item in session.current.get("options", ())
+            if isinstance(item, Mapping)
+        )
+        recommended = [
+            (index, item) for index, item in enumerate(options, 1)
+            if bool(item.get("recommended"))
+        ]
+        if len(recommended) != 1:
+            break
+        index, _option = recommended[0]
+        results.append(answer_question(runtime, session, question_id, str(index)))
     return tuple(results)
 
 

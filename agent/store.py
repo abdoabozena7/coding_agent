@@ -19,6 +19,7 @@ from threading import RLock
 from typing import Any, Iterable, Iterator, Mapping
 
 from .models import (
+    CompletionDisposition,
     Delegation,
     DelegationStatus,
     Evidence,
@@ -458,12 +459,14 @@ class StateStore:
                     "UPDATE queued_prompts SET status='pending',started_at=NULL "
                     "WHERE status='running' AND goal_id IS NULL"
                 )
-                # Sleep authorization is intentionally process-scoped. Durable
-                # findings/cycles remain, but a restart always requires Full
-                # Docker access to be selected and Sleep enabled again.
+                # General Sleep (``on``) is a durable, narrowly governed
+                # preference for AUTO/session-safe checks.  Legacy
+                # ``running`` states and deeper Ultra profiles carried broader
+                # assumptions and must be reset on restart.
                 self._connection.execute(
-                    "UPDATE workflow_sessions SET sleep_state='off',ultra_profile='standard' "
-                    "WHERE sleep_state<>'off' OR ultra_profile<>'standard'"
+                    "UPDATE workflow_sessions SET ultra_profile='standard',"
+                    "sleep_state=CASE WHEN sleep_state IN ('off','on') THEN sleep_state ELSE 'off' END "
+                    "WHERE ultra_profile<>'standard' OR sleep_state NOT IN ('off','on')"
                 )
                 # Local reasoning/tool calls can legitimately take several
                 # minutes.  Ten minutes still detects abandoned processes
@@ -1900,6 +1903,36 @@ class StateStore:
                 "UPDATE goals SET status=?,metadata_json=?,updated_at=? WHERE id=?",
                 (target.value, _json(merged), _iso(now), goal_id),
             )
+            # Keep the session projection transactionally aligned with the
+            # durable Goal.  UI snapshots still treat Goal status as the
+            # highest authority, but the cached row must not retain states
+            # such as ``executing`` or ``awaiting_approval`` after a terminal
+            # transition.
+            session_projection = {
+                GoalStatus.NEW: ("idle", "none"),
+                GoalStatus.DISCOVERING: ("planning", "inspecting"),
+                GoalStatus.AWAITING_PLAN_APPROVAL: ("planning", "awaiting_approval"),
+                GoalStatus.RUNNING: ("executing", "approved"),
+                GoalStatus.REVISING: ("planning", "reviewing"),
+                GoalStatus.VERIFYING: ("verifying", "approved"),
+                GoalStatus.REVIEWING: ("reviewing", "approved"),
+                GoalStatus.PAUSED: ("blocked", None),
+                GoalStatus.RECOVERING: ("executing", "approved"),
+                GoalStatus.BLOCKED: ("blocked", None),
+                GoalStatus.COMPLETED: ("completed", "approved"),
+                GoalStatus.CANCELLED: ("cancelled", "none"),
+            }
+            run_state, plan_state = session_projection[target]
+            if plan_state is None:
+                connection.execute(
+                    "UPDATE workflow_sessions SET run_state=?,updated_at=? WHERE goal_id=?",
+                    (run_state, _iso(now), goal_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE workflow_sessions SET run_state=?,plan_state=?,updated_at=? WHERE goal_id=?",
+                    (run_state, plan_state, _iso(now), goal_id),
+                )
             self._event(
                 connection,
                 "goal.status_changed",
@@ -3918,7 +3951,10 @@ class StateStore:
             return self.list_brain_entries(run_id, section=section, role=role, limit=limit)
         rows: list[sqlite3.Row] = []
         if self._fts5_available:
-            filters, params = ["b.ultra_run_id=?", "brain_entries_fts MATCH ?"], [run_id, query]
+            # Treat model-authored focus text as literal content rather than
+            # FTS5 syntax. Paths and prose commonly contain dots or slashes.
+            fts_query = '"' + query.replace('"', '""') + '"'
+            filters, params = ["b.ultra_run_id=?", "brain_entries_fts MATCH ?"], [run_id, fts_query]
             if section is not None:
                 filters.append("b.section=?")
                 params.append(BrainSection(section).value)
@@ -3935,7 +3971,7 @@ class StateStore:
             try:
                 with self._lock:
                     rows = self._connection.execute(sql, tuple(params)).fetchall()
-            except sqlite3.OperationalError:
+            except sqlite3.DatabaseError:
                 rows = []
         if not rows:
             filters, params = ["ultra_run_id=?", "(title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')"], [run_id]
@@ -6419,6 +6455,117 @@ class StateStore:
         self.set_goal_outcome_state(goal_id, state, decision=decision.to_dict())
         return decision.to_dict()
 
+    def record_codex_visual_review(
+        self,
+        goal_id: str,
+        ultra_run_id: str,
+        *,
+        screenshot_path: str,
+        passed: bool,
+        score: float,
+        summary: str,
+        limitations: Iterable[str] = (),
+    ) -> dict[str, Any]:
+        """Record a real external Codex visual verdict and close its boundary.
+
+        The screenshot must be a durable image inside the workspace.  This API
+        does not manufacture a visual pass: the caller supplies the inspected
+        verdict, and the existing GoalOutcomeContract remains the final
+        authority over all other evidence kinds.
+        """
+
+        goal = self.get_goal(goal_id)
+        run = self.get_ultra_run(ultra_run_id)
+        if run.goal_id != goal.id:
+            raise StateStoreError("Codex visual review run does not belong to the goal")
+        screenshot = Path(screenshot_path).resolve(strict=True)
+        try:
+            relative = screenshot.relative_to(self.workspace)
+        except ValueError as exc:
+            raise StateStoreError("Codex visual review screenshot is outside the workspace") from exc
+        if screenshot.suffix.casefold() not in {".png", ".jpg", ".jpeg", ".webp"}:
+            raise StateStoreError("Codex visual review requires a durable image artifact")
+        bounded_score = float(score)
+        if not 0.0 <= bounded_score <= 1.0:
+            raise StateStoreError("Codex visual review score must be between zero and one")
+        notes = tuple(dict.fromkeys(str(item).strip() for item in limitations if str(item).strip()))
+        evidence = FinalAcceptanceEvidenceV1(
+            ultra_run_id=ultra_run_id,
+            kind="codex_visual_review",
+            authority="codex-supervisor",
+            passed=bool(passed),
+            score=bounded_score,
+            critical_findings=0 if passed else 1,
+            artifact_hash=hashlib.sha256(screenshot.read_bytes()).hexdigest(),
+            details={
+                "critical": True,
+                "screenshot_path": relative.as_posix(),
+                "summary": str(summary).strip()[:4_000],
+                "limitations": list(notes),
+                "review_mode": "external_visual_inspection",
+            },
+        )
+        self.record_final_acceptance_evidence(evidence)
+        decision = self.evaluate_final_acceptance(goal_id, ultra_run_id)
+        self.append_event(
+            "codex.visual_review_recorded",
+            goal_id=goal_id,
+            entity_type="acceptance_evidence",
+            entity_id=evidence.id,
+            payload={
+                "passed": bool(passed),
+                "score": bounded_score,
+                "screenshot_path": relative.as_posix(),
+                "decision_accepted": bool(decision.get("accepted")),
+            },
+        )
+        if decision.get("accepted"):
+            current = self.get_goal(goal_id)
+            if current.status is GoalStatus.BLOCKED:
+                self.transition_goal(
+                    goal_id,
+                    GoalStatus.RECOVERING,
+                    reason="Codex visual review supplied the missing acceptance authority",
+                )
+            current = self.get_goal(goal_id)
+            if current.status is GoalStatus.RECOVERING:
+                self.transition_goal(
+                    goal_id,
+                    GoalStatus.REVIEWING,
+                    reason="Final acceptance re-evaluated with Codex visual evidence",
+                )
+            self.update_goal_metadata(
+                goal_id,
+                completion_disposition=(
+                    CompletionDisposition.COMPLETED_WITH_LIMITATIONS.value
+                    if notes
+                    else CompletionDisposition.VERIFIED.value
+                ),
+                limitations=list(notes),
+                # Runtime/CLI SliceResult consumers use the explicit
+                # completion-prefixed key. Keep the generic field for stored
+                # v10 compatibility, but never hide a disclosed limitation at
+                # the final handoff.
+                completion_limitations=list(notes),
+                evaluator_capability="external_codex_visual_inspection",
+                passed_operational_checks=[
+                    "runtime",
+                    "browser_interactions",
+                    "console",
+                    "network",
+                    "independent_review",
+                    "codex_visual_review",
+                ],
+            )
+            current = self.get_goal(goal_id)
+            if current.status is GoalStatus.REVIEWING:
+                self.transition_goal(
+                    goal_id,
+                    GoalStatus.COMPLETED,
+                    reason="GoalOutcomeContract passed after Codex visual review",
+                )
+        return {"evidence": evidence.to_dict(), "decision": decision}
+
     def save_package_consumption_evidence(
         self,
         ultra_run_id: str,
@@ -6717,8 +6864,8 @@ class StateStore:
         normalized_mode = str(mode).strip().casefold()
         if not prompt_text or len(prompt_text) > 20_000 or "\x00" in prompt_text:
             raise ValueError("queued prompt text must be 1-20,000 characters")
-        if normalized_mode not in {"plan", "normal", "ultra"}:
-            raise ValueError("queued prompt mode must be plan, normal, or ultra")
+        if normalized_mode not in {"working", "plan", "normal", "ultra"}:
+            raise ValueError("queued prompt mode must be working or plan")
         with self.transaction() as connection:
             session = connection.execute(
                 "SELECT 1 FROM workflow_sessions WHERE id=?",

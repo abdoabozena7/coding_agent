@@ -1,0 +1,24 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "D:\projects\Ai\coding_agent\agent\__main__.py", line 7, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "D:\projects\Ai\coding_agent\agent\cli.py", line 5650, in main
+    f"Ready · {runtime.provider_name}/{runtime.model_name} · "
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\projects\Ai\coding_agent\agent\cli.py", line 2888, in execute_command
+    _run_auto(runtime, console)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "D:\projects\Ai\coding_agent\agent\cli.py", line 1402, in _run_auto
+    result = runtime.continue_until_boundary(on_checkpoint=checkpoint)
+  File "D:\projects\Ai\coding_agent\agent\runtime.py", line 9870, in continue_until_boundary
+    resume_action="Inspect",
+             ^^^^^^^^^^^^^^^
+  File "D:\projects\Ai\coding_agent\agent\runtime.py", line 2157, in converge_ultra
+    return result
+             ^^^^
+  File "D:\projects\Ai\coding_agent\agent\runtime.py", line 1996, in _plan_change_paths
+    return accepted
+    
+AttributeError: 'MasterPlanV1' object has no attribute 'expected_changes'

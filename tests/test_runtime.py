@@ -8,6 +8,7 @@ import json
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from agent.config import RuntimeConfig, update_runtime_config
@@ -16,7 +17,7 @@ from agent.hardware import HardwareProbeResult, probe_local_gpu
 from agent.model_catalog import ExecutionClass, ModelDescriptor
 from agent.models import DelegationStatus, GoalStatus, PlanStatus, TaskStatus
 from agent.providers.base import ToolCall
-from agent.runtime import AgentRuntime, RuntimeStateError
+from agent.runtime import AgentRuntime, RuntimeStateError, SliceResult
 from agent.sandbox import DockerSandbox, PermissionAdapter
 from agent.store import StateStore
 from agent.testing import ScriptedProvider, semantic_goal_intake, semantic_turn
@@ -274,7 +275,340 @@ class RuntimeTestCase(unittest.TestCase):
         return runtime, provider
 
 
+class SleepModeTests(RuntimeTestCase):
+    def test_durable_sleep_auto_approves_safe_preview_after_ui_restart(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]),
+            self.store,
+            self.workspace,
+            config=self.config,
+            sleeper=lambda _seconds: None,
+            approval=lambda _name, _args, _risk: (_ for _ in ()).throw(
+                AssertionError("safe durable Sleep action reached the UI")
+            ),
+        )
+        runtime.set_sleep_mode(True)
+
+        self.assertTrue(
+            runtime._approval_allowed(
+                "preview_html",
+                {"path": "index.html", "open_browser": True},
+                "high",
+            )
+        )
+        self.assertTrue(runtime.sleep_mode_enabled())
+        self.assertTrue(
+            any(
+                item.event_type == "sleep.auto_approval"
+                for item in self.store.list_events()
+            )
+        )
+
+    def test_general_sleep_survives_state_store_restart(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]), self.store, self.workspace, config=self.config
+        )
+        runtime.set_sleep_mode(True)
+        self.store.close()
+
+        self.store = StateStore(self.workspace)
+
+        self.assertEqual(
+            self.store.get_workflow_session("workspace-session")["sleep_state"],
+            "on",
+        )
+
+
+class UltraQualityFeedbackTests(RuntimeTestCase):
+    def test_quality_replan_feedback_includes_node_findings(self):
+        runtime, _provider = self.runtime([])
+        result = SimpleNamespace(
+            run=SimpleNamespace(id=""),
+            node_results=(
+                SimpleNamespace(
+                    findings=(
+                        "Calculator state does not update after button input.",
+                    )
+                ),
+            ),
+            global_result=SimpleNamespace(
+                findings=("Global browser behavior did not pass.",)
+            ),
+        )
+
+        feedback = runtime._ultra_quality_feedback(result)
+
+        self.assertIn("Calculator state does not update", feedback)
+        self.assertIn("Global browser behavior did not pass", feedback)
+
+
 class PlanningAndCompletionTests(RuntimeTestCase):
+    def test_repair_scope_allows_approved_capability_but_rejects_new_one(self):
+        goal = self.store.create_goal("Create and verify the requested application.")
+        task = {
+            "id": "T001",
+            "title": "Build application",
+            "description": "Create package.json, run npm install, and verify the app.",
+            "acceptance_criteria": ["The application runs."],
+            "verification": ["Run npm test."],
+            "depends_on": [],
+            "risk": "medium",
+        }
+        basis = {
+            "applicability_evidence": [
+                {"fact": "Workspace inspected.", "source": "inspection:I001", "supports_tasks": ["T001"]}
+            ],
+            "execution_strategy": "Install the approved test dependency and run verification.",
+            "expected_changes": [
+                {"path": "package.json", "intent": "Add the approved dependency.", "supports_tasks": ["T001"]}
+            ],
+        }
+        approved = self.store.create_plan(goal.id, "Initial plan", [task], **basis)
+        proposed = self.store.create_plan(
+            goal.id,
+            "Repair plan",
+            [{**task, "description": "Repair package.json, run npm install, and verify again."}],
+            **basis,
+        )
+        self.assertTrue(
+            AgentRuntime._repair_revision_is_in_scope(approved, proposed, [task])
+        )
+
+        prefixed_basis = {
+            **basis,
+            "expected_changes": [
+                {
+                    "path": "workspace/package.json",
+                    "intent": "Repair the already approved dependency manifest.",
+                    "supports_tasks": ["T001"],
+                }
+            ],
+        }
+        prefixed = self.store.create_plan(
+            goal.id,
+            "Transport-prefixed repair",
+            [task],
+            **prefixed_basis,
+        )
+        self.assertTrue(
+            AgentRuntime._repair_revision_is_in_scope(approved, prefixed, [task])
+        )
+
+        network_task = {
+            **task,
+            "description": "Repair the package and call a new external service over the network.",
+        }
+        expanded = self.store.create_plan(
+            goal.id,
+            "Expanded repair",
+            [network_task],
+            **basis,
+        )
+        self.assertFalse(
+            AgentRuntime._repair_revision_is_in_scope(
+                approved,
+                expanded,
+                [network_task],
+            )
+        )
+
+    def test_ultra_convergence_scopes_and_approves_persisted_plan_projection(self):
+        runtime, _provider = self.runtime([])
+        goal = self.store.create_goal(
+            "Build and verify the calculator.",
+            session_id=runtime.session_id,
+        )
+        self.store.update_goal_metadata(goal.id, ultra_run_id="ultra-test")
+        self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+        task = {
+            "id": "T001",
+            "title": "Build calculator",
+            "description": "Create the approved calculator artifact.",
+            "acceptance_criteria": ["The calculator artifact exists."],
+            "verification": ["Read the calculator artifact."],
+            "depends_on": [],
+            "risk": "medium",
+        }
+        basis = {
+            "applicability_evidence": [
+                {
+                    "fact": "Workspace inspected.",
+                    "source": "inspection:I001",
+                    "supports_tasks": ["T001"],
+                }
+            ],
+            "execution_strategy": "Build, inspect, and independently review.",
+            "expected_changes": [
+                {
+                    "path": "index.html",
+                    "intent": "Create the calculator.",
+                    "supports_tasks": ["T001"],
+                }
+            ],
+        }
+        accepted = self.store.create_plan(goal.id, "Approved plan", [task], **basis)
+        self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.store.approve_plan(
+            goal.id,
+            accepted.revision,
+            expected_fingerprint=accepted.fingerprint,
+        )
+        self.store.update_goal_metadata(
+            goal.id,
+            waiting_question="This stale approval message must not survive execution.",
+        )
+        self.assertEqual(runtime.dashboard().waiting_question, "")
+        proposed = self.store.create_plan(goal.id, "Repair plan", [task], **basis)
+        revision_required = SimpleNamespace(
+            run=SimpleNamespace(phase="revision_required"),
+            results=(),
+            global_result=None,
+        )
+        stable_boundary = SimpleNamespace(
+            run=SimpleNamespace(phase="awaiting_plan_approval"),
+            results=(),
+            global_result=None,
+        )
+
+        with mock.patch.object(runtime, "_ensure_ultra_session"), mock.patch.object(
+            runtime,
+            "wait_for_ultra",
+            side_effect=[revision_required, stable_boundary],
+        ), mock.patch.object(
+            runtime, "replan_ultra", return_value=SimpleNamespace(revision=99)
+        ) as replan, mock.patch.object(runtime, "approve_ultra") as approve:
+            result = runtime.converge_ultra()
+
+        self.assertIs(result, stable_boundary)
+        approve.assert_called_once_with(
+            proposed.revision,
+            approved_by="risk-adaptive-policy",
+        )
+        replan.assert_called_once_with(
+            mock.ANY,
+            allow_scope_expansion=False,
+        )
+
+    def test_resume_contracts_ultra_repair_from_accepted_foundation(self):
+        runtime, _provider = self.runtime([])
+        goal = self.store.create_goal(
+            "Build and verify the calculator.",
+            session_id=runtime.session_id,
+        )
+        task = {
+            "id": "T001",
+            "title": "Build calculator",
+            "description": "Create the approved calculator artifact.",
+            "acceptance_criteria": ["The calculator artifact exists."],
+            "verification": ["Read the calculator artifact."],
+            "depends_on": [],
+            "risk": "medium",
+        }
+        basis = {
+            "applicability_evidence": [
+                {
+                    "fact": "Workspace inspected.",
+                    "source": "inspection:I001",
+                    "supports_tasks": ["T001"],
+                }
+            ],
+            "execution_strategy": "Build and verify.",
+            "expected_changes": [
+                {
+                    "path": "src/App.js",
+                    "intent": "Create the calculator.",
+                    "supports_tasks": ["T001"],
+                }
+            ],
+        }
+        accepted = self.store.create_plan(goal.id, "Approved plan", [task], **basis)
+        self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.store.approve_plan(
+            goal.id,
+            accepted.revision,
+            expected_fingerprint=accepted.fingerprint,
+        )
+        self.store.update_goal_metadata(goal.id, ultra_run_id="ultra-repair")
+        self.store.transition_goal(goal.id, GoalStatus.REVISING)
+        expanded = self.store.create_plan(
+            goal.id,
+            "Expanded repair",
+            [task],
+            **{
+                **basis,
+                "expected_changes": [
+                    {
+                        "path": "new/outside.js",
+                        "intent": "Add an avoidable new path.",
+                        "supports_tasks": ["T001"],
+                    }
+                ],
+            },
+        )
+        self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+
+        def replan(feedback):
+            self.assertIn("src/App.js", feedback)
+            self.store.transition_goal(goal.id, GoalStatus.PAUSED)
+            return "ultra-repair-plan"
+
+        with mock.patch.object(
+            runtime, "replan_ultra", side_effect=replan
+        ) as ultra_replan, mock.patch.object(runtime, "generate_plan") as normal_plan:
+            result = runtime.resume()
+
+        self.assertEqual(result, "ultra-repair-plan")
+        ultra_replan.assert_called_once()
+        normal_plan.assert_not_called()
+        self.assertEqual(self.store.get_plan(goal.id, expanded.revision).status, PlanStatus.REJECTED)
+
+    def test_ultra_replan_contract_exhaustion_is_a_resumable_boundary(self):
+        from agent.ultra import AgentProtocolError
+
+        runtime, _provider = self.runtime([])
+        goal = self.store.create_goal(
+            "Repair the approved calculator.",
+            session_id=runtime.session_id,
+        )
+        self.store.update_goal_metadata(
+            goal.id,
+            ultra_run_id="ultra-source",
+            accepted_foundation_source_run_id="ultra-source",
+        )
+        self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.store.transition_goal(goal.id, GoalStatus.REVISING)
+        fake_session = SimpleNamespace(
+            running=False,
+            restart_plan_from_accepted_foundation=mock.Mock(
+                side_effect=AgentProtocolError(
+                    "repair plan paths exceed approved scope: new.css"
+                )
+            ),
+        )
+
+        with mock.patch.object(
+            runtime, "active_ultra_run", return_value=SimpleNamespace(id="ultra-source")
+        ), mock.patch.object(
+            runtime, "_make_ultra_session", return_value=fake_session
+        ), mock.patch.object(self.store, "update_ultra_run"):
+            result = runtime.replan_ultra("Reuse only approved paths.")
+
+        self.assertIsInstance(result, SliceResult)
+        self.assertEqual(result.status, "paused")
+        paused = self.store.get_goal(goal.id)
+        self.assertEqual(paused.status, GoalStatus.PAUSED)
+        self.assertEqual(paused.metadata["resume_action"], "ultra_replan")
+        self.assertEqual(paused.metadata["boundary_kind"], "contract_incompatibility")
+
+        with mock.patch.object(
+            runtime, "replan_ultra", return_value="retried-ultra-plan"
+        ) as retry, mock.patch.object(runtime, "generate_plan") as normal_plan:
+            resumed = runtime.resume()
+
+        self.assertEqual(resumed, "retried-ultra-plan")
+        retry.assert_called_once()
+        normal_plan.assert_not_called()
+
     def test_resume_rebuilds_an_interrupted_discovering_plan(self):
         runtime, _provider = self.runtime([])
         goal = self.store.create_goal(
@@ -570,7 +904,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         self.assertTrue(goal.metadata["completion_limitations"])
         self.assertTrue(goal.metadata["latest_evaluation"]["scores"])
 
-    def test_mode_changes_preserve_one_durable_run_contract_and_quality_state(self):
+    def test_mode_changes_are_locked_without_mutating_the_durable_run_contract(self):
         runtime, _provider = self.runtime([inspect_call(), plan_call(), plan_pass()])
         plan = runtime.start_goal("Build persistent behavior")
         runtime.approve_plan(plan.revision)
@@ -578,20 +912,22 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         run_id = before.metadata["run_id"]
         fingerprint = before.metadata["goal_contract_fingerprint"]
 
-        for mode in ("chat", "plan", "goal", "chat", "goal", "ultra"):
-            runtime.transition_mode(mode)
+        # Compatibility aliases that normalize to the already-bound Normal
+        # mode are idempotent. Material changes are rejected while running.
+        for mode in ("chat", "goal", "normal"):
+            self.assertEqual(runtime.transition_mode(mode), "normal")
+        for mode in ("plan", "ultra"):
+            with self.assertRaisesRegex(RuntimeStateError, "locked"):
+                runtime.transition_mode(mode)
 
         after = runtime.active_goal()
         session = self.store.get_workflow_session(runtime.session_id)
         self.assertEqual(after.id, before.id)
         self.assertEqual(after.metadata["run_id"], run_id)
         self.assertEqual(after.metadata["goal_contract_fingerprint"], fingerprint)
-        self.assertEqual(session["state"]["run_id"], run_id)
-        self.assertEqual(session["session_mode"], "ultra")
+        self.assertEqual(session["session_mode"], "normal")
         transitions = [event for event in self.store.list_recent_events(after.id, limit=100) if event.event_type == "mode.transition"]
-        # Legacy chat/plan/goal aliases all normalize to one durable Normal
-        # mode, so only the final Normal -> Ultra transition is material.
-        self.assertGreaterEqual(len(transitions), 1)
+        self.assertEqual(transitions, [])
 
     def test_ultra_can_visit_plan_and_change_depth_without_replacing_the_run(self):
         runtime, _provider = self.runtime([])
@@ -599,7 +935,8 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         runtime.transition_mode("plan")
         session = self.store.get_workflow_session(runtime.session_id)
         self.assertEqual(session["session_mode"], "plan")
-        self.assertEqual(session["state"]["plan_return_mode"], "ultra")
+        self.assertEqual(session["state"]["interaction_mode"], "plan")
+        self.assertEqual(session["state"]["minimum_strategy"], "recursive")
 
         runtime.transition_mode("normal")
         self.assertEqual(
@@ -607,10 +944,8 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             "normal",
         )
 
-        runtime.transition_mode("ultra")
         session = self.store.get_workflow_session(runtime.session_id)
-        self.assertEqual(session["session_mode"], "ultra")
-        self.assertNotIn("plan_return_mode", session["state"])
+        self.assertEqual(session["state"]["interaction_mode"], "working")
 
     def test_normal_can_visit_plan_and_return_to_normal(self):
         runtime, _provider = self.runtime([])
@@ -916,7 +1251,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         events = self.store.list_recent_events(goal_id, limit=100)
         self.assertFalse(any(event.event_type == "quality_convergence.decided" for event in events))
 
-    def test_repeated_invalid_plan_shapes_checkpoint_after_four_aggregated_retries(self):
+    def test_repeated_identical_invalid_plan_stops_without_burning_repair_budget(self):
         runtime, provider = self.runtime(
             [inspect_call(), *(invalid_plan_call(index) for index in range(1, 5))]
         )
@@ -930,11 +1265,29 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             for event in self.store.list_recent_events(runtime.active_goal().id, limit=100)
             if event.event_type == "planning.checkpoint"
         ]
+        self.assertEqual(checkpoints[-1].payload["format_attempts"], 1)
+        self.assertIn("contract_incompatibility", checkpoints[-1].payload["reason"])
+        self.assertEqual(provider.remaining, 2)
+
+    def test_three_distinct_plan_contract_failures_use_three_independent_repairs(self):
+        invalid_turns = []
+        for index in range(1, 5):
+            turn = invalid_plan_call(index)
+            turn["tool_calls"][0]["args"]["summary"] = f"Distinct malformed attempt {index}"
+            invalid_turns.append(turn)
+        runtime, provider = self.runtime([inspect_call(), *invalid_turns])
+
+        self.assertIsNone(runtime.start_goal("Exercise independent plan repairs"))
+
+        checkpoints = [
+            event
+            for event in self.store.list_recent_events(runtime.active_goal().id, limit=100)
+            if event.event_type == "planning.checkpoint"
+        ]
         self.assertEqual(checkpoints[-1].payload["format_attempts"], 3)
-        self.assertIn("model_capability_exhausted", checkpoints[-1].payload["reason"])
         self.assertEqual(provider.remaining, 1)
 
-    def test_repeated_invalid_plan_evidence_uses_the_same_four_attempt_cutoff(self):
+    def test_repeated_identical_applicability_failure_stops_without_budget_burn(self):
         runtime, provider = self.runtime(
             [inspect_call(), *(invalid_evidence_plan_call(index) for index in range(1, 5))]
         )
@@ -948,11 +1301,11 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             if event.event_type == "planning.checkpoint"
         ]
         self.assertEqual(checkpoints[-1].payload["format_attempts"], 0)
-        self.assertEqual(checkpoints[-1].payload["applicability_attempts"], 3)
+        self.assertEqual(checkpoints[-1].payload["applicability_attempts"], 1)
         self.assertIn("tool:missing-inspection", checkpoints[-1].payload["technical_detail"])
-        self.assertEqual(provider.remaining, 1)
+        self.assertEqual(provider.remaining, 2)
 
-    def test_one_turn_with_many_invalid_proposals_stops_exactly_at_four(self):
+    def test_one_turn_with_duplicate_invalid_proposals_stops_at_first_repeat(self):
         burst = {
             "tool_calls": [
                 invalid_plan_call(index)["tool_calls"][0]
@@ -968,7 +1321,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             for event in self.store.list_recent_events(runtime.active_goal().id, limit=100)
             if event.event_type == "planning.checkpoint"
         ]
-        self.assertEqual(checkpoints[-1].payload["format_attempts"], 3)
+        self.assertEqual(checkpoints[-1].payload["format_attempts"], 1)
         provider.assert_exhausted()
 
     def test_plan_pauses_for_revision_bound_user_approval(self):
@@ -1329,6 +1682,59 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         self.assertIn("pass must explicitly cover every accepted task", rejection_context)
         provider.assert_exhausted()
 
+    def test_final_review_reserves_its_last_turn_for_a_verdict(self):
+        inspect_evidence = {
+            "tool_calls": [
+                {
+                    "id": "inspect-evidence",
+                    "name": "inspect_task",
+                    "args": {
+                        "task_id": "T001",
+                        "evidence_offset": 0,
+                        "evidence_limit": 10,
+                    },
+                }
+            ]
+        }
+        runtime, provider = self.runtime(
+            [
+                inspect_call(),
+                plan_call(),
+                plan_pass(),
+                {"tool_calls": [finish_call()]},
+                inspect_evidence,
+                inspect_evidence,
+                inspect_evidence,
+                review_pass(),
+            ]
+        )
+        plan = runtime.start_goal("Build persistent behavior")
+        runtime.approve_plan(plan.revision)
+        runtime.update_task_from_user(
+            "T001",
+            "done",
+            "The requested behavior and focused verification passed.",
+        )
+
+        result = runtime.run_slice()
+
+        self.assertTrue(result.completed)
+        reviewer_calls = [
+            call for call in provider.calls
+            if "independent final reviewer" in call.system
+        ]
+        self.assertEqual(len(reviewer_calls), 4)
+        final_tools = {
+            item["function"]["name"] for item in reviewer_calls[-1].tools
+        }
+        self.assertEqual(final_tools, {"submit_review"})
+        final_context = "\n".join(
+            str(message.get("content", ""))
+            for message in reviewer_calls[-1].conversation
+        )
+        self.assertIn("FINAL REVIEW VERDICT TURN", final_context)
+        provider.assert_exhausted()
+
     def test_user_can_update_checklist_mid_goal_and_new_revision_reapproval_is_mandatory(self):
         runtime, provider = self.runtime([inspect_call(), plan_call(), plan_pass()])
         first = runtime.start_goal("Build persistent behavior")
@@ -1653,22 +2059,22 @@ class DelegationAndReviewTests(RuntimeTestCase):
 
 
 class RecoveryRuntimeTests(RuntimeTestCase):
-    def test_plan_to_ultra_transition_reuses_goal_and_changes_only_policy(self):
+    def test_execution_depth_can_increase_before_plan_approval(self):
         goal = self.store.create_goal("Saved planning objective")
         self.store.transition_goal(goal.id, GoalStatus.DISCOVERING)
         self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
         runtime = AgentRuntime(
             ScriptedProvider([]), self.store, self.workspace, config=self.config
         )
-        result = runtime.prepare_ultra_from_existing_goal()
+        with mock.patch.object(runtime, "generate_plan", return_value="revision") as generate:
+            self.assertEqual(runtime.prepare_ultra_from_existing_goal(), "revision")
 
-        self.assertIsNone(result)
-        self.assertEqual(self.store.get_latest_goal().id, goal.id)
-        self.assertEqual(
-            self.store.get_goal(goal.id).metadata["execution_policy"]["mode"],
-            "ultra",
-        )
+        current = self.store.get_latest_goal()
+        self.assertEqual(current.id, goal.id)
+        self.assertEqual(current.metadata["execution_strategy"], "recursive")
+        self.assertFalse(current.metadata["strategy_locked"])
         self.assertIsNone(runtime.ultra_session)
+        generate.assert_called_once()
 
     def test_failed_ultra_foundation_retry_reuses_saved_goal(self):
         goal = self.store.create_goal("Saved canonical objective")

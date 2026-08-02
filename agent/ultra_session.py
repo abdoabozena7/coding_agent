@@ -60,6 +60,7 @@ from .goal_outcome import (
     OptimizationExperimentV1,
 )
 from .models import DomainError, GoalStatus, Plan, PlanStatus, RoleProfile, TaskStatus, utc_now
+from .semantic import RequestedEffect, SemanticGoalV2
 from .providers.base import AssistantTurn, ToolCall
 from .project_brain import ProjectBrain
 from .safety import redact_data, redact_text
@@ -71,6 +72,7 @@ from .tools._security import atomic_write_bytes
 from .swarm_coordinator import SwarmCoordinator
 from .swarm_protocol import SwarmMessageType, SwarmMessageV1
 from .ultra import (
+    ApprovalRequiredError,
     AgentProtocolError,
     AgentRequest,
     AgentResponse,
@@ -117,6 +119,7 @@ from .ultra_models import (
     WorkNode,
     WorkNodeKind,
     WorkNodeStatus,
+    normalize_contract_path,
 )
 from .visual_judge import (
     UnavailableVisionJudge,
@@ -163,6 +166,129 @@ _TESTER_VERIFICATION_COMMAND_RE = re.compile(
 _SHELL_COMPOSITION_RE = re.compile(r"[\r\n;&|<>`]|\$\(")
 
 
+def _bind_accepted_repair_feedback(
+    plan: MasterPlanV1,
+    feedback: str,
+) -> MasterPlanV1:
+    """Keep explicit repair requirements attached to every repair module.
+
+    Small models sometimes return a schema-valid repair plan that collapses
+    detailed, accepted feedback into a generic objective such as "verify the
+    app".  The harness must not invent product semantics, but it also must not
+    discard semantics already supplied by the user or an evidence-backed
+    reviewer.  Preserve that exact feedback in the approval-visible objective
+    and in the durable node metadata used by specialists.
+    """
+
+    accepted = str(feedback or "").strip()
+    if not accepted:
+        return plan
+    scenarios: tuple[Mapping[str, Any], ...] = ()
+    marker_index = accepted.casefold().find("metadata.browser_scenarios")
+    if marker_index >= 0:
+        array_index = accepted.find("[", marker_index)
+        if array_index >= 0:
+            try:
+                parsed, _end = json.JSONDecoder().raw_decode(accepted[array_index:])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = None
+            if isinstance(parsed, list) and parsed and all(
+                isinstance(item, Mapping)
+                and bool(item.get("steps"))
+                and bool(item.get("assertions"))
+                for item in parsed
+            ):
+                scenarios = tuple(dict(item) for item in parsed)
+    bound_modules = []
+    for module in plan.modules:
+        marker = "Accepted repair requirements:"
+        objective = module.objective.strip()
+        if marker.casefold() not in objective.casefold():
+            objective = f"{objective}\n\n{marker}\n{accepted}".strip()
+        bound_modules.append(
+            replace(
+                module,
+                objective=objective[:8_000],
+                metadata={
+                    **dict(module.metadata),
+                    **(
+                        {"browser_scenarios": list(scenarios)}
+                        if scenarios
+                        else {}
+                    ),
+                    "accepted_repair_feedback": accepted,
+                    "accepted_repair_feedback_bound": True,
+                    **(
+                        {"verification_only": True}
+                        if scenarios
+                        and re.search(
+                            r"\b(?:verification[- ]focused|verification only|preserve the current implementation)\b",
+                            accepted,
+                            re.IGNORECASE,
+                        )
+                        else {}
+                    ),
+                },
+            )
+        )
+    return replace(plan, modules=tuple(bound_modules))
+
+
+def _explicit_repair_scope_paths(feedback: str) -> tuple[str, ...]:
+    """Extract only paths the user explicitly marks as the entire repair scope.
+
+    This is an authority parser, not a semantic router.  It deliberately does
+    nothing unless the feedback contains an unambiguous ``keep/edit ... exactly
+    <path>`` or ``only ... <path>`` instruction.  A later, narrower repair
+    authority must win over the broader path set approved by an older plan.
+    """
+
+    text = str(feedback or "").strip()
+    if not text:
+        return ()
+    clauses = re.findall(
+        r"(?:keep|edit|modify|change|touch|limit(?:\s+the\s+repair)?\s+to)"
+        r"[^\r\n;]{0,48}?\b(?:exactly|only)\b\s+"
+        r"((?:[\w.-]+[\\/])*[\w.-]+\.[A-Za-z0-9]{1,12})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    paths: list[str] = []
+    for candidate in clauses:
+        normalized = normalize_contract_path(candidate)
+        if normalized and normalized not in paths:
+            paths.append(normalized)
+    return tuple(paths)
+
+
+def _bind_repair_architecture_authority(
+    architecture: EngineArchitectureSpec,
+    feedback: str,
+) -> EngineArchitectureSpec:
+    """Make newer, explicit repair authority win over stale design details."""
+
+    accepted = str(feedback or "").strip()
+    if not accepted:
+        return architecture
+    precedence = (
+        "Latest accepted repair requirements take precedence over conflicting "
+        f"earlier implementation details: {accepted}"
+    )
+    return replace(
+        architecture,
+        summary=f"{architecture.summary}\n\n{precedence}".strip()[:8_000],
+        decisions=(
+            *architecture.decisions,
+            {
+                "decision": "Apply the latest accepted repair requirements.",
+                "reason": accepted,
+                "status": "accepted_revision_authority",
+            },
+        ),
+        invariants=tuple(dict.fromkeys((*architecture.invariants, precedence))),
+    )
+
+
 def _tester_verification_command_allowed(command: str) -> bool:
     """Allow one verifier invocation, never shell-composed workspace edits."""
 
@@ -171,6 +297,128 @@ def _tester_verification_command_allowed(command: str) -> bool:
         text
         and not _SHELL_COMPOSITION_RE.search(text)
         and _TESTER_VERIFICATION_COMMAND_RE.match(text)
+    )
+
+
+_TESTER_CD_COMMAND_RE = re.compile(
+    r"^\s*cd\s+(?:\"([^\"]+)\"|'([^']+)'|([^\s;&|<>`]+))"
+    r"\s*&&\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_tester_verification_call(
+    call: ToolCall,
+) -> tuple[ToolCall, str]:
+    """Convert a safe ``cd && verifier`` into typed cwd transport.
+
+    This does not grant shell composition: only one workspace-relative cwd and
+    one already-allowlisted verifier command survive the conversion.
+    """
+
+    if call.name not in {"run_bash", "run_command"}:
+        return call, ""
+    command = str(call.args.get("command") or "")
+    match = _TESTER_CD_COMMAND_RE.fullmatch(command)
+    if match is None:
+        return call, ""
+    cwd = next((value for value in match.groups()[:3] if value is not None), "")
+    verification = str(match.group(4) or "").strip()
+    normalized_cwd = cwd.strip().replace("\\", "/")
+    path = PurePosixPath(normalized_cwd)
+    if (
+        not normalized_cwd
+        or path.is_absolute()
+        or ".." in path.parts
+        or re.match(r"^[A-Za-z]:", normalized_cwd)
+        or not _tester_verification_command_allowed(verification)
+    ):
+        return call, ""
+    return (
+        ToolCall(
+            id=call.id,
+            name="run_command",
+            args={"cwd": normalized_cwd, "command": verification},
+        ),
+        "tester cd-and-verifier shell syntax normalized to run_command cwd",
+    )
+
+
+_COMMAND_EXIT_CODE_RE = re.compile(r"^\s*exit code:\s*(-?\d+)\b", re.IGNORECASE)
+
+
+def _tester_command_receipt(
+    call: ToolCall,
+    result: str,
+    *,
+    node_id: str = "",
+    usage: Mapping[str, int] | None = None,
+) -> AgentResponse | None:
+    """Turn an executed verifier's exit status into authoritative evidence.
+
+    The harness owns command execution and may therefore report the exact
+    outcome without asking a small model to restate it as a typed boolean on a
+    second inference.  No verdict is synthesized for errors, non-verifier
+    commands, approval boundaries, or output without the executor's leading
+    exit-code receipt.
+    """
+
+    if call.name not in {"run_bash", "run_command"}:
+        return None
+    command = str(call.args.get("command") or "").strip()
+    if not _tester_verification_command_allowed(command):
+        return None
+    output = str(result or "")
+    if output.startswith("Error:"):
+        return None
+    match = _COMMAND_EXIT_CODE_RE.match(output)
+    if match is None:
+        return None
+    returncode = int(match.group(1))
+    passed = returncode == 0
+    cwd = str(call.args.get("cwd") or ".").strip() or "."
+    bounded_output = redact_text(output[:12_000])
+    finding = (
+        ""
+        if passed
+        else f"Verification command failed with exit code {returncode}: {command}"
+    )
+    result_record = {
+        "name": "executable_verification",
+        "command": command,
+        "cwd": cwd,
+        "returncode": returncode,
+        "passed": passed,
+    }
+    evidence = {
+        "kind": "executable_verification",
+        **result_record,
+        "output": bounded_output,
+    }
+    return AgentResponse.from_mapping(
+        {
+            "payload": {
+                "passed": passed,
+                "success": passed,
+                "issues": [] if passed else [finding],
+                "findings": [] if passed else [finding],
+                "test_results": [result_record],
+                "evidence": [evidence],
+            },
+            "summary": (
+                f"Executable verification passed: {command}"
+                if passed
+                else finding
+            ),
+            "reasoning_summary": (
+                "Verdict derived from the harness-owned process exit status; "
+                "no model-authored completion claim was used."
+            ),
+        },
+        node_id=node_id,
+        provider="harness",
+        model="command-receipt-v1",
+        usage=dict(usage or {}),
     )
 _STAGE_COMPONENT_FILE_TOOL = {
     "type": "function",
@@ -929,12 +1177,33 @@ _PHASE_CONTRACTS: dict[str, Mapping[str, Any]] = {
                     "title": "module title",
                     "objective": "bounded objective",
                     "acceptance_criteria": ["observable criterion"],
-                    "verification": ["command or inspection"],
+                    "verification": [
+                        "literal executable command or tool call such as npm test, "
+                        "python -m pytest -q, or preview_html index.html; never prose"
+                    ],
                     "depends_on": [],
-                    "write_paths": ["workspace/relative/path"],
+                    "write_paths": ["relative/path"],
                     "forbidden_changes": [],
                     "owned_interfaces": [],
-                    "metadata": {"external_dependencies": []},
+                    "metadata": {
+                        "external_dependencies": [],
+                        "browser_scenarios": [
+                            {
+                                "name": "observable user flow",
+                                "steps": [
+                                    {"action": "click", "role": "button", "name": "Control name"}
+                                ],
+                                "assertions": [
+                                    {
+                                        "role": "textbox",
+                                        "name": "Output name",
+                                        "property": "value",
+                                        "equals": "expected value",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
                 }
             ],
         }
@@ -1003,7 +1272,13 @@ class WorkspaceUltraAgent:
                 "stage_component_file",
                 "publish_component",
             }
-        if self.role in {AgentRole.TESTER, AgentRole.RESEARCHER}:
+        if self.role is AgentRole.TESTER:
+            # ``run_command`` is the typed cwd transport used when a weak
+            # model proposes the otherwise-safe ``cd dir && verifier`` form.
+            # The tester command validator still rejects every non-verifier
+            # command before either executor can be reached.
+            return _READ_TOOLS | {"run_bash", "run_command", "preview_html"}
+        if self.role is AgentRole.RESEARCHER:
             return _READ_TOOLS | {"run_bash", "preview_html"}
         return _READ_TOOLS
 
@@ -1037,12 +1312,25 @@ class WorkspaceUltraAgent:
         target = self._html_write_target(request)
         if not target:
             return None
+        contract = dict(request.task.get("contract", {}))
+        metadata = dict(contract.get("metadata") or {})
+        interactions = [
+            dict(item)
+            for item in metadata.get("browser_scenarios", ())
+            if isinstance(item, Mapping)
+        ]
         result = str(
             self.executor(
                 ToolCall(
                     "harness-html-preview",
                     "preview_html",
-                    {"path": target, "open_browser": False, "verify": True, "settle_ms": 750},
+                    {
+                        "path": target,
+                        "open_browser": False,
+                        "verify": True,
+                        "settle_ms": 750,
+                        "interactions": interactions,
+                    },
                 ),
                 request,
             )
@@ -1587,6 +1875,20 @@ class WorkspaceUltraAgent:
             and request.phase == InnerPhase.REVIEW.value
             and isinstance(request.task.get("review_verdicts"), Sequence)
         )
+        bounded_review_inspection_phase = bool(
+            self.role
+            in {
+                AgentRole.REVIEWER,
+                AgentRole.CLEAN_CODE_REVIEWER,
+                AgentRole.SECURITY_REVIEWER,
+                AgentRole.TEST_QUALITY_REVIEWER,
+            }
+            and request.phase
+            in {
+                InnerPhase.REVIEW.value,
+                InnerPhase.GLOBAL_REVIEW.value,
+            }
+        )
         configured_effort = str(getattr(self.provider, "reasoning_effort", "medium"))
         deterministic_roles = {
             AgentRole.GOAL_UNDERSTANDING,
@@ -1654,6 +1956,45 @@ class WorkspaceUltraAgent:
             request.phase,
             {"payload": {"success": True, "findings": [], "evidence": []}},
         )
+        if (
+            self.role is AgentRole.MEMORY
+            and request.phase == InnerPhase.MEMORY_WRITEBACK.value
+        ):
+            summaries = [
+                str(item).strip()
+                for item in request.task.get("result_summaries", ())
+                if str(item).strip()
+            ]
+            self.events.publish(
+                "ultra.deterministic_memory_writeback",
+                "Durable result receipts were compacted without another model call.",
+                run_id=request.run_id,
+                node_id=request.node_id,
+                summaries=len(summaries),
+            )
+            return AgentResponse.from_mapping(
+                {
+                    "payload": {
+                        "success": True,
+                        "insights": [
+                            {
+                                "summary": summary[:500],
+                                "severity": "info",
+                                "details": {"source": "accepted_result_receipt"},
+                            }
+                            for summary in summaries[-6:]
+                        ],
+                    },
+                    "summary": "Accepted result receipts were written to durable memory.",
+                    "reasoning_summary": (
+                        "Memory writeback copied accepted external summaries only; "
+                        "it did not ask the model to reinterpret or mutate the result."
+                    ),
+                },
+                node_id=request.node_id,
+                provider="harness",
+                model="durable-memory-writeback-v1",
+            )
         if self.role is AgentRole.CODER and request.phase in {
             InnerPhase.IMPLEMENT.value,
             InnerPhase.FIX.value,
@@ -1712,6 +2053,9 @@ class WorkspaceUltraAgent:
                                 "passed": False,
                                 "scores": dict(harness_preview.get("benchmark_scores", {})),
                                 "screenshot_path": harness_preview.get("screenshot_path"),
+                                "interaction_results": list(
+                                    harness_preview.get("interaction_results", ()) or ()
+                                ),
                             }
                         ],
                         "evidence": [
@@ -1719,6 +2063,9 @@ class WorkspaceUltraAgent:
                                 "kind": "browser_preview",
                                 "verification": harness_preview.get("verification"),
                                 "screenshot_path": harness_preview.get("screenshot_path"),
+                                "interaction_results": list(
+                                    harness_preview.get("interaction_results", ()) or ()
+                                ),
                             }
                         ],
                     },
@@ -1728,6 +2075,74 @@ class WorkspaceUltraAgent:
                 node_id=request.node_id,
                 provider=self.provider_name,
                 model=self.model,
+            )
+        if (
+            harness_preview
+            and request.phase == InnerPhase.TEST.value
+            and self.role is AgentRole.TESTER
+            and str(
+                harness_preview.get("verification")
+                or harness_preview.get("status")
+                or ""
+            ).casefold()
+            in {"passed", "ok", "success"}
+        ):
+            self.events.publish(
+                "ultra.deterministic_test_gate",
+                "Harness browser verification passed; using its receipt as the tester verdict.",
+                run_id=request.run_id,
+                node_id=request.node_id,
+                screenshot_path=harness_preview.get("screenshot_path"),
+            )
+            return AgentResponse.from_mapping(
+                {
+                    "payload": {
+                        "passed": True,
+                        "success": True,
+                        "issues": [],
+                        "findings": [],
+                        "test_results": [
+                            {
+                                "name": "harness_html_preview",
+                                "passed": True,
+                                "http_status": harness_preview.get("http_status"),
+                                "screenshot_path": harness_preview.get("screenshot_path"),
+                                "interaction_results": list(
+                                    harness_preview.get("interaction_results", ()) or ()
+                                ),
+                            }
+                        ],
+                        "evidence": [
+                            {
+                                "kind": "harness_browser_preview",
+                                "source": "harness",
+                                "status": "passed",
+                                "http_status": harness_preview.get("http_status"),
+                                "console_errors": list(
+                                    harness_preview.get("console_errors", ()) or ()
+                                ),
+                                "page_errors": list(
+                                    harness_preview.get("page_errors", ()) or ()
+                                ),
+                                "network_errors": list(
+                                    harness_preview.get("network_errors", ()) or ()
+                                ),
+                                "screenshot_path": harness_preview.get("screenshot_path"),
+                                "interaction_results": list(
+                                    harness_preview.get("interaction_results", ()) or ()
+                                ),
+                            }
+                        ],
+                    },
+                    "summary": "Harness browser preview passed with authoritative evidence.",
+                    "reasoning_summary": (
+                        "The deterministic browser gate observed HTTP success and no "
+                        "blocking page, console, or network errors."
+                    ),
+                },
+                node_id=request.node_id,
+                provider="harness",
+                model="browser-preview-gate-v1",
             )
         debate_protocol = reasoning_debate_protocol_for(
             self.role.value,
@@ -2379,6 +2794,7 @@ class WorkspaceUltraAgent:
         invalid_json_attempts = 0
         component_unused_retries = 0
         quality_read_count = 0
+        successful_mutation_paths: set[str] = set()
         max_invalid_json_attempts = 4 if self.provider_name.casefold() == "ollama" else 2
         for step in range(1, self.max_steps + 1):
             try:
@@ -2462,6 +2878,17 @@ class WorkspaceUltraAgent:
                         "passed independent review. Do not call tools or propose workspace "
                         "writes. Publish only the typed component_package metadata that "
                         "describes the accepted candidate."
+                    )
+                if request.phase == "master_plan":
+                    system_prompt += (
+                        "\n\nMASTER PLAN VERIFICATION TRANSPORT: every module.verification item "
+                        "must begin with a literal executable command or harness tool name. "
+                        "Valid shapes include 'npm test', 'python -m pytest -q', and "
+                        "'preview_html path/to/entry.html'. Invalid shapes include 'run tests', "
+                        "'test the UI', or 'verify the app'. If using npm/pnpm/yarn/bun/npx, "
+                        "include package.json in a module write_paths. If using preview_html, "
+                        "include that exact preview target in write_paths. Choose commands and "
+                        "paths from the model-authored plan; do not emit placeholders."
                     )
                 if self.role is AgentRole.CODER and request.phase in {
                     InnerPhase.IMPLEMENT.value,
@@ -2601,6 +3028,35 @@ class WorkspaceUltraAgent:
                             }
                         )
                         continue
+                    if self.role is AgentRole.TESTER:
+                        normalized_test_call, normalization_note = (
+                            _normalize_tester_verification_call(call)
+                        )
+                        if normalization_note:
+                            call = normalized_test_call
+                            self.events.publish(
+                                "ultra.tool_proposal_normalized",
+                                normalization_note,
+                                run_id=request.run_id,
+                                node_id=request.node_id,
+                                role=self.role.value,
+                                phase=request.phase,
+                                tool=call.name,
+                            )
+                            if call.name not in exposed_tools:
+                                result = (
+                                    "Error: typed tester verification transport "
+                                    f"{call.name!r} is not exposed in this phase"
+                                )
+                                conversation.append(
+                                    {
+                                        "role": "tool",
+                                        "id": call.id,
+                                        "name": call.name,
+                                        "content": result,
+                                    }
+                                )
+                                continue
                     if (
                         self.role is AgentRole.TESTER
                         and call.name in {"run_bash", "run_command"}
@@ -2731,7 +3187,44 @@ class WorkspaceUltraAgent:
                                 node_id=request.node_id,
                                 path=call.args.get("path", ""),
                             )
+                    mutation_path = (
+                        str(effective_call.args.get("path") or "").strip()
+                        if effective_call.name in _WRITE_TOOLS
+                        else ""
+                    )
+                    repeated_mutation_path = bool(
+                        mutation_path and mutation_path in successful_mutation_paths
+                    )
                     result = self.executor(effective_call, request)
+                    tester_receipt = None
+                    if (
+                        self.role is AgentRole.TESTER
+                        and request.phase == InnerPhase.TEST.value
+                    ):
+                        tester_receipt = _tester_command_receipt(
+                            effective_call,
+                            str(result),
+                            node_id=request.node_id,
+                            usage=totals,
+                        )
+                    if tester_receipt is not None:
+                        self.events.publish(
+                            "ultra.deterministic_test_gate",
+                            tester_receipt.summary,
+                            run_id=request.run_id,
+                            node_id=request.node_id,
+                            role=self.role.value,
+                            phase=request.phase,
+                            command=str(effective_call.args.get("command") or ""),
+                            cwd=str(effective_call.args.get("cwd") or "."),
+                            passed=bool(tester_receipt.payload.get("passed")),
+                            returncode=int(
+                                dict(tester_receipt.payload["test_results"][0]).get(
+                                    "returncode", -1
+                                )
+                            ),
+                        )
+                        return tester_receipt
                     if effective_call.name == "stage_component_file":
                         # The full source is durable in the isolated artifact
                         # store. Replaying it through every subsequent local
@@ -3025,6 +3518,8 @@ class WorkspaceUltraAgent:
                         inspection_observed = True
                     if effective_call.name in _WRITE_TOOLS and not str(result).startswith("Error:"):
                         mutation_observed = True
+                        if mutation_path:
+                            successful_mutation_paths.add(mutation_path)
                     conversation.append(
                         {
                             "role": "tool",
@@ -3033,21 +3528,50 @@ class WorkspaceUltraAgent:
                             "content": result,
                         }
                     )
+                    if repeated_mutation_path and schemas:
+                        # The durable executor/replay guard has already
+                        # accepted this exact path. A weak model repeating the
+                        # same mutation cannot add evidence, so close tools and
+                        # require the typed handoff. Independent review and
+                        # executable verification still decide acceptance.
+                        schemas.clear()
+                        conversation.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "The same successful mutation was proposed again and the "
+                                    "durable replay guard preserved the accepted bytes. Tools are "
+                                    "now closed. Return the response_contract JSON using only the "
+                                    "observed mutation receipt; do not claim review or test success."
+                                ),
+                            }
+                        )
+                        self.events.publish(
+                            "ultra.repeated_mutation_handoff",
+                            "Closed tools after a duplicate mutation proposal and requested the typed handoff.",
+                            run_id=request.run_id,
+                            node_id=request.node_id,
+                            role=self.role.value,
+                            phase=request.phase,
+                            path=mutation_path,
+                        )
                     if (
-                        component_leaf_quality_phase
+                        (component_leaf_quality_phase or bounded_review_inspection_phase)
                         and effective_call.name in _READ_TOOLS
                         and not str(result).startswith("Error:")
                     ):
                         quality_read_count += 1
-                        if quality_read_count >= 2 and schemas:
+                        read_budget = 2 if component_leaf_quality_phase else 4
+                        if quality_read_count >= read_budget and schemas:
                             schemas.clear()
                             conversation.append(
                                 {
                                     "role": "user",
                                     "content": (
-                                        "The bounded inspection budget is complete. Use the "
-                                        "durable receipts and latest focused read to return the "
-                                        "response_contract JSON now. Do not request another tool."
+                                        "The bounded independent inspection budget is complete. "
+                                        "Use only the observed tool receipts to return the "
+                                        "response_contract JSON now. Do not request another tool, "
+                                        "invent missing evidence, or repeat an inspection."
                                     ),
                                 }
                             )
@@ -3250,6 +3774,72 @@ class WorkspaceUltraAgent:
                         response = AgentResponse(
                             payload=payload,
                             summary=response.summary or "Harness browser verification failed",
+                            insights=response.insights,
+                            reasoning_summary=response.reasoning_summary,
+                            usage=response.usage,
+                            provider=response.provider,
+                            model=response.model,
+                        )
+                    else:
+                        payload = dict(response.payload)
+                        existing_evidence = list(payload.get("evidence", ()) or ())
+                        existing_evidence.append(
+                            {
+                                "kind": "harness_browser_preview",
+                                "status": "passed",
+                                "http_status": harness_preview.get("http_status"),
+                                "console_errors": list(harness_preview.get("console_errors", ()) or ()),
+                                "page_errors": list(harness_preview.get("page_errors", ()) or ()),
+                                "network_errors": list(harness_preview.get("network_errors", ()) or ()),
+                                "screenshot_path": harness_preview.get("screenshot_path"),
+                                "interaction_results": list(
+                                    harness_preview.get("interaction_results", ()) or ()
+                                ),
+                            }
+                        )
+                        payload["evidence"] = existing_evidence
+                        existing_results = list(payload.get("test_results", ()) or ())
+                        existing_results.append(
+                            {
+                                "name": "harness_html_preview",
+                                "passed": True,
+                                "http_status": harness_preview.get("http_status"),
+                                "screenshot_path": harness_preview.get("screenshot_path"),
+                            }
+                        )
+                        payload["test_results"] = existing_results
+                        evidence_absence = re.compile(
+                            r"(?:no|missing|lack(?:ing)?|additional)\s+(?:browser\s+|runtime\s+|"
+                            r"verification\s+)?evidence|not\s+verified",
+                            re.IGNORECASE,
+                        )
+                        raw_issues = list(payload.get("issues", ()) or ())
+                        raw_findings = list(payload.get("findings", ()) or ())
+                        issues = [item for item in raw_issues if not evidence_absence.search(str(item))]
+                        findings = [item for item in raw_findings if not evidence_absence.search(str(item))]
+                        provider_claimed_only_missing_evidence = bool(
+                            evidence_absence.search(
+                                " ".join(
+                                    [
+                                        str(response.summary or ""),
+                                        *(str(item) for item in raw_issues),
+                                        *(str(item) for item in raw_findings),
+                                    ]
+                                )
+                            )
+                        )
+                        payload["issues"] = issues
+                        payload["findings"] = findings
+                        if provider_claimed_only_missing_evidence and not issues and not findings:
+                            payload["passed"] = True
+                            payload["success"] = True
+                        response = AgentResponse(
+                            payload=payload,
+                            summary=(
+                                "Harness browser preview passed with authoritative evidence."
+                                if provider_claimed_only_missing_evidence
+                                else response.summary
+                            ),
                             insights=response.insights,
                             reasoning_summary=response.reasoning_summary,
                             usage=response.usage,
@@ -3510,6 +4100,31 @@ class DurableContextBuilder:
         self.fallback = FocusedContextBuilder(max_chars)
 
     def build(self, request: ContextRequest) -> Mapping[str, Any]:
+        # A bounded repair already carries the latest accepted authority in its
+        # node contract.  Rehydrating the whole project brain here can drown a
+        # small local model in stale, contradictory lessons from earlier
+        # revisions (and materially increase inference latency).  Keep the
+        # current contract and direct dependency evidence, and explicitly mark
+        # historical sections as omitted.  Normal first-pass implementation
+        # still receives the full durable context below.
+        if "accepted repair requirements:" in request.node.contract.objective.casefold():
+            return {
+                "north_star": {
+                    "objective": request.goal.objective,
+                    "success_criteria": list(request.goal.success_criteria),
+                },
+                "repair_contract": asdict(request.node.contract),
+                "dependency_artifacts": {
+                    node_id: asdict(result)
+                    for node_id, result in request.dependency_results.items()
+                },
+                "_omitted": [
+                    "historical_architecture",
+                    "project_lessons",
+                    "project_knowledge",
+                    "role_memory",
+                ],
+            }
         run_id = self.run_id()
         if not run_id:
             return self.fallback.build(request)
@@ -3650,6 +4265,7 @@ class StateStoreUltraAdapter(InMemoryUltraState):
         self._lease_ids: dict[str, list[str]] = {}
         self._lease_scopes: dict[str, tuple[str, ...]] = {}
         self._lease_hashes: dict[str, dict[str, str | None]] = {}
+        self._lease_initial_hashes: dict[str, dict[str, str | None]] = {}
         self._used_project_lessons: dict[str, dict[str, Any]] = {}
         model_name = str(descriptor.model).casefold()
         self._global_memory_enabled = not model_name.startswith(("offline", "fake", "test"))
@@ -3844,6 +4460,8 @@ class StateStoreUltraAdapter(InMemoryUltraState):
             if not path.is_file() or ".coding-agent" in path.parts:
                 continue
             relative = path.relative_to(self.workspace).as_posix()
+            if relative.startswith(("output/playwright/", ".playwright-cli/")):
+                continue
             try:
                 values[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
             except OSError:
@@ -5911,9 +6529,22 @@ window.buildPreview=(context)=>{
         executable = dict(
             _run_python_test_artifacts(self.workspace, node.write_paths)
         )
+        mutation_evidence: list[Mapping[str, Any]] = []
+        for raw_path in node.write_paths:
+            path = _normalized_path(raw_path)
+            if not path or any(character in path for character in "*?["):
+                continue
+            known, before = self.initial_lease_hash(node.id, path)
+            after = _hash_file(self.workspace, path)
+            if known and before != after:
+                mutation_evidence.append(
+                    {"path": path, "before_sha256": before, "after_sha256": after}
+                )
         return {
             "passed": bool(artifacts.get("passed"))
             and bool(executable.get("passed")),
+            "workspace_mutated": bool(mutation_evidence),
+            "mutation_evidence": mutation_evidence,
             "findings": [
                 *artifacts.get("findings", ()),
                 *executable.get("findings", ()),
@@ -6563,7 +7194,10 @@ window.buildPreview=(context)=>{
                         tool_policy={"write_paths": list(module.write_paths)},
                     ).to_dict(),
                     "priority": max(0, len(master.modules) - index),
-                    "metadata": {"ultra_node_id": module.id},
+                    "metadata": {
+                        **dict(module.metadata),
+                        "ultra_node_id": module.id,
+                    },
                 }
             )
             paths = module.write_paths or (".",)
@@ -6606,6 +7240,30 @@ window.buildPreview=(context)=>{
             proposed_by="ultra-planner",
             submit=True,
         )
+        goal = self.store.get_goal(self.goal_id)
+        authored_effects = tuple(
+            RequestedEffect.parse(item)
+            for item in goal.metadata.get("accepted_requested_effects", ())
+        )
+        if RequestedEffect.READ_WORKSPACE not in authored_effects:
+            authored_effects = (RequestedEffect.READ_WORKSPACE, *authored_effects)
+        semantic_goal = SemanticGoalV2(
+            original_request=goal.objective,
+            interpreted_outcome=goal_spec.objective,
+            requested_effects=authored_effects,
+            required_outcomes=goal_spec.in_scope or goal_spec.success_criteria,
+            constraints=goal_spec.constraints,
+            exclusions=goal_spec.out_of_scope,
+            acceptance_criteria=goal_spec.success_criteria,
+            repository_evidence_refs=(f"ultra:{self.run_id}:foundation",),
+            status="critic_accepted",
+        )
+        self.store.update_goal_metadata(
+            self.goal_id,
+            semantic_goal=semantic_goal.to_dict(),
+            semantic_goal_fingerprint=semantic_goal.fingerprint,
+            accepted_semantic_fingerprint=semantic_goal.fingerprint,
+        )
         self.store.update_ultra_run(
             self.run_id,
             phase=UltraPhase.AWAITING_APPROVAL,
@@ -6618,6 +7276,11 @@ window.buildPreview=(context)=>{
                 # quality artifact as well.
                 "master_plan_fingerprint": self.plan.fingerprint,
                 "module_count": len(master.modules),
+                # Keep the exact durable objective available to evaluators and
+                # restart recovery.  Replacing the config at approval used to
+                # discard it, which silently disabled task-specific gates such
+                # as the Three.js/WebGL benchmark.
+                "prompt": goal.objective,
             },
         )
         brain = ProjectBrain(self.store, self.run_id)
@@ -6662,20 +7325,25 @@ window.buildPreview=(context)=>{
             )
         return self.plan
 
-    def approve_master(self, master: MasterPlanV1) -> Plan:
+    def approve_master(
+        self,
+        master: MasterPlanV1,
+        *,
+        approved_by: str = "user",
+    ) -> Plan:
         if not self.run_id or not self.plan:
             raise StateStoreError("ULTRA foundation is not bound to a durable master plan")
         accepted, _ = self.store.approve_plan(
             self.goal_id,
             self.plan.revision,
-            approved_by="user",
+            approved_by=approved_by,
             expected_fingerprint=self.plan.fingerprint,
         )
         self.store.approve_ultra_master(
             self.run_id,
             accepted.revision,
             accepted.fingerprint,
-            approved_by="user",
+            approved_by=approved_by,
         )
         self.plan = accepted
         self.approved = True
@@ -7778,16 +8446,53 @@ window.buildPreview=(context)=>{
                     candidates.extend(str(artifact.get(key) or "") for key in ("path", "uri"))
                 else:
                     candidates.append(str(artifact))
-        prompt = str(self.store.get_ultra_run(self.run_id).config.get("prompt", ""))
-        should_check = any(value.casefold().endswith((".html", ".htm")) or "index.html" in value.casefold() for value in candidates)
-        should_check = should_check or any(term in prompt.casefold() for term in ("html", "browser game", "three.js", "threejs", "3d game", "single-file"))
-        index_path = (self.workspace / "index.html").resolve(strict=False)
-        try:
-            index_path.relative_to(self.workspace)
-        except ValueError:
+        durable_run = self.store.get_ultra_run(self.run_id)
+        prompt = str(durable_run.config.get("prompt", ""))
+        # This evaluator is intentionally specific to interactive 3D/WebGL
+        # artifacts. Normal HTML products are already covered by the real
+        # browser/runtime gate and must not be rejected for lacking a scene,
+        # camera, animation loop, or gameplay state.
+        architecture_text = _json(
+            asdict(durable_run.architecture_spec)
+            if durable_run.architecture_spec is not None
+            else {}
+        )
+        evaluator_contract = f"{prompt}\n{architecture_text}".casefold()
+        should_check = any(
+            term in evaluator_contract
+            for term in (
+                "three.js",
+                "threejs",
+                "webgl",
+                "3d game",
+                "3d html",
+                "browser game",
+            )
+        )
+        if not should_check:
             return None
-        if not should_check and not index_path.exists():
-            return None
+        html_targets: list[tuple[str, Path]] = []
+        for raw in candidates:
+            value = str(raw or "").strip().replace("\\", "/")
+            if value.startswith("workspace:"):
+                value = value.removeprefix("workspace:")
+            value = value.removeprefix("./")
+            if not value.casefold().endswith((".html", ".htm")):
+                continue
+            candidate = (self.workspace / value).resolve(strict=False)
+            try:
+                candidate.relative_to(self.workspace)
+            except ValueError:
+                continue
+            html_targets.append((value, candidate))
+        fallback = (
+            "index.html",
+            (self.workspace / "index.html").resolve(strict=False),
+        )
+        target_name, index_path = next(
+            ((name, path) for name, path in html_targets if path.is_file()),
+            html_targets[0] if html_targets else fallback,
+        )
         if not index_path.is_file():
             recorded = self.store.record_benchmark_result(
                 suite_name="weak-model-html",
@@ -7799,8 +8504,8 @@ window.buildPreview=(context)=>{
                 metrics={"missing_index_html": 1.0},
                 scores={"overall": 0.0},
                 result="failed",
-                artifact_refs=("workspace:index.html",),
-                blocker="HTML benchmark target index.html was not created",
+                artifact_refs=(f"workspace:{target_name}",),
+                blocker=f"HTML benchmark target {target_name} was not created",
             )
             return recorded
         try:
@@ -7816,8 +8521,8 @@ window.buildPreview=(context)=>{
                 metrics={"read_error": 1.0},
                 scores={"overall": 0.0},
                 result="failed",
-                artifact_refs=("workspace:index.html",),
-                blocker=f"HTML benchmark could not read index.html: {type(exc).__name__}",
+                artifact_refs=(f"workspace:{target_name}",),
+                blocker=f"HTML benchmark could not read {target_name}: {type(exc).__name__}",
             )
             return recorded
         preview: Mapping[str, Any] = {}
@@ -7826,7 +8531,7 @@ window.buildPreview=(context)=>{
             preview_raw = tools.run_tool(
                 "preview_html",
                 {
-                    "path": "index.html",
+                    "path": target_name,
                     "open_browser": False,
                     "verify": True,
                     "settle_ms": 2500,
@@ -7867,7 +8572,7 @@ window.buildPreview=(context)=>{
             provider=self.descriptor.provider,
             model=self.descriptor.model,
             ultra_run_id=self.run_id,
-            artifact_ref="workspace:index.html",
+            artifact_ref=f"workspace:{target_name}",
             preview=preview,
         )
 
@@ -8073,12 +8778,14 @@ window.buildPreview=(context)=>{
                 self._lease_ids[lease.owner] = created
                 self._lease_scopes[lease.owner] = scopes
                 self._lease_hashes[lease.owner] = hashes
+                self._lease_initial_hashes[lease.owner] = dict(hashes)
 
         def released(lease: RuntimeLease) -> None:
             with self._adapter_lock:
                 lease_ids = self._lease_ids.pop(lease.owner, [])
                 self._lease_scopes.pop(lease.owner, None)
                 self._lease_hashes.pop(lease.owner, None)
+                self._lease_initial_hashes.pop(lease.owner, None)
             for lease_id in lease_ids:
                 self.store.release_resource_lease(lease_id)
 
@@ -8095,6 +8802,16 @@ window.buildPreview=(context)=>{
             if not scopes or not _within_scope(normalized, scopes):
                 return False, None
             return True, self._lease_hashes.get(owner, {}).get(normalized)
+
+    def initial_lease_hash(self, owner: str, path: str) -> tuple[bool, str | None]:
+        """Return the immutable pre-execution hash for mutation proof."""
+
+        normalized = _normalized_path(path)
+        with self._adapter_lock:
+            scopes = self._lease_scopes.get(owner, ())
+            if not scopes or not _within_scope(normalized, scopes):
+                return False, None
+            return True, self._lease_initial_hashes.get(owner, {}).get(normalized)
 
     def advance_lease_hash(self, owner: str, path: str, value: str | None) -> None:
         normalized = _normalized_path(path)
@@ -8139,15 +8856,50 @@ class UltraSession:
 
     def _workspace_hashes(self) -> dict[str, str]:
         values: dict[str, str] = {}
-        for path in self.workspace.rglob("*"):
-            if not path.is_file() or ".coding-agent" in path.parts:
-                continue
-            relative = path.relative_to(self.workspace).as_posix()
-            try:
-                values[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
-            except OSError:
-                continue
+        ignored_parts = {
+            ".coding-agent",
+            ".git",
+            ".hg",
+            ".svn",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+            "__pycache__",
+            "node_modules",
+            "run-artifacts",
+        }
+        workspace = self.workspace.resolve()
+        for current, directories, filenames in os.walk(
+            workspace,
+            topdown=True,
+            followlinks=False,
+        ):
+            # Prune ignored descendants before traversal.  Never inspect the
+            # absolute workspace ancestors: a perfectly valid workspace may
+            # itself live under a parent named ``run-artifacts`` or ``.git``.
+            directories[:] = [
+                name
+                for name in directories
+                if name not in ignored_parts
+                and not (Path(current) / name).is_symlink()
+            ]
+            for filename in filenames:
+                path = Path(current) / filename
+                if path.is_symlink():
+                    continue
+                try:
+                    relative = path.relative_to(workspace).as_posix()
+                    if relative.startswith(("output/playwright/", ".playwright-cli/")):
+                        continue
+                    values[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+                except (OSError, ValueError):
+                    continue
         return values
+
+    def _workspace_fingerprint(self) -> str:
+        return hashlib.sha256(
+            _json(self._workspace_hashes()).encode("utf-8")
+        ).hexdigest()
 
     @staticmethod
     def _recoverable_workspace_path(value: str) -> bool:
@@ -8436,6 +9188,61 @@ class UltraSession:
                 return target.relative_to(workspace).as_posix()
         return None
 
+    def _checkpoint_tool_approval_boundary(
+        self,
+        *,
+        tool: str,
+        args: Mapping[str, Any],
+        risk: str,
+        action_id: str,
+        reason: str,
+    ) -> None:
+        if not self.goal_id:
+            return
+        fingerprint = hashlib.sha256(
+            _json({"tool": tool, "args": redact_data(dict(args)), "risk": risk}).encode("utf-8")
+        ).hexdigest()
+        goal = self.store.get_goal(self.goal_id)
+        self.store.update_goal_metadata(
+            self.goal_id,
+            pending_tool_approval={
+                "tool": tool,
+                "arguments": redact_data(dict(args)),
+                "risk": risk,
+                "action_id": action_id,
+                "action_fingerprint": fingerprint,
+            },
+            waiting_question=(
+                f"Approval is required before {tool} can run. No workspace mutation "
+                "from this action occurred. Retry from the saved checkpoint to approve it."
+            ),
+            waiting_on="approval",
+            resume_action="Retry",
+            auto_retryable=False,
+        )
+        if goal.status is GoalStatus.RUNNING:
+            self.store.transition_goal(
+                self.goal_id,
+                GoalStatus.PAUSED,
+                reason=reason,
+            )
+        self.store.append_event(
+            "execution.boundary",
+            goal_id=self.goal_id,
+            entity_type="action",
+            entity_id=action_id,
+            payload={
+                "phase": "waiting_for_approval",
+                "reason": reason,
+                "waiting_on": "user",
+                "resume_action": "Retry",
+                "tool": tool,
+                "risk": risk,
+                "action_fingerprint": fingerprint,
+                "workspace_mutated": False,
+            },
+        )
+
     def _execute_tool(self, call: ToolCall, request: AgentRequest) -> str:
         allowed = WorkspaceUltraAgent(
             None,
@@ -8449,6 +9256,38 @@ class UltraSession:
             return f"Error: role {request.role.value} cannot use {call.name}"
         args = dict(call.args) if isinstance(call.args, dict) else {}
         node = self._node(request.node_id)
+        if call.name in {"run_bash", "run_command"} and node is not None:
+            command = " ".join(str(args.get("command") or "").split()).casefold()
+            approved_commands = {
+                " ".join(str(item).split()).casefold()
+                for item in node.contract.verification
+                if str(item).strip()
+                and re.match(
+                    r"^(?:python(?:\.exe)?(?:\s+-m)?|pytest|npm|pnpm|yarn|bun|deno|"
+                    r"node|cargo|go\s+test|dotnet|playwright|npx\s+playwright)\b",
+                    str(item).strip(),
+                    re.IGNORECASE,
+                )
+            }
+            if command not in approved_commands:
+                error = (
+                    f"command {str(args.get('command') or '')!r} is not an approval-bound "
+                    "verification command for this node; use one of: "
+                    + (", ".join(sorted(approved_commands)) or "the non-shell verifier in the plan")
+                )
+                self.store.append_event(
+                    "tool_contract.rejected",
+                    goal_id=self.goal_id,
+                    payload={
+                        "actor": request.role.value,
+                        "received": [call.name],
+                        "stage": "ultra_execution_command_scope",
+                        "error": error,
+                        "approval_requested": False,
+                        "workspace_mutated": False,
+                    },
+                )
+                return f"Error: {error}"
         if call.name in {"read_file", "list_files", "grep"} and "path" in args:
             component_path = self._component_read_path(
                 request,
@@ -8567,9 +9406,99 @@ class UltraSession:
                 raise StaleWriteError(
                     f"pre-write hash changed for {path!r}: expected {expected!r}, got {current!r}"
                 )
+        tool_spec = tools.get_spec(call.name)
+        if tool_spec is not None:
+            try:
+                args = dict(tools.validate_tool_arguments(tool_spec.schema, args))
+            except (TypeError, ValueError) as exc:
+                error = f"invalid arguments: {redact_text(exc, 1_000)}"
+                self.store.append_event(
+                    "tool_contract.rejected",
+                    goal_id=self.goal_id,
+                    payload={
+                        "actor": request.role.value,
+                        "received": [call.name],
+                        "stage": "ultra_execution_arguments",
+                        "error": error,
+                        "approval_requested": False,
+                        "workspace_mutated": False,
+                    },
+                )
+                return f"Error: {error}"
+            applicability_error = tools.applicability_issue(
+                call.name, args, self.workspace
+            )
+            if applicability_error:
+                self.store.append_event(
+                    "tool_contract.rejected",
+                    goal_id=self.goal_id,
+                    payload={
+                        "actor": request.role.value,
+                        "received": [call.name],
+                        "stage": "ultra_execution_applicability",
+                        "error": applicability_error,
+                        "approval_requested": False,
+                        "workspace_mutated": False,
+                    },
+                )
+                return f"Error: {applicability_error}"
         risk = _TOOL_RISK.get(call.name, "unknown")
         normal_requirement = tools.requires_approval(call.name, args)
         needs_approval = self.permission_adapter.requires_approval(normal_requirement)
+        replay_key = ""
+        if call.name in _WRITE_TOOLS:
+            replay_key = hashlib.sha256(
+                _json(
+                    {
+                        "tool": call.name,
+                        "arguments": args,
+                        "ultra_run_id": self.run_id,
+                        "node_id": request.node_id,
+                        "role": request.role.value,
+                        "phase": request.phase,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            current_workspace_fingerprint = self._workspace_fingerprint()
+            prior_guard = next(
+                (
+                    event
+                    for event in reversed(
+                        self.store.list_recent_events(self.goal_id, limit=2_000)
+                    )
+                    if event.event_type == "mutation.replay_guard"
+                    and str(event.payload.get("replay_key") or "") == replay_key
+                    and str(event.payload.get("post_workspace_fingerprint") or "")
+                    == current_workspace_fingerprint
+                ),
+                None,
+            )
+            if prior_guard is not None:
+                prior_result = str(
+                    prior_guard.payload.get("result")
+                    or "The identical saved mutation is already applied."
+                )
+                self.store.append_event(
+                    "mutation.replay_prevented",
+                    goal_id=self.goal_id,
+                    entity_type="action",
+                    entity_id=str(prior_guard.entity_id or ""),
+                    payload={
+                        "tool": call.name,
+                        "node_id": request.node_id,
+                        "phase": request.phase,
+                        "replay_key": replay_key,
+                        "workspace_fingerprint": current_workspace_fingerprint,
+                    },
+                )
+                self.events.publish(
+                    "tool_result",
+                    "Identical saved mutation already applied; replay prevented.",
+                    tool=call.name,
+                    actor=request.role.value,
+                    node_id=request.node_id,
+                )
+                return prior_result
         self.events.publish(
             "tool_call",
             call.name,
@@ -8592,17 +9521,68 @@ class UltraSession:
             risk=risk,
             mutating=call.name in _WRITE_TOOLS,
         )
-        if needs_approval and not self.approval(call.name, dict(args), risk):
-            result = "Permission denied by the user. Do not repeat the same action."
-            self.store.complete_action(action_id, result, status="denied")
-            self.events.publish(
-                "tool_result",
-                result,
-                tool=call.name,
-                actor=request.role.value,
-                node_id=request.node_id,
-            )
-            return result
+        if needs_approval:
+            try:
+                approval_value = self.approval(call.name, dict(args), risk)
+                if isinstance(approval_value, bool):
+                    approval_granted = approval_value
+                else:
+                    approval_token = str(
+                        getattr(approval_value, "value", approval_value)
+                    ).strip().casefold()
+                    if approval_token == "ui_error":
+                        raise RuntimeError(
+                            "the approval interface closed without a decision"
+                        )
+                    approval_granted = approval_token in {
+                        "allow_once",
+                        "allow_session",
+                        "allow",
+                        "yes",
+                    }
+            except Exception as exc:
+                result = (
+                    "Error: approval could not be collected; the action was not "
+                    f"executed. {type(exc).__name__}: {redact_text(exc, 500)}"
+                )
+                self.store.complete_action(action_id, result, status="failed")
+                self._checkpoint_tool_approval_boundary(
+                    tool=call.name,
+                    args=args,
+                    risk=risk,
+                    action_id=action_id,
+                    reason=f"Approval for {call.name} could not be collected.",
+                )
+                self.events.publish(
+                    "tool_result",
+                    result,
+                    tool=call.name,
+                    actor=request.role.value,
+                    node_id=request.node_id,
+                )
+                raise ApprovalRequiredError(
+                    f"Approval for {call.name} is required before execution can continue."
+                ) from exc
+            if not approval_granted:
+                result = "Permission denied by the user. Do not repeat the same action."
+                self.store.complete_action(action_id, result, status="denied")
+                self._checkpoint_tool_approval_boundary(
+                    tool=call.name,
+                    args=args,
+                    risk=risk,
+                    action_id=action_id,
+                    reason=f"Approval for {call.name} was not granted.",
+                )
+                self.events.publish(
+                    "tool_result",
+                    result,
+                    tool=call.name,
+                    actor=request.role.value,
+                    node_id=request.node_id,
+                )
+                raise ApprovalRequiredError(
+                    f"Approval for {call.name} is required before execution can continue."
+                )
         path = str(args.get("path", "")) if call.name in {"write_file", "edit_file", "materialize_artifact"} else ""
         pre_hash = _hash_file(self.workspace, path) if path else None
         pre_text = ""
@@ -8688,6 +9668,20 @@ class UltraSession:
                     for key in changed_files
                 )
             if not changed_files:
+                self.store.append_event(
+                    "mutation.replay_guard",
+                    goal_id=self.goal_id,
+                    entity_type="action",
+                    entity_id=action_id,
+                    payload={
+                        "tool": call.name,
+                        "node_id": request.node_id,
+                        "phase": request.phase,
+                        "replay_key": replay_key,
+                        "post_workspace_fingerprint": self._workspace_fingerprint(),
+                        "result": redact_text(result, 2_000),
+                    },
+                )
                 self.events.publish(
                     "tool_result", result, tool=call.name,
                     actor=request.role.value, node_id=request.node_id,
@@ -8726,6 +9720,25 @@ class UltraSession:
                 pre_hash=pre_hash,
                 post_hash=_hash_file(self.workspace, path) if path else None,
                 metadata={"action_id": action_id, "changed_files": list(changed_files)},
+            )
+        if (
+            call.name in _WRITE_TOOLS
+            and not result.startswith("Error:")
+            and replay_key
+        ):
+            self.store.append_event(
+                "mutation.replay_guard",
+                goal_id=self.goal_id,
+                entity_type="action",
+                entity_id=action_id,
+                payload={
+                    "tool": call.name,
+                    "node_id": request.node_id,
+                    "phase": request.phase,
+                    "replay_key": replay_key,
+                    "post_workspace_fingerprint": self._workspace_fingerprint(),
+                    "result": redact_text(result, 2_000),
+                },
             )
         self.events.publish(
             "tool_result",
@@ -8790,7 +9803,12 @@ class UltraSession:
             process_token=f"pid:{os.getpid()}",
         )
 
-    def start(self, objective: str) -> MasterPlanV1 | None:
+    def start(
+        self,
+        objective: str,
+        *,
+        requested_effects: Sequence[str] = (),
+    ) -> MasterPlanV1 | None:
         if self.orchestrator and self.orchestrator.phase not in {
             EnginePhase.COMPLETED,
             EnginePhase.CANCELLED,
@@ -8798,15 +9816,237 @@ class UltraSession:
         }:
             raise RuntimeError("an ULTRA run is already active")
         goal = self.store.create_goal(redact_text(objective, 20_000))
+        if requested_effects:
+            self.store.update_goal_metadata(
+                goal.id,
+                accepted_requested_effects=list(
+                    dict.fromkeys(str(item) for item in requested_effects if str(item))
+                ),
+            )
         self.store.transition_goal(goal.id, GoalStatus.DISCOVERING, reason="ULTRA foundation started")
-        return self._prepare_existing_goal(goal.id, objective)
+        return self._prepare_existing_goal(
+            goal.id,
+            objective,
+            requested_effects=requested_effects,
+        )
 
     def restart_foundation(self, goal_id: str, objective: str) -> MasterPlanV1 | None:
         """Create a fresh ULTRA run/revision while preserving the durable goal."""
 
-        return self._prepare_existing_goal(goal_id, objective)
+        effects = tuple(
+            str(item)
+            for item in self.store.get_goal(goal_id).metadata.get(
+                "accepted_requested_effects", ()
+            )
+            if str(item)
+        )
+        return self._prepare_existing_goal(
+            goal_id,
+            objective,
+            requested_effects=effects,
+        )
 
-    def _prepare_existing_goal(self, goal_id: str, objective: str) -> MasterPlanV1 | None:
+    def restart_plan_from_accepted_foundation(
+        self,
+        goal_id: str,
+        source_run_id: str,
+        feedback: str,
+        *,
+        allow_scope_expansion: bool = False,
+    ) -> MasterPlanV1:
+        """Create a repair plan without replaying accepted semantic stages."""
+
+        source = self.store.get_ultra_run(source_run_id)
+        if source.goal_id != goal_id:
+            raise RuntimeError("repair source run does not belong to the active goal")
+        if source.goal_spec is None or source.architecture_spec is None:
+            raise RuntimeError("repair source has no accepted semantic foundation")
+        goal = self.store.get_goal(goal_id)
+        self.store.update_goal_metadata(
+            goal_id,
+            accepted_foundation_source_run_id=source_run_id,
+        )
+        goal = self.store.get_goal(goal_id)
+        self.goal_id = goal_id
+        self.answers = dict(goal.metadata.get("plan_answers", {}))
+        self.adapter = StateStoreUltraAdapter(
+            self.store,
+            goal_id,
+            self.descriptor,
+            self.permission_adapter.access_level,
+            self.config,
+            workspace=self.workspace,
+            events=self.events,
+        )
+        repair_kind = (
+            "EVIDENCE-BOUND SCOPE REPAIR REQUEST"
+            if allow_scope_expansion
+            else "IN-SCOPE QUALITY REPAIR REQUEST"
+        )
+        repair_policy = (
+            "The prior approved paths were proven insufficient by authoritative evidence. "
+            "You may add only concrete workspace-relative paths directly required to resolve "
+            "the cited failures. Do not add unrelated dependencies, network effects, or permissions. "
+            "The expanded revision will wait for explicit user approval."
+            if allow_scope_expansion
+            else "Reuse the accepted scope and output authority."
+        )
+        repair_prompt = (
+            f"{goal.objective}\n\n{repair_kind}:\n"
+            f"{redact_text(feedback, 4_000)}\n"
+            "Reuse the accepted semantic goal and architecture. "
+            f"{repair_policy} "
+            "Revise only the execution plan and verification needed to resolve the cited evidence."
+        )
+        self._ensure_outcome_contract(goal.objective)
+        factory = WorkspaceUltraAgentFactory(
+            self.descriptor,
+            self._execute_tool,
+            self.events,
+            max_steps=self.agent_steps,
+            reasoning_effort=self.reasoning_effort,
+        )
+        self.orchestrator = UltraOrchestrator(
+            factory,
+            execution_class=self.descriptor.execution_class,
+            state=self.adapter,
+            events=self.events,
+            config=self.config,
+            context_builder=DurableContextBuilder(
+                self.store,
+                lambda: self.adapter.run_id if self.adapter else None,
+                self.config.context_chars,
+            ),
+            leases=self.adapter.lease_manager(self.workspace),
+            model_snapshot=self.descriptor.to_dict(),
+        )
+        engine_goal = EngineGoalSpec(
+            objective=source.goal_spec.objective,
+            success_criteria=source.goal_spec.success_criteria
+            or ("Complete the requested outcome with authoritative evidence.",),
+            constraints=source.goal_spec.constraints,
+            in_scope=source.goal_spec.scope,
+            out_of_scope=source.goal_spec.non_goals,
+            assumptions=tuple(
+                f"{key}: {value}"
+                for key, value in source.goal_spec.answered_questions.items()
+            ),
+        )
+        interfaces = tuple(
+            {
+                "name": name,
+                **(
+                    dict(value)
+                    if isinstance(value, Mapping)
+                    else {"contract": value}
+                ),
+            }
+            for name, value in source.architecture_spec.interfaces.items()
+        )
+        accepted_engine_architecture = EngineArchitectureSpec(
+            summary=source.architecture_spec.summary,
+            components=source.architecture_spec.components
+            or ({"name": "accepted-project"},),
+            interfaces=interfaces,
+            decisions=source.architecture_spec.decisions,
+            invariants=source.architecture_spec.constraints,
+        )
+        planning_architecture = _bind_repair_architecture_authority(
+            accepted_engine_architecture,
+            redact_text(feedback, 4_000),
+        )
+        explicit_repair_paths = _explicit_repair_scope_paths(feedback)
+        plan = self.orchestrator.prepare_plan_revision(
+            repair_prompt,
+            goal_spec=engine_goal,
+            architecture=planning_architecture,
+            requested_effects=tuple(
+                str(item)
+                for item in goal.metadata.get("accepted_requested_effects", ())
+                if str(item)
+            ),
+            approved_write_paths=(
+                explicit_repair_paths
+                or tuple(
+                    str(item)
+                    for item in goal.metadata.get("approved_scope_paths", ())
+                    if str(item)
+                )
+            ) if not allow_scope_expansion else (),
+        )
+        plan = _bind_accepted_repair_feedback(
+            plan,
+            redact_text(feedback, 4_000),
+        )
+        # The orchestrator owns the executable master contract used after
+        # approval.  Keep its in-memory copy aligned with the persisted Plan
+        # projection so execution cannot fall back to the model's lossy,
+        # generic repair wording.
+        self.orchestrator.master_plan = plan
+        # Replanning may enrich the transient planning context with the latest
+        # repair authority, but the accepted semantic ArchitectureSpec is an
+        # immutable foundation and must persist byte-for-byte across revisions.
+        self.adapter.bind_foundation(engine_goal, accepted_engine_architecture, plan)
+        assert self.adapter.run_id
+        durable_run = self.store.get_ultra_run(self.adapter.run_id)
+        fingerprint = (
+            durable_run.master_plan_fingerprint
+            or str(durable_run.config.get("master_plan_fingerprint", ""))
+            or plan.fingerprint
+        )
+        policy = QualityPolicyV1()
+        self.store.save_quality_policy(
+            self.adapter.run_id,
+            policy,
+            master_plan_fingerprint=fingerprint,
+        )
+        baseline_hashes = self._workspace_hashes()
+        baseline = QualityCycleV1(
+            ultra_run_id=self.adapter.run_id,
+            kind=QualityCycleKind.BASELINE,
+            attempt=1,
+            approach_fingerprint=hashlib.sha256(
+                _json(
+                    {
+                        "inventory": sorted(baseline_hashes),
+                        "master_plan": fingerprint,
+                        "source_run_id": source_run_id,
+                    }
+                ).encode("utf-8")
+            ).hexdigest(),
+            inputs={
+                "inventory": sorted(baseline_hashes),
+                "file_hashes": baseline_hashes,
+                "master_plan_fingerprint": fingerprint,
+                "accepted_foundation_source": source_run_id,
+            },
+            outputs={
+                "confirmed_findings": [],
+                "quality_checklist": list(policy.required_reviews),
+            },
+            metrics={"project_files": len(baseline_hashes)},
+            result="baseline_complete",
+            ended_at=utc_now(),
+        )
+        self.store.save_quality_cycle(baseline)
+        self._capture_workspace_baseline(self.adapter.run_id)
+        self.events.publish(
+            "ultra.plan_repair_prepared",
+            "Prepared a new plan from the accepted foundation without semantic replay.",
+            run_id=self.adapter.run_id,
+            source_run_id=source_run_id,
+            goal_id=goal_id,
+            fingerprint=fingerprint,
+        )
+        return plan
+
+    def _prepare_existing_goal(
+        self,
+        goal_id: str,
+        objective: str,
+        *,
+        requested_effects: Sequence[str] = (),
+    ) -> MasterPlanV1 | None:
         self.goal_id = goal_id
         self.answers = {}
         self.adapter = StateStoreUltraAdapter(
@@ -8843,7 +10083,10 @@ class UltraSession:
             leases=self.adapter.lease_manager(self.workspace),
             model_snapshot=self.descriptor.to_dict(),
         )
-        plan = self.orchestrator.prepare(objective)
+        plan = self.orchestrator.prepare(
+            objective,
+            requested_effects=requested_effects,
+        )
         if plan is None:
             assert self.orchestrator.goal_spec
             self.adapter.checkpoint_questions(self.orchestrator.goal_spec)
@@ -8939,6 +10182,7 @@ class UltraSession:
             WorkNodeStatus.COMPLETED: NodeStatus.COMPLETED,
             WorkNodeStatus.FAILED: NodeStatus.FAILED,
             WorkNodeStatus.BLOCKED: NodeStatus.BLOCKED,
+            WorkNodeStatus.CONFLICT: NodeStatus.CONFLICT,
             WorkNodeStatus.CANCELLED: NodeStatus.CANCELLED,
             WorkNodeStatus.UNCERTAIN: NodeStatus.UNCERTAIN,
             WorkNodeStatus.REVISION_REQUIRED: NodeStatus.REVISION_REQUIRED,
@@ -8978,6 +10222,109 @@ class UltraSession:
         """
 
         run = self.store.get_ultra_run(run_id)
+        engine_metadata = (
+            dict(run.config.get("engine_metadata") or {})
+            if isinstance(run.config.get("engine_metadata"), Mapping)
+            else {}
+        )
+        raw_goal = engine_metadata.get("accepted_goal_spec")
+        raw_architecture = engine_metadata.get("accepted_architecture")
+        if (
+            run.goal_spec is None
+            and isinstance(raw_goal, Mapping)
+        ):
+            restored_goal = EngineGoalSpec(
+                objective=str(raw_goal.get("objective") or ""),
+                success_criteria=tuple(
+                    str(item) for item in raw_goal.get("success_criteria", ()) if str(item)
+                ),
+                constraints=tuple(
+                    str(item) for item in raw_goal.get("constraints", ()) if str(item)
+                ),
+                in_scope=tuple(
+                    str(item) for item in raw_goal.get("in_scope", ()) if str(item)
+                ),
+                out_of_scope=tuple(
+                    str(item) for item in raw_goal.get("out_of_scope", ()) if str(item)
+                ),
+                assumptions=tuple(
+                    str(item) for item in raw_goal.get("assumptions", ()) if str(item)
+                ),
+                questions=tuple(
+                    dict(item)
+                    for item in raw_goal.get("questions", ())
+                    if isinstance(item, Mapping)
+                ),
+            )
+            restored_architecture = None
+            if isinstance(raw_architecture, Mapping):
+                restored_architecture = EngineArchitectureSpec(
+                    summary=str(raw_architecture.get("summary") or ""),
+                    components=tuple(
+                        dict(item)
+                        for item in raw_architecture.get("components", ())
+                        if isinstance(item, Mapping)
+                    ),
+                    interfaces=tuple(
+                        dict(item)
+                        for item in raw_architecture.get("interfaces", ())
+                        if isinstance(item, Mapping)
+                    ),
+                    decisions=tuple(
+                        dict(item)
+                        for item in raw_architecture.get("decisions", ())
+                        if isinstance(item, Mapping)
+                    ),
+                    invariants=tuple(
+                        str(item)
+                        for item in raw_architecture.get("invariants", ())
+                        if str(item)
+                    ),
+                )
+            self.store.update_ultra_run(
+                run_id,
+                goal_spec=StateStoreUltraAdapter._goal_spec(restored_goal),
+                architecture_spec=(
+                    StateStoreUltraAdapter._architecture(restored_architecture)
+                    if restored_architecture is not None
+                    else None
+                ),
+            )
+            run = self.store.get_ultra_run(run_id)
+            self.events.publish(
+                "ultra.foundation_checkpoint_enriched",
+                "Restored accepted foundation metadata without repeating a model stage.",
+                run_id=run_id,
+                architecture_restored=restored_architecture is not None,
+            )
+        checkpoint = (
+            dict(engine_metadata.get("foundation_checkpoint") or {})
+            if isinstance(engine_metadata.get("foundation_checkpoint"), Mapping)
+            else {}
+        )
+        if (
+            run.status is UltraRunStatus.PAUSED
+            and str(checkpoint.get("stage") or "") == "master_plan"
+            and run.plan_revision is None
+            and run.goal_spec is not None
+            and run.architecture_spec is not None
+        ):
+            self.store.update_ultra_run(
+                run.id,
+                status=UltraRunStatus.BLOCKED,
+                error="superseded by targeted master-plan checkpoint repair",
+            )
+            self.events.publish(
+                "ultra.master_plan_checkpoint_resumed",
+                "Resuming only the saved master-plan stage from accepted foundation data.",
+                run_id=run.id,
+                goal_id=run.goal_id,
+            )
+            return self.restart_plan_from_accepted_foundation(
+                run.goal_id,
+                run.id,
+                str(checkpoint.get("error") or "repair the master-plan contract"),
+            )
         nodes = self.store.list_work_nodes(run_id)
         reconciled_nodes = []
         for item in nodes:
@@ -9433,6 +10780,7 @@ class UltraSession:
                 in {
                     NodeStatus.FAILED,
                     NodeStatus.BLOCKED,
+                    NodeStatus.CONFLICT,
                     NodeStatus.REVISION_REQUIRED,
                 }
             ):
@@ -9748,13 +11096,21 @@ class UltraSession:
         )
         return plan
 
-    def approve(self, revision: int | None = None) -> Plan:
+    def approve(
+        self,
+        revision: int | None = None,
+        *,
+        approved_by: str = "user",
+    ) -> Plan:
         if not self.orchestrator or not self.adapter or not self.orchestrator.master_plan:
             raise RuntimeError("there is no ULTRA master plan to approve")
         if revision is not None and self.adapter.plan and revision != self.adapter.plan.revision:
             raise ValueError(f"ULTRA is awaiting plan revision {self.adapter.plan.revision}")
         self.orchestrator.approve(self.orchestrator.master_plan.fingerprint)
-        accepted = self.adapter.approve_master(self.orchestrator.master_plan)
+        accepted = self.adapter.approve_master(
+            self.orchestrator.master_plan,
+            approved_by=approved_by,
+        )
         self.future = self.orchestrator.background.start(self._run_and_finalize)
         return accepted
 

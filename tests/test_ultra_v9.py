@@ -21,6 +21,7 @@ from agent.providers.base import AssistantTurn, ToolCall
 from agent.store import StateStore
 from agent.tui import ChoiceItem, ChoiceListState
 from agent.ultra import (
+    AgentProtocolError,
     AgentRequest,
     AgentRole,
     MasterPlanV1,
@@ -254,28 +255,55 @@ class PromptCompletenessV9Tests(unittest.TestCase):
         )
         self.assertEqual(
             [item.id for item in decision.questions],
-            ["execution_mode", "platform", "packaging"],
+            ["platform", "packaging"],
         )
 
-    def test_existing_game_refinement_targets_discovered_nested_artifact(self) -> None:
+    def test_refinement_path_is_not_inferred_from_prompt_text(self) -> None:
         prompt = (
             "make this game more advanced\n"
             "Discovered repository context: ultra-output/lane-crossing-game/index.html "
             "-> html_document index.html"
         )
 
+        self.assertEqual(UltraOrchestrator._final_output_paths(prompt), ())
+        plan = MasterPlanV1.from_mapping(
+            {
+                "summary": "Refine the accepted artifact in place.",
+                "modules": [
+                    {
+                        "id": "M001",
+                        "title": "Refine existing artifact",
+                        "objective": "Improve the discovered game without changing packaging.",
+                        "acceptance_criteria": ["The existing artifact is improved in place."],
+                        "verification": ["Run the accepted browser checks."],
+                        "write_paths": ["ultra-output/lane-crossing-game/index.html"],
+                    }
+                ],
+            }
+        )
         self.assertEqual(
-            UltraOrchestrator._final_output_paths(prompt),
+            plan.modules[0].write_paths,
             ("ultra-output/lane-crossing-game/index.html",),
         )
 
-    def test_existing_single_file_game_refinement_preserves_root_packaging(self) -> None:
+    def test_root_packaging_requires_an_explicit_accepted_plan_path(self) -> None:
         prompt = (
             "make this game more advanced\n"
             "Discovered repository context: index.html -> html_document index.html"
         )
 
-        self.assertEqual(UltraOrchestrator._final_output_paths(prompt), ("index.html",))
+        self.assertEqual(UltraOrchestrator._final_output_paths(prompt), ())
+        task = TaskContractV1.from_mapping(
+            {
+                "id": "M001",
+                "title": "Refine the root artifact",
+                "objective": "Improve the accepted single-file artifact.",
+                "acceptance_criteria": ["Packaging remains unchanged."],
+                "verification": ["Run the browser verification contract."],
+                "write_paths": ["index.html"],
+            }
+        )
+        self.assertEqual(task.write_paths, ("index.html",))
 
 
 class WorkspaceRecoveryV9Tests(unittest.TestCase):
@@ -313,7 +341,7 @@ class WorkspaceRecoveryV9Tests(unittest.TestCase):
 
 
 class MaterializedPackageV9Tests(unittest.TestCase):
-    def test_component_review_missing_boolean_uses_typed_evidence_not_prose(self) -> None:
+    def test_component_review_missing_boolean_requires_targeted_typed_repair(self) -> None:
         task = {
             "contract": {
                 "metadata": {"component_package_only": True},
@@ -328,15 +356,19 @@ class MaterializedPackageV9Tests(unittest.TestCase):
             },
             task,
         )
-        self.assertTrue(normalized["passed"])
-        self.assertTrue(any("typed component evidence" in item for item in actions))
+        self.assertNotIn("passed", normalized)
+        self.assertEqual(actions, ())
+        with self.assertRaises(AgentProtocolError):
+            UltraOrchestrator._validate_typed_response("review", normalized)
 
         empty, _ = UltraOrchestrator._normalize_typed_payload(
             "review",
             {"findings": [], "issues": [], "evidence": []},
             task,
         )
-        self.assertFalse(empty["passed"])
+        self.assertNotIn("passed", empty)
+        with self.assertRaises(AgentProtocolError):
+            UltraOrchestrator._validate_typed_response("review", empty)
 
     def test_weak_model_nested_component_file_arguments_are_normalized(self) -> None:
         normalized = normalize_generated_tool_args(
@@ -740,13 +772,13 @@ class MaterializedPackageV9Tests(unittest.TestCase):
             )
             self.assertTrue(accepted[0].passed)
 
-    def test_workforce_templates_cover_ml_backend_and_frontend(self) -> None:
+    def test_prompt_words_do_not_inject_cross_domain_workforce_templates(self) -> None:
         cases = (
-            ("ML churn project", {"data", "model", "training", "evaluation", "serving"}),
-            ("Backend appointment booking API", {"domain", "api", "persistence", "auth", "operations", "tests"}),
-            ("Frontend analytics dashboard", {"layout", "components", "data", "accessibility", "quality", "visual_qa"}),
+            "ML churn project",
+            "Backend appointment booking API",
+            "Frontend analytics dashboard",
         )
-        for title, expected in cases:
+        for title in cases:
             with self.subTest(title=title):
                 node = WorkNode(
                     TaskContractV1(
@@ -759,27 +791,21 @@ class MaterializedPackageV9Tests(unittest.TestCase):
                     )
                 )
                 children = UltraOrchestrator._deterministic_cross_domain_children(node)
-                self.assertEqual(
-                    {str(item["id"]).split(".")[-1] for item in children},
-                    expected,
-                )
-                self.assertTrue(
-                    all(item["metadata"]["materialized_components_required"] for item in children)
-                )
+                self.assertEqual(children, ())
 
-    def test_minimal_game_prompt_infers_logic_and_spatial_concerns(self) -> None:
+    def test_minimal_game_prompt_does_not_infer_product_concerns_or_nodes(self) -> None:
         matrix = UltraOrchestrator._concern_coverage_matrix(
             "اعمل لي لعبة 3D بـThree.js"
         )
-        self.assertEqual(matrix.task_family, "interactive_game")
-        self.assertTrue(
+        self.assertEqual(matrix.task_family, "model_authored")
+        self.assertFalse(
             {
                 "spatial_semantics",
                 "gameplay_state",
                 "progression_pacing",
                 "world_scale",
                 "runtime_performance",
-            }.issubset({item.id for item in matrix.concerns})
+            }.intersection({item.id for item in matrix.concerns})
         )
 
         node = WorkNode(
@@ -793,58 +819,34 @@ class MaterializedPackageV9Tests(unittest.TestCase):
                 metadata={"force_recursive_specialists": True},
             )
         )
-        children = UltraOrchestrator._deterministic_shared_artifact_children(node)
-        owned = {
-            concern
-            for child in children
-            for concern in child["metadata"]["concern_ids"]
-        }
-        self.assertFalse(matrix.missing_critical_owners(children))
-        self.assertIn("spatial_semantics", owned)
-        self.assertIn("progression_pacing", owned)
-
-        character = next(child for child in children if child["id"].endswith(".character"))
-        character_node = WorkNode(TaskContractV1.from_mapping(character))
-        character_children = UltraOrchestrator._deterministic_specialist_children(character_node)
-        controls = next(
-            child for child in character_children if child["id"].endswith(".controls")
-        )
-        movement_parent = WorkNode(TaskContractV1.from_mapping(controls))
-        movement = next(
-            child
-            for child in UltraOrchestrator._deterministic_specialist_children(movement_parent)
-            if child["id"].endswith(".movement")
-        )
-        self.assertIn("spatial_semantics", movement["metadata"]["concern_ids"])
-        self.assertTrue(
-            any("faces and animates" in item for item in movement["acceptance_criteria"])
+        self.assertEqual(
+            UltraOrchestrator._deterministic_shared_artifact_children(node),
+            (),
         )
 
-    def test_concern_coverage_is_domain_specific_not_game_hard_coded(self) -> None:
-        cases = {
-            "Backend appointment booking API": {
-                "security_boundaries",
-                "data_integrity",
-                "concurrency_idempotency",
-                "operability",
-            },
-            "Frontend analytics dashboard": {
-                "ui_state_integrity",
-                "frontend_accessibility",
-                "frontend_security",
-                "frontend_performance",
-            },
-            "ML churn project": {
-                "data_leakage",
-                "ml_reproducibility",
-                "evaluation_validity",
-                "ml_serving_reliability",
-            },
+    def test_concern_coverage_is_domain_neutral_without_accepted_metadata(self) -> None:
+        cases = (
+            "Backend appointment booking API",
+            "Frontend analytics dashboard",
+            "ML churn project",
+        )
+        forbidden_domain_concerns = {
+            "security_boundaries",
+            "data_integrity",
+            "ui_state_integrity",
+            "frontend_accessibility",
+            "data_leakage",
+            "ml_reproducibility",
         }
-        for prompt, required in cases.items():
+        for prompt in cases:
             with self.subTest(prompt=prompt):
                 matrix = UltraOrchestrator._concern_coverage_matrix(prompt)
-                self.assertTrue(required.issubset({item.id for item in matrix.concerns}))
+                self.assertEqual(matrix.task_family, "model_authored")
+                self.assertFalse(
+                    forbidden_domain_concerns.intersection(
+                        {item.id for item in matrix.concerns}
+                    )
+                )
                 node = WorkNode(
                     TaskContractV1(
                         id="ROOT",
@@ -856,17 +858,17 @@ class MaterializedPackageV9Tests(unittest.TestCase):
                     )
                 )
                 children = UltraOrchestrator._deterministic_cross_domain_children(node)
-                self.assertFalse(matrix.missing_critical_owners(children))
+                self.assertEqual(children, ())
 
-    def test_frontend_visual_prompt_is_not_rewritten_as_vehicle_game(self) -> None:
+    def test_frontend_visual_semantics_are_not_inferred_from_keywords(self) -> None:
         self.assertFalse(
             UltraOrchestrator._requires_game_artifact("Frontend analytics dashboard")
         )
-        self.assertTrue(
+        self.assertFalse(
             UltraOrchestrator._requires_visual_artifact("Frontend analytics dashboard")
         )
 
-    def test_existing_master_modules_receive_concerns_without_duplicate_swarms(self) -> None:
+    def test_existing_master_modules_are_not_rewritten_by_harness_templates(self) -> None:
         modules = tuple(
             TaskContractV1(
                 id=f"M{index}",
@@ -886,18 +888,8 @@ class MaterializedPackageV9Tests(unittest.TestCase):
             "Backend appointment booking API",
             plan,
         )
-        owned = {
-            concern
-            for module in enriched.modules
-            for concern in module.metadata["concern_ids"]
-        }
-        matrix = UltraOrchestrator._concern_coverage_matrix(
-            "Backend appointment booking API"
-        )
-        self.assertTrue(set(matrix.critical_ids).issubset(owned))
-        self.assertTrue(
-            all(module.metadata["cross_domain_template_root"] is False for module in enriched.modules)
-        )
+        self.assertEqual(enriched, plan)
+        self.assertTrue(all(not module.metadata for module in enriched.modules))
         self.assertTrue(
             all(
                 not UltraOrchestrator._deterministic_cross_domain_children(WorkNode(module))

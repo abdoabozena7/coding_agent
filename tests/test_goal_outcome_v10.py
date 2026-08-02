@@ -154,6 +154,61 @@ class GoalOutcomeContractTests(unittest.TestCase):
 
 
 class GoalOutcomePersistenceTests(unittest.TestCase):
+    def test_codex_visual_review_closes_a_visual_only_blocker_with_limitations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(directory)
+            goal = store.create_goal("Build a polished web app")
+            store.transition_goal(goal.id, GoalStatus.DISCOVERING)
+            store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+            store.transition_goal(goal.id, GoalStatus.RUNNING)
+            store.transition_goal(goal.id, GoalStatus.VERIFYING)
+            store.transition_goal(goal.id, GoalStatus.REVIEWING)
+            store.transition_goal(goal.id, GoalStatus.BLOCKED)
+            run = UltraRun(
+                id="ultra_visual",
+                goal_id=goal.id,
+                provider="ollama",
+                model="test",
+                execution_class=ExecutionClass.LOCAL,
+                access_level=AccessLevel.NORMAL,
+                concurrency=1,
+                phase=UltraPhase.COMPLETED,
+                status=UltraRunStatus.COMPLETED,
+            )
+            store.create_ultra_run(run)
+            contract = GoalOutcomeContractV1(
+                goal_id=goal.id,
+                objective=goal.objective,
+                required_evidence=("codex_visual_review",),
+                require_candidate_preferred=False,
+            )
+            store.save_goal_outcome_contract(contract, ultra_run_id=run.id)
+            screenshot = Path(directory, "review.png")
+            screenshot.write_bytes(b"not-a-real-png-but-durable-test-bytes")
+
+            result = store.record_codex_visual_review(
+                goal.id,
+                run.id,
+                screenshot_path=str(screenshot),
+                passed=True,
+                score=0.97,
+                summary="Clear hierarchy and usable controls.",
+                limitations=("Visual ambition is intentionally modest.",),
+            )
+
+            self.assertTrue(result["decision"]["accepted"])
+            completed = store.get_goal(goal.id)
+            self.assertEqual(completed.status, GoalStatus.COMPLETED)
+            self.assertEqual(
+                completed.metadata["completion_disposition"],
+                "completed_with_limitations",
+            )
+            self.assertEqual(
+                completed.metadata["completion_limitations"],
+                ["Visual ambition is intentionally modest."],
+            )
+            store.close()
+
     def test_schema_v10_persists_contract_heartbeat_experiments_and_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(directory)

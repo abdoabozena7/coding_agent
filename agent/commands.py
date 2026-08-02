@@ -82,6 +82,10 @@ class CommandParseError(ValueError):
     pass
 
 
+class UnknownCommandParseError(CommandParseError):
+    """An unrecognised slash prefix that may still be ordinary chat text."""
+
+
 def _required(text: str, usage: str) -> str:
     value = text.strip()
     if not value:
@@ -115,6 +119,10 @@ def parse_command(line: str) -> UserCommand:
     prefix = stripped[0]
     body = stripped[1:].strip()
     if not body:
+        # Keep the parser compatibility value for callers that use ``/`` to
+        # open a palette.  The persistent controller converts a literal slash
+        # submitted as message text to Chat; Ctrl+K remains the discoverable
+        # palette entry point.
         return UserCommand(CommandKind.MENU, raw=raw)
     command_parts = body.split(maxsplit=1)
     name = command_parts[0].lower()
@@ -141,6 +149,8 @@ def parse_command(line: str) -> UserCommand:
             return UserCommand(CommandKind.MODE, {"mode": None}, raw)
         mode = rest.lower()
         mode_aliases = {
+            "working": "normal",
+            "work": "normal",
             "manual": "normal",
             "default": "normal",
             "auto": "normal",
@@ -152,7 +162,7 @@ def parse_command(line: str) -> UserCommand:
         }
         mode = mode_aliases.get(mode, mode)
         if mode not in {"plan", "normal", "ultra"}:
-            raise CommandParseError(f"Usage: {usage('mode', 'plan|normal|ultra')}")
+            raise CommandParseError(f"Usage: {usage('mode', 'goal|plan|ultra')}")
         return UserCommand(CommandKind.MODE, {"mode": mode}, raw)
     if name in {"api-key", "apikey", "add-api-key"}:
         provider = rest.casefold() or None
@@ -425,6 +435,6 @@ def parse_command(line: str) -> UserCommand:
     if name == "todo":  # defensive; handled above, retained for readability
         raise CommandParseError(f"Usage: {usage('todo', 'TASK_ID [NOTE]')}")
 
-    raise CommandParseError(
-        f"Unknown command '{prefix}{name}'. Type / for commands or /help for details."
+    raise UnknownCommandParseError(
+        f"Unknown command '{prefix}{name}'. Type /help for commands."
     )

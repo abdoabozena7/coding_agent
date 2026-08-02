@@ -6,7 +6,7 @@ import re
 from dataclasses import replace
 from datetime import datetime, timezone
 from threading import RLock
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from ..models import (
     GoalStatus,
@@ -20,7 +20,7 @@ from ..models import (
 from ..quality import ChangeSetStatus
 from ..store import NotFoundError, StalePlanError
 from ..ultra_models import WorkNodeStatus
-from .schemas import PlanPayload, ReviewSubmissionPayload
+from .schemas import PlanPayload, ReviewSubmissionPayload, WorkspaceContextPayload
 
 
 REVIEWABLE_CHANGE_SET_STATES = {
@@ -157,19 +157,40 @@ def _diff_files(diff: str, declared_paths: Iterable[str]) -> list[dict[str, Any]
 class CoreWebAdapter:
     """One narrow, auditable boundary between browser actions and the core."""
 
-    def __init__(self, runtime: Any) -> None:
+    def __init__(
+        self,
+        runtime: Any,
+        *,
+        on_execution_requested: Callable[[], bool] | None = None,
+    ) -> None:
         self.runtime = runtime
         self.store = runtime.store
         self.events = runtime.events
         self.session_id = runtime.session_id
         self._lock = RLock()
         self._requested_view = "plan"
+        self._on_execution_requested = on_execution_requested
 
     def _goal(self) -> Any:
         goal = self.runtime.active_goal() or self.store.get_latest_goal(self.session_id)
         if goal is None:
             raise NotFoundError("this session does not have a plan yet")
         return goal
+
+    def _workspace_goal(self) -> Any | None:
+        """Return completed history unless Plan explicitly starts a new request."""
+
+        active = self.runtime.active_goal()
+        if active is not None:
+            return active
+        latest = self.store.get_latest_goal(self.session_id)
+        if (
+            latest is not None
+            and latest.status in {GoalStatus.COMPLETED, GoalStatus.CANCELLED}
+            and self.runtime.interaction_mode.value == "plan"
+        ):
+            return None
+        return latest
 
     @staticmethod
     def _can_manage_queue(goal: Any) -> bool:
@@ -191,7 +212,7 @@ class CoreWebAdapter:
 
     @staticmethod
     def _queued_prompt_snapshot(item: Any) -> dict[str, Any]:
-        return {
+        payload = {
             "id": item.id,
             "sequence": item.sequence,
             "text": item.text,
@@ -202,6 +223,7 @@ class CoreWebAdapter:
             "created_at": item.created_at.isoformat(),
             "started_at": item.started_at.isoformat() if item.started_at else None,
         }
+        return payload
 
     def queue_snapshot(self) -> dict[str, Any]:
         items = self.store.list_queued_prompts(
@@ -269,8 +291,9 @@ class CoreWebAdapter:
         }
 
     def workspace_context(self) -> dict[str, Any]:
-        goal = self.runtime.active_goal() or self.store.get_latest_goal(self.session_id)
+        goal = self._workspace_goal()
         session = self.store.get_workflow_session(self.session_id)
+        runtime_snapshot = self.runtime.workflow_runtime_snapshot()
         queue = self.queue_snapshot()
         required_view: str | None = None
         checkpoint_id: str | None = None
@@ -299,6 +322,8 @@ class CoreWebAdapter:
             ):
                 required_view = "plan"
                 plan_badge = 1
+        # A durable RUNNING goal owns the truth.  A stale plan badge must not
+        # make the browser claim that approval is still pending.
         if required_view == "review":
             attention = {
                 "state": "waiting",
@@ -318,10 +343,10 @@ class CoreWebAdapter:
         elif goal is None:
             attention = {
                 "state": "idle",
-                "eyebrow": "No project yet",
-                "title": "Start from the terminal",
-                "body": "Create a Goal to see its plan, review gates, and execution here.",
-                "action": None,
+                "eyebrow": "Plan your next request",
+                "title": "Describe what you want to change",
+                "body": "The request will be inspected and planned. Nothing runs until you choose Approve & work.",
+                "action": {"label": "Write a plan request", "view": "plan"},
             }
         elif goal.status is GoalStatus.COMPLETED:
             attention = {
@@ -332,12 +357,17 @@ class CoreWebAdapter:
                 "action": None,
             }
         elif goal.status in {GoalStatus.BLOCKED, GoalStatus.PAUSED}:
+            blocker = str(
+                goal.metadata.get("waiting_question")
+                or goal.metadata.get("retry_reason")
+                or "The saved workflow is paused at a safe checkpoint."
+            )
             attention = {
                 "state": "blocked",
                 "eyebrow": "Workflow needs attention",
-                "title": "Work cannot continue yet",
-                "body": "Return to the terminal for the blocking question, permission, or recovery action.",
-                "action": None,
+                "title": "The workflow is paused",
+                "body": blocker,
+                "action": {"label": "Open execution details", "view": "agents"},
             }
         else:
             attention = {
@@ -349,7 +379,7 @@ class CoreWebAdapter:
             }
         with self._lock:
             requested_view = self._requested_view
-        return {
+        payload = {
             "session_id": self.session_id,
             "session_short": self.session_id[:8],
             "requested_view": requested_view,
@@ -366,7 +396,13 @@ class CoreWebAdapter:
                 if goal is not None
                 else None
             ),
-            "mode": str(session["session_mode"]),
+            "mode": self.runtime.interaction_mode.value,
+            "runtime": runtime_snapshot.to_dict(),
+            "route": runtime_snapshot.route,
+            "execution_strategy": runtime_snapshot.execution_strategy,
+            "phase": runtime_snapshot.phase,
+            "waiting_on": runtime_snapshot.waiting_on,
+            "resume_action": runtime_snapshot.resume_action,
             "attention": attention,
             "navigation": {
                 "plan": {"badge": plan_badge},
@@ -379,18 +415,79 @@ class CoreWebAdapter:
                     and self._can_manage_queue(goal)
                 ),
                 "can_open_execution": goal is not None,
+                "can_submit_plan_request": goal is None,
             },
             "queue": queue,
             "updated_at": _iso_now(),
         }
+        return WorkspaceContextPayload.model_validate(payload).model_dump()
 
     def plan_snapshot(self) -> dict[str, Any]:
-        goal = self._goal()
+        goal = self._workspace_goal()
+        runtime_snapshot = self.runtime.workflow_runtime_snapshot()
+        if goal is None:
+            envelope = self.runtime.model_capability_envelope()
+            return {
+                "session_id": self.session_id,
+                "session_short": self.session_id[:8],
+                "state": "new_request",
+                "goal_id": None,
+                "objective": "",
+                "revision": None,
+                "status": "draft",
+                "goal_status": "idle",
+                "session_mode": "plan",
+                "interaction_mode": "plan",
+                "summary": "",
+                "tasks": [],
+                "global_constraints": [],
+                "protected_paths": [],
+                "draft": None,
+                "capability_envelope": envelope.to_dict(),
+                "task_demand": None,
+                "strategy_decision": None,
+                "capabilities": {
+                    "can_edit": False,
+                    "can_save_draft": False,
+                    "can_create_revision": False,
+                    "can_approve": False,
+                    "can_manage_queue": False,
+                    "can_submit_request": True,
+                    "can_increase_depth": False,
+                },
+                "queue": self.queue_snapshot(),
+                "updated_at": _iso_now(),
+                "connection": "connected",
+                "runtime": runtime_snapshot.to_dict(),
+            }
         plan = self.store.get_latest_plan(goal.id)
         if plan is None:
             raise NotFoundError("this session does not have a plan yet")
         session = self.store.get_workflow_session(self.session_id)
         session_mode = str(session["session_mode"])
+        strategy = str(
+            goal.metadata.get("execution_strategy")
+            or dict(goal.metadata.get("execution_policy") or {}).get("strategy")
+            or ("recursive" if session_mode == "ultra" else "staged")
+        )
+        strategy_locked = bool(goal.metadata.get("strategy_locked"))
+        semantic_goal = dict(goal.metadata.get("semantic_goal") or {})
+        strategy_decision = dict(goal.metadata.get("strategy_decision") or {})
+        execution_nodes: list[dict[str, Any]] = []
+        run = self.store.get_active_ultra_run(goal.id)
+        if run is not None:
+            execution_nodes = [
+                {
+                    "id": node.id,
+                    "title": node.title,
+                    "objective": node.objective,
+                    "parent_id": node.parent_id,
+                    "dependencies": list(node.depends_on),
+                    "assigned_role": node.assigned_role,
+                    "status": node.status.value,
+                }
+                for node in self.store.list_work_nodes(run.id)
+            ]
         can_edit = (
             goal.status is GoalStatus.AWAITING_PLAN_APPROVAL
             and session_mode in {"plan", "normal"}
@@ -406,6 +503,14 @@ class CoreWebAdapter:
             "status": plan.status.value,
             "goal_status": goal.status.value,
             "session_mode": session_mode,
+            "interaction_mode": str(goal.metadata.get("interaction_mode") or self.runtime.interaction_mode.value),
+            "execution_strategy": strategy,
+            "strategy_locked": strategy_locked,
+            "capability_envelope": dict(goal.metadata.get("model_capability_envelope") or {}),
+            "task_demand": dict(goal.metadata.get("task_demand") or {}),
+            "strategy_decision": strategy_decision,
+            "semantic_goal": semantic_goal,
+            "execution_nodes": execution_nodes,
             "summary": plan.summary,
             "tasks": [_task_snapshot(task) for task in plan.tasks],
             "global_constraints": list(
@@ -420,14 +525,43 @@ class CoreWebAdapter:
                 "can_approve": (
                     goal.status is GoalStatus.AWAITING_PLAN_APPROVAL
                     and plan.status is PlanStatus.PENDING_APPROVAL
-                    and session_mode != "plan"
                 ),
                 "can_manage_queue": self._can_manage_queue(goal),
+                "can_submit_request": False,
+                "can_increase_depth": (
+                    goal.status is GoalStatus.AWAITING_PLAN_APPROVAL
+                    and plan.status is PlanStatus.PENDING_APPROVAL
+                    and not strategy_locked
+                    and strategy == "staged"
+                ),
             },
             "queue": self.queue_snapshot(),
             "updated_at": plan.updated_at.isoformat(),
             "connection": "connected",
+            "runtime": runtime_snapshot.to_dict(),
         }
+
+    def submit_plan_request(self, request: str) -> dict[str, Any]:
+        with self._lock:
+            if self.runtime.active_goal() is not None:
+                raise ValueError("Finish or cancel the active workflow before starting another plan.")
+            self.runtime.transition_mode("plan")
+            self.runtime.route_input(str(request))
+            return self.plan_snapshot()
+
+    def increase_execution_depth(self) -> dict[str, Any]:
+        with self._lock:
+            before = self.plan_snapshot()
+            if not bool(before.get("capabilities", {}).get("can_increase_depth")):
+                raise ValueError("Execution depth can increase only on an unapproved staged plan.")
+            self.runtime.increase_execution_depth()
+            after = self.plan_snapshot()
+            return {
+                "increased": True,
+                "previous_revision": before.get("revision"),
+                "revision": after.get("revision"),
+                "strategy": after.get("execution_strategy"),
+            }
 
     @staticmethod
     def _task_value(item: Any, index: int) -> dict[str, Any]:
@@ -581,8 +715,8 @@ class CoreWebAdapter:
                 )
             if session_mode not in {"plan", "normal"}:
                 raise ValueError(
-                    "Ultra plans are governed by the orchestrator. "
-                    "Use the guided replan flow to change this plan."
+                    "This recursive plan is governed by its specialist hierarchy. "
+                    "Use the guided replan flow to change it before approval."
                 )
             old_plan = self.store.get_latest_plan(goal.id)
             if old_plan is None:
@@ -737,11 +871,6 @@ class CoreWebAdapter:
                 raise ValueError("This plan is not waiting for approval.")
             if plan.status is not PlanStatus.PENDING_APPROVAL:
                 raise ValueError(f"Plan r{revision} is already {plan.status.value}.")
-            session = self.store.get_workflow_session(self.session_id)
-            if str(session["session_mode"]) == "plan":
-                raise ValueError(
-                    "Plan mode can save revisions, but execution requires Normal or Ultra mode."
-                )
             approved = self.runtime.approve_plan(
                 revision,
                 approved_by="user@local-web",
@@ -758,10 +887,23 @@ class CoreWebAdapter:
                     "actor": "user",
                 },
             )
+            execution_requested = False
+            if self._on_execution_requested is not None:
+                execution_requested = bool(self._on_execution_requested())
+            self.events.publish(
+                "plan.approved.local_web",
+                "Approval accepted in Plan Studio; terminal execution is starting.",
+                goal_id=goal.id,
+                session_id=self.session_id,
+                revision=approved.revision,
+                execution_requested=execution_requested,
+                source="local_web",
+            )
             return {
                 "approved": True,
                 "revision": approved.revision,
                 "goal_status": self.store.get_goal(goal.id).status.value,
+                "execution_requested": execution_requested,
             }
 
     def discard_plan_draft(self) -> dict[str, Any]:

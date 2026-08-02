@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 from threading import RLock, Thread
 import time
-from typing import Any
+from typing import Any, Mapping, Sequence
 from urllib.parse import quote, unquote, urlsplit
 from urllib.request import urlopen
 
@@ -151,7 +151,87 @@ def browser_capability() -> dict[str, Any]:
     return {"playwright": playwright_available, "channel": channel, "executable": executable, "available": bool(executable)}
 
 
-def _verify(url: str, screenshot_path: Path, settle_ms: int) -> dict[str, Any]:
+def _interaction_locator(page: Any, item: Mapping[str, Any]) -> Any:
+    selector = str(item.get("selector") or "").strip()
+    if selector:
+        return page.locator(selector)
+    role = str(item.get("role") or "").strip()
+    name = str(item.get("name") or "").strip()
+    if not role:
+        raise ValueError("interaction target requires role or selector")
+    return page.get_by_role(role, name=name or None, exact=bool(item.get("exact", True)))
+
+
+def _run_interaction_scenarios(
+    page: Any,
+    url: str,
+    scenarios: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for raw in scenarios[:20]:
+        scenario = dict(raw)
+        name = str(scenario.get("name") or "browser interaction")[:160]
+        receipt: dict[str, Any] = {"name": name, "passed": False, "assertions": []}
+        try:
+            if bool(scenario.get("reload", True)):
+                page.goto(url, wait_until="load", timeout=30_000)
+            for raw_step in list(scenario.get("steps") or ())[:40]:
+                step = dict(raw_step)
+                action = str(step.get("action") or "")
+                if action == "press":
+                    key = str(step.get("key") or "")
+                    if not key:
+                        raise ValueError("press interaction requires key")
+                    page.keyboard.press(key)
+                    continue
+                locator = _interaction_locator(page, step)
+                if action == "click":
+                    locator.click()
+                elif action == "fill":
+                    locator.fill(str(step.get("value") or ""))
+                else:
+                    raise ValueError(f"unsupported interaction action {action!r}")
+            assertions: list[dict[str, Any]] = []
+            for raw_assertion in list(scenario.get("assertions") or ())[:20]:
+                assertion = dict(raw_assertion)
+                locator = _interaction_locator(page, assertion)
+                prop = str(assertion.get("property") or "")
+                observed = locator.input_value() if prop == "value" else locator.inner_text()
+                expected = assertion.get("equals")
+                contains = assertion.get("contains")
+                passed = (
+                    observed == str(expected)
+                    if expected is not None
+                    else str(contains) in observed
+                    if contains is not None
+                    else False
+                )
+                assertions.append(
+                    {
+                        "property": prop,
+                        "observed": observed,
+                        "expected": expected,
+                        "contains": contains,
+                        "passed": passed,
+                    }
+                )
+            receipt["assertions"] = assertions
+            receipt["passed"] = bool(assertions) and all(item["passed"] for item in assertions)
+            if not receipt["passed"]:
+                receipt["error"] = "one or more interaction assertions failed"
+        except Exception as exc:
+            receipt["error"] = f"{type(exc).__name__}: {exc}"
+            receipt["failure_kind"] = (
+                "contract"
+                if "unknown key" in str(exc).casefold()
+                or isinstance(exc, ValueError)
+                else "application"
+            )
+        results.append(receipt)
+    return results
+
+
+def _verify(url: str, screenshot_path: Path, settle_ms: int, interactions: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
     capability = browser_capability()
     result: dict[str, Any] = {
         "status": "unavailable",
@@ -159,6 +239,7 @@ def _verify(url: str, screenshot_path: Path, settle_ms: int) -> dict[str, Any]:
         "page_errors": [],
         "network_errors": [],
         "screenshot_path": None,
+        "interaction_results": [],
     }
     if not capability["playwright"]:
         result["reason"] = "Python Playwright is not installed"
@@ -180,6 +261,13 @@ def _verify(url: str, screenshot_path: Path, settle_ms: int) -> dict[str, Any]:
             page.on("response", lambda response: result["network_errors"].append(f"HTTP {response.status} {response.url}") if response.status >= 400 else None)
             response = page.goto(url, wait_until="load", timeout=30_000)
             page.wait_for_timeout(max(0, min(int(settle_ms), 10_000)))
+            interaction_results = _run_interaction_scenarios(page, url, interactions)
+            result["interaction_results"] = interaction_results
+            for item in interaction_results:
+                if not item.get("passed"):
+                    result["page_errors"].append(
+                        f"Interaction {item.get('name')}: {item.get('error') or 'assertion failed'}"
+                    )
             screenshot_path.parent.mkdir(parents=True, exist_ok=True)
             page.screenshot(path=str(screenshot_path), full_page=True)
             result.update({
@@ -218,7 +306,7 @@ def _open_visible(preview: Preview) -> tuple[bool, str | None]:
         return False, safe_os_error(exc)
 
 
-def create(path: str, open_browser: bool = True, verify: bool = True, settle_ms: int = 1500) -> str:
+def create(path: str, open_browser: bool = True, verify: bool = True, settle_ms: int = 1500, interactions: Sequence[Mapping[str, Any]] = ()) -> str:
     try:
         entry = resolve_workspace_path(path, must_exist=True)
         if entry.suffix.casefold() not in {".html", ".htm"} or not entry.is_file():
@@ -243,7 +331,7 @@ def create(path: str, open_browser: bool = True, verify: bool = True, settle_ms:
             server.shutdown(); server.server_close()
             return f"Error: preview server health check failed: {safe_os_error(exc)}"
         screenshot = artifact_dir / f"{preview_id}.png"
-        preview.verification = _verify(url, screenshot, settle_ms) if verify else {"status": "not_requested"}
+        preview.verification = _verify(url, screenshot, settle_ms, interactions) if verify else {"status": "not_requested"}
         opened, open_error = _open_visible(preview) if open_browser else (False, None)
         with _LOCK:
             _PREVIEWS[_key(preview_id)] = preview
@@ -259,6 +347,7 @@ def create(path: str, open_browser: bool = True, verify: bool = True, settle_ms:
             "page_errors": preview.verification.get("page_errors", []),
             "network_errors": preview.verification.get("network_errors", []),
             "screenshot_path": preview.verification.get("screenshot_path"),
+            "interaction_results": preview.verification.get("interaction_results", []),
         }
         return json.dumps(payload, ensure_ascii=False)
     except (OSError, RuntimeError, ValueError) as exc:

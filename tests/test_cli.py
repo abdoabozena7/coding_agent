@@ -22,6 +22,7 @@ from agent.commands import CommandKind, CommandParseError, parse_command
 from agent.config import InteractionMode, RuntimeConfig, SessionPreferences
 from agent.models import GoalStatus
 from agent.store import StateStore
+from agent.testing import ScriptedProvider
 from agent.ui import ConsoleUI, DashboardView, WorkspaceRefreshRequested
 from agent.ui_state import WorkspaceUIStore
 
@@ -34,6 +35,82 @@ class _TTY(io.StringIO):
 
 
 class CLITests(unittest.TestCase):
+    def test_session_recovery_backfills_model_snapshot_from_capability_envelope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with StateStore(directory) as store:
+                store.save_workflow_session(
+                    "recover-me",
+                    goal_id=None,
+                    session_mode="normal",
+                    plan_state="none",
+                    run_state="idle",
+                    state={
+                        "interaction_mode": "working",
+                        "access_level": "normal",
+                        "model_capability_envelope": {
+                            "provider": "ollama",
+                            "model": "gpt-oss:120b-cloud",
+                            "execution_class": "cloud",
+                            "capability_band": "high",
+                            "parameter_count_billions": 116.8,
+                            "context_window_tokens": 131072,
+                            "maximum_output_tokens": None,
+                            "tool_calling": False,
+                            "structured_output": False,
+                            "thinking": False,
+                            "vision": False,
+                        },
+                    },
+                )
+            output = io.StringIO()
+            with mock.patch(
+                "agent.model_catalog.ModelDescriptor.create_provider",
+                return_value=ScriptedProvider([]),
+            ), redirect_stdout(output):
+                code = main(
+                    [
+                        "--workspace", directory,
+                        "--session", "recover-me",
+                        "--provider", "ollama",
+                        "--command", "/status",
+                        "--plain",
+                        "--no-color",
+                    ]
+                )
+            with StateStore(directory) as store:
+                recovered = store.get_workflow_session("recover-me")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            recovered["state"]["model_snapshot"]["model"],
+            "gpt-oss:120b-cloud",
+        )
+        self.assertEqual(
+            recovered["state"]["model_snapshot"]["source"],
+            "session-capability-recovery",
+        )
+
+    def test_reapplying_current_mode_is_silent(self):
+        from agent.cli import _set_interaction_mode
+
+        runtime = SimpleNamespace(
+            ultra_readiness_issue=lambda: "",
+            transition_mode=mock.Mock(return_value="normal"),
+            active_goal=lambda: None,
+        )
+        console = SimpleNamespace(set_mode=mock.Mock(), write=mock.Mock())
+        preferences = SimpleNamespace(mode=InteractionMode.NORMAL)
+
+        _set_interaction_mode(
+            runtime,
+            console,
+            preferences,
+            InteractionMode.NORMAL,
+            detailed=False,
+        )
+
+        console.write.assert_not_called()
+
     def test_plan_mode_review_keeps_safe_default_and_never_offers_direct_start(self):
         from agent.cli import _plan_attention
 
@@ -47,8 +124,9 @@ class CLITests(unittest.TestCase):
 
         values = {item.value for item in request.options}
         self.assertEqual(request.default_key, "cancel")
-        self.assertIn("normal", values)
-        self.assertIn("ultra", values)
+        self.assertIn("approve", values)
+        self.assertNotIn("normal", values)
+        self.assertNotIn("ultra", values)
         self.assertNotIn("start", values)
         self.assertEqual(sum(item.recommended for item in request.options), 1)
 
@@ -60,8 +138,9 @@ class CLITests(unittest.TestCase):
             normal_available=False,
         )
         ultra_values = {item.value for item in ultra_plan_request.options}
+        self.assertIn("approve", ultra_values)
         self.assertNotIn("normal", ultra_values)
-        self.assertIn("ultra", ultra_values)
+        self.assertNotIn("ultra", ultra_values)
 
     def test_mode_command_changes_depth_without_starting_a_second_foundation(self):
         output = io.StringIO()
@@ -83,9 +162,9 @@ class CLITests(unittest.TestCase):
             )
         )
 
-        runtime.transition_mode.assert_called_once_with("ultra")
+        runtime.increase_execution_depth.assert_called_once_with()
         runtime.prepare_ultra_from_existing_goal.assert_not_called()
-        self.assertEqual(preferences.mode, InteractionMode.ULTRA)
+        self.assertEqual(preferences.mode, InteractionMode.NORMAL)
 
     def test_persistent_controller_contains_last_intake_provider_failure(self):
         import time
@@ -185,6 +264,81 @@ class CLITests(unittest.TestCase):
             any("Local model stopped unexpectedly" in item.text for item in transcript)
         )
 
+    def test_persistent_controller_recovers_approved_work_without_replaying_approval(self):
+        import time
+
+        from agent.cli import _persistent_interactive_loop
+
+        started = Event()
+
+        class FakeApp:
+            def __init__(self, store, *, on_exit, **_kwargs):
+                self.store = store
+                self.on_exit = on_exit
+                self.overlay_kind = ""
+
+            def run(self):
+                deadline = time.monotonic() + 3
+                while not started.is_set() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.on_exit()
+
+            def stop(self):
+                return None
+
+            def open_details(self, *_args, **_kwargs):
+                return None
+
+            def open_swarm(self, *_args, **_kwargs):
+                return None
+
+            def update_swarm(self, *_args, **_kwargs):
+                return None
+
+        runtime = mock.Mock()
+        runtime.workspace = Path("workspace")
+        runtime.model_name = "test-model"
+        runtime.session_id = "web-approved-session"
+        runtime.interaction_mode = SimpleNamespace(value="working")
+        runtime.dashboard.return_value = SimpleNamespace(
+            status="running",
+            tasks=(),
+            objective="Build the approved project",
+            goal_id="goal-web",
+            plan_revision=1,
+        )
+        goal = SimpleNamespace(
+            id="goal-web",
+            status=GoalStatus.RUNNING,
+            metadata={},
+            active_plan_revision=1,
+        )
+        runtime.active_goal.return_value = goal
+        runtime.store.list_timeline_entries.return_value = []
+        runtime.store.count_queued_prompts.return_value = 0
+        runtime.store.list_queued_prompts.return_value = []
+        runtime.store.get_workflow_session.return_value = {"state": {}}
+        runtime.local_web_server.take_execution_request.return_value = False
+        console = mock.Mock()
+        console.stream = io.StringIO()
+        console.color = False
+
+        with mock.patch("agent.cli.PersistentWorkspaceApp", FakeApp), mock.patch(
+            "agent.cli.TelemetrySampler"
+        ) as telemetry, mock.patch(
+            "agent.cli.question_session", return_value=None
+        ), mock.patch(
+            "agent.cli._current_ultra_run", return_value=None
+        ), mock.patch(
+            "agent.cli._run_auto", side_effect=lambda *_args, **_kwargs: started.set()
+        ) as run_auto:
+            telemetry.return_value.start.return_value = None
+            telemetry.return_value.stop.return_value = None
+            _persistent_interactive_loop(runtime, console, SessionPreferences())
+
+        self.assertTrue(started.is_set())
+        run_auto.assert_called_once_with(runtime, console)
+
     def test_general_sleep_mode_is_available_outside_ultra(self):
         output = io.StringIO()
         console = ConsoleUI(stream=output, color=False)
@@ -195,6 +349,7 @@ class CLITests(unittest.TestCase):
             execute_command(runtime, console, parse_command("/sleep on"), preferences)
         )
         self.assertTrue(console.sleep_enabled)
+        runtime.set_sleep_mode.assert_called_once_with(True)
         runtime.sleep_profile.assert_not_called()
         self.assertTrue(
             execute_command(runtime, console, parse_command("/sleep status"), preferences)
@@ -249,7 +404,7 @@ class CLITests(unittest.TestCase):
         self.assertIn("Full access is unavailable", output.getvalue())
 
     def test_mode_picker_cannot_select_ultra_when_runtime_prerequisite_is_missing(self):
-        answers = iter(("2", "1"))
+        answers = iter(("2",))
         output = io.StringIO()
 
         selected = choose_interaction_mode(
@@ -259,8 +414,8 @@ class CLITests(unittest.TestCase):
             ultra_disabled_reason="A usable local GPU was not detected.",
         )
 
-        self.assertEqual(selected, InteractionMode.NORMAL)
-        self.assertIn("Ultra is unavailable", output.getvalue())
+        self.assertEqual(selected, InteractionMode.PLAN)
+        self.assertIn("ultra", output.getvalue().casefold())
         self.assertIn("usable local GPU", output.getvalue())
 
     def test_status_command_is_offline_import_safe_and_creates_durable_state(self):
@@ -348,7 +503,7 @@ class CLITests(unittest.TestCase):
             {"key": "api_key", "value": "gemini"},
         )
 
-    def test_sequential_main_commands_share_goal_mode_with_settings(self):
+    def test_legacy_goal_alias_keeps_user_facing_settings_automatic(self):
         with tempfile.TemporaryDirectory() as directory:
             output = io.StringIO()
             with redirect_stdout(output):
@@ -368,9 +523,9 @@ class CLITests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             rendered = output.getvalue()
-            self.assertIn("NORMAL mode active", rendered)
+            self.assertIn("GOAL workflow selected", rendered)
             self.assertIn("Session settings", rendered)
-            self.assertIn("mode       = normal", rendered)
+            self.assertIn("mode       = automatic", rendered)
             self.assertNotIn("API_KEY", rendered)
 
     def test_startup_mode_is_persisted_before_the_first_intake(self):
@@ -394,7 +549,9 @@ class CLITests(unittest.TestCase):
                 session = state.get_workflow_session("workspace-session")
 
         self.assertEqual(code, 0)
-        self.assertEqual(session["session_mode"], "ultra")
+        self.assertEqual(session["session_mode"], "normal")
+        self.assertEqual(session["state"]["interaction_mode"], "working")
+        self.assertEqual(session["state"]["minimum_strategy"], "recursive")
 
     def test_doctor_record_command_persists_benchmark_history(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -609,8 +766,9 @@ class CLITests(unittest.TestCase):
     def test_noninteractive_approval_fails_closed(self):
         output = io.StringIO()
         console = ConsoleUI(stream=output, color=False, input_func=lambda _prompt: (_ for _ in ()).throw(EOFError()))
-        self.assertFalse(console.confirm_action("write_file", {"path": "x"}, "high"))
-        self.assertIn("Approval denied", output.getvalue())
+        with self.assertRaisesRegex(RuntimeError, "approval interface is unavailable"):
+            console.confirm_action("write_file", {"path": "x"}, "high")
+        self.assertIn("Approval is still required", output.getvalue())
 
     def test_persistent_simple_policy_allows_project_edits_without_interrupting(self):
         console = ConsoleUI(stream=io.StringIO(), color=False)
@@ -618,6 +776,59 @@ class CLITests(unittest.TestCase):
         console.bind_workspace_store(store)
         self.assertTrue(console.confirm_action("write_file", {"path": "app.py"}, "risky"))
         self.assertIsNone(store.active_attention())
+
+    def test_sleep_auto_approves_only_safe_unattended_project_actions(self):
+        output = io.StringIO()
+        console = ConsoleUI(
+            stream=output,
+            color=False,
+            input_func=lambda _prompt: (_ for _ in ()).throw(
+                AssertionError("safe Sleep actions must not ask the user")
+            ),
+        )
+        console.set_sleep_mode(True)
+
+        self.assertTrue(
+            console.confirm_action(
+                "preview_html",
+                {"path": "index.html", "open_browser": True},
+                "high",
+            )
+        )
+        self.assertTrue(
+            console.confirm_action(
+                "run_command",
+                {"command": "python -m pytest -q"},
+                "high",
+            )
+        )
+        self.assertIn("Sleep auto-approved", output.getvalue())
+
+        console.input_func = lambda _prompt: (_ for _ in ()).throw(EOFError())
+        with self.assertRaisesRegex(RuntimeError, "approval interface is unavailable"):
+            console.confirm_action(
+                "run_command",
+                {"command": "npm install untrusted-package"},
+                "critical",
+            )
+
+    def test_persistent_sleep_auto_approves_preview_without_attention_panel(self):
+        console = ConsoleUI(stream=io.StringIO(), color=False)
+        store = WorkspaceUIStore()
+        console.bind_workspace_store(store)
+        console.set_sleep_mode(True)
+
+        self.assertTrue(
+            console.confirm_action(
+                "preview_html",
+                {"path": "index.html", "open_browser": True},
+                "high",
+            )
+        )
+        self.assertIsNone(store.active_attention())
+        self.assertTrue(
+            any("sleep.auto_approval" in item for item in store.snapshot().advanced_log)
+        )
 
     def test_persistent_simple_workspace_keeps_multiline_results_and_errors_visible(self):
         console = ConsoleUI(stream=io.StringIO(), color=False)

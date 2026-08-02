@@ -126,6 +126,7 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
             workflow_mode="ultra",
         )
         store.set_activity(ActivityStage.BUILDING, "Implementing", running=True)
+        store.update_workflow_mode("working")
         app = PersistentWorkspaceApp(
             store,
             on_input=lambda _item: None,
@@ -139,8 +140,9 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         header = list(app._header_fragments())
         header_text = "".join(item[1] for item in header)
         footer_text = "".join(item[1] for item in app._footer_fragments())
-        self.assertIn("ULTRA", header_text)
-        self.assertTrue(any(item[0] == "class:workspace.ultra" for item in header))
+        self.assertIn("WORKING", header_text)
+        self.assertNotIn("ULTRA", header_text)
+        self.assertFalse(any(item[0] == "class:workspace.ultra" for item in header))
         self.assertIn("Ctrl+C Pause", footer_text)
         self.assertIn("? Help", footer_text)
         self.assertNotIn("F3", footer_text)
@@ -573,6 +575,73 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
             )
             app.run()
         self.assertTrue(store.snapshot().sleep_enabled)
+
+    def test_f5_does_not_ask_user_to_preclassify_the_next_prompt(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        submitted = []
+        with create_pipe_input() as pipe:
+            pipe.send_text("\x1b[15~\x11")
+            app = PersistentWorkspaceApp(
+                store,
+                on_input=submitted.append,
+                on_interrupt=lambda: None,
+                on_exit=store.mark_exit,
+                output=io.StringIO(),
+                app_input=pipe,
+                app_output=DummyOutput(),
+                no_color=True,
+            )
+            app.run()
+        self.assertEqual(submitted, [])
+        self.assertEqual(store.snapshot().workflow_mode, "ready")
+
+    def test_ordinary_enter_does_not_attach_a_mode_override(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        submitted = []
+        with create_pipe_input() as pipe:
+            pipe.send_text("hello\r\x11")
+            app = PersistentWorkspaceApp(
+                store,
+                on_input=submitted.append,
+                on_interrupt=lambda: None,
+                on_exit=store.mark_exit,
+                output=io.StringIO(),
+                app_input=pipe,
+                app_output=DummyOutput(),
+                no_color=True,
+            )
+            app.run()
+        self.assertEqual(submitted[0].text, "hello")
+        self.assertEqual(submitted[0].mode, "")
+
+    def test_small_terminal_pages_attention_options_around_selection(self):
+        store = WorkspaceUIStore()
+        store.present_attention(
+            AttentionRequest(
+                id="recovery-options",
+                kind=AttentionKind.RECOVERY,
+                title="Routing needs attention",
+                message="The exact request is saved.",
+                options=tuple(
+                    AttentionOption(str(index), label, label.casefold())
+                    for index, label in enumerate(
+                        ("Retry", "Keep saved", "Local", "Model", "Stop", "Details")
+                    )
+                ),
+                default_key="0",
+            )
+        )
+        for _ in range(5):
+            store.move_attention(1)
+        rendered = render_persistent_workspace(store.snapshot(), width=80, height=24)
+        self.assertIn("Options 4-6 of 6", rendered)
+        self.assertIn("Details", rendered)
 
     def test_page_up_follow_state_survives_mode_switch(self):
         from prompt_toolkit.input.defaults import create_pipe_input

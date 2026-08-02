@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Calculator</title>
+<!-- Inline favicon to avoid 404 requests -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='0.9em' font-size='90'%3E🧮%3C/text%3E%3C/svg%3E" />
+<style>
+  body { font-family: Arial, sans-serif; background-color: #333; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+  .calculator { background-color: #444; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.5); text-align: center; width: 300px; }
+  #display { width: 100%; padding: 15px; margin-bottom: 10px; border: none; border-radius: 4px; background-color: #555; color: #fff; font-size: 2em; text-align: right; box-sizing: border-box; }
+  .buttons { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 10px; }
+  button { padding: 15px; border: none; border-radius: 4px; background-color: #777; color: #fff; font-size: 1.2em; cursor: pointer; outline: none; transition: background-color 0.2s; }
+  button:hover { background-color: #888; }
+  button:focus { outline: 3px solid gold; }
+  #equals { background-color: #ff9500; }
+  #equals:hover { background-color: #e68a00; }
+</style>
+</head>
+<body>
+<div class="calculator">
+  <input type="text" id="display" readonly value="0" aria-live="polite" aria-label="Calculator display" />
+  <div class="buttons">
+    <button id="clear" data-action="clear" aria-label="Clear">C</button>
+    <button id="backspace" data-action="backspace" aria-label="Backspace">&#9003;</button>
+    <button id="operator_divide" data-value="/" aria-label="Divide">/</button>
+    <button id="operator_multiply" data-value="*" aria-label="Multiply">*</button>
+
+    <!-- Second Row -->
+    <button id="number_7" data-value="7">7</button>
+    <button id="number_8" data-value="8">8</button>
+    <button id="number_9" data-value="9">9</button>
+    <button id="operator_subtract" data-value="-" aria-label="Subtract">-</button>
+
+    <!-- Third Row -->
+    <button id="number_4" data-value="4">4</button>
+    <button id="number_5" data-value="5">5</button>
+    <button id="number_6" data-value="6">6</button>
+    <button id="operator_add" data-value="+" aria-label="Add">+</button>
+
+    <!-- Fourth Row -->
+    <button id="number_1" data-value="1">1</button>
+    <button id="number_2" data-value="2">2</button>
+    <button id="number_3" data-value="3">3</button>
+    <button id="equals" data-action="equals" aria-label="Equals">=</button>
+
+    <!-- Fifth Row -->
+    <button id="number_0" data-value="0" style="grid-column: span 2;">0</button>
+    <button id="decimal" data-value="." aria-label="Decimal point">.</button>
+  </div>
+</div>
+<script>
+  // --- CORE CALCULATOR LOGIC ---
+  const display = document.getElementById('display');
+  let currentInput = '0';
+  let previousValue = null;
+  let operation = null;
+
+  function updateDisplay() {
+    display.value = currentInput;
+  }
+
+  window.inputDigit = function(digit) {
+    if (currentInput.startsWith('Cannot')) {
+      currentInput = (digit === '.' ? '0.' : String(digit));
+      updateDisplay();
+      return;
+    }
+    if (currentInput === '0' && digit !== '.') {
+      currentInput = String(digit);
+    } else if (digit === '.' && currentInput.includes('.')) {
+      return;
+    } else {
+      currentInput += digit;
+    }
+    updateDisplay();
+  };
+
+  window.inputBackspace = function() {
+    if (currentInput === '0' || currentInput.length === 1) {
+      currentInput = '0';
+    } else {
+      currentInput = currentInput.slice(0, -1);
+    }
+    updateDisplay();
+  };
+
+  window.clearDisplay = function() {
+    currentInput = '0';
+    previousValue = null;
+    operation = null;
+    updateDisplay();
+  };
+
+  function calculate(prev, current, op) {
+    const num1 = parseFloat(prev);
+    const num2 = parseFloat(current);
+    if (isNaN(num1) || isNaN(num2)) return 'Error';
+    let result;
+    switch (op) {
+      case '+': result = num1 + num2; break;
+      case '-': result = num1 - num2; break;
+      case '*': result = num1 * num2; break;
+      case '/':
+        if (num2 === 0) return 'Cannot divide by zero';
+        result = num1 / num2;
+        return parseFloat(result.toFixed(7)).toString();
+    }
+    return result.toString();
+  }
+
+  window.inputOperator = function(nextOperation) {
+    const inputValue = currentInput;
+    if (previousValue === null) {
+      previousValue = parseFloat(inputValue);
+      operation = nextOperation;
+      currentInput = '0';
+    } else if (operation) {
+      const result = calculate(previousValue, parseFloat(inputValue), operation);
+      if (result === 'Cannot divide by zero' || result === 'Error') {
+        currentInput = result;
+        previousValue = null;
+        operation = null;
+        updateDisplay();
+        return;
+      }
+      previousValue = parseFloat(result);
+      operation = nextOperation;
+      currentInput = '0';
+    }
+    updateDisplay();
+  };
+
+  window.equals = function() {
+    if (previousValue === null || !operation) return;
+    const result = calculate(previousValue, parseFloat(currentInput), operation);
+    if (result === 'Cannot divide by zero' || result === 'Error') {
+      currentInput = result;
+      previousValue = null;
+      operation = null;
+    } else {
+      currentInput = result;
+      previousValue = result;
+      operation = null;
+    }
+    updateDisplay();
+  };
+
+  document.addEventListener('DOMContentLoaded', () => {
+    const buttons = document.querySelectorAll('[data-action], [data-value]');
+    buttons.forEach(button => {
+      button.addEventListener('click', e => {
+        const action = e.currentTarget.dataset.action;
+        const value = e.currentTarget.dataset.value;
+        if (action === 'clear') {
+          window.clearDisplay();
+        } else if (action === 'backspace') {
+          window.inputBackspace();
+        } else if (action === 'equals') {
+          window.equals();
+        } else if (['+', '-', '*', '/'].includes(value)) {
+          window.inputOperator(value);
+        } else if (value !== undefined) {
+          window.inputDigit(value);
+        }
+      });
+    });
+
+    document.addEventListener('keydown', event => {
+      const key = event.key;
+      if (/[0-9]/.test(key)) {
+        window.inputDigit(key);
+        return;
+      }
+      if (key === '.' || key === ',') {
+        window.inputDigit('.');
+        return;
+      }
+      if (['+', '-', '*', '/', 'Add', 'Subtract', 'Multiply', 'Divide'].includes(key)) {
+        const opMap = { Add: '+', Subtract: '-', Multiply: '*', Divide: '/' };
+        const op = opMap[key] || key;
+        window.inputOperator(op);
+        return;
+      }
+      if (key === 'Enter' || key === 'Return') {
+        event.preventDefault();
+        window.equals();
+        return;
+      }
+      if (key === 'Backspace') {
+        window.inputBackspace();
+        return;
+      }
+      if (key === 'Escape' || key === 'Clear') {
+        window.clearDisplay();
+        return;
+      }
+    });
+  });
+</script>
+</body>
+</html>

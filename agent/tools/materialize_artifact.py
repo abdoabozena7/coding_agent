@@ -10,7 +10,9 @@ from typing import Callable, Mapping, Any
 from ._security import MAX_PATH_CHARS, MAX_WRITE_BYTES, atomic_write_bytes, encoded_text, get_workspace, resolve_workspace_path
 
 
-REQUIRES_APPROVAL = True
+# Materialization is confined to the selected workspace and an accepted
+# artifact contract; it must not create a duplicate approval boundary.
+REQUIRES_APPROVAL = False
 _LOCK = RLock()
 _PROVIDERS: dict[str, Callable[[str], Mapping[str, Any]]] = {}
 

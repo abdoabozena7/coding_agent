@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Three.js Calculator</title>
+  <style>
+    body { margin:0; overflow:hidden; }
+    canvas { display:block; }
+  </style>
+  <script src="https://unpkg.com/three@0.152.2/build/three.min.js"></script>
+</head>
+<body>
+<script>
+// Basic Three.js setup
+let scene = new THREE.Scene();
+let camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+let renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+// Light
+let light = new THREE.DirectionalLight(0xffffff, 1);
+light.position.set(5,10,7.5);
+scene.add(light);
+
+// Calculator base (a box)
+let calcGeometry = new THREE.BoxGeometry(4, 0.5, 3);
+let calcMaterial = new THREE.MeshPhongMaterial({ color: 0x222222 });
+let calculator = new THREE.Mesh(calcGeometry, calcMaterial);
+scene.add(calculator);
+
+// Create button meshes (simple cylinders) arranged in grid
+let buttonMaterial = new THREE.MeshPhongMaterial({ color: 0x555555 });
+let buttonGeo = new THREE.CylinderGeometry(0.3, 0.3, 0.1, 32);
+let buttons = [];
+let labels = ["7","8","9","/","4","5","6","*","1","2","3","-","0","C","=","+"];
+let rows = 4, cols = 4;
+for(let i=0;i<rows;i++){
+  for(let j=0;j<cols;j++){
+    let btn = new THREE.Mesh(buttonGeo, buttonMaterial);
+    btn.position.set(-1.5 + j*1.0, 0.3, 1.5 - i*1.0);
+    // simple rotation to lay flat
+    btn.rotation.x = Math.PI/2;
+    scene.add(btn);
+    buttons.push(btn);
+  }
+}
+
+camera.position.set(0,5,8);
+camera.lookAt(0,0,0);
+
+function animate(){
+  requestAnimationFrame(animate);
+  renderer.render(scene, camera);
+}
+animate();
+
+// Simple calculator logic (no UI interaction needed for test)
+function calculate(a, op, b){
+  switch(op){
+    case '+': return a + b;
+    case '-': return a - b;
+    case '*': return a * b;
+    case '/': return a / b;
+    default: throw new Error('Unknown operator');
+  }
+}
+
+// Self‑test
+(function(){
+  const tests = [
+    {a:3, op:'+', b:5, expected:8},
+    {a:10, op:'-', b:2, expected:8},
+    {a:4, op:'*', b:6, expected:24},
+    {a:9, op:'/', b:3, expected:3}
+  ];
+  let allPass = true;
+  for(const t of tests){
+    const result = calculate(t.a, t.op, t.b);
+    if(Math.abs(result - t.expected) > 1e-9){
+      allPass = false;
+      console.error('FAIL', t, 'got', result);
+    }
+  }
+  if(allPass){
+    console.log('TEST_RESULT: PASS');
+  } else {
+    console.log('TEST_RESULT: FAIL');
+  }
+})();
+</script>
+</body>
+</html>

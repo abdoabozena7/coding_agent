@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+import json
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 from agent.models import GoalStatus, RoleProfile, Task
@@ -324,6 +326,21 @@ class UltraStoreTests(unittest.TestCase):
         self.store._fts5_available = False
         self.assertEqual(brain.search("double")[0].id, second.id)
 
+    def test_brain_search_treats_path_punctuation_as_literal_text(self) -> None:
+        brain = ProjectBrain(self.store, self.run.id)
+        brain.record_lesson(
+            "src/index.html browser verification",
+            "Preview src/index.html in a real browser before completion.",
+        )
+
+        results = self.store.search_brain(
+            self.run.id,
+            "src/index.html must verify browser.",
+            section=BrainSection.LESSON,
+        )
+
+        self.assertIsInstance(results, tuple)
+
     def test_foundation_project_lessons_are_reused_before_planning(self) -> None:
         module = self.store.sync_master_modules(self.run.id)[0]
         brain = ProjectBrain(self.store, self.run.id)
@@ -469,6 +486,116 @@ class UltraStoreTests(unittest.TestCase):
         self.assertEqual(restored["metadata"]["positive_outcomes"], 1)
         self.assertGreater(restored["confidence"], memory["confidence"])
         self.assertIn(f"benchmark:{gate['benchmark_id']}", restored["evidence_refs"])
+
+    def test_html_benchmark_uses_the_actual_nested_artifact_path(self) -> None:
+        target = self.workspace / "src" / "index.html"
+        target.parent.mkdir(parents=True)
+        target.write_text("<!doctype html><title>Calculator</title>", encoding="utf-8")
+        self.store.update_ultra_run(
+            self.run.id,
+            config={"prompt": "Build a Three.js browser game."},
+        )
+        adapter = StateStoreUltraAdapter(
+            self.store,
+            self.goal.id,
+            ModelDescriptor("ollama", "gemma4", CatalogExecutionClass.LOCAL),
+            PermissionAccessLevel.NORMAL,
+            UltraConfig(),
+            workspace=self.workspace,
+        )
+        adapter.run_id = self.run.id
+        tool_calls = []
+
+        def run_tool(name, args):
+            tool_calls.append((name, dict(args)))
+            if name == "preview_html":
+                return json.dumps(
+                    {
+                        "preview_id": "preview-1",
+                        "verification": "passed",
+                        "screenshot_path": "",
+                    }
+                )
+            return json.dumps({"stopped": True})
+
+        with mock.patch(
+            "agent.ultra_session.tools.run_tool", side_effect=run_tool
+        ), mock.patch(
+            "agent.ultra_session.record_single_file_3d_html_benchmark",
+            return_value={"result": "passed"},
+        ) as benchmark:
+            result = adapter._record_html_benchmark_if_applicable(
+                EngineResult(
+                    node_id="global",
+                    success=True,
+                    summary="nested artifact accepted",
+                    artifacts=({"path": "src/index.html"},),
+                    evidence=({"kind": "browser", "passed": True},),
+                ),
+                (),
+            )
+
+        self.assertEqual(result["result"], "passed")
+        self.assertEqual(tool_calls[0][0], "preview_html")
+        self.assertEqual(tool_calls[0][1]["path"], "src/index.html")
+        self.assertEqual(
+            benchmark.call_args.kwargs["artifact_ref"],
+            "workspace:src/index.html",
+        )
+
+    def test_threejs_benchmark_does_not_reject_a_normal_html_application(self) -> None:
+        target = self.workspace / "src" / "index.html"
+        target.parent.mkdir(parents=True)
+        target.write_text("<!doctype html><title>Calculator</title>", encoding="utf-8")
+        self.store.update_ultra_run(
+            self.run.id,
+            config={"prompt": "Build a calculator web app."},
+        )
+        adapter = StateStoreUltraAdapter(
+            self.store,
+            self.goal.id,
+            ModelDescriptor("ollama", "gemma4", CatalogExecutionClass.LOCAL),
+            PermissionAccessLevel.NORMAL,
+            UltraConfig(),
+            workspace=self.workspace,
+        )
+        adapter.run_id = self.run.id
+
+        with mock.patch("agent.ultra_session.tools.run_tool") as run_tool:
+            result = adapter._record_html_benchmark_if_applicable(
+                EngineResult(
+                    node_id="global",
+                    success=True,
+                    summary="calculator accepted",
+                    artifacts=({"path": "src/index.html"},),
+                    evidence=({"kind": "browser", "passed": True},),
+                ),
+                (),
+            )
+
+        self.assertIsNone(result)
+        run_tool.assert_not_called()
+
+    def test_workspace_preservation_baseline_excludes_generated_preview_files(self) -> None:
+        source = self.workspace / "src" / "index.html"
+        preview = self.workspace / "output" / "playwright" / "preview.png"
+        source.parent.mkdir(parents=True)
+        preview.parent.mkdir(parents=True)
+        source.write_text("<!doctype html>", encoding="utf-8")
+        preview.write_bytes(b"generated screenshot")
+        adapter = StateStoreUltraAdapter(
+            self.store,
+            self.goal.id,
+            ModelDescriptor("ollama", "gemma4", CatalogExecutionClass.LOCAL),
+            PermissionAccessLevel.NORMAL,
+            UltraConfig(),
+            workspace=self.workspace,
+        )
+
+        hashes = adapter._workspace_hashes()
+
+        self.assertIn("src/index.html", hashes)
+        self.assertNotIn("output/playwright/preview.png", hashes)
 
     def test_failed_global_evaluation_penalizes_used_project_lessons(self) -> None:
         module = self.store.sync_master_modules(self.run.id)[0]

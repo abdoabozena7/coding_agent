@@ -1,0 +1,4 @@
+Local Web Views ready on 127.0.0.1:65479.
+Ready · ollama/qwen2.5-coder:7b · local · normal · state .coding-agent/state.db
+semantic-router provider request is active
+fatal: Goal intake is saved but could not be validated: task_demand.rationale requires at least one model-authored reason

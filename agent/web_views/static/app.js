@@ -37,6 +37,9 @@ const state = {
   busy: false,
   draggedPromptId: null,
   contextTimer: null,
+  viewFingerprints: {},
+  pendingUpdates: {},
+  scrollingUntil: 0,
 };
 
 function statusLabel(status) {
@@ -70,6 +73,52 @@ function statusClass(status) {
 
 function badge(status) {
   return `<span class="status-badge status-${statusClass(status)}">${escapeHtml(statusLabel(status))}</span>`;
+}
+
+function compactList(items, emptyText = "No additional requirements were recorded.") {
+  const values = (items || []).filter((item) => String(item || "").trim());
+  if (!values.length) return `<p class="subtle">${escapeHtml(emptyText)}</p>`;
+  return `<ul class="plain-list">${values.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+}
+
+function executionPresentation(plan) {
+  const recursive = plan.execution_strategy === "recursive";
+  const decision = plan.strategy_decision || {};
+  const envelope = plan.capability_envelope || {};
+  const nodes = plan.execution_nodes || [];
+  const topLevel = nodes.filter((node) => !node.parent_id);
+  const plannedCount = recursive ? (topLevel.length || plan.tasks.length) : plan.tasks.length;
+  const label = recursive ? "Recursive specialists" : "Staged coordinator";
+  const explanation = recursive
+    ? `${plannedCount} top-level node${plannedCount === 1 ? "" : "s"} are planned. Each node can split into narrower specialists; integration and independent review remain explicit gates.`
+    : `One coordinator will run ${plannedCount} dependency-ordered step${plannedCount === 1 ? "" : "s"}. Specialist agents are not created for this plan.`;
+  const nodeRows = recursive && nodes.length
+    ? `<ol class="blueprint-list">${nodes.map((node) => `
+        <li class="blueprint-node${node.parent_id ? " child" : ""}">
+          <div><strong>${escapeHtml(node.title)}</strong><span>${escapeHtml(node.assigned_role || "Focused specialist")}</span></div>
+          <p>${escapeHtml(node.objective || "Bounded specialist outcome")}</p>
+        </li>`).join("")}</ol>`
+    : "";
+  return `
+    <section class="section execution-plan">
+      <div class="section-head">
+        <div>
+          <h3>How the system will execute this plan</h3>
+          <p>Selected automatically from this request and the chosen model. This is read-only.</p>
+        </div>
+        <span class="strategy-label">${escapeHtml(label)}</span>
+      </div>
+      <p class="reading compact">${escapeHtml(explanation)}</p>
+      ${compactList(decision.reasons, "The capability policy did not record an additional reason.")}
+      ${nodeRows}
+      <div class="meta-line advanced-only">
+        <span>Model: ${escapeHtml(envelope.model || "unknown")}</span>
+        <span>Capability: ${escapeHtml(envelope.capability_band || "minimal")}</span>
+        <span>Concurrency: ${escapeHtml(decision.max_concurrency || envelope.max_concurrency || 1)}</span>
+        <span>${plan.strategy_locked ? "Locked at approval" : "Provisional until approval"}</span>
+      </div>
+      ${plan.capabilities.can_increase_depth ? `<div class="section-actions advanced-only"><button class="secondary-button" data-action="increase-depth" type="button">Increase execution depth</button></div>` : ""}
+    </section>`;
 }
 
 async function api(path, options = {}) {
@@ -152,7 +201,13 @@ function renderChrome() {
     button.setAttribute("aria-current", button.dataset.view === state.currentView ? "page" : "false");
   });
   if (!state.context) return;
-  $("#sessionMeta").textContent = `Session ${state.context.session_short} · ${state.context.mode}`;
+  const runtime = state.context.runtime || {};
+  const mode = String(runtime.session_mode || state.context.mode || "ready").replaceAll("_", " ");
+  const route = String(runtime.route || state.context.route || "pending");
+  const strategy = String(runtime.execution_strategy || state.context.execution_strategy || "pending");
+  const phase = String(runtime.phase || state.context.phase || "ready").replaceAll("_", " ");
+  const model = runtime.model ? ` · ${runtime.provider || "model"}/${runtime.model}` : "";
+  $("#sessionMeta").textContent = `Session ${mode} · Route ${route} · Execution ${strategy} · Status ${phase}${model}`;
   Object.entries(state.context.navigation || {}).forEach(([view, item]) => {
     const node = $(`[data-badge="${view}"]`);
     const count = Number(item.badge || 0);
@@ -171,6 +226,62 @@ function renderChrome() {
     action.textContent = attention.action.label;
     action.dataset.view = attention.action.view;
   }
+}
+
+function stableFingerprint(value) {
+  const volatile = new Set([
+    "updated_at",
+    "heartbeat_at",
+    "heartbeat_age",
+    "last_event_id",
+  ]);
+  const scrub = (item) => {
+    if (Array.isArray(item)) return item.map(scrub);
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(
+      Object.entries(item)
+        .filter(([key]) => !volatile.has(key))
+        .map(([key, nested]) => [key, scrub(nested)]),
+    );
+  };
+  return JSON.stringify(scrub(value || {}));
+}
+
+function captureScrollAnchor() {
+  const anchors = $$('[data-scroll-anchor]', $("#viewRoot"));
+  const visible = anchors.find((node) => node.getBoundingClientRect().bottom > 96);
+  if (visible) {
+    return {
+      id: visible.dataset.scrollAnchor,
+      top: visible.getBoundingClientRect().top,
+      scrollY: window.scrollY,
+    };
+  }
+  return { id: "", top: 0, scrollY: window.scrollY };
+}
+
+function restoreScrollAnchor(anchor) {
+  if (!anchor) return;
+  if (anchor.id) {
+    const target = $$('[data-scroll-anchor]', $("#viewRoot"))
+      .find((node) => node.dataset.scrollAnchor === anchor.id);
+    if (target) {
+      window.scrollBy(0, target.getBoundingClientRect().top - anchor.top);
+      return;
+    }
+  }
+  window.scrollTo({ top: anchor.scrollY, behavior: "auto" });
+}
+
+function readerIsBusy() {
+  const focused = document.activeElement;
+  return window.scrollY > 24
+    || Date.now() < state.scrollingUntil
+    || Boolean(focused && $("#viewRoot").contains(focused));
+}
+
+function showActivityBanner(show = true) {
+  $("#activityBanner").classList.toggle("hidden", !show);
 }
 
 async function refreshContext({ enforceGate = true } = {}) {
@@ -350,14 +461,61 @@ function taskEditor(task, index) {
     </div>`;
 }
 
+function renderNewPlanRequest() {
+  const envelope = state.plan.capability_envelope || {};
+  $("#viewRoot").innerHTML = `
+    <header class="view-head">
+      <div>
+        <p class="eyebrow">Plan before work</p>
+        <h2>What do you want to build or change?</h2>
+        <p>Describe the complete outcome. The system will inspect the workspace and prepare a plan; no files change yet.</p>
+      </div>
+      <span class="status-badge status-waiting">Plan</span>
+    </header>
+    <section class="section">
+      <div class="form-field full">
+        <label for="newPlanRequest">Request</label>
+        <textarea id="newPlanRequest" autofocus
+          placeholder="Describe the outcome, constraints, and how you will know it works"></textarea>
+        <p class="subtle">Ctrl/Cmd + Enter submits. You will review the generated plan before work starts.</p>
+      </div>
+      <div class="section-actions">
+        <button class="primary-button" data-action="submit-plan-request" type="button">Prepare plan</button>
+      </div>
+    </section>
+    <section class="section advanced-only">
+      <div class="section-head"><div><h3>Selected model capability</h3><p>Metadata only; unknown fields use the conservative minimal envelope.</p></div></div>
+      <div class="meta-line">
+        <span>Band: ${escapeHtml(envelope.capability_band || "minimal")}</span>
+        <span>Parameters: ${escapeHtml(envelope.parameter_count_billions ?? "unknown")}B</span>
+        <span>Context: ${escapeHtml(envelope.context_window_tokens ?? "unknown")}</span>
+        <span>Concurrency: ${escapeHtml(envelope.max_concurrency ?? 1)}</span>
+      </div>
+    </section>`;
+  $$('[data-action]', $("#viewRoot")).forEach((button) => button.addEventListener("click", handlePlanAction));
+  const input = $("#newPlanRequest");
+  input.addEventListener("input", () => autoGrow(input));
+  input.addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+      event.preventDefault();
+      submitPlanRequest();
+    }
+  });
+  autoGrow(input);
+}
+
 function renderPlan() {
   const plan = state.plan;
+  if (plan.state === "new_request") {
+    renderNewPlanRequest();
+    return;
+  }
   const model = state.planModel;
   const canEdit = Boolean(plan.capabilities.can_edit);
   const phase = planPhase(plan);
   const active = plan.tasks.find((task) => ["in_progress", "verifying", "blocked"].includes(task.status));
   const taskRows = model.tasks.map((task, index) => `
-    <li class="task-row">
+    <li class="task-row" data-scroll-anchor="task-${escapeHtml(task.id)}">
       <div class="task-main">
         <span class="task-order">${String(index + 1).padStart(2, "0")}</span>
         <div class="task-copy">
@@ -401,10 +559,13 @@ function renderPlan() {
       <div>
         <p class="eyebrow">${escapeHtml(phase)}</p>
         <h2>Plan</h2>
-        <p>Revision ${plan.revision} · ${model.tasks.length} tasks · ${escapeHtml(plan.session_mode)} mode</p>
+        <p class="subtle runtime-context">Mode: ${escapeHtml((plan.runtime?.session_mode || plan.interaction_mode || "working"))} · Route: ${escapeHtml(plan.runtime?.route || "goal")} · Execution: ${escapeHtml(plan.runtime?.execution_strategy || plan.execution_strategy || "pending")} · Model: ${escapeHtml(plan.runtime?.model || plan.capability_envelope?.model || "unknown")}</p>
+        <p>Revision ${plan.revision} · ${model.tasks.length} tasks · ${escapeHtml(plan.interaction_mode || "working")}</p>
       </div>
       ${badge(plan.status)}
     </header>
+
+    ${executionPresentation(plan)}
 
     <section class="section">
       <div class="section-head">
@@ -430,6 +591,15 @@ function renderPlan() {
             <p class="subtle">${escapeHtml(plan.objective)}</p>
           </div>
         </div>`}
+    </section>
+
+    <section class="section plan-contract">
+      <div class="section-head"><div><h3>What this plan must deliver</h3><p>Accepted outcomes and success checks carried into implementation and review.</p></div></div>
+      <div class="contract-columns">
+        <div><h4>Required outcomes</h4>${compactList(plan.semantic_goal?.required_outcomes, "The task contracts below define the required outcome.")}</div>
+        <div><h4>Success checks</h4>${compactList(plan.semantic_goal?.acceptance_criteria, "The task criteria below define completion.")}</div>
+      </div>
+      ${(plan.semantic_goal?.constraints || []).length ? `<details class="advanced-section"><summary>Constraints and exclusions</summary><div class="contract-columns"><div><h4>Constraints</h4>${compactList(plan.semantic_goal.constraints)}</div><div><h4>Exclusions</h4>${compactList(plan.semantic_goal.exclusions)}</div></div></details>` : ""}
     </section>
 
     ${!canEdit && active ? `
@@ -471,16 +641,21 @@ function renderPlan() {
 
     ${plan.capabilities.can_manage_queue ? renderQueue(plan.queue) : ""}
 
+    ${!canEdit && ["running", "verifying", "reviewing"].includes(plan.goal_status) ? `
+      <section class="section work-started" role="status">
+        <div>
+          <h3>Work is running in the terminal</h3>
+          <p>Plan Studio is now read-only. Return to the terminal to follow live steps, send guidance, pause, or inspect output.</p>
+        </div>
+        <button class="primary-button" data-action="return-to-terminal" type="button">Return to terminal</button>
+      </section>` : ""}
+
     ${(canEdit || plan.capabilities.can_approve) ? `
       <section class="section">
         <div class="section-head">
           <div>
             <h3>Save or start</h3>
-            <p>${plan.session_mode === "ultra"
-              ? "This Ultra plan is orchestrator-governed and read-only here. Approval starts the bounded workflow."
-              : plan.session_mode === "plan"
-              ? "Plan mode can save a revision. Switch to Normal or Ultra before execution."
-              : "Saving a revision never starts work. Approval is always explicit."}</p>
+            <p>Saving a revision never starts work. Approve & start is the single approval that locks this plan and starts execution.</p>
           </div>
           <div class="section-actions">
             ${canEdit ? `<button class="quiet-button" data-action="save-draft"
@@ -488,21 +663,11 @@ function renderPlan() {
             <button class="secondary-button" data-action="save-revision"
                     data-help="Creates a new pending revision. It is not approved." type="button">Save revision</button>` : ""}
             ${plan.capabilities.can_approve ? `
-              <button class="primary-button" data-action="prepare-approval" type="button">
-                ${state.planDirty ? "Save revision & approve" : "Approve & start"}
+              <button class="primary-button" data-action="confirm-approval" type="button">
+                ${state.planDirty ? "Save revision & start" : "Approve & start"}
               </button>` : ""}
           </div>
         </div>
-        ${state.planConfirm ? `
-          <div class="confirm-panel" role="alert">
-            <p>${state.planDirty
-              ? "A new revision will be saved, then approved once. Execution will continue autonomously within this scope."
-              : `Plan r${plan.revision} will be approved once and execution will start.`}</p>
-            <div class="section-actions">
-              <button class="quiet-button" data-action="cancel-approval" type="button">Not yet</button>
-              <button class="primary-button" data-action="confirm-approval" type="button">Confirm and start</button>
-            </div>
-          </div>` : ""}
       </section>` : ""}
   `;
   bindPlan();
@@ -552,7 +717,7 @@ function renderQueue(queue) {
                   aria-label="New queued request"></textarea>
         <button class="secondary-button" data-action="enqueue" type="button">Add request</button>
       </div>
-      <p class="subtle">Ctrl/Cmd + Enter adds the request. It inherits the current workflow mode.</p>
+      <p class="subtle">Ctrl/Cmd + Enter adds the request. Execution depth is selected automatically for the configured model.</p>
     </section>`;
 }
 
@@ -623,6 +788,8 @@ function bindPlan() {
 async function handlePlanAction(event) {
   const action = event.currentTarget.dataset.action;
   const index = Number(event.currentTarget.dataset.index);
+  if (action === "submit-plan-request") return submitPlanRequest();
+  if (action === "increase-depth") return increaseExecutionDepth();
   if (action === "enqueue") return enqueuePrompt();
   if (action === "queue-up") return handleQueueMove(event.currentTarget.dataset.id, -1);
   if (action === "queue-down") return handleQueueMove(event.currentTarget.dataset.id, 1);
@@ -682,10 +849,50 @@ async function handlePlanAction(event) {
   }
   if (action === "save-draft") return saveDraft();
   if (action === "save-revision") return saveRevision();
-  if (action === "prepare-approval") state.planConfirm = true;
-  if (action === "cancel-approval") state.planConfirm = false;
   if (action === "confirm-approval") return confirmApproval();
+  if (action === "return-to-terminal") {
+    window.close();
+    setTimeout(() => announce("Switch to the terminal window to follow the running workflow."), 120);
+    return;
+  }
   renderPlan();
+}
+
+async function submitPlanRequest() {
+  const input = $("#newPlanRequest");
+  const request = String(input?.value || "").trim();
+  if (!request) {
+    announce("Describe the outcome before preparing the plan.", true);
+    input?.focus();
+    return;
+  }
+  try {
+    setBusy(true);
+    announce("Inspecting the workspace and preparing the plan…");
+    await api("/plan/request", {
+      method: "POST",
+      body: JSON.stringify({ request }),
+    });
+    await refreshContext({ enforceGate: false });
+    await loadView("plan", true);
+  } catch (error) {
+    announce(error.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function increaseExecutionDepth() {
+  try {
+    setBusy(true);
+    const result = await api("/plan/depth", { method: "POST", body: JSON.stringify({}) });
+    announce(`Execution depth increased. Plan revision ${result.revision || "is being prepared"}.`);
+    await loadView("plan", true);
+  } catch (error) {
+    announce(error.message, true);
+  } finally {
+    setBusy(false);
+  }
 }
 
 async function saveDraft() {
@@ -727,13 +934,17 @@ async function confirmApproval() {
       const result = await api("/plan/revision", { method: "POST", body: JSON.stringify(planPayload()) });
       revision = result.revision;
     }
-    await api("/plan/approve", {
+    const result = await api("/plan/approve", {
       method: "POST",
       body: JSON.stringify({ revision }),
     });
     state.planDirty = false;
     state.planConfirm = false;
-    announce(`Plan r${revision} approved. Execution has started.`);
+    announce(
+      result.execution_requested
+        ? `Plan r${revision} approved. Execution is starting in the terminal.`
+        : `Plan r${revision} approved. Return to the terminal to continue execution.`,
+    );
     await refreshContext({ enforceGate: false });
     await loadView("plan", true);
   } catch (error) {
@@ -845,13 +1056,56 @@ function reviewedCount() {
   return (state.review?.files || []).filter((file) => decisionForFile(file)).length;
 }
 
+function renderReadableDiff(file) {
+  const hunks = file.hunks || [];
+  const chunks = hunks.length
+    ? hunks.map((hunk) => ({
+        label: hunk.header,
+        content: String(hunk.content || "").split(/\r?\n/).slice(1).join("\n"),
+      }))
+    : file.diff
+      ? [{ label: "Recorded patch", content: file.diff }]
+      : [];
+  if (!chunks.length) {
+    return `
+      <div class="diff-unavailable" role="status">
+        <strong>Diff unavailable</strong>
+        <span>The workflow recorded this file, but no patch content was saved for it.</span>
+      </div>`;
+  }
+  return `
+    <section class="readable-diff" aria-label="Changes in ${escapeHtml(file.path)}">
+      <div class="diff-heading">
+        <h5>Changes</h5>
+        <span>Green lines were added. Red lines were removed.</span>
+      </div>
+      ${chunks.map((chunk) => `
+        <div class="diff-hunk">
+          <div class="diff-hunk-label">${escapeHtml(chunk.label)}</div>
+          <div class="diff-lines" role="region" aria-label="${escapeHtml(chunk.label)}">
+            ${String(chunk.content || "").split(/\r?\n/).map((line) => {
+              const kind = line.startsWith("+") && !line.startsWith("+++")
+                ? "added"
+                : line.startsWith("-") && !line.startsWith("---")
+                  ? "deleted"
+                  : line.startsWith("@@")
+                    ? "metadata"
+                    : "context";
+              return `<code class="diff-line ${kind}">${escapeHtml(line || " ")}</code>`;
+            }).join("")}
+          </div>
+        </div>`).join("")}
+    </section>`;
+}
+
 function renderReview() {
   const review = state.review;
   const reviewed = reviewedCount();
   const total = review.files.length;
-  const files = review.files.map((file) => {
+  const files = review.files.map((file, fileIndex) => {
     const fileDecision = state.reviewDecisions.get(`file:${file.path}`);
     const expanded = state.reviewExpanded.has(file.path);
+    const detailsId = `review-file-${fileIndex}-changes`;
     return `
       <li class="file-row">
         <div class="file-summary">
@@ -865,11 +1119,12 @@ function renderReview() {
             <button class="decision-button change ${fileDecision?.decision === "changes_requested" ? "selected" : ""}"
                     data-review="change-file" data-file="${escapeHtml(file.path)}" type="button">Request changes</button>
             <button class="quiet-button" data-review="toggle-file" data-file="${escapeHtml(file.path)}"
-                    type="button" aria-expanded="${expanded}">${expanded ? "Hide" : "Details"}</button>
+                    type="button" aria-expanded="${expanded}" aria-controls="${detailsId}">${expanded ? "Hide changes" : "View changes"}</button>
           </div>
         </div>
         ${expanded ? `
-          <div class="file-details">
+          <div class="file-details" id="${detailsId}">
+            ${renderReadableDiff(file)}
             <dl class="file-facts">
               <div class="fact"><dt>Why it changed</dt><dd>${escapeHtml(file.reason)}</dd></div>
               <div class="fact"><dt>Verification</dt><dd>${escapeHtml(typeof file.tests === "string" ? file.tests : JSON.stringify(file.tests || "Not recorded"))}</dd></div>
@@ -1108,7 +1363,7 @@ function renderAgents() {
             </div>
             ${badge(node.status)}
           </div>
-        </li>`).join("")}</ul>` : `<p class="empty-state">No Ultra work nodes are active. Normal execution remains visible in the Plan view.</p>`}
+        </li>`).join("")}</ul>` : `<p class="empty-state">No specialist work nodes are active. Current work remains visible in the Plan view.</p>`}
     </section>
     <section class="section">
       <div class="section-head"><div><h3>Active agents</h3><p>Open Advanced for IDs, logs, memory, tool use, and raw results.</p></div></div>
@@ -1199,31 +1454,69 @@ function closeDrawer() {
 
 async function loadView(view, force = false) {
   if (state.busy && !force) return;
+  if (!force && view === "plan" && (
+    state.planDirty || state.editingTask !== null || state.editingSummary
+  )) return;
+  const silent = !force;
+  const activeId = document.activeElement?.id || "";
+  const scrollAnchor = captureScrollAnchor();
   $("#errorState").classList.add("hidden");
-  $("#loading").classList.remove("hidden");
-  $("#viewRoot").classList.add("hidden");
+  if (!silent) {
+    $("#loading").classList.remove("hidden");
+    $("#viewRoot").classList.add("hidden");
+  }
   try {
     if (view === "plan") {
       const snapshot = await api("/plan");
+      const fingerprint = stableFingerprint(snapshot);
+      if (silent && state.viewFingerprints.plan === fingerprint) {
+        setConnection(true);
+        return;
+      }
+      if (silent && (state.planDirty || state.editingTask !== null || state.editingSummary || readerIsBusy())) {
+        state.pendingUpdates.plan = true;
+        showActivityBanner(true);
+        return;
+      }
+      state.viewFingerprints.plan = fingerprint;
       state.plan = snapshot;
       if (!state.planDirty || force) {
         state.planModel = makePlanModel(snapshot);
         state.planDirty = Boolean(snapshot.draft);
       }
       renderPlan();
+      restoreScrollAnchor(scrollAnchor);
     } else if (view === "review") {
-      state.review = await api("/review");
+      const snapshot = await api("/review");
+      const fingerprint = stableFingerprint(snapshot);
+      if (silent && state.viewFingerprints.review === fingerprint) return;
+      if (silent && readerIsBusy()) {
+        state.pendingUpdates.review = true;
+        showActivityBanner(true);
+        return;
+      }
+      state.viewFingerprints.review = fingerprint;
+      state.review = snapshot;
       state.reviewDecisions = new Map();
       state.reviewComments = [];
       state.reviewConfirm = false;
       renderReview();
+      restoreScrollAnchor(scrollAnchor);
     } else {
-      state.agents = await api("/agents");
+      const snapshot = await api("/agents");
+      const fingerprint = stableFingerprint(snapshot);
+      if (silent && state.viewFingerprints.agents === fingerprint) return;
+      state.viewFingerprints.agents = fingerprint;
+      state.agents = snapshot;
       renderAgents();
+      restoreScrollAnchor(scrollAnchor);
     }
     $("#loading").classList.add("hidden");
     $("#viewRoot").classList.remove("hidden");
-    $("#workspace").focus({ preventScroll: true });
+    if (activeId) document.getElementById(activeId)?.focus({ preventScroll: true });
+    if (!silent) {
+      $("#workspace").focus({ preventScroll: true });
+    }
     setConnection(true);
   } catch (error) {
     if (error.status === 404 && view !== "plan") {
@@ -1259,6 +1552,14 @@ function wireGlobalEvents() {
     await loadView(state.currentView, true);
     announce("Workspace refreshed.");
   });
+  $("#applyActivity").addEventListener("click", async () => {
+    state.pendingUpdates = {};
+    showActivityBanner(false);
+    await loadView(state.currentView, true);
+  });
+  window.addEventListener("scroll", () => {
+    state.scrollingUntil = Date.now() + 800;
+  }, { passive: true });
   $("#drawerClose").addEventListener("click", closeDrawer);
   $("#drawerBackdrop").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (event) => {
@@ -1286,7 +1587,8 @@ async function boot() {
     state.contextTimer = setInterval(async () => {
       await refreshContext({ enforceGate: true });
       const canRefreshView = state.currentView === "agents"
-        || (state.currentView === "plan" && !state.planDirty);
+        || (state.currentView === "plan" && !state.planDirty
+          && state.editingTask === null && !state.editingSummary);
       if (!state.busy && canRefreshView && document.visibilityState === "visible") {
         await loadView(state.currentView, false);
       }

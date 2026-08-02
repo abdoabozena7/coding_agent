@@ -1,0 +1,1 @@
+fatal: Recovery: this legacy session has no saved model identity. Reopen without --session and choose a model; the session data was not changed.
