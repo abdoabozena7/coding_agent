@@ -486,6 +486,45 @@ def test_provider_outage_has_no_canned_reply_and_resume_reuses_exact_turn() -> N
             second.close(); second_store.close()
 
 
+def test_goal_intake_outage_preserves_accepted_route_and_blocks_truthfully() -> None:
+    prompt = "Create a Three.js calculator and run it"
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        agent, store = runtime(
+            workspace,
+            [
+                semantic_route(
+                    "goal",
+                    original=prompt,
+                    effects=("read", "write", "run", "preview"),
+                ),
+                RuntimeError("provider offline during intake"),
+            ],
+        )
+        try:
+            with pytest.raises(ProviderUnavailableError, match="provider unavailable"):
+                agent.route_input(prompt)
+            session = store.get_workflow_session(agent.session_id)
+            pending = session["state"]["pending_semantic_turn"]
+            assert pending["stage"] == "goal_intake"
+            assert pending["status"] == "awaiting_provider"
+            assert session["state"]["route"] == "goal"
+            assert session["run_state"] == "blocked"
+            snapshot = agent.workflow_runtime_snapshot()
+            assert snapshot.route == "goal"
+            assert snapshot.phase == "retrying"
+            assert snapshot.waiting_on == "provider"
+            assert snapshot.objective == prompt
+            users = [
+                item
+                for item in store.list_chat_messages(agent.session_id)
+                if item.get("role") == "user" and item.get("content") == prompt
+            ]
+            assert len(users) == 1
+        finally:
+            agent.close(); store.close()
+
+
 def test_retyping_exact_pending_request_resumes_same_turn_without_duplicate_message() -> None:
     prompt = "Hello after a temporary outage"
     with tempfile.TemporaryDirectory() as directory:

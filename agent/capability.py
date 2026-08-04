@@ -243,7 +243,19 @@ class ModelCapabilityEnvelopeV1:
 
         def profile_bool(name: str, aliases: set[str]) -> bool:
             profile_value = getattr(provider_profile, name, None) if provider_profile is not None else None
-            return bool(profile_value) if profile_value is not None else bool(normalized_capabilities & aliases)
+            descriptor_value = bool(normalized_capabilities & aliases)
+            if profile_value is True:
+                return True
+            if profile_value is False:
+                # A newly-created provider profile frequently starts with
+                # conservative False defaults before its handshake has run.
+                # Do not let that erase documented catalog capabilities. A
+                # completed healthy probe may still authoritatively disable a
+                # capability the endpoint rejected.
+                health = str(getattr(provider_profile, "health_status", "") or "").casefold()
+                if health in {"healthy", "ready", "available", "supported"}:
+                    return False
+            return descriptor_value
 
         digest = str(
             values.get("digest")

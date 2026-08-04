@@ -348,6 +348,7 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
                     "explicit command in its task contract"
                 )
         expected = _unique_text(item.get("expected_changes", item.get("changes")))
+        requirement_refs = [value.upper() for value in _unique_text(item.get("requirement_refs"))]
         dependencies_raw = item.get("depends_on", item.get("dependencies", ()))
         if dependencies_raw is None:
             dependencies_raw = []
@@ -392,6 +393,7 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
                 "title": title,
                 "description": description,
                 "expected_changes": expected,
+                "requirement_refs": requirement_refs,
                 "acceptance_criteria": acceptance,
                 "verification": verification,
                 "depends_on": dependencies,
@@ -512,17 +514,20 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
                 }
             )
     # ``supports_tasks`` is a redundant cross-reference, not product
-    # semantics. Weak tool-calling models often omit it even though the exact
-    # path is already repeated in one or more complete task contracts. Bind
-    # only those exact textual path mentions; ambiguous changes remain invalid.
+    # semantics. Weak tool-calling models may omit it or attach a path to an
+    # operational "resource claim" task instead of the task that actually
+    # creates/uses the file. Reconcile the cross-reference from exact path
+    # mentions in the authored task contracts; never invent a path or change
+    # task meaning.
     for change_index, change in enumerate(expected_changes):
-        if change.get("supports_tasks"):
-            continue
         path = _text(change.get("path")).replace("\\", "/").casefold()
         if not path:
             continue
         matching_tasks: list[str] = []
         for task in tasks:
+            task_label = " ".join(
+                (_text(task.get("title")), _text(task.get("description")))
+            ).casefold()
             contract_text = "\n".join(
                 (
                     _text(task.get("title")),
@@ -532,14 +537,25 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
                 )
             ).replace("\\", "/").casefold()
             if path in contract_text:
+                # Resource leases are harness-owned control state, not a
+                # product task. If a provider creates a separate "resource
+                # claim" checklist item, keep the file claim attached to the
+                # authored implementation/verification task instead.
+                if any(
+                    marker in task_label
+                    for marker in ("resource claim", "accepted claim", "claim for")
+                ):
+                    continue
                 matching_tasks.append(str(task["id"]))
         if not matching_tasks and len(tasks) == 1:
             matching_tasks = [str(tasks[0]["id"])]
         if matching_tasks:
-            change["supports_tasks"] = list(dict.fromkeys(matching_tasks))
-            actions.append(
-                f"/expected_changes/{change_index}/supports_tasks bound from exact task path mentions"
-            )
+            current = list(dict.fromkeys(str(item).upper() for item in change.get("supports_tasks", ())))
+            if current != list(dict.fromkeys(matching_tasks)):
+                change["supports_tasks"] = list(dict.fromkeys(matching_tasks))
+                actions.append(
+                    f"/expected_changes/{change_index}/supports_tasks reconciled from exact task path mentions"
+                )
 
     # One repository fact commonly applies to the whole proposed plan (for
     # example, an empty-workspace inspection). Filling its omitted coverage is

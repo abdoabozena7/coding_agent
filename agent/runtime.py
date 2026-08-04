@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import difflib
 import hashlib
+import inspect
 import json
 import importlib.util
 import os
@@ -96,7 +97,7 @@ from .prompts import (
     state_envelope,
     subagent_system_prompt,
 )
-from .providers.base import AssistantTurn, ToolCall
+from .providers.base import AssistantTurn, ProviderActivityV1, ProviderCallPolicyV1, ToolCall
 from .plan_document import parse_plan_document, render_plan_document
 from .safety import ProgressWatchdog, redact_data, redact_text
 from .store import NotFoundError, StateStore, StateStoreError
@@ -121,6 +122,7 @@ from .action_policy import ApprovalRequirement, classify_action
 from .quality import ChangeSetStatus
 from .run_context import GoalContractV1, is_goal_escalation_approval
 from .semantic import (
+    canonicalize_requirement_anchors,
     RequestedEffect,
     ResourceClaimV1,
     SemanticGoalV2,
@@ -136,6 +138,8 @@ from .local_provider import (
     extract_first_json_object,
     normalize_action_proposal,
     normalize_generated_tool_payload,
+    ProviderFailureKind,
+    ProviderRequestError,
 )
 from .ultra_models import normalize_contract_path
 
@@ -161,6 +165,10 @@ class RuntimeStateError(RuntimeErrorBase):
     pass
 
 
+class HardStopError(RuntimeStateError):
+    """The user explicitly stopped the active provider/tool boundary."""
+
+
 class ProviderUnavailableError(RuntimeErrorBase):
     pass
 
@@ -177,6 +185,24 @@ def _provider_retry_after_seconds(exc: BaseException) -> int | None:
         match = re.search(r"retry[- ]after[^0-9]*(\d+)", str(exc), re.IGNORECASE)
         parsed = int(match.group(1)) if match else 0
     return max(1, min(parsed, 86_400)) if parsed > 0 else None
+
+
+def _provider_is_temporarily_overloaded(exc: BaseException) -> bool:
+    """Return whether retrying immediately would only repeat provider backpressure.
+
+    Ollama's cloud bridge commonly holds the request open for about a minute
+    before returning HTTP 503. Replaying that response through the ordinary
+    transport retry loop turns one recoverable boundary into several minutes
+    of apparent inactivity. This classifier is transport policy, not semantic
+    fallback: the exact turn stays durable and no route is guessed.
+    """
+
+    diagnostic = getattr(exc, "diagnostic", None)
+    status_code = getattr(diagnostic, "status_code", None)
+    provider_message = str(getattr(diagnostic, "provider_message", "") or "")
+    text = f"{provider_message} {exc}".casefold()
+    overloaded = "overloaded" in text or "service unavailable" in text
+    return bool(overloaded and (status_code in {None, 503} or "503" in text))
 
 
 @dataclass(frozen=True)
@@ -225,6 +251,25 @@ class WorkflowRuntimeSnapshotV1:
     heartbeat_age: float | None = None
     workspace_mutated: bool = False
     resume_action: str = ""
+    objective: str = ""
+    current_task_id: str = ""
+    active_actor: str = ""
+    active_step: int = 0
+    activity_sequence: int = 0
+    liveness: str = "ready"
+    active_operation: str = ""
+    provider_request_state: str = "idle"
+    received_bytes: int = 0
+    received_chunks: int = 0
+    received_tokens: int = 0
+    last_signal_at: float | None = None
+    timeline_preview: tuple[dict[str, Any], ...] = ()
+    stream_state: str = "idle"
+    stream_kind: str = "none"
+    safe_stream_preview: str = ""
+    first_byte_at: float | None = None
+    task_items: tuple[dict[str, Any], ...] = ()
+    next_task: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -244,6 +289,25 @@ class WorkflowRuntimeSnapshotV1:
             "heartbeat_age": self.heartbeat_age,
             "workspace_mutated": self.workspace_mutated,
             "resume_action": self.resume_action,
+            "objective": self.objective,
+            "current_task_id": self.current_task_id,
+            "active_actor": self.active_actor,
+            "active_step": self.active_step,
+            "activity_sequence": self.activity_sequence,
+            "liveness": self.liveness,
+            "active_operation": self.active_operation,
+            "provider_request_state": self.provider_request_state,
+            "received_bytes": self.received_bytes,
+            "received_chunks": self.received_chunks,
+            "received_tokens": self.received_tokens,
+            "last_signal_at": self.last_signal_at,
+            "timeline_preview": [dict(item) for item in self.timeline_preview],
+            "stream_state": self.stream_state,
+            "stream_kind": self.stream_kind,
+            "safe_stream_preview": self.safe_stream_preview,
+            "first_byte_at": self.first_byte_at,
+            "task_items": [dict(item) for item in self.task_items],
+            "next_task": self.next_task,
         }
 
 
@@ -323,6 +387,10 @@ class AgentRuntime:
         self.version_control = GitProtectionManager(self.workspace)
         self.events = events or EventBus()
         self.approval = approval or (lambda _name, _args, _risk: False)
+        # Optional bridge used by the loopback web workspace.  The terminal
+        # remains the owner of the live approval request; the bridge can only
+        # resolve a matching fingerprint through that owner.
+        self._external_tool_approval_resolver: Callable[[str, str], bool] | None = None
         self.config = config or RuntimeConfig.from_env()
         self.sleeper = sleeper
         self.model_descriptor = model_descriptor
@@ -330,11 +398,45 @@ class AgentRuntime:
         self.ultra_session: Any | None = None
         self._closed = False
         self._lock = RLock()
+        # Provider callbacks run on a dedicated worker while workflow methods
+        # may intentionally hold ``_lock`` across a governed model turn. Live
+        # counters must never contend with that state lock or both threads can
+        # wait on each other. Presentation telemetry therefore has its own
+        # narrow lock and never mutates durable workflow state.
+        self._live_activity_lock = RLock()
         self._work_conversation: list[dict[str, Any]] = []
         self._watchdog = ProgressWatchdog(self.config.repeated_action_limit)
         self._delegations_this_slice = 0
         self._provider_input_tokens = 0
         self._provider_output_tokens = 0
+        self._live_provider_activity: dict[str, Any] = {
+            "state": "idle",
+            "actor": "",
+            "operation": "",
+            "received_bytes": 0,
+            "received_chunks": 0,
+            "received_tokens": 0,
+            "started_at": None,
+            "last_signal_at": None,
+        }
+        try:
+            provider_parameters = inspect.signature(self.provider.call).parameters.values()
+            self._provider_accepts_activity = any(
+                item.name == "on_activity" or item.kind is inspect.Parameter.VAR_KEYWORD
+                for item in provider_parameters
+            )
+        except (TypeError, ValueError):
+            self._provider_accepts_activity = False
+        try:
+            provider_parameters = inspect.signature(self.provider.call).parameters.values()
+            self._provider_accepts_policy = any(
+                item.name == "policy" or item.kind is inspect.Parameter.VAR_KEYWORD
+                for item in provider_parameters
+            )
+        except (TypeError, ValueError):
+            self._provider_accepts_policy = False
+        self._stop_event = Event()
+        self._active_provider_abandon: Event | None = None
         self._worker_id = f"worker-{uuid.uuid4().hex[:16]}"
         self._foreign_execution_owner_live = False
         self.retry_ledger = RetryLedger()
@@ -658,7 +760,10 @@ class AgentRuntime:
             )
             model_name = str(getattr(provider_instance, "model", "unknown"))
             execution_class = (
-                "cloud" if provider_name in {"openai", "gemini"} else "local"
+                "cloud"
+                if provider_name in {"openai", "gemini"}
+                or model_name.casefold().endswith((":cloud", "-cloud"))
+                else "local"
             )
             concurrency = int(
                 self.config.ultra_local_concurrency
@@ -781,7 +886,17 @@ class AgentRuntime:
         waiting_on = ""
         resume_action = ""
         current_task = ""
+        current_task_id = ""
+        objective = str(
+            goal.objective
+            if goal is not None
+            else (pending or {}).get("original_input") or ""
+        )
+        active_actor = ""
+        active_step = 0
         last_tool = ""
+        task_items: list[dict[str, Any]] = []
+        next_task = ""
         mutated = bool((goal.metadata if goal is not None else {}).get("workspace_mutated"))
         if goal is not None:
             phase_by_status = {
@@ -828,7 +943,20 @@ class AgentRuntime:
             if plan is not None:
                 active = [task for task in plan.tasks if task.status.value in {"in_progress", "verifying"}]
                 if active:
-                    current_task = active[0].id
+                    current_task_id = active[0].id
+                    current_task = f"{active[0].id} · {active[0].title}"
+            if plan is not None:
+                for task in plan.tasks:
+                    status = str(task.status.value if hasattr(task.status, "value") else task.status)
+                    task_items.append({
+                        "id": str(task.id),
+                        "title": str(task.title),
+                        "status": status,
+                        "dependencies": list(getattr(task, "depends_on", ()) or ()),
+                        "evidence": " ".join(str(getattr(task, "evidence", "") or "").split()),
+                    })
+                    if not next_task and status in {"pending", "ready", "queued"}:
+                        next_task = str(task.title)
             actions = self.store.list_actions(goal.id, status="running")
             if actions:
                 last_tool = str(actions[-1].get("tool_name") or "")
@@ -856,6 +984,33 @@ class AgentRuntime:
             if events:
                 latest = events[-1]
                 payload = dict(latest.payload)
+                # State-transition events do not all repeat actor/step context.
+                # Preserve the newest explicit runtime identity instead of
+                # clearing the activity strip whenever a bookkeeping event wins.
+                contextual_payload = next(
+                    (
+                        dict(event.payload)
+                        for event in reversed(events)
+                        if event.payload.get("actor") or event.payload.get("active_actor")
+                    ),
+                    {},
+                )
+                active_actor = str(
+                    contextual_payload.get("active_actor")
+                    or contextual_payload.get("actor")
+                    or ""
+                )
+                try:
+                    active_step = max(
+                        0,
+                        int(
+                            contextual_payload.get("active_step")
+                            or contextual_payload.get("step")
+                            or 0
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    active_step = 0
                 running_actions = {
                     str(item.get("id") or ""): item
                     for item in self.store.list_actions(goal.id, status="running")
@@ -882,14 +1037,23 @@ class AgentRuntime:
                         phase = "starting"
                         waiting_on = "tool"
                     elif latest.event_type in {"tool.completed", "tool.failed"}:
-                        # A failed tool result is evidence for the coordinator's
-                        # repair loop, not a user boundary by itself. The goal
-                        # row remains authoritative until that loop persists a
-                        # real pause/blocker.
+                        # A completed action is ordinary work.  A failed action
+                        # may still be recoverable by the coordinator, but it
+                        # must never be projected as normal ``Working``: that
+                        # made the TUI look healthy while the user was staring
+                        # at a tool error.  ``retrying`` is an active repair
+                        # state; a later durable boundary promotes it to
+                        # ``paused`` with an explicit recovery action.
                         phase = "working"
                         waiting_on = ""
                         if latest.event_type == "tool.failed":
-                            reason = str(payload.get("result") or "The last tool failed; repair is continuing.")
+                            phase = "retrying"
+                            waiting_on = "coordinator"
+                            reason = str(
+                                payload.get("result")
+                                or "The last tool failed; the coordinator is repairing it."
+                            )
+                            resume_action = "Retry"
                 last_tool = last_tool or str(payload.get("tool") or payload.get("last_tool") or "")
                 if not waiting_on:
                     waiting_on = str(payload.get("waiting_on") or "")
@@ -906,7 +1070,82 @@ class AgentRuntime:
                 heartbeat_at = float(raw_heartbeat) if raw_heartbeat is not None else None
             except (TypeError, ValueError):
                 heartbeat_at = None
+        with self._live_activity_lock:
+            provider_activity = dict(self._live_provider_activity)
+        provider_signal = provider_activity.get("last_signal_at")
+        if provider_signal is not None:
+            try:
+                provider_signal = float(provider_signal)
+            except (TypeError, ValueError):
+                provider_signal = None
+        if provider_signal and (heartbeat_at is None or provider_signal > heartbeat_at):
+            heartbeat_at = provider_signal
         age = max(0.0, time.time() - heartbeat_at) if heartbeat_at else None
+        provider_state = str(provider_activity.get("state") or "idle")
+        # A live goal can remain RUNNING while the durable retry policy waits
+        # for its next attempt.  Project that boundary explicitly instead of
+        # leaving the header at a misleading generic Working/Planning state.
+        retry_scheduled = bool(
+            goal is not None
+            and str(goal.metadata.get("auto_retryable") or "").casefold() in {"true", "1"}
+            and int(goal.metadata.get("retry_after_ms", 0) or 0) > 0
+        )
+        provider_boundary = provider_state in {"failed", "network_unavailable"}
+        if (
+            (retry_scheduled or provider_boundary)
+            and goal is not None
+            and goal.status in {GoalStatus.RUNNING, GoalStatus.DISCOVERING, GoalStatus.REVISING}
+        ):
+            phase = "retrying"
+            waiting_on = "provider"
+            reason = str(
+                goal.metadata.get("retry_reason")
+                or goal.metadata.get("waiting_question")
+                or "The previous provider attempt failed; preparing a bounded retry."
+            )
+            resume_action = "Retry"
+        if phase == "completed":
+            liveness = "completed"
+        elif phase in {"paused", "retrying", "waiting_for_approval"}:
+            liveness = "waiting" if waiting_on == "user" else "paused"
+        elif provider_state == "receiving":
+            liveness = "receiving"
+        elif provider_state in {"request_created", "request_sent", "connection_opened", "provider_connected"}:
+            liveness = "request_sent"
+        elif provider_state == "server_processing":
+            liveness = "processing_response"
+        elif provider_state == "network_unavailable":
+            liveness = "network_unavailable"
+        elif provider_state == "completed" and phase in {"routing", "planning", "working", "reviewing"}:
+            liveness = "processing_response"
+        elif phase in {"routing", "planning", "starting", "working", "reviewing", "waiting_for_process"}:
+            liveness = "client_active"
+        else:
+            liveness = "ready"
+        stale_after = max(15.0, float(self.config.activity_heartbeat_seconds) * 4.0)
+        if liveness in {"client_active", "request_sent", "receiving", "processing_response"} and age is not None and age > stale_after:
+            liveness = "stalled"
+        actor_label = (active_actor or str(provider_activity.get("actor") or "")).replace("-", " ").replace("_", " ").strip().title()
+        active_operation = str(provider_activity.get("operation") or "")
+        if not active_operation:
+            active_operation = current_task or reason or (
+                f"{actor_label} is active" if actor_label else phase.replace("_", " ").title()
+            )
+        timeline = tuple(
+            item.to_dict()
+            for item in self.events.list_live_events(
+                after_sequence=max(0, self.events.latest_sequence - 24),
+                limit=24,
+            )[-8:]
+        )
+        stream_kind = str(provider_activity.get("stream_kind") or "none")
+        stream_state = str(provider_activity.get("stream_state") or "idle")
+        safe_stream_preview = str(provider_activity.get("safe_stream_preview") or "")[-4_000:]
+        first_byte_at = provider_activity.get("first_byte_at")
+        try:
+            first_byte_at = float(first_byte_at) if first_byte_at is not None else None
+        except (TypeError, ValueError):
+            first_byte_at = None
         return WorkflowRuntimeSnapshotV1(
             session_mode=("plan" if self.interaction_mode is InteractionModeV2.PLAN else "working")
             if (goal is not None or pending is not None)
@@ -926,6 +1165,25 @@ class AgentRuntime:
             heartbeat_age=age,
             workspace_mutated=mutated,
             resume_action=resume_action,
+            objective=objective,
+            current_task_id=current_task_id,
+            active_actor=active_actor,
+            active_step=active_step,
+            activity_sequence=self.events.latest_sequence,
+            liveness=liveness,
+            active_operation=active_operation,
+            provider_request_state=provider_state,
+            received_bytes=max(0, int(provider_activity.get("received_bytes") or 0)),
+            received_chunks=max(0, int(provider_activity.get("received_chunks") or 0)),
+            received_tokens=max(0, int(provider_activity.get("received_tokens") or 0)),
+            last_signal_at=provider_signal or heartbeat_at,
+            timeline_preview=timeline,
+            stream_state=stream_state,
+            stream_kind=stream_kind,
+            safe_stream_preview=safe_stream_preview,
+            first_byte_at=first_byte_at,
+            task_items=tuple(task_items),
+            next_task=next_task,
         )
 
     # Short alias for API consumers that use the “runtime snapshot” wording.
@@ -1159,7 +1417,8 @@ class AgentRuntime:
     def execution_class(self) -> str:
         if self.model_descriptor is not None:
             return self.model_descriptor.execution_class.value
-        return "cloud" if self.provider_name in {"openai", "gemini"} else "local"
+        model = self.model_name.casefold()
+        return "cloud" if self.provider_name in {"openai", "gemini"} or model.endswith((":cloud", "-cloud")) else "local"
 
     @property
     def access_level(self) -> str:
@@ -1838,6 +2097,8 @@ class AgentRuntime:
         value = str(text)
         if not value.strip():
             return None
+        if self.active_goal() is None:
+            self._stop_event.clear()
         pending = self.store.get_pending_intake(self.session_id)
         if pending is not None:
             unanswered = [
@@ -2551,10 +2812,78 @@ class AgentRuntime:
     def active_goal(self) -> Goal | None:
         return self.store.load_active_goal(self.session_id)
 
+    def set_external_tool_approval_resolver(
+        self,
+        resolver: Callable[[str, str], bool] | None,
+    ) -> None:
+        """Attach the owning UI's resolver for loopback web approvals."""
+
+        self._external_tool_approval_resolver = resolver
+
+    def resolve_tool_approval(self, action_fingerprint: str, decision: str) -> bool:
+        """Resolve one visible tool approval without weakening the policy.
+
+        This deliberately does not approve from durable metadata alone: an
+        active terminal attention request must confirm the exact fingerprint.
+        That prevents a stale browser tab from authorizing a different command.
+        """
+
+        resolver = self._external_tool_approval_resolver
+        if resolver is None:
+            goal = self.active_goal()
+            pending = dict(goal.metadata.get("pending_tool_approval") or {}) if goal is not None else {}
+            if goal is None or str(pending.get("action_fingerprint") or "") != str(action_fingerprint or ""):
+                return False
+            value = str(decision or "").strip().casefold()
+            if value not in {"allow", "approve", "allow_once", "deny", "reject"}:
+                return False
+            pending["decision"] = "allow_once" if value in {"allow", "approve", "allow_once"} else "deny"
+            self.store.update_goal_metadata(goal.id, pending_tool_approval=pending)
+            return True
+        try:
+            if bool(resolver(str(action_fingerprint or ""), str(decision or ""))):
+                return True
+            # The owning UI may have been recreated after restart and have no
+            # in-memory request. Fall through to the durable one-shot marker.
+            goal = self.active_goal()
+            pending = dict(goal.metadata.get("pending_tool_approval") or {}) if goal is not None else {}
+            if goal is None or str(pending.get("action_fingerprint") or "") != str(action_fingerprint or ""):
+                return False
+            value = str(decision or "").strip().casefold()
+            if value not in {"allow", "approve", "allow_once", "deny", "reject"}:
+                return False
+            pending["decision"] = "allow_once" if value in {"allow", "approve", "allow_once"} else "deny"
+            self.store.update_goal_metadata(goal.id, pending_tool_approval=pending)
+            return True
+        except Exception as exc:
+            self.store.append_event(
+                "approval.resolution_failed",
+                goal_id=(self.active_goal().id if self.active_goal() is not None else None),
+                entity_type="tool",
+                payload={"reason": str(exc)[:500]},
+            )
+            return False
+
     def _approval_allowed(self, name: str, args: dict[str, Any], risk: str) -> bool:
         """Normalize legacy booleans and explicit interactive decisions."""
 
         goal = self.active_goal()
+        approval_task = ""
+        approval_task_id = ""
+        if goal is not None:
+            approval_plan = self.store.get_latest_plan(goal.id)
+            if approval_plan is not None:
+                active = next(
+                    (
+                        task
+                        for task in approval_plan.tasks
+                        if task.status in {TaskStatus.IN_PROGRESS, TaskStatus.VERIFYING}
+                    ),
+                    None,
+                )
+                if active is not None:
+                    approval_task_id = active.id
+                    approval_task = f"{active.id} · {active.title}"
         approval_fingerprint = hashlib.sha256(
             json.dumps({"tool": name, "args": redact_data(args), "risk": risk}, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
@@ -2572,7 +2901,30 @@ class AgentRuntime:
             risk=risk,
             action_fingerprint=approval_fingerprint,
             waiting_on="user",
+            phase="waiting_for_approval",
+            objective=(goal.objective if goal is not None else ""),
+            current_task=approval_task,
+            current_task_id=approval_task_id,
+            active_actor="coordinator",
         )
+        # Persist the exact boundary before entering the UI callback.  If the
+        # terminal is refreshed, or the browser is opened in another tab, the
+        # pending action can still be reconstructed without replaying the
+        # command.  This metadata is cleared only after the matching approval
+        # is received (or retained as a paused checkpoint when denied).
+        if goal is not None:
+            self.store.update_goal_metadata(
+                goal.id,
+                pending_tool_approval={
+                    "tool": name,
+                    "arguments": redact_data(dict(args)),
+                    "risk": risk,
+                    "action_id": approval_fingerprint,
+                    "action_fingerprint": approval_fingerprint,
+                },
+                waiting_on="approval",
+                resume_action="Retry",
+            )
         session = self.store.get_workflow_session(self.session_id)
         sleep_enabled = str(session.get("sleep_state") or "off") == "on"
         policy = classify_action(
@@ -2617,7 +2969,20 @@ class AgentRuntime:
                 action_fingerprint=approval_fingerprint,
             )
         else:
-            decision = self.approval(name, args, risk)
+            pending = goal.metadata.get("pending_tool_approval") if goal is not None else None
+            pending = dict(pending) if isinstance(pending, Mapping) else {}
+            pending_fingerprint = str(pending.get("action_fingerprint") or "")
+            pending_decision = str(pending.get("decision") or "").casefold()
+            if pending_fingerprint == approval_fingerprint and pending_decision in {
+                "allow", "allow_once", "allow_session", "deny", "reject"
+            }:
+                # A browser or recovered terminal may have answered while no
+                # in-memory callback was alive. Consume that one-shot decision
+                # here; the normal approval.received/checkpoint events below
+                # remain authoritative and are emitted exactly once.
+                decision = pending_decision
+            else:
+                decision = self.approval(name, args, risk)
         if isinstance(decision, bool):
             allowed = decision
         else:
@@ -2655,6 +3020,11 @@ class AgentRuntime:
                 tool=name,
                 action_fingerprint=approval_fingerprint,
                 waiting_on="tool",
+                phase="starting",
+                objective=(goal.objective if goal is not None else ""),
+                current_task=approval_task,
+                current_task_id=approval_task_id,
+                active_actor="coordinator",
             )
         return allowed
 
@@ -2683,6 +3053,41 @@ class AgentRuntime:
     def sleep_mode_enabled(self) -> bool:
         session = self.store.get_workflow_session(self.session_id)
         return str(session.get("sleep_state") or "off") == "on"
+
+    def auto_resolve_pending_sleep_approval(self) -> bool:
+        """Re-evaluate the currently visible approval after Sleep is enabled.
+
+        Sleep remains policy-bound: only AUTO actions and reversible project
+        checks/previews are eligible.  The exact durable fingerprint is used
+        so enabling Sleep cannot approve a stale or different action.
+        """
+
+        if not self.sleep_mode_enabled():
+            return False
+        goal = self.active_goal()
+        pending = dict(goal.metadata.get("pending_tool_approval") or {}) if goal is not None else {}
+        fingerprint = str(pending.get("action_fingerprint") or "")
+        tool = str(pending.get("tool") or "")
+        arguments = pending.get("arguments")
+        if not fingerprint or not tool or not isinstance(arguments, Mapping):
+            return False
+        policy = classify_action(
+            tool,
+            dict(arguments),
+            workspace=str(self.workspace),
+            sandboxed=self.access_level == "full",
+        )
+        safe = (
+            policy.requirement is ApprovalRequirement.AUTO
+            or (
+                policy.requirement is ApprovalRequirement.SESSION
+                and policy.group in {"project_checks", "project_preview"}
+            )
+            or (tool == "stop_preview" and policy.group == "host_action")
+        )
+        if not safe:
+            return False
+        return bool(self.resolve_tool_approval(fingerprint, "allow_once"))
 
     def _checkpoint_tool_approval_boundary(
         self,
@@ -2965,6 +3370,47 @@ class AgentRuntime:
         reserved = fixed_chars + max(4_000, output_tokens * 3)
         return max(4_000, min(configured, total_chars - reserved))
 
+    def _provider_call_policy(self, actor: str) -> ProviderCallPolicyV1:
+        """Return conservative, stage-specific budgets for local-first runs."""
+        name = str(actor or "").casefold()
+        if name == "semantic-router":
+            tokens, deadline = 1_536, 120.0
+        elif name == "semantic-goal-intake":
+            tokens, deadline = 2_048, 180.0
+        elif name in {"semantic-goal", "semantic-interpretation"}:
+            tokens, deadline = 6_144, 240.0
+        elif name in {"planner", "plan-reviewer"}:
+            tokens, deadline = (8_192 if name == "planner" else 4_096), 360.0
+        else:
+            tokens, deadline = None, 900.0
+        effort = str(getattr(self.provider, "reasoning_effort", "") or "") or None
+        return ProviderCallPolicyV1(
+            stage=name,
+            max_output_tokens=tokens,
+            reasoning_effort=effort,
+            stage_deadline_seconds=deadline,
+        )
+
+    @staticmethod
+    def _is_transport_boundary(exc: BaseException) -> bool:
+        diagnostic = getattr(exc, "diagnostic", None)
+        kind = getattr(diagnostic, "kind", None)
+        kind_value = str(getattr(kind, "value", kind) or "")
+        if kind in {
+            ProviderFailureKind.DNS_OR_SOCKET,
+            ProviderFailureKind.CONNECTION_REFUSED,
+            ProviderFailureKind.TIMEOUT,
+        } or kind_value in {
+            item.value for item in (
+                ProviderFailureKind.DNS_OR_SOCKET,
+                ProviderFailureKind.CONNECTION_REFUSED,
+                ProviderFailureKind.TIMEOUT,
+            )
+        }:
+            return True
+        text = str(getattr(diagnostic, "provider_message", "") or exc).casefold()
+        return any(marker in text for marker in ("offline", "network unavailable", "connection refused", "dns failure", "no route to host", "timed out"))
+
     def _call_provider(
         self,
         conversation: list[dict[str, Any]],
@@ -3081,6 +3527,9 @@ class AgentRuntime:
         }
         provider_conversation = [dict(message) for message in conversation]
         contract_repairs = 0
+        policy = self._provider_call_policy(actor)
+        transport_recovery_attempted = False
+        transport_recovery_succeeded = False
         for attempt in range(self.config.max_provider_retries + 1):
             try:
                 while True:
@@ -3089,7 +3538,9 @@ class AgentRuntime:
                         schemas,
                         system,
                         actor=actor,
+                        step=step,
                         stream_text=stream_text,
+                        policy=policy,
                     )
                     if not isinstance(turn, AssistantTurn):
                         raise TypeError(
@@ -3241,8 +3692,11 @@ class AgentRuntime:
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as exc:
+                if isinstance(exc, HardStopError):
+                    raise
                 last_error = exc
                 message = redact_text(exc, 500)
+                provider_overloaded = _provider_is_temporarily_overloaded(exc)
                 retry_record = self.retry_ledger.record(
                     RetryKind.PROVIDER_TRANSPORT,
                     stage=actor,
@@ -3250,6 +3704,9 @@ class AgentRuntime:
                     input_value={"step": step, "conversation_messages": len(conversation)},
                     output_value={"error_type": type(exc).__name__},
                     next_action=(
+                        "retry_later"
+                        if provider_overloaded
+                        else
                         "retry_same_provider"
                         if not isinstance(exc, (AssertionError, TypeError, ValueError))
                         and attempt < self.config.max_provider_retries
@@ -3276,9 +3733,47 @@ class AgentRuntime:
                     marker in message.casefold()
                     for marker in ("429", "quota", "authentication", "unauthorized", "forbidden")
                 )
+                transport_boundary = self._is_transport_boundary(exc)
+                if transport_recovery_succeeded:
+                    # The one automatic reconnect was consumed; a second
+                    # failure is a manual retry boundary.
+                    transport_recovery_succeeded = False
+                if transport_boundary and not transport_recovery_attempted:
+                    diagnose = getattr(self.provider, "diagnose_connectivity", None)
+                    if callable(diagnose):
+                        transport_recovery_attempted = True
+                        self.events.publish(
+                            "provider.activity",
+                            "Provider connection lost · checking for recovery",
+                            actor=actor, phase=actor, state="waiting",
+                            provider_state="network_unavailable", waiting_on="network",
+                            heartbeat_at=time.time(),
+                        )
+                        self.sleeper(5.0)
+                        try:
+                            diagnosis = diagnose()
+                            reachable = bool(
+                                getattr(diagnosis, "reachable", None)
+                                if not isinstance(diagnosis, Mapping)
+                                else diagnosis.get("reachable")
+                            )
+                        except Exception:
+                            reachable = False
+                        if reachable:
+                            self.events.publish(
+                                "provider.activity",
+                                "Provider connection restored · resuming the same saved stage",
+                                actor=actor, phase=actor, state="active",
+                                provider_state="provider_connected", waiting_on="model",
+                                heartbeat_at=time.time(),
+                            )
+                            transport_recovery_succeeded = True
+                            continue
                 if (
                     isinstance(exc, (AssertionError, TypeError, ValueError))
                     or fatal_provider_state
+                    or provider_overloaded
+                    or (transport_boundary and not transport_recovery_succeeded)
                     or attempt >= self.config.max_provider_retries
                 ):
                     break
@@ -3292,9 +3787,19 @@ class AgentRuntime:
                     self.sleeper(delay)
         assert last_error is not None
         unavailable = ProviderUnavailableError(
-            f"provider unavailable after retries: {type(last_error).__name__}: {redact_text(last_error, 500)}"
+            (
+                "Internet/provider unavailable; saved stage unchanged: "
+                if self._is_transport_boundary(last_error)
+                else
+                "provider is temporarily overloaded; the saved request was not replayed: "
+                if _provider_is_temporarily_overloaded(last_error)
+                else "provider unavailable after retries: "
+            )
+            + f"{type(last_error).__name__}: {redact_text(last_error, 500)}"
         )
         retry_after = _provider_retry_after_seconds(last_error)
+        if retry_after is None and _provider_is_temporarily_overloaded(last_error):
+            retry_after = 30
         if retry_after is not None:
             setattr(unavailable, "retry_after_seconds", retry_after)
         raise unavailable from last_error
@@ -3306,7 +3811,9 @@ class AgentRuntime:
         system: str,
         *,
         actor: str,
+        step: int = 0,
         stream_text: bool,
+        policy: ProviderCallPolicyV1 | None = None,
     ) -> AssistantTurn:
         """Bound a provider call and report liveness without replaying tools."""
 
@@ -3316,31 +3823,232 @@ class AgentRuntime:
             )
         results: Queue[tuple[str, Any]] = Queue(maxsize=1)
         abandoned = Event()
+        self._active_provider_abandon = abandoned
         started_at = time.monotonic()
         signal_at = [started_at]
+        actor_name = str(actor).casefold()
+        provider_phase = (
+            "routing"
+            if actor_name == "semantic-router"
+            else "planning"
+            if actor_name in {"semantic-goal-intake", "planner", "plan-reviewer"}
+            else "working"
+        )
+        structured_call = bool(schemas)
+        request_operation = (
+            f"Calling {self.model_name} for {actor}"
+            + (" · structured response is atomic" if structured_call else "")
+        )
+        provider_goal = self.active_goal()
+        self.events.publish(
+            "workflow.state",
+            f"Request created for {actor}",
+            actor=actor,
+            active_actor=actor,
+            active_step=step,
+            phase=provider_phase,
+            waiting_on="model",
+            reason="The provider request was created",
+            objective=(provider_goal.objective if provider_goal is not None else ""),
+            model=self.model_name,
+            provider=self.provider_name,
+        )
+
+        with self._live_activity_lock:
+            self._live_provider_activity = {
+                "state": "client_active",
+                "actor": actor,
+                "operation": request_operation,
+                "received_bytes": 0,
+                "received_chunks": 0,
+                "received_tokens": 0,
+                "stream_kind": "chat" if not structured_call else "structured",
+                "stream_state": "active",
+                "safe_stream_preview": "",
+                "first_byte_at": None,
+                "started_at": time.time(),
+                "last_signal_at": time.time(),
+            }
+        self.events.publish(
+            "provider.activity",
+            f"Request created for {actor}",
+            source_kind="MODEL",
+            actor=actor,
+            phase=provider_phase,
+            state="started",
+            provider_state="request_created",
+            operation=request_operation,
+            waiting_on="provider",
+            elapsed_seconds=0,
+            received_bytes=0,
+            received_chunks=0,
+            received_tokens=0,
+            heartbeat_at=time.time(),
+        )
+        self.events.publish(
+            "provider.activity",
+            f"Opening {self.model_name} request for {actor}",
+            source_kind="MODEL",
+            actor=actor,
+            phase=provider_phase,
+            state="started",
+            provider_state="request_created",
+            operation=f"Calling {self.model_name} for {actor}",
+            waiting_on="model",
+            elapsed_seconds=0,
+            received_bytes=0,
+            received_chunks=0,
+            received_tokens=0,
+            heartbeat_at=time.time(),
+        )
+
+        def provider_activity(activity: ProviderActivityV1) -> None:
+            if abandoned.is_set():
+                return
+            signal_at[0] = time.monotonic()
+            now_wall = time.time()
+            with self._live_activity_lock:
+                current = dict(self._live_provider_activity)
+                first_chunk = (
+                    activity.state == "receiving"
+                    and int(current.get("received_chunks") or 0) == 0
+                )
+                if activity.state == "receiving":
+                    current["received_bytes"] = int(current.get("received_bytes") or 0) + max(0, int(activity.received_bytes or 0))
+                    current["received_chunks"] = int(current.get("received_chunks") or 0) + max(0, int(activity.received_chunks or 0))
+                    current["received_tokens"] = int(current.get("received_tokens") or 0) + max(0, int(activity.received_tokens or 0))
+                elif activity.received_tokens:
+                    current["received_tokens"] = max(
+                        int(current.get("received_tokens") or 0),
+                        int(activity.received_tokens),
+                    )
+                current["state"] = str(activity.state or current.get("state") or "client_active")
+                current["last_signal_at"] = now_wall
+                if activity.state == "receiving" and current.get("first_byte_at") is None:
+                    current["first_byte_at"] = now_wall
+                current["stream_state"] = (
+                    "receiving" if activity.state == "receiving"
+                    else "validating" if activity.state == "completed"
+                    else "waiting" if activity.state in {"failed", "network_unavailable"}
+                    else "active"
+                )
+                current["operation"] = (
+                    f"Receiving {self.model_name} response for {actor}"
+                    if current["state"] == "receiving"
+                    else f"Processing {self.model_name} response for {actor}"
+                    if current["state"] == "completed"
+                    else request_operation
+                )
+                self._live_provider_activity = current
+            state_label = str(activity.state or "active").replace("_", " ")
+            message = (
+                "First response bytes received"
+                if first_chunk
+                else "Model response bytes received"
+                if activity.state == "receiving"
+                else "Model response received; validating it"
+                if activity.state == "completed"
+                else f"Provider {state_label}"
+            )
+            self.events.publish(
+                "provider.activity",
+                message,
+                source_kind="MODEL",
+                actor=actor,
+                phase=provider_phase,
+                state=("receiving" if activity.state == "receiving" else "completed" if activity.state == "completed" else "active"),
+                provider_state=activity.state,
+                operation=current["operation"],
+                detail=activity.detail,
+                waiting_on="model" if activity.state != "completed" else "harness",
+                elapsed_seconds=max(0, int(time.monotonic() - started_at)),
+                received_bytes=current["received_bytes"],
+                received_chunks=current["received_chunks"],
+                received_tokens=current["received_tokens"],
+                heartbeat_at=now_wall,
+            )
 
         def signal(kind: str, fragment: Any) -> None:
             signal_at[0] = time.monotonic()
             if abandoned.is_set():
                 return
+            if kind == "model_text" and not structured_call:
+                with self._live_activity_lock:
+                    current = dict(self._live_provider_activity)
+                    current["safe_stream_preview"] = (
+                        str(current.get("safe_stream_preview") or "") + str(fragment)
+                    )[-4_000:]
+                    current["stream_kind"] = "chat"
+                    current["stream_state"] = "receiving"
+                    current.setdefault("first_byte_at", time.time())
+                    self._live_provider_activity = current
+            if not self._provider_accepts_activity and kind in {"model_text", "model_thought"}:
+                provider_activity(ProviderActivityV1(
+                    state="receiving",
+                    received_bytes=len(str(fragment).encode("utf-8", errors="replace")),
+                    received_chunks=1,
+                ))
             self.events.publish(kind, str(fragment), actor=actor)
 
         def invoke() -> None:
             try:
+                call_kwargs: dict[str, Any] = {
+                    "on_text": (
+                        (lambda fragment: signal("model_text", fragment))
+                        if stream_text else None
+                    ),
+                    "on_thought": lambda fragment: signal("model_thought", fragment),
+                }
+                if self._provider_accepts_activity:
+                    call_kwargs["on_activity"] = provider_activity
+                if self._provider_accepts_policy and policy is not None:
+                    call_kwargs["policy"] = policy
                 value = self.provider.call(
                     list(conversation),
                     list(schemas),
                     system,
-                    on_text=(
-                        (lambda fragment: signal("model_text", fragment))
-                        if stream_text else None
-                    ),
-                    on_thought=lambda fragment: signal("model_thought", fragment),
+                    **call_kwargs,
                 )
             except BaseException as exc:
+                diagnostic = getattr(exc, "diagnostic", None)
+                transport_state = (
+                    "network_unavailable"
+                    if self._is_transport_boundary(exc)
+                    else "failed"
+                )
+                with self._live_activity_lock:
+                    self._live_provider_activity["state"] = transport_state
+                    self._live_provider_activity["stream_state"] = "waiting"
+                    self._live_provider_activity["last_signal_at"] = time.time()
+                if transport_state == "network_unavailable":
+                    self.events.publish(
+                        "provider.activity",
+                        "Internet/provider unavailable · saved stage unchanged",
+                        source_kind="MODEL", actor=actor, phase=provider_phase,
+                        state="waiting", provider_state=transport_state,
+                        operation=f"Waiting for {self.provider_name} connectivity",
+                        waiting_on="network",
+                        detail=str(getattr(diagnostic, "provider_message", "") or exc),
+                        heartbeat_at=time.time(), elapsed_seconds=max(0, int(time.monotonic() - started_at)),
+                    )
+                self.events.publish(
+                    "provider.activity",
+                    f"Provider request failed: {type(exc).__name__}",
+                    source_kind="MODEL",
+                    actor=actor,
+                    phase=provider_phase,
+                    state=("waiting" if transport_state == "network_unavailable" else "failed"),
+                    provider_state=transport_state,
+                    operation=f"{self.model_name} request failed",
+                    waiting_on="retry",
+                    elapsed_seconds=max(0, int(time.monotonic() - started_at)),
+                    heartbeat_at=time.time(),
+                )
                 results.put(("error", exc))
             else:
                 signal_at[0] = time.monotonic()
+                if not self._provider_accepts_activity:
+                    provider_activity(ProviderActivityV1(state="completed"))
                 results.put(("result", value))
 
         worker = Thread(
@@ -3353,6 +4061,10 @@ class AgentRuntime:
         next_heartbeat = started_at + heartbeat
         cloud = self.execution_class == "cloud"
         slow_warning_sent = False
+        local_poll_at = started_at + 5.0
+        connectivity_probe_at = started_at + 5.0
+        diagnostic_in_flight = False
+        diagnostic_results: Queue[dict[str, Any]] = Queue()
         while True:
             try:
                 kind, value = results.get(timeout=min(1.0, float(heartbeat)))
@@ -3360,13 +4072,83 @@ class AgentRuntime:
                 now = time.monotonic()
                 total = now - started_at
                 quiet = now - signal_at[0]
+                if self._stop_event.is_set():
+                    abandoned.set()
+                    cancel = getattr(self.provider, "cancel_active_request", None) or getattr(self.provider, "cancel", None)
+                    if callable(cancel):
+                        try:
+                            cancel()
+                        except Exception:
+                            pass
+                    self.events.publish(
+                        "provider.activity", "Request stopped by user", actor=actor,
+                        phase=provider_phase, state="stopped", provider_state="stopped",
+                        operation=f"Stopped {self.model_name} for {actor}", waiting_on="user",
+                        heartbeat_at=time.time(), elapsed_seconds=int(total),
+                    )
+                    raise HardStopError("provider request stopped by user; saved stage is resumable")
+                if not diagnostic_in_flight and now >= local_poll_at:
+                    diagnostic = getattr(self.provider, "diagnose_activity", None) if self.execution_class == "local" else getattr(self.provider, "diagnose_connectivity", None)
+                    if callable(diagnostic):
+                        diagnostic_in_flight = True
+                        def diagnose() -> None:
+                            try:
+                                value = diagnostic()
+                                if isinstance(value, Mapping):
+                                    diagnostic_results.put(dict(value))
+                                else:
+                                    diagnostic_results.put({"state": str(value)})
+                            except Exception as exc:
+                                diagnostic_results.put({"state": "unavailable", "detail": f"{type(exc).__name__}: {exc}"})
+                        Thread(target=diagnose, name=f"ga3bad-provider-diagnose-{actor[:16]}", daemon=True).start()
+                    local_poll_at = now + 5.0
+                try:
+                    diagnosis = diagnostic_results.get_nowait()
+                except Empty:
+                    diagnosis = None
+                if diagnosis:
+                    diagnostic_in_flight = False
+                    dstate = str(diagnosis.get("state") or "")
+                    if self.execution_class == "local" and dstate == "generating":
+                        self.events.publish(
+                            "provider.activity",
+                            "Ollama is actively generating on GPU · structured response is atomic",
+                            source_kind="MODEL", actor=actor, phase=provider_phase,
+                            state="active", provider_state="server_processing",
+                            operation=f"Local model generating for {actor}", waiting_on="model",
+                            received_bytes=0, received_chunks=0, heartbeat_at=time.time(),
+                        )
+                    elif self.execution_class == "cloud" and not bool(diagnosis.get("reachable", True)):
+                        self.events.publish(
+                            "provider.activity",
+                            "Internet/provider unavailable · saved stage unchanged",
+                            source_kind="MODEL", actor=actor, phase=provider_phase,
+                            state="waiting", provider_state="network_unavailable",
+                            operation=f"Waiting for {self.provider_name} connectivity", waiting_on="network",
+                            detail=str(diagnosis.get("detail") or diagnosis.get("state") or ""),
+                            heartbeat_at=time.time(),
+                        )
                 if now >= next_heartbeat:
+                    with self._live_activity_lock:
+                        live_activity = dict(self._live_provider_activity)
                     self.events.publish(
                         "heartbeat",
-                        f"{actor} provider request is active",
+                        f"{actor} provider request is open",
                         actor=actor,
                         elapsed_seconds=int(total),
                         quiet_seconds=int(quiet),
+                        phase=provider_phase,
+                        waiting_on="model",
+                        heartbeat_at=time.time(),
+                        active_actor=actor,
+                        active_step=step,
+                        source_kind="MODEL",
+                        state="active",
+                        provider_state=str(live_activity.get("state") or "client_active"),
+                        operation=str(live_activity.get("operation") or f"Calling {self.model_name}"),
+                        received_bytes=int(live_activity.get("received_bytes") or 0),
+                        received_chunks=int(live_activity.get("received_chunks") or 0),
+                        received_tokens=int(live_activity.get("received_tokens") or 0),
                     )
                     try:
                         session = self.store.get_workflow_session(self.session_id)
@@ -3387,16 +4169,20 @@ class AgentRuntime:
                     slow_warning_sent = True
                     self.events.publish(
                         "warning",
-                        f"{actor} provider stream has been quiet for {int(quiet)} seconds; "
-                        "the saved task remains active.",
+                        f"Still calling {self.model_name} for {actor}; no response bytes for "
+                        f"{int(quiet)} seconds. The request is saved and no workspace action "
+                        "has been replayed.",
                         actor=actor,
                         non_blocking=True,
+                        phase=provider_phase,
+                        waiting_on="model",
                     )
-                timed_out = total >= self.config.provider_call_timeout_seconds
+                deadline = float(policy.stage_deadline_seconds) if policy and policy.stage_deadline_seconds else float(self.config.provider_call_timeout_seconds)
+                timed_out = total >= deadline
                 silent = cloud and quiet >= self.config.cloud_idle_timeout_seconds
                 if timed_out or silent:
                     abandoned.set()
-                    cancel = getattr(self.provider, "cancel", None)
+                    cancel = getattr(self.provider, "cancel_active_request", None) or getattr(self.provider, "cancel", None)
                     if callable(cancel):
                         try:
                             cancel()
@@ -3405,12 +4191,15 @@ class AgentRuntime:
                     reason = (
                         f"cloud stream was silent for {int(quiet)} seconds"
                         if silent
-                        else f"provider call exceeded {self.config.provider_call_timeout_seconds} seconds"
+                        else f"provider call exceeded {int(deadline)} seconds"
                     )
                     raise TimeoutError(reason)
                 continue
             if kind == "error":
                 raise value
+            if abandoned.is_set() or self._stop_event.is_set():
+                raise HardStopError("provider response arrived after the request was stopped")
+            self._active_provider_abandon = None
             return value
 
     def start_goal(
@@ -3422,6 +4211,7 @@ class AgentRuntime:
         entry_surface: str = "goal",
     ) -> Plan | None:
         with self._lock:
+            self._stop_event.clear()
             # Durable objective state preserves the exact user request. Trace
             # and tool records are redacted separately at their boundaries.
             safe_objective = str(objective)
@@ -3564,9 +4354,16 @@ class AgentRuntime:
             except ProviderUnavailableError as exc:
                 self.store.append_event("planning.checkpoint", goal_id=goal.id, payload={"error": redact_text(exc, 500)})
                 retry_after = getattr(exc, "retry_after_seconds", None)
+                overloaded = "temporarily overloaded" in str(exc).casefold()
                 self.store.update_goal_metadata(
                     goal.id,
                     waiting_question=(
+                        (
+                            "The selected provider is temporarily overloaded at a saved planning checkpoint. "
+                            "Retry after the shown backoff or change model; no work was replayed and no local fallback was applied."
+                        )
+                        if overloaded
+                        else
                         "The provider retries were exhausted at a saved planning checkpoint. "
                         "Choose retry, wait, or change model; no local fallback was applied."
                     ),
@@ -3604,19 +4401,31 @@ class AgentRuntime:
         state = dict(session.get("state", {}))
         state["pending_semantic_turn"] = dict(turn)
         decision = turn.get("route_decision") or turn.get("decision")
-        if str(turn.get("status") or "").casefold() in {"routing", "awaiting_provider"}:
+        pending_status = str(turn.get("status") or "").casefold()
+        # A provider boundary during Goal Intake must not erase the route that
+        # the preceding semantic stage already accepted. Only the route stage
+        # itself is genuinely pending.
+        if pending_status == "routing" or (
+            pending_status == "awaiting_provider" and not isinstance(decision, Mapping)
+        ):
             state["route"] = "pending"
         elif isinstance(decision, Mapping):
             state["route"] = str(decision.get("route") or state.get("route") or "pending")
             strategy = turn.get("strategy_decision")
             if isinstance(strategy, Mapping) and strategy.get("strategy"):
                 state["execution_strategy"] = str(strategy["strategy"])
+        run_state = str(session["run_state"])
+        if session.get("goal_id") is None:
+            if pending_status == "awaiting_provider":
+                run_state = RunState.BLOCKED.value
+            elif pending_status and pending_status != "completed":
+                run_state = RunState.PLANNING.value
         self.store.save_workflow_session(
             self.session_id,
             goal_id=session.get("goal_id"),
             session_mode=str(session["session_mode"]),
             plan_state=str(session["plan_state"]),
-            run_state=str(session["run_state"]),
+            run_state=run_state,
             ultra_profile=str(session.get("ultra_profile", "standard")),
             sleep_state=str(session.get("sleep_state", "off")),
             state=state,
@@ -3919,6 +4728,10 @@ class AgentRuntime:
                     entity_id=str(pending["turn_id"]),
                     payload={"error": redact_text(exc, 500), "resumable": True},
                 )
+                self._release_execution_lease(
+                    stage="provider:semantic-router",
+                    state="boundary",
+                )
                 raise
             conversation.append(turn.to_message())
             structural_error = ""
@@ -4183,6 +4996,10 @@ class AgentRuntime:
                             "resumable": True,
                         },
                     )
+                    self._release_execution_lease(
+                        stage="provider:semantic-goal-intake",
+                        state="boundary",
+                    )
                     raise
                 conversation.append(turn.to_message())
                 structural_error = ""
@@ -4410,6 +5227,7 @@ class AgentRuntime:
                 constraints=semantic.constraints,
                 exclusions=semantic.exclusions,
                 acceptance_criteria=semantic.acceptance_criteria,
+                requirement_anchors=semantic.requirement_anchors,
                 unresolved_decisions=semantic.unresolved_decisions,
                 repository_evidence_refs=(f"inspection:{only_inspection}",),
                 status=semantic.status,
@@ -4436,6 +5254,7 @@ class AgentRuntime:
                 constraints=semantic.constraints,
                 exclusions=semantic.exclusions,
                 acceptance_criteria=semantic.acceptance_criteria,
+                requirement_anchors=semantic.requirement_anchors,
                 unresolved_decisions=semantic.unresolved_decisions,
                 repository_evidence_refs=semantic.repository_evidence_refs,
                 status=semantic.status,
@@ -4457,6 +5276,7 @@ class AgentRuntime:
                 constraints=semantic.constraints,
                 exclusions=semantic.exclusions,
                 acceptance_criteria=semantic.acceptance_criteria,
+                requirement_anchors=semantic.requirement_anchors,
                 unresolved_decisions=semantic.unresolved_decisions,
                 repository_evidence_refs=semantic.repository_evidence_refs,
                 status=semantic.status,
@@ -4487,6 +5307,7 @@ class AgentRuntime:
             constraints=interpreted.constraints,
             exclusions=interpreted.exclusions,
             acceptance_criteria=interpreted.acceptance_criteria,
+            requirement_anchors=interpreted.requirement_anchors,
             unresolved_decisions=interpreted.unresolved_decisions,
             repository_evidence_refs=interpreted.repository_evidence_refs,
             status="critic_accepted",
@@ -4555,10 +5376,95 @@ class AgentRuntime:
         *,
         successful_inspection_ids: frozenset[str],
     ) -> SemanticGoalV2:
+        original_proposed = proposed
+        proposed = dict(proposed or {})
+        semantic_raw, aliases = canonicalize_requirement_anchors(
+            dict(proposed.get("semantic_goal") or {})
+        )
+        proposed["semantic_goal"] = semantic_raw
+        rewritten_tasks: list[dict[str, Any]] = []
+        for task in proposed.get("tasks", ()):
+            copied = dict(task)
+            refs: list[str] = []
+            for raw_ref in copied.get("requirement_refs", ()):
+                ref = str(raw_ref or "").strip().upper()
+                mapped = aliases.get(ref, (ref,))
+                for canonical in mapped:
+                    if canonical not in refs:
+                        refs.append(canonical)
+            copied["requirement_refs"] = refs
+            rewritten_tasks.append(copied)
+        proposed["tasks"] = rewritten_tasks
+        if isinstance(original_proposed, dict):
+            original_proposed.clear()
+            original_proposed.update(proposed)
         semantic = SemanticGoalV2.from_mapping(
             dict(proposed.get("semantic_goal") or {}),
             original_request=goal.objective,
         )
+        # ``requirement_refs`` is a traceability aid, not new product
+        # semantics. Older/weak structured providers often omit the optional
+        # field on every task even though their task text names the requested
+        # technology or outcome. In that transport-only case, bind existing
+        # model-authored anchors to the strongest matching task once; keep
+        # partial/contradictory mappings strict so real coverage gaps remain
+        # actionable repair boundaries.
+        tasks = list(proposed.get("tasks") or ())
+        if semantic.requirement_anchors and tasks and not any(
+            task.get("requirement_refs") for task in tasks if isinstance(task, Mapping)
+        ):
+            stop_words = {
+                "the", "and", "with", "from", "that", "this", "into", "only",
+                "user", "request", "finished", "result", "needs", "must", "should",
+                "for", "not", "using", "through", "inside", "every", "actual",
+            }
+
+            def terms(value: Any) -> set[str]:
+                return {
+                    token
+                    for token in re.findall(r"[a-z0-9]+", str(value or "").casefold())
+                    if len(token) > 2 and token not in stop_words
+                }
+
+            task_texts = [
+                " ".join(
+                    str(task.get(key) or "")
+                    for key in ("title", "description", "acceptance_criteria", "verification")
+                ).casefold()
+                if isinstance(task, Mapping)
+                else ""
+                for task in tasks
+            ]
+            inferred: dict[int, list[str]] = {index: [] for index in range(len(tasks))}
+            for anchor in semantic.requirement_anchors:
+                anchor_terms = terms(
+                    " ".join(
+                        (
+                            anchor.verbatim_span,
+                            anchor.interpreted_requirement,
+                            *anchor.observable_implications,
+                        )
+                    )
+                )
+                anchor_span = anchor.verbatim_span.casefold().strip()
+                best_index = -1
+                best_score = 0
+                for index, text_value in enumerate(task_texts):
+                    score = len(anchor_terms & terms(text_value))
+                    if anchor_span and anchor_span in text_value:
+                        score += 100
+                    if score > best_score:
+                        best_index, best_score = index, score
+                if best_index >= 0 and best_score > 0:
+                    inferred[best_index].append(anchor.id)
+            if any(inferred.values()):
+                for index, refs in inferred.items():
+                    if refs and isinstance(tasks[index], dict):
+                        tasks[index]["requirement_refs"] = refs
+                proposed["tasks"] = tasks
+                if isinstance(original_proposed, dict):
+                    original_proposed.clear()
+                    original_proposed.update(proposed)
         if semantic.status != "interpreted":
             raise ValueError("semantic_goal.status must be interpreted before critic review")
         if semantic.unresolved_decisions:
@@ -4576,6 +5482,27 @@ class AgentRuntime:
         ):
             raise ValueError(
                 "semantic goal must cite successful repository inspection references"
+            )
+        anchor_ids = {item.id for item in semantic.requirement_anchors}
+        covered_anchor_ids: set[str] = set()
+        for index, task in enumerate(proposed.get("tasks", ())):
+            refs = {
+                str(item).strip().upper()
+                for item in task.get("requirement_refs", ())
+                if str(item).strip()
+            }
+            unknown = refs - anchor_ids
+            if unknown:
+                raise ValueError(
+                    f"task {index + 1} references unknown requirement anchors: "
+                    + ", ".join(sorted(unknown))
+                )
+            covered_anchor_ids.update(refs)
+        uncovered = anchor_ids - covered_anchor_ids
+        if uncovered:
+            raise ValueError(
+                "plan tasks do not cover requirement anchors: "
+                + ", ".join(sorted(uncovered))
             )
         # Semantic equivalence between an accepted criterion and a task is
         # deliberately model-owned. Keyword/token overlap rejected valid
@@ -5293,10 +6220,19 @@ class AgentRuntime:
         except ProviderUnavailableError as exc:
             goal = self.active_goal()
             if goal is not None:
+                overloaded = "temporarily overloaded" in str(exc).casefold()
                 self._pause_planning(
                     goal,
-                    "Planning provider retries were exhausted. Fix connectivity/rate limits, add guidance if useful, then use /resume.",
-                    "planning provider unavailable after bounded retries",
+                    (
+                        "The selected provider is temporarily overloaded. The planning checkpoint is saved; retry after the backoff or change model."
+                        if overloaded
+                        else "Planning provider retries were exhausted. Fix connectivity/rate limits, add guidance if useful, then use /resume."
+                    ),
+                    (
+                        "planning provider temporarily overloaded"
+                        if overloaded
+                        else "planning provider unavailable after bounded retries"
+                    ),
                     provider_failure=True,
                 )
             raise
@@ -5374,6 +6310,7 @@ class AgentRuntime:
         dag_repairs = 0
         applicability_repairs = 0
         critic_repairs = 0
+        critic_recovery_attempts = 0
         rejected_stage_fingerprints: dict[str, str] = {}
         unproductive_turns_after_inspection = 0
         last_plan_format_error = ""
@@ -5667,10 +6604,21 @@ class AgentRuntime:
                                         "semantic_fingerprint"
                                     )
                             if requested_fingerprint != accepted_fingerprint:
-                                raise ValueError(
-                                    "semantic_fingerprint does not match the accepted "
-                                    "semantic interpretation"
+                                # The semantic fingerprint is a harness-owned
+                                # binding, not product meaning authored by the
+                                # model.  A planner can echo a stale, truncated,
+                                # or otherwise malformed fingerprint after a
+                                # repair turn even though its tasks are meant for
+                                # the accepted semantic contract.  Rebind the
+                                # proposal to the durable accepted fingerprint
+                                # before validating tasks; never let transport
+                                # identity alone create a workflow boundary.
+                                normalization_actions = (
+                                    *normalization_actions,
+                                    "replaced model semantic_fingerprint with the "
+                                    "harness-accepted semantic fingerprint",
                                 )
+                                proposed["semantic_fingerprint"] = accepted_fingerprint
                             proposed["semantic_goal"] = dict(staged_semantic)
                             proposed["_semantic_source"] = "staged"
                         elif proposed.get("semantic_goal"):
@@ -5700,6 +6648,7 @@ class AgentRuntime:
                                 result,
                                 tool=call.name,
                                 actor="planner",
+                                phase="planning",
                             )
                             continue
                         for task in proposed["tasks"]:
@@ -5893,7 +6842,13 @@ class AgentRuntime:
                         "content": conversation_result or result,
                     }
                 )
-                self.events.publish("tool_result", result, tool=call.name, actor="planner")
+                self.events.publish(
+                    "tool_result",
+                    result,
+                    tool=call.name,
+                    actor="planner",
+                    phase="planning",
+                )
                 if plan_format_exhausted:
                     # A single model turn may contain several proposals.  The
                     # retry budget is global to this planning run, so stop at
@@ -6207,13 +7162,67 @@ class AgentRuntime:
                         ),
                     }
                 )
-                # The initial candidate is not itself a repair. Allow two
-                # complete model-authored revisions after blocking critic
-                # verdicts, and stop only if the second revision is also
-                # rejected by a third independent review.
+                # The initial candidate is not itself a repair. After three
+                # rejected candidates, give the planner one fresh-context
+                # quality-recovery pass before exposing a user boundary.  A
+                # long conversation containing several malformed candidates
+                # often makes a capable provider repeat the same omission;
+                # the recovery packet preserves the exact objective, accepted
+                # semantic contract, latest candidate, and critic findings
+                # without replaying inspection or mutating the workspace.
                 if critic_repairs >= 3:
-                    exhausted_stage = "independent_critic"
-                    break
+                    if critic_recovery_attempts < 1:
+                        critic_recovery_attempts += 1
+                        self.store.append_event(
+                            "planning.critic_recovery",
+                            goal_id=goal.id,
+                            payload={
+                                "attempt": critic_recovery_attempts,
+                                "rejected_candidates": critic_repairs,
+                                "summary": last_plan_format_error,
+                            },
+                        )
+                        accepted_semantic = (
+                            SemanticGoalV2.from_mapping(
+                                staged_semantic,
+                                original_request=goal.objective,
+                            )
+                            if isinstance(staged_semantic, Mapping)
+                            else None
+                        )
+                        conversation = [{
+                            "role": "user",
+                            "content": state_envelope(
+                                {
+                                    "objective": goal.objective,
+                                    "accepted_semantic_goal": staged_semantic,
+                                    "accepted_semantic_fingerprint": (
+                                        accepted_semantic.fingerprint
+                                        if accepted_semantic is not None
+                                        else ""
+                                    ),
+                                    "successful_inspections": list(inspection_records.values()),
+                                    "last_rejected_plan": proposed,
+                                    "critic_findings": critique,
+                                    "required_next_action": (
+                                        "Produce exactly one complete propose_plan tool call. "
+                                        "Address every blocking critic finding explicitly, "
+                                        "preserve all accepted requirements, use only the "
+                                        "listed runtime capabilities, and do not repeat the "
+                                        "rejected plan unchanged."
+                                    ),
+                                },
+                                "PLAN_QUALITY_RECOVERY",
+                                max_chars=140_000,
+                            ),
+                        }]
+                        # A fresh packet is intentionally not treated as a new
+                        # semantic or inspection stage. Keep the accepted
+                        # fingerprint and durable evidence unchanged.
+                        continue
+                    if critic_repairs >= 6:
+                        exhausted_stage = "independent_critic"
+                        break
             elif not turn.tool_calls:
                 conversation.append(
                     {
@@ -7550,6 +8559,92 @@ class AgentRuntime:
         )
         return self.store.get_goal(goal.id)
 
+    def stop_now(self, *, shutdown_ollama: bool = False) -> Any:
+        """Hard-stop the active boundary while preserving a resumable stage."""
+        if shutdown_ollama and hasattr(self.provider, "shutdown_local_server") and not bool(getattr(self.provider, "is_loopback_host", getattr(self.provider, "is_local_runner", False))):
+            raise RuntimeStateError("/stop ollama is allowed only for the local loopback Ollama runner")
+        self._stop_event.set()
+        active = self._active_provider_abandon
+        if active is not None:
+            active.set()
+        # Cancellation/unload can involve a socket or process wait. Keep the
+        # command responsive and let the durable pause be visible immediately.
+        def release_provider() -> None:
+            cancel = getattr(self.provider, "cancel_active_request", None) or getattr(self.provider, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:
+                    pass
+            unload = getattr(self.provider, "unload_model", None)
+            if callable(unload):
+                try:
+                    unload()
+                except Exception:
+                    pass
+            if shutdown_ollama:
+                shutdown = getattr(self.provider, "shutdown_local_server", None)
+                if callable(shutdown):
+                    try:
+                        shutdown()
+                    except Exception as exc:
+                        self.events.publish("warning", f"Ollama shutdown was not completed: {redact_text(exc, 300)}")
+        Thread(target=release_provider, name="ga3bad-hard-stop", daemon=True).start()
+        try:
+            tools.shutdown_workspace_resources(self.workspace)
+        except Exception:
+            pass
+        try:
+            recovery = self.store.recover_inflight()
+        except Exception:
+            recovery = None
+        goal = self.active_goal()
+        if goal is not None:
+            self.store.update_goal_metadata(
+                goal.id,
+                hard_stop=True,
+                hard_stop_at=time.time(),
+                shutdown_ollama=bool(shutdown_ollama),
+                resume_action="resume_same_stage",
+                auto_retryable=False,
+                uncertain_on_stop=(
+                    {
+                        "tasks": list(getattr(recovery, "task_ids", ())),
+                        "actions": list(getattr(recovery, "action_ids", ())),
+                        "delegations": list(getattr(recovery, "delegation_ids", ())),
+                    }
+                    if recovery is not None else {}
+                ),
+            )
+            try:
+                if goal.status is not GoalStatus.PAUSED:
+                    goal = self.store.transition_goal(goal.id, GoalStatus.PAUSED, reason="stopped by user; saved stage is resumable")
+            except Exception:
+                goal = self.store.get_goal(goal.id)
+            self.events.publish(
+                "execution.boundary",
+                "Stopped by user. The saved stage is resumable and no late response will be applied.",
+                goal_id=goal.id, reason="hard_stop", shutdown_ollama=bool(shutdown_ollama),
+            )
+            return goal
+        session = self.store.get_workflow_session(self.session_id)
+        state = dict(session.get("state") or {})
+        pending = state.get("pending_semantic_turn")
+        if isinstance(pending, Mapping):
+            saved = dict(pending)
+            saved.update({"status": "paused", "stage": saved.get("stage") or "routing", "hard_stop": True, "shutdown_ollama": bool(shutdown_ollama), "resume_action": "resume_same_stage"})
+            state["pending_semantic_turn"] = saved
+        state["hard_stop"] = {"at": time.time(), "shutdown_ollama": bool(shutdown_ollama)}
+        self.store.save_workflow_session(
+            self.session_id, goal_id=session.get("goal_id"),
+            session_mode=str(session.get("session_mode") or SessionMode.NORMAL.value),
+            plan_state=str(session.get("plan_state") or PlanState.NONE.value),
+            run_state="paused", ultra_profile=str(session.get("ultra_profile", "standard")),
+            sleep_state=str(session.get("sleep_state", "off")), state=state,
+        )
+        self.events.publish("execution.boundary", "Stopped by user. The saved request is resumable.", reason="hard_stop", shutdown_ollama=bool(shutdown_ollama))
+        return SliceResult("paused", "Stopped now. The saved stage is saved and can be resumed without replaying mutations.", needs_user=False, phase="paused", reason="hard_stop", resume_action="resume_same_stage")
+
     def complete_requested_pause(self) -> Goal | None:
         """Commit PAUSED only once active work has actually drained."""
 
@@ -7577,6 +8672,7 @@ class AgentRuntime:
         return result
 
     def _resume_pending_semantic_turn(self) -> Any:
+        self._stop_event.clear()
         session = self.store.get_workflow_session(self.session_id)
         pending = dict(session.get("state", {}).get("pending_semantic_turn", {}))
         if not pending:
@@ -7629,6 +8725,7 @@ class AgentRuntime:
         return result
 
     def resume(self) -> Any:
+        self._stop_event.clear()
         goal = self.active_goal()
         while goal is not None and goal.status is GoalStatus.AWAITING_PLAN_APPROVAL:
             pending_plan = self.latest_plan()
@@ -8071,6 +9168,7 @@ class AgentRuntime:
                 "depends_on": list(task.depends_on),
                 "risk": task.risk,
                 "attempts": task.attempts,
+                "requirement_refs": list(task.metadata.get("requirement_refs") or ()),
             }
             for task in plan.tasks
         ]
@@ -8085,6 +9183,27 @@ class AgentRuntime:
                 if task.status in {TaskStatus.PENDING, TaskStatus.READY} and task not in focus
             )
             focus_tasks = [_task_dict(task) for task in focus[:8]]
+        raw_claims = goal.metadata.get("resource_claims") or ()
+        approved_resource_claims = [
+            {
+                "path": str(item.get("selector") or path).replace("\\", "/"),
+                "resolved_paths": [
+                    str(path).replace("\\", "/")
+                    for path in item.get("resolved_paths", ())
+                    if str(path).strip()
+                ],
+                "supports_tasks": [
+                    str(task_id).strip().upper()
+                    for task_id in item.get("supports_tasks", ())
+                    if str(task_id).strip()
+                ],
+                "state": str(item.get("state") or "resolved"),
+            }
+            for item in raw_claims
+            if isinstance(item, Mapping)
+            for path in (str(item.get("selector") or "").strip(),)
+            if path
+        ]
         return {
             "goal": {
                 "id": goal.id,
@@ -8095,6 +9214,7 @@ class AgentRuntime:
                 "active_plan_revision": goal.active_plan_revision,
             },
             "runtime_environment": self._runtime_environment_payload(),
+            "accepted_semantic_goal": dict(goal.metadata.get("semantic_goal") or {}),
             "plan": None
             if plan is None
             else {
@@ -8108,6 +9228,12 @@ class AgentRuntime:
                 "tasks": task_summaries,
                 "focus_task_details": focus_tasks,
             },
+            "approved_resource_claims": approved_resource_claims,
+            "mutation_guidance": (
+                "For a mutating tool, use only a path listed in approved_resource_claims "
+                "for the harness-selected task. An empty workspace is expected; create "
+                "the accepted paths rather than inventing a different filename."
+            ),
             "durable_memory_and_evidence": [
                 {
                     "task_id": item.task_id,
@@ -8293,6 +9419,61 @@ class AgentRuntime:
                 return task.id
         return None
 
+    @staticmethod
+    def _is_harness_resource_claim_task(task: Task) -> bool:
+        """Identify a legacy checklist item for harness-owned resource leases.
+
+        Resource claims are derived from accepted expected-change paths and are
+        never user work. Older planners occasionally materialized a separate
+        "resource claim" task; treating it as obsolete keeps those accepted
+        sessions resumable without changing their product scope.
+        """
+
+        text = " ".join((task.title, task.description)).casefold()
+        return any(
+            marker in text
+            for marker in ("resource claim", "accepted claim", "claim for")
+        )
+
+    def _repair_legacy_resource_claims(self, goal: Goal, plan: Plan) -> None:
+        """Rebind persisted claims from legacy bookkeeping tasks to real work."""
+
+        raw_claims = goal.metadata.get("resource_claims") or ()
+        if not raw_claims:
+            return
+        changed = False
+        claims: list[dict[str, Any]] = []
+        for raw in raw_claims:
+            if not isinstance(raw, Mapping):
+                continue
+            claim = dict(raw)
+            path = str(claim.get("selector") or "").replace("\\", "/").casefold()
+            matches: list[str] = []
+            if path:
+                for task in plan.tasks:
+                    if self._is_harness_resource_claim_task(task):
+                        continue
+                    text = "\n".join(
+                        (
+                            task.title,
+                            task.description,
+                            *task.acceptance_criteria,
+                            *task.verification,
+                        )
+                    ).replace("\\", "/").casefold()
+                    if path in text:
+                        matches.append(task.id)
+            if matches and tuple(str(item).upper() for item in claim.get("supports_tasks", ())) != tuple(matches):
+                claim["supports_tasks"] = matches
+                changed = True
+            claims.append(claim)
+        if changed:
+            self.store.update_goal_metadata(
+                goal.id,
+                resource_claims=claims,
+                resource_claims_repaired=True,
+            )
+
     def _activate_ready_task(self, goal: Goal, plan: Plan) -> tuple[Plan, Task | None]:
         """Bind the slice to one dependency-ready task without model cooperation.
 
@@ -8303,6 +9484,24 @@ class AgentRuntime:
         selection is a deterministic scheduler decision and belongs here.
         """
 
+        # Compatibility repair for plans produced before resource claims were
+        # made harness-owned. This transition is deterministic bookkeeping; it
+        # does not mark any product work complete or create evidence.
+        for task in plan.tasks:
+            if (
+                task.status in {TaskStatus.PENDING, TaskStatus.READY}
+                and self._is_harness_resource_claim_task(task)
+            ):
+                self.store.transition_task(
+                    goal.id,
+                    plan.revision,
+                    task.id,
+                    TaskStatus.OBSOLETE,
+                    note="resource claims are harness-owned and are not execution tasks",
+                    actor="harness",
+                )
+        plan = self.store.get_latest_plan(goal.id)
+        self._repair_legacy_resource_claims(goal, plan)
         active_id = self._current_task_id(plan)
         if active_id is not None:
             return plan, next(item for item in plan.tasks if item.id == active_id)
@@ -8338,6 +9537,12 @@ class AgentRuntime:
         if call.name not in _external_schema_map():
             return f"Error: unknown workspace tool '{call.name}'"
         goal = self.store.get_goal(goal.id)
+        active_task_label = str(task_id or "")
+        active_plan = self.store.get_latest_plan(goal.id)
+        if active_plan is not None and task_id:
+            active_task = next((item for item in active_plan.tasks if item.id == task_id), None)
+            if active_task is not None:
+                active_task_label = f"{active_task.id} · {active_task.title}"
         args = call.args if isinstance(call.args, dict) else {}
         if call.name == "list_files" and not str(args.get("path") or "").strip():
             # Omitted, empty, and explicit-root paths mean the same operation.
@@ -8605,6 +9810,10 @@ class AgentRuntime:
             "execution.started",
             f"{call.name} started",
             goal_id=goal.id,
+            objective=goal.objective,
+            current_task=active_task_label,
+            current_task_id=str(task_id or ""),
+            active_actor=actor,
             tool=call.name,
             action_id=action_id,
             task_id=task_id,
@@ -8624,8 +9833,13 @@ class AgentRuntime:
                 "process.waiting",
                 f"Waiting for {call.name} to finish",
                 goal_id=goal.id,
+                objective=goal.objective,
+                current_task=active_task_label,
+                current_task_id=str(task_id or ""),
+                active_actor=actor,
                 tool=call.name,
                 action_id=action_id,
+                phase="waiting_for_process",
                 waiting_on="process",
                 heartbeat_at=time.time(),
             )
@@ -8684,11 +9898,21 @@ class AgentRuntime:
                 effective_mutation_paths,
             )
             if requested_paths - set(effective_mutation_paths):
+                accepted_for_task = tuple(
+                    sorted(set(effective_mutation_paths))
+                )
                 result = (
                     "Error: mutation target(s) are not covered by accepted, "
                     "repository-evidenced resource claims: "
                     + ", ".join(
                         sorted(requested_paths - set(effective_mutation_paths))
+                    )
+                    + (
+                        "; accepted paths for this task: "
+                        + ", ".join(accepted_for_task)
+                        if accepted_for_task
+                        else "; no accepted paths are leased for this task; "
+                        "use the accepted plan paths or propose a scoped plan change"
                     )
                 )
                 self.store.complete_action(action_id, result, status="denied")
@@ -10226,6 +11450,24 @@ class AgentRuntime:
                 if goal.status != GoalStatus.RUNNING or plan is None or plan.status != PlanStatus.ACCEPTED:
                     break
                 plan, selected = self._activate_ready_task(goal, plan)
+                selected_label = (
+                    f"{selected.id} · {selected.title}"
+                    if selected is not None
+                    else "Checking completion and evidence"
+                )
+                self.events.publish(
+                    "workflow.state",
+                    f"Coordinator is deciding the next action for {selected_label}",
+                    goal_id=goal.id,
+                    objective=goal.objective,
+                    current_task=selected_label,
+                    current_task_id=(selected.id if selected is not None else ""),
+                    actor="coordinator",
+                    active_step=step,
+                    phase="working",
+                    waiting_on="model",
+                    reason="Waiting for the model to choose the next evidence-producing action",
+                )
                 request_conversation = [
                     *self._work_conversation,
                     {
@@ -11067,6 +12309,8 @@ class AgentRuntime:
         prompt = str(text)
         if not prompt.strip():
             return SliceResult("idle", "", 0)
+        if self.active_goal() is None:
+            self._stop_event.clear()
         if not _route_checked:
             _route, result = self.route_input(prompt)
             return result

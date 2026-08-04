@@ -37,6 +37,11 @@ const state = {
   busy: false,
   draggedPromptId: null,
   contextTimer: null,
+  eventSource: null,
+  liveEvents: [],
+  lastActivitySequence: 0,
+  liveConnected: false,
+  liveClock: null,
   viewFingerprints: {},
   pendingUpdates: {},
   scrollingUntil: 0,
@@ -79,6 +84,23 @@ function compactList(items, emptyText = "No additional requirements were recorde
   const values = (items || []).filter((item) => String(item || "").trim());
   if (!values.length) return `<p class="subtle">${escapeHtml(emptyText)}</p>`;
   return `<ul class="plain-list">${values.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+}
+
+function requirementAnchors(items) {
+  const anchors = Array.isArray(items) ? items : [];
+  if (!anchors.length) return "";
+  return `
+    <div class="requirement-anchors">
+      <h4>What your words mean in the finished result</h4>
+      <ul class="plain-list">
+        ${anchors.map((anchor) => `
+          <li>
+            <strong>“${escapeHtml(anchor.verbatim_span || anchor.id)}”</strong>
+            — ${escapeHtml(anchor.interpreted_requirement || "Required as written")}
+            ${compactList(anchor.observable_implications, "")}
+          </li>`).join("")}
+      </ul>
+    </div>`;
 }
 
 function executionPresentation(plan) {
@@ -185,11 +207,125 @@ function showError(error) {
   setConnection(false);
 }
 
-function setConnection(connected) {
+function setConnection(connected, label = "") {
   const node = $("#connection");
   node.classList.toggle("connected", connected);
   node.classList.toggle("offline", !connected);
-  $("span", node).textContent = connected ? "Connected" : "Offline";
+  $("span", node).textContent = label || (connected ? "Live" : "Reconnecting");
+}
+
+function compactBytes(value) {
+  const size = Math.max(0, Number(value || 0));
+  if (size < 1024) return `${Math.round(size)} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function activityTime(value) {
+  const date = new Date(value || "");
+  return Number.isNaN(date.getTime()) ? "--:--:--" : date.toLocaleTimeString([], {
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  });
+}
+
+function appendLiveEvent(event) {
+  if (!event || typeof event !== "object") return;
+  const sequence = Number(event.sequence || 0);
+  if (sequence && state.liveEvents.some((item) => Number(item.sequence) === sequence)) return;
+  state.liveEvents.push(event);
+  state.liveEvents = state.liveEvents.slice(-80);
+  state.lastActivitySequence = Math.max(state.lastActivitySequence, sequence);
+}
+
+function renderLiveTimeline() {
+  const events = state.liveEvents.slice(-3);
+  const root = $("#liveTimeline");
+  root.innerHTML = events.length ? events.map((event) => {
+    const source = String(event.source || "HARNESS").toUpperCase();
+    return `<li class="live-event source-${escapeHtml(source.toLowerCase())}">
+      <time datetime="${escapeHtml(event.timestamp || "")}">${escapeHtml(activityTime(event.timestamp))}</time>
+      <span class="event-source">${escapeHtml(source)}</span>
+      <span class="event-message">${escapeHtml(event.message || event.operation || "Activity received")}</span>
+    </li>`;
+  }).join("") : `<li class="live-event"><span></span><span class="event-source">HARNESS</span><span class="event-message">Waiting for the first runtime event</span></li>`;
+}
+
+function renderAdvancedLiveDetails() {
+  const runtime = state.context?.runtime || {};
+  const tasks = Array.isArray(runtime.task_items) ? runtime.task_items : [];
+  const taskRoot = $("#advancedTaskList");
+  if (!taskRoot) return;
+  const currentId = String(runtime.current_task_id || "");
+  const done = new Set(["done", "completed", "complete", "skipped"]);
+  taskRoot.innerHTML = tasks.length ? tasks.map((task) => {
+    const status = String(task.status || "pending").toLowerCase();
+    const current = currentId && String(task.id || "") === currentId;
+    const cls = [
+      "task-check-item",
+      current ? "is-current" : "",
+      done.has(status) ? "is-done" : "",
+      ["blocked", "uncertain", "failed"].includes(status) ? "is-blocked" : "",
+    ].filter(Boolean).join(" ");
+    const mark = done.has(status) ? "[x]" : status === "in_progress" || status === "running" ? "[>]" : status === "blocked" || status === "uncertain" ? "[!]" : "[ ]";
+    const evidence = task.evidence ? `<small>${escapeHtml(task.evidence)}</small>` : "";
+    return `<li class="${cls}"><span class="task-status">${mark} ${escapeHtml(status)}</span><p>${escapeHtml(task.title || task.id || "Task")}${evidence}</p></li>`;
+  }).join("") : `<li class="empty-state">No authoritative task checklist is available yet.</li>`;
+
+  const streamState = String(runtime.stream_state || runtime.liveness || "idle");
+  const streamKind = String(runtime.stream_kind || "none");
+  $("#advancedStreamState").textContent = streamState.replaceAll("_", " ");
+  const output = $("#advancedModelOutput");
+  if (runtime.safe_stream_preview) {
+    output.textContent = runtime.safe_stream_preview;
+  } else if (["structured", "tool"].includes(streamKind) || ["active", "validating"].includes(streamState)) {
+    output.textContent = "Structured response · text hidden until validation";
+  } else {
+    output.textContent = "No safe text stream available.";
+  }
+  $("#advancedTransport").textContent = `Transport · ${compactBytes(Number(runtime.received_bytes || 0))} · ${Number(runtime.received_chunks || 0)} chunks · ${Number(runtime.received_tokens || 0)} tokens`;
+  const activityRoot = $("#advancedActivityList");
+  const events = state.liveEvents.slice(-24).reverse();
+  activityRoot.innerHTML = events.length ? events.map((event) => `<li class="advanced-activity-item">
+    <time>${escapeHtml(activityTime(event.timestamp))}</time><p><strong>${escapeHtml(String(event.source || "HARNESS"))}</strong> · ${escapeHtml(event.message || event.operation || "Activity received")}</p>
+  </li>`).join("") : `<li class="empty-state">No runtime events have been received yet.</li>`;
+}
+
+function renderLiveWorkflow() {
+  const runtime = state.context?.runtime || {};
+  const root = $("#liveWorkflow");
+  const liveness = String(runtime.liveness || (runtime.phase === "ready" ? "ready" : "client_active"));
+  root.classList.toggle("is-active", ["client_active", "request_sent", "request_created", "provider_connected", "server_processing", "receiving", "processing_response"].includes(liveness));
+  root.classList.toggle("is-receiving", liveness === "receiving");
+  root.classList.toggle("is-stalled", ["stalled", "network_unavailable", "disconnected"].includes(liveness));
+  const phase = String(runtime.phase || state.context?.phase || "ready").replaceAll("_", " ");
+  const operation = runtime.active_operation || runtime.current_task || runtime.reason || "Ready for your request";
+  $("#liveNowTitle").textContent = phase === "ready" ? "Ready for your request" : `${phase.replace(/\b\w/g, (x) => x.toUpperCase())} · ${operation}`;
+  const bytes = Number(runtime.received_bytes || 0);
+  const chunks = Number(runtime.received_chunks || 0);
+  const tokens = Number(runtime.received_tokens || 0);
+  const signalAge = runtime.last_signal_at ? Math.max(0, Math.floor(Date.now() / 1000 - Number(runtime.last_signal_at))) : null;
+  let evidence = "No workflow is active.";
+  if (liveness === "server_processing") evidence = "Ollama is actively generating · structured response is atomic";
+  else if (liveness === "network_unavailable") evidence = "Internet/provider unavailable · saved stage unchanged";
+  else if (liveness === "request_created") evidence = "Request created · no response bytes yet";
+  else if (liveness === "request_sent") evidence = "Request open · no response bytes yet";
+  else if (liveness === "receiving") evidence = `Receiving model output · ${compactBytes(bytes)} · ${chunks} chunks${tokens ? ` · ${tokens} tokens` : ""}`;
+  else if (liveness === "processing_response") evidence = `Response received · ${compactBytes(bytes)} · validating structured output`;
+  else if (liveness === "client_active") evidence = "Worker heartbeat active · waiting for the next verified signal";
+  else if (liveness === "stalled") evidence = signalAge !== null && signalAge <= 5
+    ? "A boundary was recorded · the harness is checking the saved workflow"
+    : "No fresh runtime signal · inspect the saved workflow before waiting longer";
+  else if (liveness === "disconnected") evidence = "Live connection lost · saved state is unchanged · reconnecting";
+  else if (liveness === "paused") evidence = "Paused at a durable checkpoint";
+  else if (liveness === "waiting") evidence = runtime.reason || "Your input is required";
+  else if (liveness === "completed") evidence = "Workflow completed with recorded evidence";
+  if (signalAge !== null && !["ready", "completed"].includes(liveness)) evidence += ` · last signal ${signalAge}s ago`;
+  $("#liveEvidence").textContent = evidence;
+  const goal = runtime.objective || state.context?.goal?.objective || "";
+  $("#liveGoal").textContent = goal ? `Goal · ${goal}${runtime.current_task ? ` · Task · ${runtime.current_task}` : ""}` : "";
+  $("#liveGoal").classList.toggle("hidden", !goal);
+  $("#liveProvenance").textContent = liveness === "receiving" ? "Model" : "Harness";
+  renderLiveTimeline();
 }
 
 function renderChrome() {
@@ -226,6 +362,25 @@ function renderChrome() {
     action.textContent = attention.action.label;
     action.dataset.view = attention.action.view;
   }
+  const toolApproval = state.context.tool_approval;
+  const toolActions = $("#toolApprovalActions");
+  const allowButton = $("#toolAllow");
+  const denyButton = $("#toolDeny");
+  const hasToolApproval = Boolean(toolApproval && toolApproval.action_fingerprint);
+  toolActions.classList.toggle("hidden", !hasToolApproval);
+  action.classList.toggle("hidden", !attention.action || hasToolApproval);
+  if (hasToolApproval) {
+    const args = toolApproval.arguments || {};
+    const command = args.command || args.path || "the requested project action";
+    $("#attentionBody").textContent = `${attention.body} Tool: ${toolApproval.tool}. Risk: ${toolApproval.risk}. Target: ${String(command).slice(0, 800)}`;
+    allowButton.disabled = Boolean(state.busy);
+    denyButton.disabled = Boolean(state.busy);
+    allowButton.dataset.fingerprint = toolApproval.action_fingerprint;
+    denyButton.dataset.fingerprint = toolApproval.action_fingerprint;
+  }
+  (runtime.timeline_preview || []).forEach(appendLiveEvent);
+  renderLiveWorkflow();
+  renderAdvancedLiveDetails();
 }
 
 function stableFingerprint(value) {
@@ -284,11 +439,117 @@ function showActivityBanner(show = true) {
   $("#activityBanner").classList.toggle("hidden", !show);
 }
 
+function applyLiveActivity(event) {
+  const anchor = readerIsBusy() ? captureScrollAnchor() : null;
+  appendLiveEvent(event);
+  if (!state.context) return;
+  const runtime = { ...(state.context.runtime || {}) };
+  if (event.phase) runtime.phase = event.phase;
+  if (event.actor) runtime.active_actor = event.actor;
+  if (event.task) runtime.current_task = event.task;
+  if (event.operation) runtime.active_operation = event.operation;
+  if (event.waiting_on) runtime.waiting_on = event.waiting_on;
+  runtime.activity_sequence = Math.max(Number(runtime.activity_sequence || 0), Number(event.sequence || 0));
+  runtime.received_bytes = Math.max(Number(runtime.received_bytes || 0), Number(event.received_bytes || 0));
+  runtime.received_chunks = Math.max(Number(runtime.received_chunks || 0), Number(event.received_chunks || 0));
+  runtime.received_tokens = Math.max(Number(runtime.received_tokens || 0), Number(event.received_tokens || 0));
+  if (event.stream_kind) runtime.stream_kind = event.stream_kind;
+  if (event.state) runtime.stream_state = event.state === "receiving" ? "receiving" : runtime.stream_state;
+  if (event.safe_text_fragment) runtime.safe_stream_preview = `${runtime.safe_stream_preview || ""}${event.safe_text_fragment}`.slice(-4000);
+  runtime.last_signal_at = Date.now() / 1000;
+  if (event.source === "MODEL") {
+    runtime.provider_request_state = event.state;
+    const providerState = event.provider_state || event.state;
+    runtime.liveness = providerState === "receiving" ? "receiving"
+      : providerState === "completed" ? "processing_response"
+      : providerState === "failed" ? "stalled"
+      : providerState === "server_processing" ? "server_processing"
+      : providerState === "network_unavailable" ? "network_unavailable"
+      : providerState === "request_created" ? "request_created"
+      : "request_sent";
+  } else if (event.state === "waiting") {
+    runtime.liveness = "waiting";
+  } else if (event.state === "failed") {
+    runtime.liveness = "stalled";
+  }
+  state.context = { ...state.context, runtime };
+  renderLiveWorkflow();
+  renderAdvancedLiveDetails();
+  restoreScrollAnchor(anchor);
+}
+
+function startLiveEvents() {
+  state.eventSource?.close();
+  const source = new EventSource(`/api/sessions/${encodeURIComponent(sessionId)}/events`);
+  state.eventSource = source;
+  source.addEventListener("open", () => {
+    // TCP/HTTP open is not yet a verified live workflow channel. Wait for a
+    // valid snapshot or activity event before claiming the UI is live.
+    state.liveConnected = false;
+    setConnection(false, "Reconnecting");
+  });
+  source.addEventListener("snapshot", (message) => {
+    try {
+      const anchor = readerIsBusy() ? captureScrollAnchor() : null;
+      const context = JSON.parse(message.data);
+      state.context = context;
+      (context.runtime?.timeline_preview || []).forEach(appendLiveEvent);
+      state.liveConnected = true;
+      renderChrome();
+      restoreScrollAnchor(anchor);
+      setConnection(true, "Live");
+    } catch {
+      setConnection(false, "Reconnecting");
+    }
+  });
+  source.addEventListener("activity", (message) => {
+    try {
+      applyLiveActivity(JSON.parse(message.data));
+      state.liveConnected = true;
+      setConnection(true, "Live");
+    } catch {
+      // A malformed presentation event is ignored; the durable snapshot and
+      // reconciliation polling remain authoritative.
+    }
+  });
+  source.addEventListener("error", () => {
+    state.liveConnected = false;
+    setConnection(false, "Reconnecting");
+    if (state.context) {
+      state.context = {
+        ...state.context,
+        runtime: { ...(state.context.runtime || {}), liveness: "disconnected" },
+      };
+      renderLiveWorkflow();
+    }
+  });
+}
+
+function openActivityTimeline() {
+  const events = state.liveEvents.slice().reverse();
+  openDrawer({
+    eyebrow: "Verified runtime events",
+    title: "Live workflow activity",
+    body: events.length ? `<ol class="activity-detail-list">${events.map((event) => `
+      <li>
+        <div class="activity-detail-meta">${escapeHtml(activityTime(event.timestamp))} · ${escapeHtml(event.source || "HARNESS")} · ${escapeHtml(event.state || "active")} · #${escapeHtml(event.sequence || "-")}</div>
+        <p>${escapeHtml(event.message || event.operation || "Activity received")}</p>
+        ${state.detail === "advanced" && event.operation ? `<div class="activity-detail-meta">${escapeHtml(event.phase || "")} · ${escapeHtml(event.actor || "")} · ${escapeHtml(event.operation)}</div>` : ""}
+      </li>`).join("")}</ol>` : `<p class="empty-state">No runtime events have been received yet.</p>`,
+  });
+}
+
 async function refreshContext({ enforceGate = true } = {}) {
   try {
     const context = await api("/workspace");
-    state.context = context;
-    setConnection(true);
+    const liveUnavailable = Boolean(state.eventSource && !state.liveConnected);
+    state.context = liveUnavailable
+      ? {
+          ...context,
+          runtime: { ...(context.runtime || {}), liveness: "disconnected" },
+        }
+      : context;
+    setConnection(!liveUnavailable, liveUnavailable ? "Polling" : "Connected");
     if (enforceGate && context.required_view && context.required_view !== state.currentView) {
       await navigate(context.required_view, { gate: true });
       return;
@@ -330,6 +591,7 @@ function planPayload() {
       outputs: [...task.outputs],
       expected_files: [...task.expected_files],
       acceptance_criteria: [...task.acceptance_criteria],
+      requirement_refs: [...(task.requirement_refs || [])],
       tests: [...task.tests],
       risk_level: task.risk_level || "medium",
       required_tools: [...task.required_tools],
@@ -361,6 +623,7 @@ function makePlanModel(snapshot) {
       outputs: [...(task.outputs || [])],
       expected_files: [...(task.expected_files || [])],
       acceptance_criteria: [...(task.acceptance_criteria || ["Requested behavior is implemented."])],
+      requirement_refs: [...(task.requirement_refs || [])],
       tests: [...(task.tests || ["Run the relevant verification."])],
       required_tools: [...(task.required_tools || [])],
       memory_dependencies: [...(task.memory_dependencies || [])],
@@ -599,6 +862,7 @@ function renderPlan() {
         <div><h4>Required outcomes</h4>${compactList(plan.semantic_goal?.required_outcomes, "The task contracts below define the required outcome.")}</div>
         <div><h4>Success checks</h4>${compactList(plan.semantic_goal?.acceptance_criteria, "The task criteria below define completion.")}</div>
       </div>
+      ${requirementAnchors(plan.semantic_goal?.requirement_anchors)}
       ${(plan.semantic_goal?.constraints || []).length ? `<details class="advanced-section"><summary>Constraints and exclusions</summary><div class="contract-columns"><div><h4>Constraints</h4>${compactList(plan.semantic_goal.constraints)}</div><div><h4>Exclusions</h4>${compactList(plan.semantic_goal.exclusions)}</div></div></details>` : ""}
     </section>
 
@@ -829,6 +1093,7 @@ async function handlePlanAction(event) {
       outputs: [],
       expected_files: [],
       acceptance_criteria: ["The requested outcome is implemented."],
+      requirement_refs: [],
       tests: ["Run the relevant verification."],
       risk_level: "medium",
       required_tools: [],
@@ -947,6 +1212,28 @@ async function confirmApproval() {
     );
     await refreshContext({ enforceGate: false });
     await loadView("plan", true);
+  } catch (error) {
+    announce(error.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function resolveToolApproval(decision) {
+  const approval = state.context?.tool_approval;
+  if (!approval?.action_fingerprint) return;
+  try {
+    setBusy(true);
+    await api("/tool-approval", {
+      method: "POST",
+      body: JSON.stringify({
+        action_fingerprint: approval.action_fingerprint,
+        decision,
+      }),
+    });
+    announce(decision === "deny" ? "Denied. The action remains stopped." : "Approved. Resuming the saved action.");
+    await refreshContext({ enforceGate: false });
+    await loadView(state.currentView, true);
   } catch (error) {
     announce(error.message, true);
   } finally {
@@ -1470,7 +1757,7 @@ async function loadView(view, force = false) {
       const snapshot = await api("/plan");
       const fingerprint = stableFingerprint(snapshot);
       if (silent && state.viewFingerprints.plan === fingerprint) {
-        setConnection(true);
+        setConnection(!state.eventSource || state.liveConnected, state.eventSource ? (state.liveConnected ? "Live" : "Reconnecting") : "Connected");
         return;
       }
       if (silent && (state.planDirty || state.editingTask !== null || state.editingSummary || readerIsBusy())) {
@@ -1517,7 +1804,7 @@ async function loadView(view, force = false) {
     if (!silent) {
       $("#workspace").focus({ preventScroll: true });
     }
-    setConnection(true);
+    setConnection(!state.eventSource || state.liveConnected, state.eventSource ? (state.liveConnected ? "Live" : "Reconnecting") : "Connected");
   } catch (error) {
     if (error.status === 404 && view !== "plan") {
       $("#loading").classList.add("hidden");
@@ -1547,6 +1834,8 @@ function wireGlobalEvents() {
   });
   $$(".nav-button").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.view)));
   $("#attentionAction").addEventListener("click", () => navigate($("#attentionAction").dataset.view));
+  $("#toolAllow").addEventListener("click", () => resolveToolApproval("allow_once"));
+  $("#toolDeny").addEventListener("click", () => resolveToolApproval("deny"));
   $("#refreshButton").addEventListener("click", async () => {
     await refreshContext({ enforceGate: true });
     await loadView(state.currentView, true);
@@ -1562,6 +1851,7 @@ function wireGlobalEvents() {
   }, { passive: true });
   $("#drawerClose").addEventListener("click", closeDrawer);
   $("#drawerBackdrop").addEventListener("click", closeDrawer);
+  $("#openActivity").addEventListener("click", openActivityTimeline);
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !$("#drawer").classList.contains("hidden")) closeDrawer();
   });
@@ -1583,6 +1873,8 @@ async function boot() {
       history.replaceState({ view: state.currentView }, "", `/sessions/${sessionId}/${state.currentView}`);
     }
     renderChrome();
+    startLiveEvents();
+    state.liveClock = setInterval(() => renderLiveWorkflow(), 1000);
     await loadView(state.currentView, true);
     state.contextTimer = setInterval(async () => {
       await refreshContext({ enforceGate: true });
@@ -1592,7 +1884,7 @@ async function boot() {
       if (!state.busy && canRefreshView && document.visibilityState === "visible") {
         await loadView(state.currentView, false);
       }
-    }, 4000);
+    }, 10000);
   } catch (error) {
     showError(error);
   }

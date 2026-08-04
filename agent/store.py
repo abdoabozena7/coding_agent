@@ -2267,7 +2267,14 @@ class StateStore:
             priority=int(value.get("priority", 0)),
             attempts=int(value.get("attempts", 0)),
             origin=str(value.get("origin", origin)),
-            metadata=dict(value.get("metadata") or {}),
+            metadata={
+                **dict(value.get("metadata") or {}),
+                **(
+                    {"requirement_refs": tuple(str(item).upper() for item in value.get("requirement_refs", ())) }
+                    if value.get("requirement_refs")
+                    else {}
+                ),
+            },
         )
 
     def create_plan(

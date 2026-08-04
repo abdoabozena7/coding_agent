@@ -381,6 +381,22 @@ class WorkspaceStoreTests(unittest.TestCase):
         self.assertEqual(after.summary, before.summary)
         self.assertGreater(after.last_signal_at, before.last_signal_at)
 
+    def test_tool_events_refresh_liveness_signal(self):
+        store = WorkspaceUIStore()
+        store.set_activity(ActivityStage.BUILDING, "Applying the accepted change", running=True)
+        before = store.snapshot()
+        time.sleep(0.001)
+        store.handle_event(
+            "tool_result",
+            "Applied patch to 1 file",
+            {"tool": "apply_patch", "phase": "working"},
+        )
+        after = store.snapshot()
+        assert after.last_signal_at is not None
+        if before.last_signal_at is not None:
+            assert after.last_signal_at > before.last_signal_at
+        assert after.activity.last_signal_at > before.activity.last_signal_at
+
     def test_approval_received_releases_stale_approval_activity(self):
         store = WorkspaceUIStore()
         store.handle_event(
@@ -449,6 +465,110 @@ class WorkspaceStoreTests(unittest.TestCase):
         self.assertEqual(snapshot.workflow_mode, "working")
         self.assertEqual(snapshot.runtime_phase, "planning")
 
+    def test_live_routing_snapshot_replaces_stale_idle_progress_phase(self):
+        store = WorkspaceUIStore()
+        store.update_identity(
+            workspace="project-109",
+            model="gpt-oss:120b-cloud",
+            status="idle",
+            workflow_mode="ready",
+        )
+        store.update_runtime_context(
+            {
+                "session_mode": "working",
+                "route": "pending",
+                "execution_strategy": "pending",
+                "phase": "routing",
+                "waiting_on": "model",
+            }
+        )
+        snapshot = store.snapshot()
+        self.assertEqual(snapshot.status, "routing")
+        self.assertEqual(snapshot.runtime_phase, "routing")
+        self.assertEqual(snapshot.progress.phase, "routing")
+        self.assertTrue(snapshot.running)
+
+        store.handle_event(
+            "heartbeat",
+            "semantic-router provider request is active",
+            {
+                "phase": "routing",
+                "waiting_on": "model",
+                "heartbeat_at": time.time(),
+            },
+        )
+        snapshot = store.snapshot()
+        self.assertEqual(snapshot.progress.phase, "routing")
+        self.assertEqual(snapshot.waiting_on, "model")
+        self.assertNotEqual(snapshot.status, "idle")
+
+    def test_planning_tool_failure_shows_repair_phase_while_worker_is_live(self):
+        store = WorkspaceUIStore()
+        store.update_runtime_context(
+            {
+                "session_mode": "working",
+                "route": "goal",
+                "execution_strategy": "staged",
+                "phase": "planning",
+            }
+        )
+        store.handle_event(
+            "tool_result",
+            "Error: semantic_fingerprint does not match the accepted semantic interpretation",
+            {"tool": "propose_plan", "actor": "planner", "phase": "planning"},
+        )
+        snapshot = store.snapshot()
+        self.assertTrue(snapshot.running)
+        self.assertEqual(snapshot.runtime_phase, "planning")
+        self.assertEqual(snapshot.activity.stage, ActivityStage.PLANNING)
+        self.assertIn("repairing", snapshot.activity.summary.casefold())
+        self.assertEqual(snapshot.resources.model_activity, "repairing plan")
+        self.assertFalse(snapshot.transcript)
+        self.assertTrue(any("planning repair" in item for item in snapshot.advanced_log))
+
+    def test_execution_tool_failure_is_recovery_not_healthy_working(self):
+        store = WorkspaceUIStore()
+        store.update_runtime_context(
+            {
+                "session_mode": "working",
+                "route": "goal",
+                "execution_strategy": "staged",
+                "phase": "working",
+            }
+        )
+        store.handle_event(
+            "tool_result",
+            "Error: command exited with code 1",
+            {"tool": "run_command", "actor": "coordinator", "phase": "execution"},
+        )
+        snapshot = store.snapshot()
+        self.assertTrue(snapshot.running)
+        self.assertEqual(snapshot.status, "recovering")
+        self.assertEqual(snapshot.runtime_phase, "retrying")
+        self.assertEqual(snapshot.waiting_on, "coordinator")
+        self.assertIn("repair", snapshot.progress.active_operation.casefold())
+
+    def test_terminal_planning_error_clears_running_state(self):
+        store = WorkspaceUIStore()
+        store.update_runtime_context(
+            {
+                "session_mode": "working",
+                "route": "goal",
+                "execution_strategy": "staged",
+                "phase": "planning",
+            }
+        )
+        store.handle_event(
+            "error",
+            "Plan could not be prepared within the repair budget.",
+            {"planning_terminal": True},
+        )
+        snapshot = store.snapshot()
+        self.assertFalse(snapshot.running)
+        self.assertEqual(snapshot.status, "paused")
+        self.assertEqual(snapshot.runtime_phase, "paused")
+        self.assertIn("repair budget", snapshot.progress.blocker)
+
     def test_plan_studio_approval_event_enters_starting_state(self):
         store = WorkspaceUIStore()
         store.update_runtime_context(
@@ -468,6 +588,85 @@ class WorkspaceStoreTests(unittest.TestCase):
         self.assertEqual(snapshot.status, "running")
         self.assertEqual(snapshot.runtime_phase, "starting")
         self.assertEqual(snapshot.waiting_on, "worker")
+
+    def test_live_runtime_context_keeps_exact_goal_task_and_actor_visible(self):
+        store = WorkspaceUIStore()
+        store.update_runtime_context(
+            {
+                "session_mode": "working",
+                "route": "goal",
+                "execution_strategy": "staged",
+                "phase": "working",
+                "objective": "Create a Three.js 3D calculator and run it",
+                "current_task": "T001 · Initialize project and install three.js",
+                "current_task_id": "T001",
+                "active_actor": "coordinator",
+                "active_step": 2,
+                "waiting_on": "model",
+                "reason": "Waiting for the model response",
+            }
+        )
+
+        snapshot = store.snapshot()
+        self.assertEqual(snapshot.objective, "Create a Three.js 3D calculator and run it")
+        self.assertEqual(snapshot.current_task_id, "T001")
+        self.assertEqual(snapshot.active_actor, "coordinator")
+        self.assertEqual(snapshot.active_step, 2)
+        self.assertEqual(
+            snapshot.progress.current_task,
+            "T001 · Initialize project and install three.js",
+        )
+        self.assertNotEqual(snapshot.progress.current_task, "Working on the next step")
+
+    def test_model_heartbeat_explains_actor_and_elapsed_wait(self):
+        store = WorkspaceUIStore()
+        store.handle_event(
+            "heartbeat",
+            "coordinator provider request is active",
+            {
+                "phase": "working",
+                "waiting_on": "model",
+                "active_actor": "coordinator",
+                "active_step": 3,
+                "elapsed_seconds": 41,
+                "heartbeat_at": time.time(),
+            },
+        )
+
+        snapshot = store.snapshot()
+        self.assertEqual(snapshot.active_actor, "coordinator")
+        self.assertEqual(snapshot.active_step, 3)
+        self.assertEqual(
+            snapshot.progress.active_operation,
+            "Coordinator · waiting for response · 41s",
+        )
+
+    def test_recursive_activity_names_live_specialist_and_node(self):
+        store = WorkspaceUIStore()
+        store.update_swarm_summary(
+            {
+                "nodes": [
+                    {
+                        "id": "node-ui",
+                        "title": "Build the 3D calculator controls",
+                        "status": "running",
+                    }
+                ],
+                "agents": [
+                    {
+                        "work_node_id": "node-ui",
+                        "role": "three_js_ui_specialist",
+                        "status": "running",
+                    }
+                ],
+            }
+        )
+
+        snapshot = store.snapshot()
+        self.assertEqual(
+            snapshot.swarm.active_labels,
+            ("Three Js Ui Specialist · Build the 3D calculator controls",),
+        )
 
 
 if __name__ == "__main__":

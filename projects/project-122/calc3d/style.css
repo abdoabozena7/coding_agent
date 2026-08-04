@@ -1,0 +1,87 @@
+/*
+ * Calc3D – Impressive visual design
+ * Gradient background, custom font, and styled calculator buttons.
+ */
+
+/* Gradient background for the whole page */
+body {
+    margin: 0;
+    padding: 0;
+    font-family: "Segoe UI", Tahoma, sans-serif;
+    /* A smooth blue‑to‑purple linear gradient */
+    background: linear-gradient(135deg, #1e3c72, #2a5298);
+    color: #fff;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    min-height: 100vh;
+}
+
+/* Canvas styling – keep it centered */
+#three-canvas {
+    width: 100%;
+    max-width: 600px;
+    height: 400px;
+    display: block;
+    margin: 20px auto;
+    border: 2px solid #fff;
+    border-radius: 8px;
+    box-shadow: 0 0 15px rgba(0, 0, 0, 0.5);
+}
+
+/* Calculator UI container */
+#calc-ui {
+    width: 100%;
+    max-width: 300px;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin: 20px auto;
+}
+
+/* Display area */
+#calc-display {
+    grid-column: span 4;
+    background: rgba(255, 255, 255, 0.1);
+    padding: 12px;
+    font-size: 1.5rem;
+    text-align: right;
+    border-radius: 8px;
+    box-shadow: inset 0 0 5px rgba(0,0,0,0.3);
+    color: #fff;
+}
+
+/* Button styling – the class expected by the markup */
+.calc-button {
+    background: rgba(255, 255, 255, 0.15);
+    border: none;
+    font-size: 1.2rem;
+    padding: 12px;
+    border-radius: 8px;               /* <-- required */
+    box-shadow: 0 4px 6px rgba(0,0,0,0.3); /* <-- required */
+    color: #fff;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.1s;
+}
+
+.calc-button:hover {
+    background: rgba(255, 255, 255, 0.25);
+    transform: translateY(-2px);
+}
+
+.calc-button:active {
+    background: rgba(255, 255, 255, 0.35);
+    transform: translateY(0);
+}
+
+/* Ensure the page is responsive */
+@media (max-width: 480px) {
+    #three-canvas {
+        height: 250px;
+    }
+    #calc-ui {
+        max-width: 260px;
+    }
+}
+

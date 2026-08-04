@@ -16,6 +16,8 @@ from openai import OpenAI
 
 from .base import (
     AssistantTurn,
+    ProviderActivityV1,
+    ProviderCallPolicyV1,
     ProviderCapabilities,
     SUMMARY_INSTRUCTION,
     ToolCall,
@@ -135,7 +137,10 @@ class OpenAIProvider:
                 )
         return messages
 
-    def call(self, conversation, tools, system, on_text=None, on_thought=None) -> AssistantTurn:
+    def call(
+        self, conversation, tools, system, on_text=None, on_thought=None,
+        on_activity=None, policy: ProviderCallPolicyV1 | None = None,
+    ) -> AssistantTurn:
         # Chat Completions currently exposes no reasoning-summary stream, so
         # on_thought is intentionally unused.
         request: dict[str, Any] = {
@@ -145,9 +150,18 @@ class OpenAIProvider:
             "stream_options": {"include_usage": True},
         }
         request["reasoning_effort"] = self.reasoning_effort
+        if policy is not None:
+            if policy.reasoning_effort:
+                request["reasoning_effort"] = policy.reasoning_effort
+            if policy.max_output_tokens is not None:
+                request["max_completion_tokens"] = int(policy.max_output_tokens)
         if tools:
             request["tools"] = tools
+        if on_activity:
+            on_activity(ProviderActivityV1(state="request_created"))
         stream = self._client_().chat.completions.create(**request)
+        if on_activity:
+            on_activity(ProviderActivityV1(state="provider_connected"))
 
         usage = None
         content_parts: list[str] = []
@@ -156,6 +170,13 @@ class OpenAIProvider:
         slots: dict[tuple[int, int], dict[str, Any]] = {}
 
         for chunk in stream:
+            if on_activity:
+                encoded = str(chunk).encode("utf-8", errors="replace")
+                on_activity(ProviderActivityV1(
+                    state="receiving",
+                    received_bytes=len(encoded),
+                    received_chunks=1,
+                ))
             chunk_usage = _value(chunk, "usage")
             if chunk_usage is not None:
                 usage = chunk_usage
@@ -238,6 +259,14 @@ class OpenAIProvider:
                 output_tokens=_value(usage, "completion_tokens", 0) or 0,
             )
 
+        if on_activity:
+            on_activity(ProviderActivityV1(
+                state="completed",
+                received_tokens=(
+                    int(_value(usage, "completion_tokens", 0) or 0)
+                    if usage is not None else 0
+                ),
+            ))
         return AssistantTurn(
             text="".join(content_parts) or None,
             tool_calls=tool_calls,

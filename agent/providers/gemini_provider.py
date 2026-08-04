@@ -18,6 +18,8 @@ from google.genai import types
 
 from .base import (
     AssistantTurn,
+    ProviderActivityV1,
+    ProviderCallPolicyV1,
     ProviderCapabilities,
     SUMMARY_INSTRUCTION,
     ToolCall,
@@ -234,23 +236,35 @@ class GeminiProvider:
             declarations.append(_function_declaration(function))
         return [types.Tool(function_declarations=declarations)] if declarations else []
 
-    def call(self, conversation, tools, system, on_text=None, on_thought=None) -> AssistantTurn:
+    def call(
+        self, conversation, tools, system, on_text=None, on_thought=None,
+        on_activity=None, policy: ProviderCallPolicyV1 | None = None,
+    ) -> AssistantTurn:
         gemini_tools = self._to_tools(tools)
-        config = types.GenerateContentConfig(
-            system_instruction=str(system or ""),
-            tools=gemini_tools or None,
-            thinking_config=types.ThinkingConfig(
+        config_kwargs = {
+            "system_instruction": str(system or ""),
+            "tools": gemini_tools or None,
+            "thinking_config": types.ThinkingConfig(
                 include_thoughts=True,
                 thinking_budget={"low": 1024, "medium": 4096, "high": 8192, "xhigh": 16384}.get(
                     str(getattr(self, "reasoning_effort", "medium")), 4096
                 ),
             ),
+        }
+        if policy is not None and policy.max_output_tokens is not None:
+            config_kwargs["max_output_tokens"] = int(policy.max_output_tokens)
+        config = types.GenerateContentConfig(
+            **config_kwargs,
         )
+        if on_activity:
+            on_activity(ProviderActivityV1(state="request_created"))
         stream = self._client_().models.generate_content_stream(
             model=self.model,
             contents=self._to_contents(conversation),
             config=config,
         )
+        if on_activity:
+            on_activity(ProviderActivityV1(state="provider_connected"))
 
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
@@ -259,6 +273,13 @@ class GeminiProvider:
         seen_ids: set[str] = set()
 
         for chunk in stream:
+            if on_activity:
+                encoded = str(chunk).encode("utf-8", errors="replace")
+                on_activity(ProviderActivityV1(
+                    state="receiving",
+                    received_bytes=len(encoded),
+                    received_chunks=1,
+                ))
             chunk_usage = _value(chunk, "usage_metadata")
             if chunk_usage is not None:
                 usage = chunk_usage
@@ -335,6 +356,13 @@ class GeminiProvider:
         native = (
             {"provider": "gemini", "parts": native_parts} if native_parts else {}
         )
+        if on_activity:
+            on_activity(ProviderActivityV1(
+                state="completed",
+                received_tokens=(
+                    normalized_usage.output_tokens if normalized_usage is not None else 0
+                ),
+            ))
         return AssistantTurn(
             text="".join(text_parts) or None,
             tool_calls=tool_calls,

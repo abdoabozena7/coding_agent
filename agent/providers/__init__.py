@@ -12,6 +12,9 @@ provider's SDK installed unless you actually use it.
 from .base import (  # re-exported for convenience
     AssistantTurn,
     Provider,
+    ProviderCallPolicyV1,
+    ProviderConnectivityV1,
+    ProviderActivityV1,
     ProviderCapabilities,
     ToolCall,
     Usage,
@@ -20,6 +23,9 @@ from .base import (  # re-exported for convenience
 __all__ = [
     "AssistantTurn",
     "Provider",
+    "ProviderCallPolicyV1",
+    "ProviderConnectivityV1",
+    "ProviderActivityV1",
     "ProviderCapabilities",
     "ToolCall",
     "Usage",

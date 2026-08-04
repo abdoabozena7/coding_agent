@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from .providers import AssistantTurn, ProviderCapabilities, ToolCall, Usage
+from .providers import AssistantTurn, ProviderActivityV1, ProviderCapabilities, ToolCall, Usage
 from .providers.base import coerce_tool_args, native_data, render_for_summary, tool_call_id
 
 
@@ -150,13 +150,18 @@ class ScriptedProvider:
             ]
         return []
 
-    def call(self, conversation, tools, system, on_text=None, on_thought=None) -> AssistantTurn:
+    def call(
+        self, conversation, tools, system, on_text=None, on_thought=None,
+        on_activity=None,
+    ) -> AssistantTurn:
         request = ProviderRequest(
             conversation=copy.deepcopy(list(conversation or [])),
             tools=copy.deepcopy(list(tools or [])),
             system=str(system or ""),
         )
         self.calls.append(request)
+        if on_activity:
+            on_activity(ProviderActivityV1(state="request_sent"))
         if not self._turns:
             raise AssertionError("ScriptedProvider has no turn left to return")
 
@@ -172,13 +177,31 @@ class ScriptedProvider:
         thoughts = scripted.thought_chunks or self._native_thoughts(scripted.turn)
         if on_thought:
             for fragment in thoughts:
+                if on_activity:
+                    on_activity(ProviderActivityV1(
+                        state="receiving",
+                        received_bytes=len(fragment.encode("utf-8")),
+                        received_chunks=1,
+                    ))
                 on_thought(fragment)
         text_chunks = scripted.text_chunks
         if not text_chunks and scripted.turn.text:
             text_chunks = [scripted.turn.text]
         if on_text:
             for fragment in text_chunks:
+                if on_activity:
+                    on_activity(ProviderActivityV1(
+                        state="receiving",
+                        received_bytes=len(fragment.encode("utf-8")),
+                        received_chunks=1,
+                    ))
                 on_text(fragment)
+        if on_activity:
+            usage = scripted.turn.usage
+            on_activity(ProviderActivityV1(
+                state="completed",
+                received_tokens=(usage.output_tokens if usage is not None else 0),
+            ))
         return copy.deepcopy(scripted.turn)
 
     def summarize(self, messages) -> str:

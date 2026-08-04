@@ -301,6 +301,19 @@ def normalize_generated_tool_payload(
                             f"/authority_spans/{effect} bound to the complete exact "
                             "request for an approval-gated Goal"
                         )
+            # Do not carry an empty-effect sentinel into the semantic route
+            # validator.  This is a wire-shape cleanup; it does not add an
+            # effect or broaden authority.
+            raw_effect_values = normalized.get("requested_effects")
+            if isinstance(raw_effect_values, list):
+                cleaned_effects = [
+                    item for item in raw_effect_values
+                    if str(item or "").strip().casefold()
+                    not in {"", "none", "no_effect", "no effects", "no requested effects"}
+                ]
+                if cleaned_effects != raw_effect_values:
+                    actions.append("/requested_effects empty sentinel removed")
+                normalized["requested_effects"] = cleaned_effects
             normalized["authority_spans"] = canonical_spans
     elif name == "request_plan_input":
         questions = normalized.get("questions", ())
@@ -344,6 +357,13 @@ def normalize_generated_tool_payload(
 
             canonical: list[Any] = []
             for effect_index, effect in enumerate(raw_effects):
+                if str(effect or "").strip().casefold() in {
+                    "", "none", "no_effect", "no effects", "no requested effects"
+                }:
+                    actions.append(
+                        f"/requested_effects/{effect_index} empty sentinel removed"
+                    )
+                    continue
                 try:
                     value = RequestedEffect.parse(effect).value
                 except (TypeError, ValueError):
@@ -373,7 +393,20 @@ def normalize_generated_tool_payload(
             "status", "attempt", "attempts", "evidence", "note",
             "blocked_reason", "last_error", "started_at", "completed_at",
             "ready_at", "updated_at", "worker_id",
+            # Resource leases and execution metadata are derived by the
+            # harness from the accepted plan.  Weak models sometimes echo
+            # these fields from the execution state when proposing a repair;
+            # accepting them would both fail the transport schema and blur the
+            # authority boundary.
+            "resource_claims", "resource_claim", "resolved_paths", "lease",
+            "execution_state", "runtime_state", "worker_state",
         }
+        for field in sorted(lifecycle_fields):
+            if field in normalized:
+                normalized.pop(field)
+                actions.append(
+                    f"/{field} removed (harness-owned plan-change metadata)"
+                )
         raw_tasks = normalized.get("tasks", ())
         if isinstance(raw_tasks, tuple):
             raw_tasks = list(raw_tasks)
@@ -390,6 +423,38 @@ def normalize_generated_tool_payload(
                     clean["id"] = clean.pop("task_id")
                     actions.append(
                         f"/tasks/{task_index}/task_id normalized to id"
+                    )
+                # Preserve model-authored task meaning while accepting the
+                # common aliases emitted by local/tool-capable providers.  No
+                # product content is invented here: each fallback is copied
+                # from a field the model already supplied.
+                aliases = (
+                    ("name", "title"),
+                    ("summary", "description"),
+                    ("task", "description"),
+                    ("acceptance", "acceptance_criteria"),
+                    ("criteria", "acceptance_criteria"),
+                    ("verification_steps", "verification"),
+                    ("dependencies", "depends_on"),
+                )
+                for source, target in aliases:
+                    if target not in clean and source in clean:
+                        value = clean.pop(source)
+                        if source in {"acceptance", "criteria", "verification_steps", "dependencies"} and isinstance(value, str):
+                            value = [value]
+                        clean[target] = value
+                        actions.append(
+                            f"/tasks/{task_index}/{source} normalized to {target}"
+                        )
+                # Some models provide only a detailed description.  A short
+                # title derived from that same authored text is a structural
+                # repair, not a semantic guess, and prevents a repair turn from
+                # failing solely on the required display label.
+                if not str(clean.get("title") or "").strip() and str(clean.get("description") or "").strip():
+                    description = " ".join(str(clean["description"]).split())
+                    clean["title"] = description[:180].rstrip() or "Repair task"
+                    actions.append(
+                        f"/tasks/{task_index}/title derived from description"
                     )
                 for field in sorted(lifecycle_fields):
                     if field in clean:

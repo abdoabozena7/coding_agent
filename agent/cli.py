@@ -2601,7 +2601,7 @@ def execute_command(
     if command.kind == CommandKind.KEYMAP:
         console.write(
             "Keymap: F2 Simple/Advanced display, F3 model, F4 permissions, "
-            "F6 Sleep, F7 diff, F8 project folder, Ctrl+K actions, Ctrl+C "
+            "F5 activity, F6 Sleep, F7 diff, F8 project folder, Ctrl+K actions, Ctrl+C "
             "cooperative pause, Ctrl+Q checkpoint-safe exit."
         )
         return True
@@ -2647,6 +2647,15 @@ def execute_command(
             )
         console.write(result)
         return True
+    if command.kind == CommandKind.STOP:
+        result = runtime.stop_now(
+            shutdown_ollama=bool(command.args.get("shutdown_ollama"))
+        )
+        console.write(
+            "Stopped now. The saved stage is resumable."
+            + (" Ollama shutdown was requested." if command.args.get("shutdown_ollama") else "")
+        )
+        return True
     if command.kind == CommandKind.SETUP:
         _setup_sandbox(runtime, console)
         return True
@@ -2669,6 +2678,16 @@ def execute_command(
         enabled = action == "on"
         runtime.set_sleep_mode(enabled)
         console.set_sleep_mode(enabled)
+        if enabled:
+            # If the workflow is already paused on a safe approval, enabling
+            # Sleep should re-evaluate that exact fingerprint immediately;
+            # risky approvals remain visible and manual.
+            try:
+                auto_resolve = getattr(runtime, "auto_resolve_pending_sleep_approval", None)
+                if callable(auto_resolve) and auto_resolve():
+                    console.write("Sleep Mode resumed the pending safe action.")
+            except Exception as exc:
+                console.write(f"Sleep Mode is on; pending approval remains visible ({exc}).")
         if action == "off":
             runtime.sleep_profile("off", preferences.mode)
         elif preferences.mode is InteractionMode.ULTRA:
@@ -2729,6 +2748,25 @@ def execute_command(
             "Details\n  The persistent workspace opens collapsed messages and diagnostics here. "
             "In plain mode use /thinking, /trace, /status, or /history for the corresponding detail."
         )
+        return True
+    if command.kind == CommandKind.ACTIVITY:
+        snapshot = runtime.workflow_runtime_snapshot()
+        lines = [
+            f"Live workflow activity · {snapshot.phase} · {snapshot.liveness}",
+            f"Now: {snapshot.active_operation or snapshot.current_task or snapshot.reason or 'Ready'}",
+            (
+                f"Provider: {snapshot.provider}/{snapshot.model} · "
+                f"{snapshot.received_bytes} bytes · {snapshot.received_chunks} chunks · "
+                f"{snapshot.received_tokens} tokens"
+            ),
+            "",
+        ]
+        for item in snapshot.timeline_preview:
+            lines.append(
+                f"{item.get('timestamp', '')} · {item.get('source', 'HARNESS')} · "
+                f"{item.get('message') or item.get('operation') or 'Activity'}"
+            )
+        console.write("\n".join(lines))
         return True
     if command.kind == CommandKind.INSIGHTS:
         _show_insights(runtime, console, command.args.get("target"))
@@ -3066,6 +3104,38 @@ def _action_attention(store: WorkspaceUIStore) -> AttentionRequest:
     )
 
 
+def _tool_approval_attention(pending: Mapping[str, Any]) -> AttentionRequest:
+    """Rehydrate a durable tool approval after a terminal restart."""
+
+    tool = str(pending.get("tool") or "action").replace("_", " ")
+    arguments = pending.get("arguments")
+    target = json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)
+    fingerprint = str(pending.get("action_fingerprint") or "")
+    return AttentionRequest(
+        id=f"tool-approval:{fingerprint}:{time.monotonic_ns()}",
+        kind=AttentionKind.APPROVAL,
+        title=f"Allow {tool}?",
+        message=(
+            f"The saved workflow is waiting before this computer action runs. "
+            f"Risk: {pending.get('risk') or 'risky'}. Target: {target[:600]}"
+        ),
+        options=(
+            AttentionOption(
+                "allow_once", "Allow once", "allow_once", shortcut="y",
+                description="Authorize this exact saved action and resume it.",
+            ),
+            AttentionOption(
+                "deny", "Deny", "deny", shortcut="n", primary=True,
+                description="Keep the action stopped at the saved checkpoint.",
+            ),
+        ),
+        details=target,
+        default_key="deny",
+        cancel_key="deny",
+        action_fingerprint=fingerprint,
+    )
+
+
 def _persistent_interactive_loop(
     runtime: AgentRuntime,
     console: ConsoleUI,
@@ -3103,19 +3173,35 @@ def _persistent_interactive_loop(
             event_key=f"timeline:{timeline_item.get('sequence')}",
         )
         last_loaded = (role, content)
+    work_running = Event()
     if isinstance(getattr(runtime, "session_id", None), str):
-        store.bind_timeline_sink(
-            lambda role, content, key: runtime.store.append_chat_message(
+        def persist_presented_timeline(role: str, content: str, key: str) -> None:
+            # A new semantic turn persists its exact user input itself with a
+            # stable turn key before the provider call. Persisting the same
+            # composer echo here creates the duplicate rows visible in
+            # Workspace Chat. Guidance entered while a worker is already live
+            # is presentation-owned and still needs this sink.
+            if str(role) == "user" and not work_running.is_set():
+                return
+            runtime.store.append_chat_message(
                 runtime.session_id,
                 {"role": role, "content": content},
                 event_key=key,
                 visibility="transcript",
             )
+
+        store.bind_timeline_sink(
+            persist_presented_timeline
         )
     console.bind_workspace_store(store)
+    # Web approvals must resolve the same in-memory AttentionRequest that is
+    # blocking the worker.  They never bypass the terminal's fingerprint or
+    # permission policy.
+    set_approval_resolver = getattr(runtime, "set_external_tool_approval_resolver", None)
+    if callable(set_approval_resolver):
+        set_approval_resolver(console.resolve_external_approval)
     inbox: Queue[WorkspaceInput] = Queue()
     stop = Event()
-    work_running = Event()
 
     def submit(item: WorkspaceInput) -> None:
         inbox.put(item)
@@ -3158,30 +3244,9 @@ def _persistent_interactive_loop(
         )
     except (AttributeError, StateStoreError, TypeError, ValueError):
         store.set_queued_count(0)
-    if timeline_entries:
-        restored_lines: list[str] = []
-        for entry in timeline_entries:
-            if str(entry.get("visibility")) != "transcript":
-                continue
-            message = entry.get("message") or {}
-            if not isinstance(message, Mapping):
-                continue
-            content = str(message.get("content") or "").strip()
-            if not content:
-                continue
-            restored_lines.extend(
-                (
-                    f"{str(message.get('role') or 'assistant').upper()} | {entry.get('created_at', '')}",
-                    content,
-                    "",
-                )
-            )
-        if restored_lines:
-            app.open_details(
-                "Workspace chat",
-                "\n".join(restored_lines).rstrip(),
-                kind="chat",
-            )
+    # Restored transcript rows are already visible in the main workspace.
+    # Do not force-open the Chat overlay on startup; an old overlay looked
+    # like the current workflow even when it belonged to a previous project.
     telemetry = TelemetrySampler(
         lambda sample: store.update_resources(**sample.as_update())
     )
@@ -3269,6 +3334,12 @@ def _persistent_interactive_loop(
                 permission_adapter=adapter,
                 session_id=target,
             )
+            # Keep browser approvals attached to the newly restored runtime;
+            # otherwise a session switch would leave the terminal showing the
+            # request while the web button could no longer wake its worker.
+            set_approval_resolver = getattr(runtime, "set_external_tool_approval_resolver", None)
+            if callable(set_approval_resolver):
+                set_approval_resolver(console.resolve_external_approval)
             preferences.mode = (
                 InteractionMode.PLAN
                 if str(state.get("interaction_mode") or saved["session_mode"]) == "plan"
@@ -3771,6 +3842,13 @@ def _persistent_interactive_loop(
             """Open read-only workspace overlays without touching live engine objects."""
 
             nonlocal cached_swarm_snapshot, last_swarm_refresh
+            if command.kind is CommandKind.ACTIVITY:
+                app.open_details(
+                    "Live workflow activity",
+                    app._activity_timeline_text(),
+                    kind="activity",
+                )
+                return True
             if command.kind in {CommandKind.AGENTS, CommandKind.AGENT, CommandKind.TREE}:
                 _open_local_web_view(runtime, console, "agents")
                 return True
@@ -3795,6 +3873,7 @@ def _persistent_interactive_loop(
             if command.kind is CommandKind.CHAT:
                 entries = runtime.store.list_timeline_entries(runtime.session_id, limit=500)
                 lines: list[str] = []
+                last_message: tuple[str, str] | None = None
                 for entry in entries:
                     if str(entry.get("visibility")) != "transcript":
                         continue
@@ -3803,11 +3882,19 @@ def _persistent_interactive_loop(
                         continue
                     role = str(message.get("role") or "assistant").upper()
                     content = str(message.get("content") or "").strip()
-                    if content:
+                    current_message = (role, content)
+                    if content and current_message != last_message:
+                        last_message = current_message
                         lines.extend((f"{role} · {entry.get('created_at', '')}", content, ""))
+                project_name = Path(runtime.workspace).resolve().name
+                transcript_text = (
+                    "\n".join(lines)
+                    if lines
+                    else "No durable conversation has been recorded yet."
+                )
                 app.open_details(
-                    "Workspace chat",
-                    "\n".join(lines) if lines else "No durable conversation has been recorded yet.",
+                    f"Workspace chat · {project_name}",
+                    f"Current project: {project_name}\nSession: {runtime.session_id}\n\n{transcript_text}",
                     kind="chat",
                 )
                 return True
@@ -4298,6 +4385,45 @@ def _persistent_interactive_loop(
                         )
 
                 if active_work is None:
+                    # A worker can be restored after a process restart while
+                    # its in-memory approval request is gone. Rehydrate the
+                    # exact saved action instead of showing a generic Working
+                    # screen with no way to continue.
+                    try:
+                        restored_goal = runtime.active_goal()
+                        restored_pending = (
+                            dict(restored_goal.metadata.get("pending_tool_approval") or {})
+                            if restored_goal is not None
+                            else {}
+                        )
+                    except Exception:
+                        restored_goal, restored_pending = None, {}
+                    if (
+                        restored_pending.get("action_fingerprint")
+                        and not restored_pending.get("decision")
+                        and store.active_attention() is None
+                    ):
+                        store.set_activity(
+                            ActivityStage.PAUSED,
+                            f"Approval required · {str(restored_pending.get('tool') or 'action').replace('_', ' ')}",
+                            running=False,
+                        )
+                        resolution = store.request_attention(
+                            _tool_approval_attention(restored_pending)
+                        )
+                        if runtime.resolve_tool_approval(
+                            str(restored_pending.get("action_fingerprint")),
+                            resolution.value,
+                        ):
+                            start(
+                                parse_command("/resume"),
+                                summary=(
+                                    "Approved · resuming the saved action"
+                                    if resolution.value in {"allow_once", "allow_session"}
+                                    else "Denied · recording the saved boundary"
+                                ),
+                            )
+                        continue
                     local_web = getattr(runtime, "local_web_server", None)
                     take_execution_request = getattr(
                         local_web,
@@ -4679,6 +4805,7 @@ def _persistent_interactive_loop(
                         CommandKind.MEMORY, CommandKind.TRACE, CommandKind.INSIGHTS,
                         CommandKind.HISTORY, CommandKind.VERSIONS, CommandKind.HELP,
                         CommandKind.KEYMAP, CommandKind.SLEEP, CommandKind.DETAILS,
+                        CommandKind.ACTIVITY,
                         CommandKind.QUEUE, CommandKind.PROJECT_BRAIN,
                         CommandKind.EFFECTIVE_PLAN, CommandKind.ULTRA_DETAILS,
                         CommandKind.SESSIONS,
@@ -4792,6 +4919,19 @@ def _persistent_interactive_loop(
                         continue
                     if active_command.kind is CommandKind.PAUSE:
                         interrupt()
+                        continue
+                    if active_command.kind is CommandKind.STOP:
+                        try:
+                            runtime.stop_now(
+                                shutdown_ollama=bool(active_command.args.get("shutdown_ollama"))
+                            )
+                            store.append_transcript(
+                                "assistant",
+                                "Stopped now. The saved stage is resumable and late provider output will be ignored."
+                                + (" Ollama shutdown requested." if active_command.args.get("shutdown_ollama") else ""),
+                            )
+                        except Exception as exc:
+                            store.append_transcript("assistant", f"Stop could not be completed: {redact_text(exc, 500)}")
                         continue
                     if active_command.kind is CommandKind.CANCEL:
                         # Ask for confirmation on the input thread; the worker
@@ -5051,6 +5191,9 @@ def _persistent_interactive_loop(
         store.mark_exit()
         controller_thread.join(timeout=5)
         telemetry.stop()
+        set_approval_resolver = getattr(runtime, "set_external_tool_approval_resolver", None)
+        if callable(set_approval_resolver):
+            set_approval_resolver(None)
         console.bind_workspace_store(None)
 
 
@@ -5088,6 +5231,7 @@ def _legacy_interactive_loop(
         CommandKind.STATUS,
         CommandKind.THINKING,
         CommandKind.DETAILS,
+        CommandKind.ACTIVITY,
         CommandKind.AGENTS,
         CommandKind.AGENT,
         CommandKind.TREE,
@@ -5191,6 +5335,13 @@ def _legacy_interactive_loop(
                     "Guidance queued for the next safe checkpoint. "
                     "Use /pause if it must apply before more work runs."
                 )
+                continue
+            if active_work is not None and command.kind is CommandKind.STOP:
+                try:
+                    runtime.stop_now(shutdown_ollama=bool(command.args.get("shutdown_ollama")))
+                    console.write("Stopped now. The saved stage is resumable; late output will be ignored.")
+                except Exception as exc:
+                    console.write(f"Stop could not be completed: {redact_text(exc, 500)}")
                 continue
             if active_work is not None and command.kind not in active_observer_kinds:
                 console.write(

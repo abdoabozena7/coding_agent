@@ -479,6 +479,14 @@ class SemanticRouteDecisionV3:
             raw_effects = (raw_effects,)
         if not isinstance(raw_effects, Sequence) or isinstance(raw_effects, (str, bytes)):
             raise ValueError("requested_effects must be an array or canonical boolean object")
+        # ``none`` is an empty-effect sentinel used by some local structured
+        # emitters.  It is not a permission and must not turn an otherwise
+        # valid Chat/Goal decision into an unknown-effect failure.
+        raw_effects = tuple(
+            item for item in raw_effects
+            if str(item or "").strip().casefold()
+            not in {"", "none", "no_effect", "no effects", "no requested effects"}
+        )
         effects = tuple(dict.fromkeys(RequestedEffectV2.parse(item) for item in raw_effects))
         raw_spans = value.get("authority_spans", {})
         if not isinstance(raw_spans, Mapping):

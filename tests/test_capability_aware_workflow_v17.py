@@ -92,6 +92,30 @@ def test_raw_parameter_count_is_normalized_to_billions() -> None:
     assert value.capability_band is CapabilityBand.HIGH
 
 
+def test_unprobed_profile_defaults_do_not_erase_catalog_capabilities() -> None:
+    class UnprobedProfile:
+        health_status = "unknown"
+        tool_call_support = False
+        structured_output_support = False
+        thinking_support = False
+        vision_support = False
+        context_size = 32_768
+        maximum_output_size = 4_096
+
+    value = ModelCapabilityEnvelopeV1.from_metadata(
+        provider="ollama",
+        model="opaque-cloud-model",
+        execution_class="cloud",
+        capabilities=("tools", "structured_output", "thinking"),
+        metadata={"parameter_size": "120B", "context_window_tokens": 32_768},
+        provider_profile=UnprobedProfile(),
+    )
+    assert value.tool_calling is True
+    assert value.structured_output is True
+    assert value.thinking is True
+    assert value.vision is False
+
+
 def test_single_model_authored_rationale_string_repairs_to_one_item_array() -> None:
     value = TaskDemandV1.from_mapping({
         "reasoning": 2,

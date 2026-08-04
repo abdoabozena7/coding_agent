@@ -25,6 +25,7 @@ class TaskPayload(BaseModel):
     outputs: list[str] = Field(default_factory=list, max_length=80)
     expected_files: list[str] = Field(default_factory=list, max_length=80)
     acceptance_criteria: list[str] = Field(default_factory=list, min_length=1, max_length=20)
+    requirement_refs: list[str] = Field(default_factory=list, max_length=40)
     tests: list[str] = Field(default_factory=list, min_length=1, max_length=20)
     risk_level: Literal["low", "medium", "high", "critical"] = "medium"
     required_tools: list[str] = Field(default_factory=list, max_length=40)
@@ -41,6 +42,7 @@ class TaskPayload(BaseModel):
         "outputs",
         "expected_files",
         "acceptance_criteria",
+        "requirement_refs",
         "tests",
         "required_tools",
         "memory_dependencies",
@@ -80,6 +82,13 @@ class PlanApprovalPayload(BaseModel):
     revision: int = Field(ge=1)
 
 
+class ToolApprovalPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    action_fingerprint: str = Field(min_length=16, max_length=128)
+    decision: Literal["allow", "approve", "allow_once", "deny", "reject"]
+
+
 class PlanRequestPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -112,6 +121,7 @@ class WorkspaceContextPayload(BaseModel):
     phase: str = "ready"
     waiting_on: str = ""
     resume_action: str = ""
+    tool_approval: dict[str, Any] | None = None
 
 
 class QueuePromptPayload(BaseModel):

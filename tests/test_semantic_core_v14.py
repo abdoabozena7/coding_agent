@@ -171,6 +171,41 @@ class SemanticCoreV14Tests(unittest.TestCase):
         )
         self.assertTrue(any("supports_tasks bound" in item for item in actions))
 
+    def test_expected_change_path_is_reconciled_from_an_operational_claim_task(self) -> None:
+        raw = {
+            "summary": "Create the page.",
+            "execution_strategy": "Create and verify the page.",
+            "applicability_evidence": [{"fact": "The root is empty.", "source": "inspection:I001"}],
+            "expected_changes": [{
+                "path": "index.html",
+                "intent": "Create the entry point.",
+                "basis": "model_selected_new_layout",
+                "supports_tasks": ["3"],
+            }],
+            "tasks": [
+                {
+                    "title": "Create index.html entry point",
+                    "description": "Write index.html with the requested interactive experience.",
+                    "acceptance_criteria": ["index.html exists and loads."],
+                    "verification": ["Open index.html and require a successful load."],
+                },
+                {
+                    "title": "Verify the page",
+                    "description": "Run the accepted browser verification.",
+                    "acceptance_criteria": ["The page has no runtime errors."],
+                    "verification": ["Run the browser check."],
+                },
+                {
+                    "title": "Resource claim for index.html",
+                    "description": "Obtain an accepted resource claim for index.html.",
+                    "acceptance_criteria": ["The claim is available."],
+                    "verification": ["Inspect the accepted claim."],
+                },
+            ],
+        }
+        normalized, _actions = normalize_plan_draft(raw)
+        assert normalized["expected_changes"][0]["supports_tasks"] == ["T001"]
+
     def test_full_planner_accepts_missing_cross_references_with_two_inspections(self) -> None:
         request = "Create a Three.js calculator and run it."
         plan = {

@@ -107,6 +107,14 @@ TASK_SCHEMA: dict[str, Any] = {
         },
         "depends_on": {},
         "expected_changes": {},
+        "requirement_refs": {
+            "type": "array", "minItems": 1, "maxItems": 40,
+            "items": {"type": "string", "minLength": 1, "maxLength": 24},
+            "description": (
+                "Requirement anchor ids implemented and verified by this task. "
+                "Every accepted anchor must be covered by at least one task."
+            ),
+        },
         "risk": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
     },
     "required": ["title", "description", "acceptance_criteria", "verification"],
@@ -172,6 +180,13 @@ SEMANTIC_GOAL_SCHEMA: dict[str, Any] = {
     "properties": {
         "original_request": {"type": "string", "minLength": 1, "maxLength": 200_000},
         "interpreted_outcome": {"type": "string", "minLength": 1, "maxLength": 20_000},
+        # Legacy providers sometimes echo a semantic lifecycle value. It is
+        # optional and never authoritative; the harness canonicalizes it.
+        "status": {
+            "type": "string",
+            "maxLength": 32,
+            "description": "Legacy transport only; omit it. The harness owns lifecycle status.",
+        },
         "requested_effects": {
             "type": "array",
             "maxItems": 7,
@@ -210,6 +225,33 @@ SEMANTIC_GOAL_SCHEMA: dict[str, Any] = {
             "type": "array", "minItems": 1, "maxItems": 40,
             "items": {"type": "string", "minLength": 1, "maxLength": 2_000},
         },
+        "requirement_anchors": {
+            "type": "array", "minItems": 1, "maxItems": 40,
+            "description": (
+                "Trace every material user-authored deliverable, named technology or medium, "
+                "interaction, visual/runtime quality, format, and constraint to an exact span. "
+                "Interpret what must be observable in the finished result; importing or naming "
+                "a technology is not evidence that its distinctive capability was delivered."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "minLength": 1, "maxLength": 24},
+                    "verbatim_span": {"type": "string", "minLength": 1, "maxLength": 2_000},
+                    "interpreted_requirement": {"type": "string", "minLength": 3, "maxLength": 4_000},
+                    "observable_implications": {
+                        "type": "array", "minItems": 1, "maxItems": 12,
+                        "items": {"type": "string", "minLength": 3, "maxLength": 2_000},
+                    },
+                    "kind": {"type": "string", "minLength": 1, "maxLength": 100},
+                },
+                "required": [
+                    "verbatim_span", "interpreted_requirement",
+                    "observable_implications", "kind",
+                ],
+                "additionalProperties": False,
+            },
+        },
         "unresolved_decisions": {
             "type": "array", "maxItems": 20,
             "items": {"type": "string", "minLength": 1, "maxLength": 2_000},
@@ -222,7 +264,7 @@ SEMANTIC_GOAL_SCHEMA: dict[str, Any] = {
     "required": [
         "original_request", "interpreted_outcome", "requested_effects",
         "required_outcomes", "constraints", "exclusions",
-        "acceptance_criteria", "unresolved_decisions",
+        "acceptance_criteria", "requirement_anchors", "unresolved_decisions",
         "repository_evidence_refs",
     ],
     "additionalProperties": False,
@@ -571,6 +613,59 @@ class ControlValidationError(ValueError):
     pass
 
 
+def _normalize_plan_change_args(args: Mapping[str, Any]) -> dict[str, Any]:
+    """Repair transport-only coordinator variance before schema validation.
+
+    Some providers reuse their execution-task envelope when asking for a plan
+    revision.  Resource leases and lifecycle fields belong to the harness, and
+    aliases such as ``name``/``summary`` carry the same model-authored task
+    meaning as the canonical fields.  This helper is intentionally narrow: it
+    never creates paths, criteria, dependencies, or effects.
+    """
+
+    normalized = dict(args)
+    harness_fields = {
+        "resource_claims", "resource_claim", "resolved_paths", "lease",
+        "status", "attempt", "attempts", "evidence", "note",
+        "blocked_reason", "last_error", "started_at", "completed_at",
+        "ready_at", "updated_at", "worker_id", "execution_state",
+        "runtime_state", "worker_state",
+    }
+    for field in harness_fields:
+        normalized.pop(field, None)
+    raw_tasks = normalized.get("tasks")
+    if not isinstance(raw_tasks, list):
+        return normalized
+    tasks: list[Any] = []
+    for raw in raw_tasks:
+        if not isinstance(raw, Mapping):
+            tasks.append(raw)
+            continue
+        task = dict(raw)
+        aliases = (
+            ("name", "title"),
+            ("summary", "description"),
+            ("task", "description"),
+            ("acceptance", "acceptance_criteria"),
+            ("criteria", "acceptance_criteria"),
+            ("verification_steps", "verification"),
+            ("dependencies", "depends_on"),
+        )
+        for source, target in aliases:
+            if target not in task and source in task:
+                value = task.pop(source)
+                if source in {"acceptance", "criteria", "verification_steps", "dependencies"} and isinstance(value, str):
+                    value = [value]
+                task[target] = value
+        if not str(task.get("title") or "").strip() and str(task.get("description") or "").strip():
+            task["title"] = " ".join(str(task["description"]).split())[:180].rstrip()
+        for field in harness_fields:
+            task.pop(field, None)
+        tasks.append(task)
+    normalized["tasks"] = tasks
+    return normalized
+
+
 def _schema_errors(
     value: Any,
     schema: dict[str, Any],
@@ -658,6 +753,8 @@ def validate_control_call(name: str, args: Any) -> dict[str, Any]:
     if schema is None:
         raise ControlValidationError(f"unknown control tool '{name}'")
     normalized = args
+    if name == "propose_plan_change" and isinstance(args, Mapping):
+        normalized = _normalize_plan_change_args(args)
     if name == "update_task" and isinstance(args, dict):
         # Tool-capable models commonly emit semantically equivalent evidence
         # objects even when the portable schema requests strings.  Canonicalize

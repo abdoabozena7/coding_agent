@@ -1,0 +1,13 @@
+{
+  "name": "threejs-calculator",
+  "version": "1.0.0",
+  "description": "3D calculator using Three.js",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "dependencies": {
+    "three": "latest"
+  }
+}
+

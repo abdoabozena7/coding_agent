@@ -8,12 +8,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import socket
+import subprocess
+import getpass
+import time
 from dataclasses import replace
 from collections.abc import Mapping
 from typing import Any
 
 from .base import (
     AssistantTurn,
+    ProviderActivityV1,
+    ProviderCallPolicyV1,
+    ProviderConnectivityV1,
     ProviderCapabilities,
     SUMMARY_INSTRUCTION,
     ToolCall,
@@ -135,7 +141,7 @@ class OllamaProvider:
             self._capability_cache[key] = cached
         self.capability_profile = cached
 
-    def _post_json(self, path: str, payload: dict):
+    def _post_json(self, path: str, payload: dict, on_activity=None):
         data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
         request = urllib.request.Request(
             f"{self.host}{path}",
@@ -144,13 +150,18 @@ class OllamaProvider:
             method="POST",
         )
         try:
+            if on_activity:
+                on_activity(ProviderActivityV1(state="request_created"))
             timeout = self.request_timeout
             if not self._request_timeout_explicit and self.max_output_tokens is not None:
                 timeout = max(
                     300.0,
                     min(900.0, 120.0 + (self.max_output_tokens * 0.20)),
                 )
-            return urllib.request.urlopen(request, timeout=timeout)
+            response = urllib.request.urlopen(request, timeout=timeout)
+            if on_activity:
+                on_activity(ProviderActivityV1(state="provider_connected"))
+            return response
         except urllib.error.HTTPError as error:
             try:
                 body = error.read().decode("utf-8", errors="replace")
@@ -222,6 +233,99 @@ class OllamaProvider:
             # Preserve the original, correctly classified timeout. The next
             # GPU-residency check still fails closed if cancellation failed.
             pass
+
+    def cancel_active_request(self) -> None:
+        """Best-effort cancellation of the current Ollama generation."""
+        self._cancel_active_generation()
+
+    def unload_model(self) -> None:
+        """Unload this model without shutting down the Ollama server."""
+        self._cancel_active_generation()
+
+    @property
+    def is_loopback_host(self) -> bool:
+        hostname = (urllib.parse.urlsplit(self.host).hostname or "").casefold()
+        return hostname in {"localhost", "127.0.0.1", "::1"}
+
+    @property
+    def is_local_runner(self) -> bool:
+        return self.is_loopback_host and not self.model.casefold().endswith((":cloud", "-cloud"))
+
+    def diagnose_activity(self) -> dict[str, Any]:
+        """Read Ollama's runner state; this is telemetry, not response bytes."""
+        if not self.is_local_runner:
+            return {"local": False, "state": "remote"}
+        try:
+            request = urllib.request.Request(f"{self.host}/api/ps", method="GET")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            models = payload.get("models") if isinstance(payload, Mapping) else ()
+            loaded = any(
+                isinstance(item, Mapping)
+                and str(item.get("name") or item.get("model") or "").casefold() == self.model.casefold()
+                for item in (models if isinstance(models, (list, tuple)) else ())
+            )
+            return {"local": True, "state": "generating" if loaded else "not_loaded", "model_loaded": loaded}
+        except Exception as exc:
+            return {"local": True, "state": "unavailable", "detail": f"{type(exc).__name__}: {exc}"}
+
+    def diagnose_connectivity(self) -> ProviderConnectivityV1:
+        """Probe the configured Ollama endpoint, never a generic internet host."""
+        target = self.host
+        configured_host = (urllib.parse.urlsplit(self.host).hostname or "").casefold()
+        if not self.is_local_runner and configured_host in {"localhost", "127.0.0.1", "::1"} and self.model.casefold().endswith((":cloud", "-cloud")):
+            # Cloud-tagged Ollama models are served by Ollama Cloud even when
+            # the local client endpoint is loopback; probe that provider host.
+            target = "https://ollama.com"
+        try:
+            request = urllib.request.Request(f"{target}/api/version", method="GET")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                status = int(getattr(response, "status", 200) or 200)
+            return ProviderConnectivityV1(True, "reachable", status_code=status, endpoint=target, local=self.is_local_runner)
+        except urllib.error.HTTPError as exc:
+            return ProviderConnectivityV1(True, "http_error", str(exc), status_code=int(exc.code), endpoint=target, local=self.is_local_runner)
+        except socket.gaierror as exc:
+            return ProviderConnectivityV1(False, "dns_failure", str(exc), endpoint=target, local=self.is_local_runner)
+        except ConnectionRefusedError as exc:
+            return ProviderConnectivityV1(False, "connection_refused", str(exc), endpoint=target, local=self.is_local_runner)
+        except urllib.error.URLError as exc:
+            return ProviderConnectivityV1(False, "network_unavailable", str(exc.reason), endpoint=target, local=self.is_local_runner)
+        except Exception as exc:
+            return ProviderConnectivityV1(False, "network_unavailable", f"{type(exc).__name__}: {exc}", endpoint=target, local=self.is_local_runner)
+
+    def shutdown_local_server(self) -> bool:
+        """Stop only a loopback Ollama owned by the current user."""
+        hostname = (urllib.parse.urlsplit(self.host).hostname or "").casefold()
+        if hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise RuntimeError("refusing to shut down a remote Ollama host")
+        try:
+            import psutil  # type: ignore
+        except Exception:
+            return False
+        current_user = getpass.getuser().casefold()
+        targets = []
+        for proc in psutil.process_iter(["pid", "name", "username", "ppid"]):
+            try:
+                name = str(proc.info.get("name") or "").casefold()
+                owner = str(proc.info.get("username") or "").casefold()
+                if name in {"ollama", "ollama.exe", "ollama_app.exe", "ollama_llama_server", "ollama_llama_server.exe"} and (not owner or current_user in owner):
+                    targets.append(proc)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        # Children first prevents a runner from immediately respawning.
+        targets.sort(key=lambda p: int(p.info.get("ppid") or 0), reverse=True)
+        for proc in targets:
+            try:
+                proc.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        gone, alive = psutil.wait_procs(targets, timeout=2)
+        for proc in alive:
+            try:
+                proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return bool(targets)
 
     def reset_model_cache(self) -> None:
         """Unload a degraded local runner so the next GPU call gets a clean KV cache."""
@@ -379,7 +483,15 @@ class OllamaProvider:
                 )
         return messages
 
-    def call(self, conversation, tools, system, on_text=None, on_thought=None) -> AssistantTurn:
+    def call(
+        self, conversation, tools, system, on_text=None, on_thought=None,
+        on_activity=None, policy: ProviderCallPolicyV1 | None = None,
+    ) -> AssistantTurn:
+        if policy is not None:
+            if policy.reasoning_effort:
+                self.reasoning_effort = str(policy.reasoning_effort)
+            if policy.max_output_tokens is not None:
+                self.max_output_tokens = min(65_536, max(128, int(policy.max_output_tokens)))
         self._ensure_capabilities()
         tool_specs = tuple(tools or ())
         payload = self.request_compiler.compile(
@@ -423,14 +535,14 @@ class OllamaProvider:
 
         runner_replayed = False
         try:
-            response = self._post_json("/api/chat", payload)
+            response = self._post_json("/api/chat", payload, on_activity=on_activity)
         except ProviderRequestError as error:
             if self._runner_recovery_allowed(error):
                 # Keep the execution class GPU-only: unload the corrupted
                 # runner/KV cache, then replay the exact governed request once
                 # so Ollama reloads it with num_gpu unchanged.
                 self.reset_model_cache()
-                response = self._post_json("/api/chat", payload)
+                response = self._post_json("/api/chat", payload, on_activity=on_activity)
                 runner_replayed = True
             else:
                 field = error.diagnostic.incompatible_field
@@ -447,7 +559,7 @@ class OllamaProvider:
                 )
                 adapted_payload = dict(payload)
                 adapted_payload.pop(field, None)
-                response = self._post_json("/api/chat", adapted_payload)
+                response = self._post_json("/api/chat", adapted_payload, on_activity=on_activity)
 
         def consume(stream: Any) -> None:
             nonlocal malformed_chunks, valid_chunks, usage
@@ -455,6 +567,13 @@ class OllamaProvider:
                 for raw_line in stream:
                     if not raw_line or not raw_line.strip():
                         continue
+                    if on_activity:
+                        raw_size = len(raw_line) if isinstance(raw_line, bytes) else len(str(raw_line).encode("utf-8"))
+                        on_activity(ProviderActivityV1(
+                            state="receiving",
+                            received_bytes=raw_size,
+                            received_chunks=1,
+                        ))
                     try:
                         chunk = json.loads(raw_line)
                     except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
@@ -517,7 +636,7 @@ class OllamaProvider:
             runner_replayed = True
             malformed_chunks = 0
             valid_chunks = 0
-            consume(self._post_json("/api/chat", payload))
+            consume(self._post_json("/api/chat", payload, on_activity=on_activity))
 
         if malformed_chunks and not valid_chunks:
             raise ProviderRequestError(ProviderDiagnostic(
@@ -556,6 +675,11 @@ class OllamaProvider:
             if thought_parts
             else {}
         )
+        if on_activity:
+            on_activity(ProviderActivityV1(
+                state="completed",
+                received_tokens=(usage.output_tokens if usage is not None else 0),
+            ))
         return AssistantTurn(
             text="".join(text_parts) or None,
             tool_calls=tool_calls,

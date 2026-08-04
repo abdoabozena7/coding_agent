@@ -23,6 +23,33 @@ from typing import Any, Callable, Optional, Protocol
 
 
 @dataclass(frozen=True)
+class ProviderCallPolicyV1:
+    """Per-stage budget supplied by the harness.
+
+    This is deliberately provider-neutral: adapters may map the output and
+    reasoning fields to their native request shape, while the watchdog owns
+    the durable stage deadline.
+    """
+
+    stage: str = ""
+    max_output_tokens: int | None = None
+    reasoning_effort: str | None = None
+    stage_deadline_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class ProviderConnectivityV1:
+    """A provider-specific connectivity diagnosis."""
+
+    reachable: bool
+    state: str
+    detail: str = ""
+    status_code: int | None = None
+    endpoint: str = ""
+    local: bool = False
+
+
+@dataclass(frozen=True)
 class ProviderCapabilities:
     """Features an adapter can provide to a harness.
 
@@ -95,6 +122,17 @@ class Usage:
     output_tokens: int = 0
 
 
+@dataclass(frozen=True)
+class ProviderActivityV1:
+    """Authoritative transport activity, never model-authored reasoning."""
+
+    state: str
+    received_bytes: int = 0
+    received_chunks: int = 0
+    received_tokens: int = 0
+    detail: str = ""
+
+
 @dataclass
 class AssistantTurn:
     """The provider-neutral shape of one model reply."""
@@ -137,6 +175,8 @@ class Provider(Protocol):
         system,
         on_text: Optional[Callable[[str], None]] = None,
         on_thought: Optional[Callable[[str], None]] = None,
+        on_activity: Optional[Callable[[ProviderActivityV1], None]] = None,
+        policy: Optional[ProviderCallPolicyV1] = None,
     ) -> AssistantTurn: ...
 
     def summarize(self, messages) -> str: ...

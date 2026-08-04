@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from queue import Empty
 import socket
 import threading
 import time
@@ -13,11 +15,12 @@ from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 from ..store import NotFoundError, StalePlanError, StateStoreError
+from ..events import LiveWorkflowEventV1
 from .schemas import (
     ExplanationRequestPayload,
     PlanApprovalPayload,
@@ -26,6 +29,7 @@ from .schemas import (
     QueuePromptPayload,
     QueueReorderPayload,
     ReviewSubmissionPayload,
+    ToolApprovalPayload,
 )
 from .security import SessionSecurity
 from .service import CoreWebAdapter
@@ -163,6 +167,74 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
         check_session(session_id)
         return adapter.workspace_context()
 
+    @app.get("/api/sessions/{session_id}/events")
+    async def live_events(request: Request, session_id: str):
+        """Stream safe workflow activity; durable snapshots repair reconnects."""
+
+        check_session(session_id)
+        raw_after = request.headers.get("last-event-id") or request.query_params.get("after") or "0"
+        try:
+            after_sequence = max(0, int(raw_after))
+        except (TypeError, ValueError):
+            after_sequence = 0
+
+        async def stream():
+            queue = adapter.events.open_queue()
+            cursor = after_sequence
+            try:
+                snapshot = adapter.workspace_context()
+                latest = adapter.events.latest_sequence
+                cursor = max(cursor, latest)
+                yield "retry: 1000\n"
+                yield (
+                    f"id: {latest}\n"
+                    "event: snapshot\n"
+                    f"data: {json.dumps(snapshot, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                )
+                # Replay the bounded in-process history requested by a client
+                # that reconnects without forcing a full page rebuild.
+                for item in adapter.events.list_live_events(
+                    after_sequence=after_sequence,
+                    limit=256,
+                ):
+                    if item.sequence <= cursor:
+                        continue
+                    cursor = item.sequence
+                    yield (
+                        f"id: {item.sequence}\n"
+                        "event: activity\n"
+                        f"data: {json.dumps(item.to_dict(), ensure_ascii=False, separators=(',', ':'))}\n\n"
+                    )
+                while not security.expired:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        event = await asyncio.to_thread(queue.get, True, 10.0)
+                    except Empty:
+                        yield ": keepalive\n\n"
+                        continue
+                    item = LiveWorkflowEventV1.from_ui_event(event)
+                    if item.sequence <= cursor:
+                        continue
+                    cursor = item.sequence
+                    yield (
+                        f"id: {item.sequence}\n"
+                        "event: activity\n"
+                        f"data: {json.dumps(item.to_dict(), ensure_ascii=False, separators=(',', ':'))}\n\n"
+                    )
+            finally:
+                adapter.events.close_queue(queue)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @app.post("/api/sessions/{session_id}/plan/draft")
     async def save_draft(session_id: str, payload: PlanPayload):
         check_session(session_id)
@@ -187,6 +259,11 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
     async def approve_plan(session_id: str, payload: PlanApprovalPayload):
         check_session(session_id)
         return adapter.approve_plan(payload.revision)
+
+    @app.post("/api/sessions/{session_id}/tool-approval")
+    async def resolve_tool_approval(session_id: str, payload: ToolApprovalPayload):
+        check_session(session_id)
+        return adapter.resolve_tool_approval(payload.action_fingerprint, payload.decision)
 
     @app.post("/api/sessions/{session_id}/plan/request")
     async def submit_plan_request(session_id: str, payload: PlanRequestPayload):

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Three.js 3D Calculator</title>
+    <!-- Three.js CDN (pinned version) -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.min.js"></script>
+    <!-- Local styles and scripts -->
+    <link rel="stylesheet" href="style.css" />
+    <script src="calc.js"></script>
+    <script src="script.js" defer></script>
+</head>
+<body>
+    <canvas id="three-canvas"></canvas>
+    <div id="calc-ui">
+        <div id="calc-display">0</div>
+        <div id="calc-buttons">
+            <!-- Digit buttons -->
+            <button class="calc-button" data-key="7">7</button>
+            <button class="calc-button" data-key="8">8</button>
+            <button class="calc-button" data-key="9">9</button>
+            <button class="calc-button" data-key="/">÷</button>
+            <button class="calc-button" data-key="4">4</button>
+            <button class="calc-button" data-key="5">5</button>
+            <button class="calc-button" data-key="6">6</button>
+            <button class="calc-button" data-key="*">×</button>
+            <button class="calc-button" data-key="1">1</button>
+            <button class="calc-button" data-key="2">2</button>
+            <button class="calc-button" data-key="3">3</button>
+            <button class="calc-button" data-key="-">−</button>
+            <button class="calc-button" data-key="0">0</button>
+            <button class="calc-button" data-key=".">.</button>
+            <button class="calc-button" data-key="=">=</button>
+            <button class="calc-button" data-key="+">+</button>
+        </div>
+    </div>
+    <script>
+        // Run test mode when URL contains ?test=1
+        document.addEventListener('DOMContentLoaded', () => {
+            if (window.location.search.includes('test=1') && typeof window.runTestMode === 'function') {
+                window.runTestMode();
+            }
+        });
+    </script>
+</body>
+</html>
+

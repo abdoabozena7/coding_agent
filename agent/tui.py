@@ -970,6 +970,15 @@ def _compact_duration(seconds: int | float | None) -> str:
     return f"{hours}h {minutes:02d}m"
 
 
+def _compact_bytes(value: int | float | None) -> str:
+    size = max(0.0, float(value or 0))
+    if size < 1_024:
+        return f"{int(size)} B"
+    if size < 1_048_576:
+        return f"{size / 1_024:.1f} KB"
+    return f"{size / 1_048_576:.1f} MB"
+
+
 def _progress_lines(snapshot: WorkspaceSnapshot, width: int) -> list[str]:
     progress = snapshot.progress
     activity = snapshot.activity
@@ -1032,7 +1041,7 @@ def _progress_lines(snapshot: WorkspaceSnapshot, width: int) -> list[str]:
 
 
 def _compact_progress_lines(snapshot: WorkspaceSnapshot, width: int) -> list[str]:
-    """Return the calm default activity strip; detailed facts live in /status."""
+    """Render the current goal, actor, task, and operation without inventing progress."""
 
     progress = snapshot.progress
     activity = snapshot.activity
@@ -1046,16 +1055,28 @@ def _compact_progress_lines(snapshot: WorkspaceSnapshot, width: int) -> list[str
         "verifying": "Verifying the result",
         "running": "Building",
     }.get(normalized, normalized.title() or "Working")
-    operation = progress.active_operation or progress.current_task or activity.summary
-    lines = [_fit(f"{phase}  ·  {operation or 'Waiting for the next step'}", width).rstrip()]
+    actor = str(snapshot.active_actor or "").replace("-", " ").replace("_", " ").strip()
+    actor_label = {
+        "semantic router": "Router",
+        "semantic goal intake": "Goal intake",
+        "plan reviewer": "Plan reviewer",
+    }.get(actor.casefold(), actor.title())
+    operation = progress.active_operation or activity.summary or "Waiting for the next runtime signal"
+    if actor_label and actor_label.casefold() not in operation.casefold():
+        operation = f"{actor_label} · {operation}"
+    lines = [_fit(f"{phase} · {operation}", width).rstrip()]
+
+    if snapshot.objective:
+        lines.append(_fit(f"Goal · {snapshot.objective}", width).rstrip())
+
     facts: list[str] = []
+    task = progress.current_task or snapshot.current_task
+    if task:
+        facts.append(f"Task · {task}")
     if progress.total > 0:
-        percent = min(100, max(0, int(progress.completed * 100 / progress.total)))
-        facts.append(
-            f"Step {progress.completed}/{progress.total} · {percent}% · {progress.remaining} tasks remaining"
-        )
-    elif snapshot.running:
-        facts.append("Planning · total not known yet")
+        facts.append(f"Step {progress.completed}/{progress.total} · {progress.remaining} remaining")
+    elif snapshot.running and not task:
+        facts.append("Plan size not known yet")
     changes = snapshot.changes
     if changes.files:
         facts.append(
@@ -1072,13 +1093,18 @@ def _compact_progress_lines(snapshot: WorkspaceSnapshot, width: int) -> list[str
             f"ETA ~{_compact_duration(progress.eta_low_seconds)}–"
             f"{_compact_duration(progress.eta_high_seconds)}"
         )
-    lines.append(_fit(" · ".join(facts), width).rstrip())
+    if facts:
+        lines.append(_fit(" · ".join(facts), width).rstrip())
     if progress.blocker:
         lines.append(_fit(f"Blocked · {progress.blocker}", width).rstrip())
     elif progress.retry_reason:
         lines.append(
             _fit(f"Retry {progress.retry_count or 1} · {progress.retry_reason}", width).rstrip()
         )
+    # A blocker is more important than the goal reminder; keep the current
+    # action and exact task visible while replacing the least specific line.
+    if len(lines) > 3 and (progress.blocker or progress.retry_reason):
+        return [lines[0], lines[-2], lines[-1]]
     return lines[:3]
 
 
@@ -1155,20 +1181,23 @@ def _contextual_footer_text(snapshot: WorkspaceSnapshot, width: int) -> str:
     """Return a short, context-sensitive set of currently useful controls."""
 
     if snapshot.attention is not None:
-        value = "Arrows Select | Enter Confirm | Esc Back | ? Help"
+        if snapshot.attention.kind.value == "approval":
+            value = "[Y] Allow once | [N] Deny | / Commands | Arrows Select | Enter Confirm"
+        else:
+            value = "Arrows Select | Enter Confirm | Esc Back | ? Help"
     elif snapshot.runtime_phase == "waiting_for_approval":
-        value = "Approve in the prompt | F7 Diff | Mode locked | ? Help"
+        value = "Approve in the prompt | F5 Activity | F7 Diff | ? Help"
     elif snapshot.runtime_phase == "waiting_for_process":
-        value = "Waiting for process | Ctrl+C Pause | F7 Diff | Mode locked | ? Help"
+        value = "Waiting for process | /stop Stop now | F5 Activity | Ctrl+C Pause | ? Help"
     elif snapshot.running:
-        value = "/ Queue | Ctrl+C Pause | F7 Diff | Mode locked | ? Help"
+        value = "/stop Stop now | F5 Activity | / Queue | Ctrl+C Pause | F7 Diff | ? Help"
     elif str(snapshot.status).casefold() == "paused":
-        value = "/resume Continue | /plan Review | F7 Diff | Mode locked | ? Help"
+        value = "/resume Continue | F5 Activity | F7 Diff | ? Help"
     elif str(snapshot.status).casefold() not in {"idle", "completed", "cancelled"}:
-        value = "/details Diagnose | /resume Retry | Mode locked | ? Help"
+        value = "F5 Activity | /details Diagnose | /resume Retry | ? Help"
     else:
         target = "Simple" if snapshot.mode is ExperienceMode.ADVANCED else "Advanced"
-        value = f"/ Commands | F2 {target} | F8 Folder | ? Help"
+        value = f"/ Commands | F2 {target} | F5 Activity | F6 Sleep {'ON' if snapshot.sleep_enabled else 'OFF'} | ? Help"
     if snapshot.queued_count:
         value += f" | queued {snapshot.queued_count}"
     return _fit(value, width).rstrip()
@@ -1315,11 +1344,33 @@ class PersistentWorkspaceApp:
         )
         self._transcript_window = transcript
         self._follow_transcript = True
-        activity = Window(
-            content=FormattedTextControl(self._activity_fragments),
+        narrow_activity = Window(
+            content=FormattedTextControl(self._live_activity_fragments),
             wrap_lines=True,
             always_hide_cursor=True,
-            height=Dimension(min=1, max=3, preferred=2),
+            height=Dimension(min=6, max=8, preferred=7),
+        )
+        wide_activity = Window(
+            content=FormattedTextControl(self._live_activity_fragments),
+            wrap_lines=True,
+            always_hide_cursor=True,
+            width=Dimension(min=38, max=56, preferred=46),
+        )
+        divider_char = "│" if terminal_supports_unicode(output) else "|"
+        rule_char = "─" if terminal_supports_unicode(output) else "-"
+        self._wide_workspace_body = VSplit(
+            [
+                transcript,
+                Window(width=1, char=divider_char),
+                wide_activity,
+            ]
+        )
+        self._narrow_workspace_body = HSplit(
+            [
+                transcript,
+                Window(height=1, char=rule_char),
+                narrow_activity,
+            ]
         )
         telemetry = Window(
             content=FormattedTextControl(self._telemetry_fragments),
@@ -1359,8 +1410,7 @@ class PersistentWorkspaceApp:
             [
                 Window(content=FormattedTextControl(self._header_fragments), height=1),
                 Window(height=1, char="─" if terminal_supports_unicode(output) else "-"),
-                transcript,
-                activity,
+                DynamicContainer(self._workspace_body_container),
                 attention,
                 DynamicContainer(self._palette_container),
                 Window(content=FormattedTextControl(self._composer_prompt_fragments), height=1),
@@ -1424,6 +1474,10 @@ class PersistentWorkspaceApp:
             return self._editor_root
         return self._overlay_window if self._overlay_kind else self._main_root
 
+    def _workspace_body_container(self) -> Any:
+        columns, _rows = self._terminal_size()
+        return self._wide_workspace_body if columns >= 120 else self._narrow_workspace_body
+
     def _terminal_size(self) -> tuple[int, int]:
         try:
             application = self._application
@@ -1464,14 +1518,14 @@ class PersistentWorkspaceApp:
         )
 
     def _palette_container(self) -> Any:
-        if not self._palette_open or self.store.active_attention() is not None:
+        if not self._palette_open:
             return Window(height=0)
         return Window(
             content=FormattedTextControl(self._palette_fragments),
             height=Dimension(
                 min=2,
-                max=11,
-                preferred=min(10, min(4, len(self._palette_matches)) * 2 + 2),
+                max=13,
+                preferred=min(12, min(6, len(self._palette_matches)) * 2 + 2),
             ),
             wrap_lines=False,
             always_hide_cursor=True,
@@ -1562,6 +1616,33 @@ class PersistentWorkspaceApp:
         self._swarm_snapshot = dict(snapshot)
         self._swarm_state.clamp(self._swarm_snapshot)
         self.request_redraw()
+
+    def _activity_timeline_text(self) -> str:
+        snapshot = self.store.snapshot()
+        lines = [
+            f"NOW  {snapshot.runtime_phase.replace('_', ' ').title()} · "
+            f"{snapshot.active_operation or snapshot.progress.active_operation or snapshot.current_task or 'Ready'}",
+            (
+                f"MODEL  {snapshot.model or 'unknown'} · {snapshot.liveness} · "
+                f"{_compact_bytes(snapshot.received_bytes)} · "
+                f"{snapshot.received_chunks} chunks · {snapshot.received_tokens} tokens"
+            ),
+        ]
+        if snapshot.objective:
+            lines.extend(("", f"GOAL  {snapshot.objective}"))
+        if snapshot.current_task:
+            lines.append(f"TASK  {snapshot.current_task}")
+        lines.extend(("", "ACTIVITY"))
+        for entry in snapshot.live_timeline:
+            stamp = entry.timestamp[11:19] if len(entry.timestamp) >= 19 and "T" in entry.timestamp else "--:--:--"
+            lines.append(
+                f"{stamp}  {(entry.source or 'HARNESS').upper():<7}  {entry.message}"
+            )
+            if snapshot.mode is ExperienceMode.ADVANCED and entry.operation:
+                lines.append(f"           {entry.state} · {entry.operation}")
+        if not snapshot.live_timeline:
+            lines.append("No runtime activity has been recorded yet.")
+        return "\n".join(lines)
 
     def open_details(self, title: str, value: str, *, kind: str = "details") -> None:
         self._overlay_kind = kind
@@ -1655,6 +1736,15 @@ class PersistentWorkspaceApp:
         def _choose_permissions(event: Any) -> None:
             self.on_input(WorkspaceInput(kind="permissions"))
 
+        @self._bindings.add("f5", eager=True)
+        def _open_activity(event: Any) -> None:
+            self.open_details(
+                "Live workflow activity",
+                self._activity_timeline_text(),
+                kind="activity",
+            )
+            event.app.invalidate()
+
         @self._bindings.add("f6", eager=True)
         def _toggle_sleep(event: Any) -> None:
             self.store.toggle_sleep_mode()
@@ -1670,9 +1760,24 @@ class PersistentWorkspaceApp:
 
         @self._bindings.add("c-k", eager=True)
         def _open_actions(event: Any) -> None:
-            if self.store.active_attention() is None and not self._overlay_kind:
+            if not self._overlay_kind:
                 self._open_palette()
                 event.app.invalidate()
+
+        @self._bindings.add("/", eager=True)
+        def _slash_palette(event: Any) -> None:
+            """Open the palette immediately; do not wait for buffer callbacks."""
+
+            if self._overlay_kind == "plan_edit":
+                self._editor_buffer.insert_text("/")
+                return
+            if self._overlay_kind:
+                return
+            if not self._buffer.text:
+                self._open_palette()
+            else:
+                self._buffer.insert_text("/")
+            event.app.invalidate()
 
         @self._bindings.add("?", eager=True)
         def _show_help(event: Any) -> None:
@@ -1704,10 +1809,11 @@ class PersistentWorkspaceApp:
                         "  Ctrl+Q        exit only at a safe checkpoint",
                         "",
                         "Inspect",
-                        "  F7 diff | F8 project folder | /agents | /tree | /thinking",
+                        "  F5 activity | F7 diff | F8 project folder | /agents | /tree",
                         "",
                         "Session",
-                        "  F2 details | F3 model | F4 permissions | F6 Sleep",
+                        "  F2 Advanced/Simple | F3 model | F4 permissions | F6 Sleep",
+                        "  /sleep on | /sleep off | /sleep status",
                     )
                 ),
                 kind="help",
@@ -1796,7 +1902,10 @@ class PersistentWorkspaceApp:
 
         @self._bindings.add("up", eager=True)
         def _attention_up(event: Any) -> None:
-            if self.store.active_attention() is not None:
+            if self._palette_open and self._palette_matches:
+                self._palette_index = (self._palette_index - 1) % len(self._palette_matches)
+                event.app.invalidate()
+            elif self.store.active_attention() is not None:
                 self.store.move_attention(-1)
                 event.app.invalidate()
             elif self._overlay_kind == "plan_edit":
@@ -1805,13 +1914,13 @@ class PersistentWorkspaceApp:
             elif self._overlay_kind == "swarm":
                 self._swarm_state.move(self._swarm_snapshot, -1)
                 event.app.invalidate()
-            elif self._palette_open and self._palette_matches:
-                self._palette_index = (self._palette_index - 1) % len(self._palette_matches)
-                event.app.invalidate()
 
         @self._bindings.add("down", eager=True)
         def _attention_down(event: Any) -> None:
-            if self.store.active_attention() is not None:
+            if self._palette_open and self._palette_matches:
+                self._palette_index = (self._palette_index + 1) % len(self._palette_matches)
+                event.app.invalidate()
+            elif self.store.active_attention() is not None:
                 self.store.move_attention(1)
                 event.app.invalidate()
             elif self._overlay_kind == "plan_edit":
@@ -1819,9 +1928,6 @@ class PersistentWorkspaceApp:
                 event.app.invalidate()
             elif self._overlay_kind == "swarm":
                 self._swarm_state.move(self._swarm_snapshot, 1)
-                event.app.invalidate()
-            elif self._palette_open and self._palette_matches:
-                self._palette_index = (self._palette_index + 1) % len(self._palette_matches)
                 event.app.invalidate()
 
         @self._bindings.add("left", eager=True)
@@ -1871,6 +1977,9 @@ class PersistentWorkspaceApp:
                 return
             value = self._buffer.text.strip()
             attention = self.store.active_attention()
+            if self._palette_open and self._complete_palette(execute=True):
+                event.app.invalidate()
+                return
             if attention is not None:
                 if value and attention.allow_custom:
                     self._buffer.reset()
@@ -1878,9 +1987,39 @@ class PersistentWorkspaceApp:
                 elif not value:
                     self.store.resolve_selected_attention()
                 else:
-                    self.store.set_attention_feedback(
-                        "This decision does not accept free text. Use a shown shortcut or clear the input."
-                    )
+                    normalized = value.casefold().lstrip("/").strip()
+                    if attention.kind.value == "approval" and normalized in {
+                        "allow", "approve", "approved", "yes", "y", "allow once",
+                    }:
+                        self._buffer.reset()
+                        key = next(
+                            (item.key for item in attention.options
+                             if item.value in {"allow_once", "allow_session", "allow", "yes"}
+                             or item.key in {"allow", "approve", "yes"}),
+                            "",
+                        )
+                        if key:
+                            self.store.resolve_attention(key)
+                        else:
+                            self.store.set_attention_feedback("Allow is not available for this action.")
+                    elif attention.kind.value == "approval" and normalized in {
+                        "deny", "reject", "rejected", "no", "n", "cancel",
+                    }:
+                        self._buffer.reset()
+                        key = next(
+                            (item.key for item in attention.options
+                             if item.value in {"deny", "cancel", "no"}
+                             or item.key in {"deny", "cancel", "no"}),
+                            "",
+                        )
+                        if key:
+                            self.store.resolve_attention(key)
+                        else:
+                            self.store.set_attention_feedback("Deny is not available for this action.")
+                    else:
+                        self.store.set_attention_feedback(
+                            "This decision does not accept free text. Use Allow/Deny, a shown shortcut, or clear the input."
+                        )
                 return
             if self._overlay_kind == "swarm":
                 self._swarm_state.prompt_expanded = not self._swarm_state.prompt_expanded
@@ -1893,9 +2032,6 @@ class PersistentWorkspaceApp:
                     self.on_input(WorkspaceInput(text=value))
                 return
             if self._overlay_kind:
-                return
-            if self._palette_open and self._complete_palette(execute=True):
-                event.app.invalidate()
                 return
             if value:
                 self._buffer.reset()
@@ -1999,6 +2135,21 @@ class PersistentWorkspaceApp:
                 if self._buffer.text or (request.allow_custom and not pressed.isdigit()):
                     self._buffer.insert_text(pressed)
                     return
+                if request.kind.value == "approval":
+                    aliases = {
+                        "a": {"allow_once", "allow_session", "allow", "yes"},
+                        "d": {"deny", "cancel", "no"},
+                    }
+                    targets = aliases.get(pressed.casefold())
+                    if targets:
+                        match = next(
+                            (option for option in request.options
+                             if option.key in targets or option.value in targets),
+                            None,
+                        )
+                        if match is not None:
+                            self.store.resolve_attention(match.key)
+                            return
                 match = next(
                     (
                         option
@@ -2018,7 +2169,7 @@ class PersistentWorkspaceApp:
             self._bindings.add(key, eager=True)(_shortcut)
 
     def _palette_fragments(self) -> Any:
-        page_size = 4
+        page_size = 6
         total = len(self._palette_matches)
         start = max(
             0,
@@ -2146,16 +2297,28 @@ class PersistentWorkspaceApp:
             else snapshot.status
         )
         phase = str(phase).replace("_", " ").title()
-        right = " · ".join(item for item in (f"Status {phase}", snapshot.model) if item)
         try:
             width = max(24, get_app().output.get_size().columns)
         except (AttributeError, RuntimeError, ValueError):
             width = 100
-        left = f" {project}  Session {workflow} · Route {route} · Execution {strategy} · View {mode}"
-        remaining = max(0, width - len(left) - 2)
-        right = textwrap.shorten(right, width=max(1, remaining), placeholder="…") if right else ""
+        show_view = width >= 100
+        left = f" {project}  Session {workflow} · Route {route} · Execution {strategy}"
+        if show_view:
+            left += f" · View {mode}"
+        # Preserve operational state at the 80-column minimum. View mode and
+        # model identity are progressively disclosed when width allows them.
+        status_text = f"Status {phase}"
+        model_suffix = f" · {snapshot.model}" if width >= 120 and snapshot.model else ""
+        right = status_text + model_suffix
+        remaining = max(0, width - len(left) - 1)
+        if len(right) > remaining:
+            right = status_text if len(status_text) <= remaining else textwrap.shorten(
+                status_text,
+                width=max(1, remaining),
+                placeholder="…",
+            )
         gap = " " * max(1, width - len(left) - len(right))
-        return FormattedText([
+        fragments = [
             (
                 "class:workspace.ultra"
                 if snapshot.workflow_mode == "ultra"
@@ -2172,10 +2335,16 @@ class PersistentWorkspaceApp:
             ("class:workspace.queue", route),
             ("class:workspace.muted", " · Execution "),
             ("class:workspace.plan", strategy),
-            ("class:workspace.muted", " · View "),
-            ("class:workspace.mode", mode),
-            ("class:workspace.phase", gap + right),
-        ])
+        ]
+        if show_view:
+            fragments.extend(
+                [
+                    ("class:workspace.muted", " · View "),
+                    ("class:workspace.mode", mode),
+                ]
+            )
+        fragments.append(("class:workspace.phase", gap + right))
+        return FormattedText(fragments)
 
     def _transcript_fragments(self) -> Any:
         snapshot = self.store.snapshot()
@@ -2215,6 +2384,169 @@ class PersistentWorkspaceApp:
             )
         return FormattedText(fragments)
 
+    def _live_activity_fragments(self) -> Any:
+        """Render a truthful live rail without exposing model scratch work."""
+
+        snapshot = self.store.snapshot()
+        # Use the same size source as the responsive container. This keeps
+        # the rail contents and the actual wide/narrow layout in agreement,
+        # including during resize events and deterministic PTY tests.
+        terminal_width = self._terminal_size()[0]
+        wide = terminal_width >= 120
+        width = min(54, max(34, terminal_width - 2)) if wide else max(34, terminal_width - 2)
+        fragments: list[tuple[str, str]] = [
+            ("class:workspace.stage.active", " NOW\n"),
+        ]
+        # Keep a permission boundary visible even if the terminal is narrow or
+        # the attention window is pushed below the fold by a long activity rail.
+        # The real AttentionRequest remains the interactive source of truth;
+        # this is a redundant, high-salience affordance, not a second state.
+        if snapshot.attention is not None and snapshot.attention.kind.value == "approval":
+            request = snapshot.attention
+            fragments.append(("class:workspace.attention", " APPROVAL REQUIRED\n"))
+            fragments.append((
+                "class:workspace.assistant",
+                f" {_fit(request.title, width).rstrip()}\n",
+            ))
+            if request.message:
+                fragments.append((
+                    "class:workspace.muted",
+                    f" {_fit(request.message, width).rstrip()}\n",
+                ))
+            fragments.append((
+                "class:workspace.queue",
+                " [Y] Allow once    [N] Deny    (or type /allow or /deny)\n",
+            ))
+        phase = str(snapshot.runtime_phase or snapshot.progress.phase or "ready").replace("_", " ").title()
+        operation = (
+            snapshot.active_operation
+            or snapshot.progress.active_operation
+            or snapshot.current_task
+            or "Ready for the next request"
+        )
+        fragments.append(("class:workspace.assistant", f" {_fit(f'{phase} · {operation}', width).rstrip()}\n"))
+
+        signal_age = (
+            max(0, int(time.time() - snapshot.last_signal_at))
+            if snapshot.last_signal_at is not None else None
+        )
+        liveness = str(snapshot.liveness or "ready")
+        structured_request = "structured response" in str(
+            snapshot.active_operation or snapshot.progress.active_operation or ""
+        ).casefold()
+        if liveness == "receiving":
+            evidence = (
+                f"Receiving · {_compact_bytes(snapshot.received_bytes)} · "
+                f"{snapshot.received_chunks} chunks"
+            )
+        elif liveness == "processing_response":
+            evidence = "Response received · validating"
+        elif liveness == "server_processing":
+            evidence = "Ollama is actively generating · structured response is atomic"
+        elif liveness == "network_unavailable":
+            evidence = "Provider/network unavailable · saved stage unchanged"
+        elif liveness == "request_sent":
+            evidence = "Request open · no response bytes yet"
+        elif liveness == "stalled":
+            evidence = "No fresh runtime signal · inspect or retry"
+        elif liveness in {"client_active", "waiting"}:
+            evidence = "Worker heartbeat active"
+        elif liveness == "paused":
+            evidence = "Paused at a saved checkpoint"
+        elif liveness == "completed":
+            evidence = "Workflow completed"
+        else:
+            evidence = "Ready"
+        if signal_age is not None and liveness not in {"ready", "completed"}:
+            evidence += f" · signal {signal_age}s ago"
+        if structured_request and liveness == "request_sent":
+            evidence = "Structured response open - no content tokens yet"
+        if snapshot.mode is ExperienceMode.ADVANCED and liveness not in {"ready", "completed"}:
+            evidence += (
+                f" - bytes {_compact_bytes(snapshot.received_bytes)}"
+                f" - chunks {snapshot.received_chunks}"
+                f" - tokens {snapshot.received_tokens}"
+            )
+        elif (
+            snapshot.mode is ExperienceMode.SIMPLE
+            and liveness in {"request_sent", "receiving", "processing_response", "client_active"}
+        ):
+            evidence += " - Toggle Advanced (F2) to see verified bytes/chunks/tokens"
+        fragments.append((
+            "class:workspace.error" if liveness in {"stalled", "network_unavailable"} else "class:workspace.muted",
+            f" {_fit(evidence, width).rstrip()}\n",
+        ))
+
+        if wide:
+            if snapshot.objective:
+                fragments.extend((
+                    ("class:workspace.project", "\n CURRENT WORK\n"),
+                    ("class:workspace.muted", f" Goal · {_fit(snapshot.objective, width - 8).rstrip()}\n"),
+                ))
+            if snapshot.current_task:
+                fragments.append(("class:workspace.assistant", f" Task · {_fit(snapshot.current_task, width - 8).rstrip()}\n"))
+
+        if snapshot.mode is ExperienceMode.ADVANCED:
+            if snapshot.task_items:
+                fragments.append(("class:workspace.project", "\n TASK CHECKLIST\n"))
+                status_marks = {
+                    "done": "[x]", "completed": "[x]", "skipped": "[-]",
+                    "in_progress": "[>]", "running": "[>]", "verifying": "[?]",
+                    "blocked": "[!]", "uncertain": "[!]",
+                }
+                for item in snapshot.task_items:
+                    status = str(item.get("status") or "pending").casefold()
+                    mark = status_marks.get(status, "[ ]")
+                    title = _fit(
+                        str(item.get("title") or item.get("id") or "task"),
+                        max(16, width - 8),
+                    ).rstrip()
+                    style = (
+                        "class:workspace.success" if mark == "[x]"
+                        else "class:workspace.error" if mark == "[!]"
+                        else "class:workspace.assistant"
+                    )
+                    fragments.append((style, f" {mark} {title}\n"))
+                if snapshot.next_task:
+                    fragments.append(("class:workspace.muted", f" Next · {_fit(snapshot.next_task, width - 8).rstrip()}\n"))
+            fragments.append(("class:workspace.project", "\n MODEL OUTPUT\n"))
+            if snapshot.safe_stream_preview:
+                preview = snapshot.safe_stream_preview[-1_200:].replace("\n", " ")
+                fragments.append(("class:workspace.assistant", f" {_fit(preview, width - 2).rstrip()}\n"))
+            elif snapshot.stream_kind in {"structured", "tool"} or snapshot.stream_state in {"active", "validating"}:
+                fragments.append(("class:workspace.muted", " Structured response · text hidden until validation\n"))
+            else:
+                fragments.append(("class:workspace.muted", " No safe text stream available\n"))
+            fragments.append((
+                "class:workspace.muted",
+                f" Transport · {_compact_bytes(snapshot.received_bytes)} · {snapshot.received_chunks} chunks · {snapshot.received_tokens} tokens\n",
+            ))
+
+        fragments.append(("class:workspace.queue", "\n ACTIVITY\n"))
+        entries = list(snapshot.live_timeline)
+        if not wide:
+            # Heartbeats prove liveness in the NOW block; reserve the compact
+            # timeline for state transitions and evidence-bearing events.
+            meaningful = [item for item in entries if "request is open" not in item.message.casefold()]
+            entries = meaningful or entries
+        entries = entries[-(7 if wide else 3):]
+        if not entries:
+            fragments.append(("class:workspace.muted", " Waiting for the first runtime event\n"))
+        source_styles = {
+            "MODEL": "class:workspace.actor.architect",
+            "TOOL": "class:workspace.actor.tool",
+            "PROCESS": "class:workspace.actor.test",
+            "USER": "class:workspace.user",
+            "HARNESS": "class:workspace.queue",
+        }
+        for entry in entries:
+            stamp = entry.timestamp[11:19] if len(entry.timestamp) >= 19 and "T" in entry.timestamp else "--:--:--"
+            source = (entry.source or "HARNESS").upper()
+            prefix = f" {stamp} {source:<7} "
+            fragments.append((source_styles.get(source, "class:workspace.muted"), prefix))
+            fragments.append(("class:workspace.assistant", _fit(entry.message, max(12, width - len(prefix))).rstrip() + "\n"))
+        return FormattedText(fragments)
+
     def _activity_fragments(self) -> Any:
         snapshot = self.store.snapshot()
         activity = snapshot.activity
@@ -2242,10 +2574,13 @@ class PersistentWorkspaceApp:
             lines[0] = f"{spinner} {lines[0]}"
         swarm = snapshot.swarm
         if swarm.running or swarm.reviewing or swarm.blocked:
-            agent_line = (
-                f"Agents {swarm.total} · {swarm.running} running · "
-                f"{swarm.reviewing} reviewing"
-            )
+            if swarm.active_labels:
+                agent_line = "Agents · " + " | ".join(swarm.active_labels[:2])
+            else:
+                agent_line = (
+                    f"Agents {swarm.total} · {swarm.running} running · "
+                    f"{swarm.reviewing} reviewing"
+                )
             if swarm.blocked:
                 agent_line += f" · {swarm.blocked} blocked"
             lines.insert(min(2, len(lines)), agent_line)
@@ -2340,7 +2675,26 @@ class PersistentWorkspaceApp:
             ("class:workspace.attention", f" ! {request.title}\n"),
         ]
         if request.message:
-            fragments.append(("class:workspace.assistant", f"   {request.message}\n\n"))
+            # Keep the actual decision controls in the first viewport.  Risky
+            # command previews can be hundreds of characters long and used to
+            # push Allow/Deny below the fold in Simple mode.  Advanced keeps a
+            # compact multi-line preview; the full request remains available
+            # in the details inspector and is never discarded.
+            message_width = max(36, self._current_width() - 4)
+            message_lines = textwrap.wrap(
+                " ".join(str(request.message).split()),
+                width=message_width,
+            )
+            limit = 2 if snapshot.mode is ExperienceMode.SIMPLE else 5
+            preview = message_lines[:limit]
+            if len(message_lines) > limit:
+                preview[-1] = preview[-1].rstrip(" .") + " ..."
+            fragments.append(("class:workspace.assistant", "   " + "\n   ".join(preview) + "\n"))
+            if request.kind is AttentionKind.APPROVAL:
+                fragments.append((
+                    "class:workspace.muted",
+                    "   Choose Allow once or Deny; nothing runs automatically.\n",
+                ))
 
         page_size = 3
         total_options = len(request.options)
@@ -2405,17 +2759,32 @@ class PersistentWorkspaceApp:
         label = _workspace_copy(snapshot.locale, "guide" if snapshot.running else "write")
         if snapshot.attention is not None and snapshot.attention.allow_custom:
             label = _workspace_copy(snapshot.locale, "custom")
+        # Working/Plan is the stable interaction mode. During an active
+        # request, show the actual runtime phase in the composer so a planning
+        # repair is not presented as generic successful "Working" activity.
+        phase = str(snapshot.runtime_phase or "").casefold()
+        phase_label = {
+            "routing": "ROUTING",
+            "planning": "PLANNING",
+            "retrying": "RECOVERING",
+            "paused": "PAUSED",
+            "awaiting_approval": "APPROVAL",
+            "waiting_for_approval": "APPROVAL",
+            "waiting_for_process": "WAITING",
+            "reviewing": "REVIEWING",
+        }.get(phase)
+        prompt_mode = phase_label or snapshot.workflow_mode.upper()
         mode_style = (
             "class:workspace.plan"
-            if snapshot.workflow_mode == "plan"
+            if prompt_mode == "PLAN"
             else "class:workspace.ultra"
-            if snapshot.workflow_mode == "ultra"
+            if prompt_mode == "ULTRA"
             else "class:workspace.queue"
         )
         return FormattedText(
             [
                 ("class:composer.prompt", " › "),
-                (mode_style, f"[{snapshot.workflow_mode.upper()}] "),
+                (mode_style, f"[{prompt_mode}] "),
                 (
                     "class:workspace.muted",
                     label

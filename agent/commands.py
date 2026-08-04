@@ -24,6 +24,7 @@ class CommandKind(str, Enum):
     SKILLS = "skills"
     PROCESSES = "processes"
     STOP_PROCESS = "stop_process"
+    STOP = "stop"
     TREE = "tree"
     AGENTS = "agents"
     AGENT = "agent"
@@ -31,6 +32,7 @@ class CommandKind(str, Enum):
     TRACE = "trace"
     THINKING = "thinking"
     DETAILS = "details"
+    ACTIVITY = "activity"
     QUEUE = "queue"
     ENQUEUE = "enqueue"
     GUIDE = "guide"
@@ -238,6 +240,10 @@ def parse_command(line: str) -> UserCommand:
         return UserCommand(CommandKind.THINKING, {"action": action}, raw=raw)
     if name == "details":
         return UserCommand(CommandKind.DETAILS, {"target": rest or None}, raw=raw)
+    if name == "activity":
+        if rest:
+            raise CommandParseError(f"{prefix}activity does not take arguments.")
+        return UserCommand(CommandKind.ACTIVITY, raw=raw)
     if name == "queue":
         if rest:
             raise CommandParseError(f"{prefix}queue does not take arguments.")
@@ -253,6 +259,11 @@ def parse_command(line: str) -> UserCommand:
             {"mode": parts[0].casefold(), "text": _required(parts[1], usage("enqueue", "MODE TEXT"))},
             raw=raw,
         )
+    if name == "stop":
+        action = rest.casefold().strip()
+        if action not in {"", "ollama"}:
+            raise CommandParseError(f"Usage: {usage('stop', '[ollama]')}")
+        return UserCommand(CommandKind.STOP, {"shutdown_ollama": action == "ollama"}, raw=raw)
     if name == "guide":
         return UserCommand(
             CommandKind.GUIDE,

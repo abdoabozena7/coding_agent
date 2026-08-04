@@ -13,6 +13,7 @@ from enum import Enum
 import hashlib
 import json
 from pathlib import PurePosixPath
+import re
 from typing import Any, Iterable, Mapping
 
 
@@ -47,6 +48,13 @@ class RequestedEffect(str, Enum):
                     break
             value = authored
         normalized = str(getattr(value, "value", value)).strip().casefold()
+        # A few structured-output providers emit a sentinel such as ``none``
+        # when the effect list is empty.  That sentinel is transport noise, not
+        # a capability effect.  Callers that accept an empty list filter it
+        # before parsing; retaining the explicit failure here protects callers
+        # that require at least one real effect (for example an Action).
+        if normalized in {"", "none", "no_effect", "no effects", "no requested effects"}:
+            raise ValueError(f"empty requested effect sentinel: {value!r}")
         aliases = {
             "read": cls.READ_WORKSPACE.value,
             "read_file": cls.READ_WORKSPACE.value,
@@ -118,6 +126,127 @@ def _fingerprint(value: Mapping[str, Any]) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class RequirementAnchorV1:
+    """Model-authored meaning tied to an exact span of user authority.
+
+    The harness validates provenance and coverage, while the model owns the
+    domain interpretation. This prevents a named medium, framework, format, or
+    experiential requirement from degrading into a superficial import.
+    """
+
+    id: str
+    verbatim_span: str
+    interpreted_requirement: str
+    observable_implications: tuple[str, ...]
+    kind: str = "requirement"
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        identifier = str(self.id or "").strip().upper()
+        span = str(self.verbatim_span or "")
+        meaning = str(self.interpreted_requirement or "").strip()
+        kind = str(self.kind or "requirement").strip().casefold()
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9_.-]{0,23}", identifier):
+            raise SemanticContractError("requirement anchor id is invalid")
+        if not span.strip() or len(span) > 2_000:
+            raise SemanticContractError("requirement anchor requires a bounded verbatim span")
+        if not meaning or len(meaning) > 4_000:
+            raise SemanticContractError("requirement anchor requires a bounded interpretation")
+        implications = _bounded_strings(
+            self.observable_implications,
+            field_name="requirement anchor observable_implications",
+            limit=12,
+            item_limit=2_000,
+        )
+        if not implications:
+            raise SemanticContractError(
+                "requirement anchor requires at least one observable implication"
+            )
+        if not kind or len(kind) > 100:
+            raise SemanticContractError("requirement anchor kind is invalid")
+        if self.version != 1:
+            raise SemanticContractError("RequirementAnchorV1 only accepts version 1")
+        object.__setattr__(self, "id", identifier)
+        object.__setattr__(self, "verbatim_span", span)
+        object.__setattr__(self, "interpreted_requirement", meaning)
+        object.__setattr__(self, "observable_implications", implications)
+        object.__setattr__(self, "kind", kind)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "RequirementAnchorV1":
+        return cls(
+            id=str(value.get("id") or ""),
+            verbatim_span=str(value.get("verbatim_span") or ""),
+            interpreted_requirement=str(value.get("interpreted_requirement") or ""),
+            observable_implications=tuple(value.get("observable_implications") or ()),
+            kind=str(value.get("kind") or "requirement"),
+            version=int(value.get("version") or 1),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "verbatim_span": self.verbatim_span,
+            "interpreted_requirement": self.interpreted_requirement,
+            "observable_implications": list(self.observable_implications),
+            "kind": self.kind,
+            "version": self.version,
+        }
+
+
+def canonicalize_requirement_anchors(
+    value: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, tuple[str, ...]]]:
+    """Assign stable harness-owned IDs and return a legacy alias map.
+
+    Model IDs are transport hints only.  Missing, malformed, long, or
+    duplicate values cannot invalidate otherwise useful semantic meaning;
+    canonical order is the durable identity used by plans and fingerprints.
+    """
+    raw = dict(value or {})
+    anchors = raw.get("requirement_anchors") or ()
+    normalized: list[dict[str, Any]] = []
+    aliases: dict[str, list[str]] = {}
+    if isinstance(anchors, Mapping):
+        anchors = (anchors,)
+    for index, item in enumerate(anchors if isinstance(anchors, (list, tuple)) else ()):
+        if isinstance(item, RequirementAnchorV1):
+            item = item.to_dict()
+        if not isinstance(item, Mapping):
+            continue
+        canonical = f"R{index + 1:03d}"
+        copied = dict(item)
+        original_id = str(copied.get("id") or "").strip().upper()
+        if original_id:
+            aliases.setdefault(original_id, []).append(canonical)
+        # Canonical IDs are intentionally generated even when a model emits
+        # spaces, Arabic text, a number, or a duplicate.
+        copied["id"] = canonical
+        # Weak structured emitters sometimes place the model-authored meaning
+        # under a transport alias, or provide only the observable implications.
+        # Normalize that shape without inventing a requirement: the fallback
+        # is composed exclusively from the model's own implications.
+        if not str(copied.get("interpreted_requirement") or "").strip():
+            for alias in ("interpretation", "meaning", "requirement", "description"):
+                candidate = copied.get(alias)
+                if str(candidate or "").strip():
+                    copied["interpreted_requirement"] = str(candidate).strip()
+                    break
+        implications = copied.get("observable_implications")
+        if isinstance(implications, str) and implications.strip():
+            copied["observable_implications"] = [implications.strip()]
+        if not str(copied.get("interpreted_requirement") or "").strip():
+            values = copied.get("observable_implications") or ()
+            if isinstance(values, (list, tuple)) and values:
+                copied["interpreted_requirement"] = " ".join(
+                    str(value).strip() for value in values if str(value).strip()
+                )[:4_000]
+        normalized.append(copied)
+    raw["requirement_anchors"] = normalized
+    return raw, {key: tuple(items) for key, items in aliases.items()}
+
+
+@dataclass(frozen=True, slots=True)
 class SemanticGoalV2:
     """Repository-grounded interpretation of one request.
 
@@ -132,6 +261,7 @@ class SemanticGoalV2:
     constraints: tuple[str, ...] = ()
     exclusions: tuple[str, ...] = ()
     acceptance_criteria: tuple[str, ...] = ()
+    requirement_anchors: tuple[RequirementAnchorV1, ...] = ()
     unresolved_decisions: tuple[str, ...] = ()
     repository_evidence_refs: tuple[str, ...] = ()
     status: str = "pending"
@@ -154,6 +284,24 @@ class SemanticGoalV2:
         object.__setattr__(self, "original_request", original)
         object.__setattr__(self, "interpreted_outcome", outcome)
         object.__setattr__(self, "requested_effects", tuple(dict.fromkeys(effects)))
+        anchors = tuple(
+            item
+            if isinstance(item, RequirementAnchorV1)
+            else RequirementAnchorV1.from_mapping(item)
+            for item in self.requirement_anchors
+        )
+        if len(anchors) > 40:
+            raise SemanticContractError("requirement_anchors exceeds 40 items")
+        anchor_ids = [item.id for item in anchors]
+        if len(anchor_ids) != len(set(anchor_ids)):
+            raise SemanticContractError("requirement anchor ids must be unique")
+        missing_spans = [item.id for item in anchors if item.verbatim_span not in original]
+        if missing_spans:
+            raise SemanticContractError(
+                "requirement anchor spans must be verbatim substrings of original_request: "
+                + ", ".join(missing_spans)
+            )
+        object.__setattr__(self, "requirement_anchors", anchors)
         for name, limit in (
             ("required_outcomes", 40),
             ("constraints", 40),
@@ -213,6 +361,7 @@ class SemanticGoalV2:
                 }
             )
             raw = merged
+        raw, _aliases = canonicalize_requirement_anchors(raw)
         if not str(raw.get("interpreted_outcome") or "").strip():
             for alias in (
                 "interpretation",
@@ -228,23 +377,53 @@ class SemanticGoalV2:
         supplied_original = str(raw.get("original_request") or original_request)
         if supplied_original != str(original_request):
             raise SemanticContractError("semantic interpretation changed the original request")
+        # ``status`` is a lifecycle field owned by the harness, not semantic
+        # content the model is expected to author.  Some providers still echo
+        # the legacy ``pending`` value (or omit it entirely) while submitting
+        # a complete interpretation.  Treat that transport detail as an
+        # interpreted proposal so it cannot consume a semantic-repair attempt
+        # or stop planning before the actual contract is validated.  Accepted
+        # metadata is reconstructed explicitly by the harness as
+        # ``critic_accepted`` after the review gates pass.
+        raw_status = str(raw.get("status") or "").strip().casefold()
+        semantic_status = "critic_accepted" if raw_status == "critic_accepted" else "interpreted"
+        raw_effects = raw.get("requested_effects") or ()
+        if isinstance(raw_effects, Mapping):
+            raw_effects = tuple(
+                key for key, enabled in raw_effects.items() if bool(enabled)
+            )
+        elif isinstance(raw_effects, str):
+            raw_effects = (raw_effects,)
+        elif not isinstance(raw_effects, (list, tuple)):
+            raw_effects = ()
+        # ``none`` is a common empty-array spelling from local structured
+        # emitters.  It must not turn a valid Goal into a semantic contract
+        # failure; real effects remain model-authored and are still validated
+        # strictly below.
+        raw_effects = tuple(
+            item for item in raw_effects
+            if str(item or "").strip().casefold()
+            not in {"", "none", "no_effect", "no effects", "no requested effects"}
+        )
         return cls(
             original_request=supplied_original,
             interpreted_outcome=str(raw.get("interpreted_outcome") or "").strip(),
-            requested_effects=tuple(raw.get("requested_effects") or ()),
+            requested_effects=raw_effects,
             required_outcomes=tuple(raw.get("required_outcomes") or ()),
             constraints=tuple(raw.get("constraints") or ()),
             exclusions=tuple(raw.get("exclusions") or ()),
             acceptance_criteria=tuple(raw.get("acceptance_criteria") or ()),
+            requirement_anchors=tuple(raw.get("requirement_anchors") or ()),
             unresolved_decisions=tuple(raw.get("unresolved_decisions") or ()),
             repository_evidence_refs=tuple(raw.get("repository_evidence_refs") or ()),
-            status=str(raw.get("status") or "interpreted"),
+            status=semantic_status,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             **asdict(self),
             "requested_effects": [item.value for item in self.requested_effects],
+            "requirement_anchors": [item.to_dict() for item in self.requirement_anchors],
         }
 
     @property
@@ -371,7 +550,7 @@ __all__ = [
     "RequestedEffect",
     "ResourceClaimV1",
     "SemanticContractError",
-    "SemanticGoalV2",
+    "RequirementAnchorV1", "canonicalize_requirement_anchors", "SemanticGoalV2",
     "StrategyAttemptV1",
     "VerificationContractV1",
 ]

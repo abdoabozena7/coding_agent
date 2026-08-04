@@ -37,6 +37,7 @@ class CommandAvailability:
 
 COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/status", "show the latest project snapshot", "Inspect", live_safe=True),
+    CommandSpec("/activity", "open the verified live workflow timeline", "Inspect", live_safe=True),
     CommandSpec("/agents", "open Agent Tree in the local web workspace", "Inspect", live_safe=True),
     CommandSpec("/thinking", "show or hide redacted reasoning summaries", "Inspect", aliases=("/reasoning",), arguments="[show|hide|status]", live_safe=True),
     CommandSpec("/details", "open the latest collapsed item or diagnostic", "Inspect", arguments="[ID]", live_safe=True),
@@ -63,6 +64,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/help", "show command help", "Help", arguments="[TOPIC]", live_safe=True),
     CommandSpec("/keymap", "show predictable keyboard controls", "Help", live_safe=True),
     CommandSpec("/pause", "request a cooperative checkpoint", "Workflow", live_safe=True),
+    CommandSpec("/stop", "stop the active provider/tool and save a resumable checkpoint", "Workflow", arguments="[ollama]", checkpoint_required=True),
     CommandSpec("/enqueue", "queue an immutable prompt with its selected mode", "Workflow", arguments="plan|normal|ultra TEXT", live_safe=True),
     CommandSpec("/guide", "add guidance to the currently active goal", "Workflow", arguments="TEXT", live_safe=True),
     CommandSpec("/resume", "continue a valid paused state", "Workflow", aliases=("/continue",), checkpoint_required=True),
@@ -75,6 +77,12 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/model", "choose model and reasoning effort", "Session", arguments="[MODEL] [EFFORT]", checkpoint_required=True),
     CommandSpec("/permissions", "choose NORMAL / FULL access", "Session", aliases=("/permission", "/access"), arguments="[normal|full]", checkpoint_required=True),
     CommandSpec("/sleep", "control safe unattended choices", "Session", arguments="[on|off|status]", live_safe=True),
+    # Argument-level entries keep the most important unattended controls
+    # discoverable from the palette instead of requiring the user to remember
+    # the second token while work is active.
+    CommandSpec("/sleep on", "turn on safe unattended approvals", "Session", live_safe=True),
+    CommandSpec("/sleep off", "turn off unattended approvals", "Session", live_safe=True),
+    CommandSpec("/sleep status", "show the current Sleep Mode policy", "Session", live_safe=True),
     CommandSpec("/settings", "inspect settings or add a provider API key", "Session", arguments="[api-key PROVIDER|KEY VALUE]", live_safe=True),
     CommandSpec("/api-key", "securely add or replace a provider API key", "Session", aliases=("/apikey", "/add-api-key"), arguments="[openai|gemini|ollama]", live_safe=True),
     CommandSpec("/doctor", "audit local model readiness", "Session", arguments="[--live] [--record]", checkpoint_required=True),
@@ -124,17 +132,27 @@ COMMAND_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = tuple(
 )
 
 _DESCRIPTIONS = dict(ALL_SLASH_COMMANDS)
+_LIVE_SESSION_COMMANDS = (
+    "/activity", "/status", "/sleep on", "/sleep off", "/sleep status",
+    "/stop", "/queue", "/agents", "/review", "/pause",
+)
 _CONTEXT_COMMANDS: dict[str, tuple[str, ...]] = {
     "idle": ("/plan", "/model", "/settings", "/help"),
     "new": ("/plan", "/model", "/settings", "/help"),
-    "discovering": ("/status", "/pause", "/agents", "/thinking"),
-    "revising": ("/status", "/pause", "/plan", "/thinking"),
-    "awaiting_plan_approval": ("/plan", "/questions"),
-    "running": ("/status", "/queue", "/agents", "/review", "/project-brain", "/pause"),
-    "paused": ("/resume", "/status", "/resolve", "/trace"),
-    "recovering": ("/status", "/trace", "/details", "/help"),
-    "reviewing": ("/status", "/agents", "/trace", "/pause"),
-    "verifying": ("/status", "/agents", "/trace", "/pause"),
+    "discovering": _LIVE_SESSION_COMMANDS,
+    "routing": _LIVE_SESSION_COMMANDS,
+    "planning": _LIVE_SESSION_COMMANDS,
+    "revising": _LIVE_SESSION_COMMANDS,
+    "awaiting_plan_approval": ("/plan", "/questions", "/sleep on", "/sleep off", "/sleep status", "/status"),
+    "waiting_for_approval": ("/activity", "/status", "/sleep on", "/sleep off", "/sleep status", "/queue"),
+    "waiting_for_process": _LIVE_SESSION_COMMANDS,
+    "working": _LIVE_SESSION_COMMANDS,
+    "running": _LIVE_SESSION_COMMANDS,
+    "retrying": _LIVE_SESSION_COMMANDS,
+    "recovering": _LIVE_SESSION_COMMANDS,
+    "paused": ("/resume", "/status", "/resolve", "/trace", "/activity", "/sleep on", "/sleep off", "/sleep status"),
+    "reviewing": _LIVE_SESSION_COMMANDS,
+    "verifying": _LIVE_SESSION_COMMANDS,
 }
 
 
@@ -158,6 +176,8 @@ def command_availability(spec: CommandSpec, snapshot: Any | None) -> CommandAvai
         return CommandAvailability(False, False, "Available only while paused")
     if spec.name == "/pause" and not running:
         return CommandAvailability(False, False, "Available while work is running")
+    if spec.name == "/stop" and not running and status not in {"routing", "planning", "working", "retrying", "paused"}:
+        return CommandAvailability(False, False, "Available while a provider, tool, or process is active")
     if spec.name == "/undo" and not bool(getattr(snapshot, "undo_available", False)):
         return CommandAvailability(False, False, "Available after a completed checkpoint")
     if spec.name == "/mode" and status not in {"idle", "completed", "cancelled"}:

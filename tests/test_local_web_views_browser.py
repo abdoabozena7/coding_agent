@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 import tempfile
+import time
 import unittest
 
 from playwright.sync_api import Error as PlaywrightError
@@ -225,6 +226,85 @@ class LocalWebViewsBrowserTests(unittest.TestCase):
         page.wait_for_timeout(4500)
         after = page.evaluate("window.scrollY")
         self.assertLessEqual(abs(after - before), 2)
+        self.assertEqual(self.console_errors, [])
+        self.assertEqual(self.page_errors, [])
+
+    def test_sse_activity_is_immediate_and_preserves_focus_scroll_and_draft(self):
+        page = self.tracked_page()
+        page.set_viewport_size({"width": 768, "height": 500})
+        page.goto(self.server.url_for("plan"))
+        page.get_by_role("heading", name="Plan", exact=True).wait_for()
+        page.get_by_role("button", name="Advanced", exact=True).click()
+        page.locator(".task-row").first.get_by_role("button", name="Edit", exact=True).click()
+        editor = page.get_by_label("What this task must do")
+        draft = "Keep this unsaved draft while verified live activity arrives."
+        editor.fill(draft)
+        editor.focus()
+        editor.scroll_into_view_if_needed()
+        before_top = editor.evaluate("element => element.getBoundingClientRect().top")
+
+        started = time.perf_counter()
+        self.runtime.events.publish(
+            "provider.activity",
+            "Provider request sent",
+            source_kind="MODEL",
+            phase="planning",
+            actor="planner",
+            state="started",
+            provider_state="request_sent",
+            operation="Preparing the verified project plan",
+            received_bytes=0,
+            received_chunks=0,
+        )
+        page.get_by_text("Request open · no response bytes yet", exact=False).wait_for(timeout=1000)
+        self.assertLess(time.perf_counter() - started, 1.0)
+
+        self.runtime.events.publish(
+            "provider.activity",
+            "First response bytes received",
+            source_kind="MODEL",
+            phase="planning",
+            actor="planner",
+            state="receiving",
+            provider_state="receiving",
+            operation="Receiving the verified project plan",
+            received_bytes=2048,
+            received_chunks=2,
+        )
+        page.get_by_text("Receiving model output · 2.0 KB · 2 chunks", exact=False).wait_for(timeout=1000)
+        self.assertEqual(editor.input_value(), draft)
+        self.assertTrue(editor.evaluate("element => document.activeElement === element"))
+        after_top = editor.evaluate("element => element.getBoundingClientRect().top")
+        self.assertLessEqual(abs(after_top - before_top), 2)
+        self.assertEqual(self.console_errors, [])
+        self.assertEqual(self.page_errors, [])
+
+    def test_sse_disconnect_is_truthful_and_stops_live_animation(self):
+        page = self.tracked_page()
+        page.route(
+            "**/api/sessions/*/events",
+            lambda route: route.fulfill(
+                status=200,
+                content_type="text/event-stream",
+                body="",
+            ),
+        )
+        page.goto(self.server.url_for("plan"))
+        page.get_by_role("heading", name="Plan", exact=True).wait_for()
+        page.get_by_text(
+            "Live connection lost · saved state is unchanged · reconnecting",
+            exact=True,
+        ).wait_for(timeout=3000)
+        self.assertFalse(page.locator("#liveWorkflow").evaluate(
+            "element => element.classList.contains('is-active')"
+        ))
+        self.assertTrue(page.locator("#liveWorkflow").evaluate(
+            "element => element.classList.contains('is-stalled')"
+        ))
+        self.assertIn(
+            page.locator("#connection span").text_content(),
+            {"Reconnecting", "Polling"},
+        )
         self.assertEqual(self.console_errors, [])
         self.assertEqual(self.page_errors, [])
 

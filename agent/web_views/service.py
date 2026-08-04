@@ -54,6 +54,7 @@ def _task_snapshot(task: Any) -> dict[str, Any]:
         "outputs": list(metadata.get("outputs") or ()),
         "expected_files": list(metadata.get("expected_files") or ()),
         "acceptance_criteria": list(task.acceptance_criteria),
+        "requirement_refs": list(metadata.get("requirement_refs") or ()),
         "tests": list(task.verification),
         "risk_level": task.risk,
         "required_tools": list(metadata.get("required_tools") or ()),
@@ -294,6 +295,35 @@ class CoreWebAdapter:
         goal = self._workspace_goal()
         session = self.store.get_workflow_session(self.session_id)
         runtime_snapshot = self.runtime.workflow_runtime_snapshot()
+        tool_approval: dict[str, Any] | None = None
+        if goal is not None:
+            try:
+                recent = self.store.list_recent_events(goal.id, limit=80)
+                resolved_after: set[str] = set()
+                for event in reversed(recent):
+                    if event.event_type == "approval.received":
+                        fingerprint = str(event.payload.get("action_fingerprint") or "")
+                        if fingerprint:
+                            resolved_after.add(fingerprint)
+                        continue
+                    if event.event_type != "approval.requested":
+                        continue
+                    event_payload = dict(event.payload or {})
+                    fingerprint = str(event_payload.get("action_fingerprint") or "")
+                    if not fingerprint or fingerprint in resolved_after:
+                        continue
+                    pending = dict(goal.metadata.get("pending_tool_approval") or {})
+                    arguments = pending.get("arguments")
+                    tool_approval = {
+                        "state": "waiting",
+                        "tool": str(event_payload.get("tool") or event.entity_id or "action"),
+                        "risk": str(event_payload.get("risk") or "risky"),
+                        "action_fingerprint": fingerprint,
+                        "arguments": arguments if isinstance(arguments, Mapping) else {},
+                    }
+                    break
+            except Exception:
+                tool_approval = None
         queue = self.queue_snapshot()
         required_view: str | None = None
         checkpoint_id: str | None = None
@@ -324,7 +354,15 @@ class CoreWebAdapter:
                 plan_badge = 1
         # A durable RUNNING goal owns the truth.  A stale plan badge must not
         # make the browser claim that approval is still pending.
-        if required_view == "review":
+        if tool_approval is not None:
+            attention = {
+                "state": "waiting",
+                "eyebrow": "Approval required",
+                "title": f"Allow {tool_approval['tool'].replace('_', ' ')}?",
+                "body": "The harness is waiting before running this computer action. Choose Allow once or Deny.",
+                "action": {"label": "Review approval", "view": "agents"},
+            }
+        elif required_view == "review":
             attention = {
                 "state": "waiting",
                 "eyebrow": "Your decision is needed",
@@ -403,6 +441,7 @@ class CoreWebAdapter:
             "phase": runtime_snapshot.phase,
             "waiting_on": runtime_snapshot.waiting_on,
             "resume_action": runtime_snapshot.resume_action,
+            "tool_approval": tool_approval,
             "attention": attention,
             "navigation": {
                 "plan": {"badge": plan_badge},
@@ -421,6 +460,21 @@ class CoreWebAdapter:
             "updated_at": _iso_now(),
         }
         return WorkspaceContextPayload.model_validate(payload).model_dump()
+
+    def resolve_tool_approval(self, action_fingerprint: str, decision: str) -> dict[str, Any]:
+        """Resolve one exact pending tool approval through the owning runtime."""
+
+        fingerprint = str(action_fingerprint or "").strip()
+        value = str(decision or "").strip().casefold()
+        if value not in {"allow", "approve", "allow_once", "deny", "reject"}:
+            raise ValueError("decision must be Allow or Deny")
+        resolver = getattr(self.runtime, "resolve_tool_approval", None)
+        if not fingerprint or not callable(resolver) or not resolver(fingerprint, value):
+            raise ValueError(
+                "This approval is stale or is not visible in the owning terminal. Refresh and choose the current request."
+            )
+        allowed = value in {"allow", "approve", "allow_once"}
+        return {"resolved": True, "decision": "allow" if allowed else "deny"}
 
     def plan_snapshot(self) -> dict[str, Any]:
         goal = self._workspace_goal()
@@ -576,6 +630,7 @@ class CoreWebAdapter:
             "constraints": item.constraints,
             "parallel": item.parallel,
             "comments": item.comments,
+            "requirement_refs": item.requirement_refs,
         }
         return {
             "id": item.id.upper(),
@@ -608,6 +663,31 @@ class CoreWebAdapter:
             for value in values
         )
         validate_task_dag(preview)
+        semantic_goal = dict(goal.metadata.get("semantic_goal") or {})
+        anchors = {
+            str(item.get("id") or "").strip().upper()
+            for item in semantic_goal.get("requirement_anchors", ())
+            if isinstance(item, Mapping) and str(item.get("id") or "").strip()
+        }
+        if anchors:
+            covered = {
+                str(ref).strip().upper()
+                for task in preview
+                for ref in task.metadata.get("requirement_refs", ())
+                if str(ref).strip()
+            }
+            unknown = covered - anchors
+            if unknown:
+                raise ValueError(
+                    "Plan revision references unknown requirement anchors: "
+                    + ", ".join(sorted(unknown))
+                )
+            uncovered = anchors - covered
+            if uncovered:
+                raise ValueError(
+                    "Plan revision would drop user requirement anchors: "
+                    + ", ".join(sorted(uncovered))
+                )
         ids = {task.id for task in preview}
         applicability: list[dict[str, Any]] = []
         for item in old_plan.applicability_evidence:

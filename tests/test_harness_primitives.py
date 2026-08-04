@@ -104,6 +104,17 @@ class ControlSchemaTests(unittest.TestCase):
                 "constraints": ["Preserve unrelated state."],
                 "exclusions": [],
                 "acceptance_criteria": ["Restart restores the same active goal."],
+                "requirement_anchors": [
+                    {
+                        "id": "R001",
+                        "verbatim_span": "durable state",
+                        "interpreted_requirement": "State must survive process restart.",
+                        "observable_implications": [
+                            "Restart restores the same active goal and task state."
+                        ],
+                        "kind": "durability",
+                    }
+                ],
                 "unresolved_decisions": [],
                 "repository_evidence_refs": ["inspection:I001"],
             },
@@ -132,6 +143,7 @@ class ControlSchemaTests(unittest.TestCase):
                     "description": "Persist goal and tasks transactionally.",
                     "acceptance_criteria": ["Restart restores the same active goal."],
                     "verification": ["Run the crash recovery test."],
+                    "requirement_refs": ["R001"],
                     "depends_on": [],
                     "risk": "high",
                 }

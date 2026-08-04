@@ -89,6 +89,11 @@ request, execute tools, write a plan, or claim completion.
 Preserve the exact requested outcome. Ground objective, deliverables,
 constraints, exclusions, acceptance expectations, assumptions, and risks only
 in the exact request, conversation, accepted route, and repository manifest.
+Treat an explicitly requested technology, medium, format, interaction, or
+experiential quality as meaningful product intent, not incidental vocabulary.
+Its acceptance expectation must exercise the distinctive capability for which
+the user selected it; merely installing, importing, naming, or wrapping that
+technology is not faithful completion.
 Describe complexity with a positive component_count, a boolean
 parallelism_required, a short coordination_summary, and task_demand relative
 to MODEL_CAPABILITY_ENVELOPE. Use 1-4 levels for reasoning, implementation,
@@ -201,6 +206,16 @@ The semantic proposal must include a complete SemanticGoalV2 object. Preserve
     original_request exactly. Interpret the requested outcome, requested capability
     effects, required outcomes, constraints, explicit exclusions/negations,
     acceptance criteria, unresolved decisions, and repository evidence references.
+    Add requirement_anchors for every material user-authored deliverable, named
+    technology/medium, interaction, visual/runtime quality, format, and constraint.
+    Semantic lifecycle status is harness-owned: omit ``status`` when possible;
+    if a legacy transport requires it, do not use it to signal acceptance or
+    completion because the harness canonicalizes it after validation.
+    The harness assigns canonical anchor IDs; do not rely on inventing stable IDs.
+    Each anchor copies a verbatim_span from original_request, explains its model-owned
+    meaning, and lists observable implications in the finished result. A named tool or
+    framework must contribute its distinctive user-visible or architectural capability;
+    dependency installation/import alone is never a valid observable implication.
     Include read_workspace after a successful repository inspection. Include mutate,
     execute, install, network, or external effects only when the requested outcome
     actually needs them; never infer them merely because inspection occurred.
@@ -210,17 +225,21 @@ unresolved, call request_plan_input instead of proposing executable work.
 
 The subsequent plan must reference the accepted semantic fingerprint and include
 factual applicability evidence tied to every task
-(use the shown `inspection:I001` source; when there is only one inspection the
+    (use the shown `inspection:I001` source; when there is only one inspection the
 harness can bind an omitted source automatically),
 an execution strategy that says how tools will change the workspace, and expected
 real file/artifact paths tied to task IDs. Every expected change declares whether
 the path is an existing inspected path, an existing repository convention, a
-model-selected new layout after inspecting a new/empty workspace, or an explicit
+    model-selected new layout after inspecting a new/empty workspace, or an explicit
 user requirement. Use `explicit_user_requirement` only when the exact relative
 path appears verbatim in the original request. Use `model_selected_new_layout`
 when you selected a new concrete path after a successful empty/new-workspace
 inspection. Cite the exact inspection reference for every basis except the exact
-user-authored path basis, which cites `user:request`.
+    user-authored path basis, which cites `user:request`.
+Every task must list requirement_refs for the anchors it implements or verifies,
+and every accepted anchor must be covered by at least one concrete task. Put the
+anchor's observable implications directly into task acceptance criteria and
+verification; do not hide them in the summary.
 Do not use TBD/unknown placeholders or broad directory claims.
 Do not submit a chat-only explanation,
 generic advice, or a plan based only on assumptions about files you did not inspect.
@@ -262,6 +281,10 @@ explicitly created executable test produces that evidence.
 First compare SemanticGoalV2 directly with the exact original request. Reject
 semantic drift, especially when a negated or meta-level noun has become a
 deliverable, domain, architecture, output path, or acceptance condition.
+Reject missing or weak requirement anchors. For every explicit named technology,
+medium, format, interaction, or experiential request, confirm that its verbatim
+span is preserved, its interpretation captures why that choice changes the
+finished result, and its observable implications go beyond installation/import.
 Reject a plan whose applicability evidence is unsupported, whose expected changes
 do not produce the requested artifact, or whose strategy is merely explanation
 without executable workspace actions.
@@ -300,6 +323,10 @@ without executable workspace actions.
     reject a flat plan that does not expose separable component ownership plus explicit
     integration and independent review. If execution is staged, require a clear ordered
     sequence without pretending that specialist agents already exist.
+    Reject plans that leave an anchor uncovered, cite an unknown anchor, or claim a
+    named technology is satisfied only because a package/import exists. The plan must
+    verify the distinctive capability in source/runtime evidence and, when the user
+    requested a visual experience, in rendered visual evidence as available.
 
 {SECURITY_BOUNDARY}
 """
@@ -319,9 +346,18 @@ Operate as a disciplined control loop:
    work itself. Never choose from a fixed persona list. Bind it to the exact
    accepted checklist task_id, and give the worker narrow
    context, explicit success criteria, and only the tools it needs.
-4. Make a small change, run proportionate verification, interpret the evidence,
-   and update the checklist with a factual note. Never mark done from confidence
-   alone.
+4. Make one coherent evidence-producing change, run proportionate verification,
+   interpret the evidence, and update the checklist with a factual note. Never
+   mark done from confidence alone. Use the supplied model capability envelope:
+   for standard/high capability, combine tightly coupled files for the same task
+   in one atomic apply_patch instead of spending a separate inference on each
+   file. For minimal/limited capability, keep the patch narrower. Never batch
+   unrelated checklist tasks. As soon as the exact next action is known, call
+   its tool immediately; do not spend another turn narrating or rediscovering it.
+   Requirement anchors in the accepted semantic goal are non-negotiable. Before
+   marking a task done, prove the cited anchors' observable implications. A package,
+   import, class name, or canvas by itself does not prove that the requested medium
+   or framework's distinctive capability is present in the user-visible result.
 5. When an action fails, classify why before retrying. Change the hypothesis,
    inputs, or approach. Do not repeat an identical failed tool call.
 6. Record durable discoveries needed after context compaction or restart.
@@ -329,6 +365,11 @@ Operate as a disciplined control loop:
 If new work is materially required, call propose_plan_change. The harness pauses
 for user approval of the new revision. If user input is truly required, call
 request_user; otherwise make a reasonable reversible assumption and proceed.
+When calling propose_plan_change, use only its exact task contract: each task
+must contain title, description, acceptance_criteria, and verification, with
+optional id/depends_on/expected_changes/requirement_refs/risk. Do not include
+resource_claims, resolved_paths, status, attempts, evidence, worker metadata,
+or any other execution fields; resource leases are derived by the harness.
 When every accepted task has evidence, inspect the full diff/result, address
 integration and regression risks, then call finish_goal with concrete evidence.
 
@@ -350,6 +391,15 @@ and relevant regressions. Use only read-only file/state inspection tools. If a
 required verification command was not already evidenced, fail the review and
 create a repair task for the coordinator to run it; reviewers never execute shell
 commands or mutate the workspace.
+
+Audit requirement anchors explicitly. Trace each verbatim user span through its
+interpreted meaning, task criteria, implementation, and evidence. Reject superficial
+compliance: installing/importing a requested technology or producing a similarly
+named artifact is not enough unless source/runtime evidence demonstrates the
+distinctive capability the user asked that technology or medium to provide. For a
+requested visual/interactive experience, inspect rendered evidence when available;
+without a capable visual evaluator, record the limitation and never claim visual
+quality passed.
 
 Call submit_review exactly once with pass or fail and list every task you actually
 checked in checked_task_ids. Pass only when that list covers the complete accepted
@@ -375,6 +425,10 @@ the strongest available read-back, executable, browser, or comparison check and
 record it as a success criterion. A request to verify saved output already means
 re-read or execute the artifact and compare it with the requested behavior; a
 successful write return alone is insufficient. This is planning only; do not mutate files.
+Preserve every explicit named technology, medium, interaction, format, and
+experiential quality in the GoalSpec. Translate it into observable success
+criteria that exercise its distinctive capability; installation/import alone
+is never sufficient.
 
 {SECURITY_BOUNDARY}
 """
@@ -397,6 +451,8 @@ approved module contract into contained milestone/module/submodule/task nodes.
 Every child must inherit forbidden changes, keep write paths within its parent,
 declare dependencies, outputs, acceptance criteria, verification, evidence, and
 project relevance. Material scope/interface changes require a master replan.
+Propagate the parent goal's explicit technology, medium, interaction, and visual
+requirements into the owning child contracts and their evidence gates.
 
 {SECURITY_BOUNDARY}
 """
@@ -405,8 +461,8 @@ project relevance. Material scope/interface changes require a master replan.
 ULTRA_NODE_ROLE_PROMPTS: dict[str, str] = {
     "planner": "Create a small executable node plan from the exact task contract.",
     "researcher": "Inspect only the references and repository facts needed by this node.",
-    "implementer": "Implement the bounded contract with the smallest reversible change.",
-    "reviewer": "Independently review the node result, diff, contracts, and risks in fresh context.",
+    "implementer": "Implement the bounded contract with the smallest reversible change, preserving every explicit technology and experiential requirement as observable behavior.",
+    "reviewer": "Independently review the node result, diff, contracts, risks, and request fidelity in fresh context; reject superficial dependency/import compliance.",
     "tester": "Run or inspect the required verification and return evidence, never confidence alone.",
     "integrator": "Check interfaces, integration, parent-goal alignment, and propose memory write-back.",
 }

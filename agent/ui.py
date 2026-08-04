@@ -19,7 +19,7 @@ try:
     from .action_policy import ApprovalRequirement, classify_action
     from .config import InteractionMode, runtime_setting_names
     from .events import UIEvent
-    from .safety import redact_text
+    from .safety import redact_data, redact_text
     from .tui import ChoiceItem, select_horizontal_action, terminal_supports_unicode
     from .tui_commands import (
         ALL_SLASH_COMMANDS,
@@ -39,7 +39,7 @@ except ImportError:  # direct ``python agent/main.py`` compatibility
     from action_policy import ApprovalRequirement, classify_action  # type: ignore
     from config import InteractionMode, runtime_setting_names  # type: ignore
     from events import UIEvent  # type: ignore
-    from safety import redact_text  # type: ignore
+    from safety import redact_data, redact_text  # type: ignore
     from tui import ChoiceItem, select_horizontal_action, terminal_supports_unicode  # type: ignore
     from tui_commands import (  # type: ignore
         ALL_SLASH_COMMANDS,
@@ -2479,7 +2479,12 @@ class ConsoleUI:
     def on_event(self, event: UIEvent) -> None:
         if self._workspace_store is not None:
             self._last_event_kind = event.kind
-            self._workspace_store.handle_event(event.kind, event.message, event.data)
+            payload = dict(event.data)
+            payload.setdefault("activity_sequence", event.sequence)
+            payload.setdefault("sequence", event.sequence)
+            payload.setdefault("event_id", event.event_id)
+            payload.setdefault("event_timestamp", event.timestamp)
+            self._workspace_store.handle_event(event.kind, event.message, payload)
             return
         with self._event_lock:
             if self._full_screen_depth:
@@ -2589,6 +2594,41 @@ class ConsoleUI:
         with self._approval_lock:
             return self._confirm_action_decision(name, args, risk)
 
+    def resolve_external_approval(self, action_fingerprint: str, decision: str) -> bool:
+        """Resolve the currently visible tool approval from the local web UI.
+
+        The browser is only allowed to resolve the exact request currently
+        owned by this terminal.  A stale or foreign fingerprint is rejected;
+        the worker remains blocked until the matching attention request is
+        explicitly answered.
+        """
+
+        store = self._workspace_store
+        if store is None:
+            return False
+        request = store.active_attention()
+        if request is None or request.kind is not AttentionKind.APPROVAL:
+            return False
+        expected = str(getattr(request, "action_fingerprint", "") or "")
+        supplied = str(action_fingerprint or "")
+        if not expected or not supplied or expected != supplied:
+            return False
+        value = str(decision or "").strip().casefold()
+        aliases = {
+            "allow": "allow_once",
+            "approve": "allow_once",
+            "approved": "allow_once",
+            "yes": "allow_once",
+            "deny": "deny",
+            "reject": "deny",
+            "rejected": "deny",
+            "no": "deny",
+        }
+        key = aliases.get(value, value)
+        if key not in {option.key for option in request.options}:
+            return False
+        return store.resolve_attention(key)
+
     def _confirm_action_decision(
         self,
         name: str,
@@ -2643,6 +2683,14 @@ class ConsoleUI:
 
         canonical = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
         digest = hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()[:12]
+        action_fingerprint = hashlib.sha256(
+            json.dumps(
+                {"tool": name, "args": redact_data(args), "risk": risk},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8", "replace")
+        ).hexdigest()
         options = [
             AttentionOption(
                 "allow_once", "Allow once", ApprovalDecision.ALLOW_ONCE.value,
@@ -2679,6 +2727,7 @@ class ConsoleUI:
             default_key="deny",
             cancel_key="deny",
             auto_resolve_safe=False,
+            action_fingerprint=action_fingerprint,
         )
         try:
             resolution = self._workspace_store.request_attention(request)

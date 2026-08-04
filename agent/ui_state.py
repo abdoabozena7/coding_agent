@@ -157,6 +157,7 @@ class SwarmSummarySnapshot:
     reviewing: int = 0
     completed: int = 0
     blocked: int = 0
+    active_labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +185,11 @@ class AttentionRequest:
     default_key: str = ""
     cancel_key: str = ""
     auto_resolve_safe: bool = False
+    # Durable tool approvals carry the same fingerprint as the runtime
+    # approval event.  Keeping it on the presentation request lets the web
+    # workspace and the terminal resolve exactly one action without guessing
+    # from a truncated command preview.
+    action_fingerprint: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +239,21 @@ class StructuredLogEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class LiveActivityEntry:
+    sequence: int = 0
+    timestamp: str = ""
+    source: str = "HARNESS"
+    phase: str = ""
+    state: str = "active"
+    message: str = ""
+    actor: str = ""
+    operation: str = ""
+    received_bytes: int = 0
+    received_chunks: int = 0
+    received_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class WorkspaceSnapshot:
     mode: ExperienceMode
     locale: str
@@ -267,6 +288,28 @@ class WorkspaceSnapshot:
     resume_action: str = ""
     heartbeat_at: float | None = None
     workspace_mutated: bool = False
+    objective: str = ""
+    current_task_id: str = ""
+    active_actor: str = ""
+    active_step: int = 0
+    liveness: str = "ready"
+    active_operation: str = ""
+    provider_request_state: str = "idle"
+    received_bytes: int = 0
+    received_chunks: int = 0
+    received_tokens: int = 0
+    last_signal_at: float | None = None
+    activity_sequence: int = 0
+    live_timeline: tuple[LiveActivityEntry, ...] = ()
+    # Presentation-only live output.  Structured/tool responses deliberately
+    # leave ``safe_stream_preview`` empty; the UI must never expose partial
+    # JSON or hidden reasoning.
+    stream_state: str = "idle"
+    stream_kind: str = "none"
+    safe_stream_preview: str = ""
+    first_byte_at: float | None = None
+    task_items: tuple[Mapping[str, Any], ...] = ()
+    next_task: str = ""
 
 
 _ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
@@ -336,6 +379,19 @@ class WorkspaceUIStore:
         self._execution_strategy = "pending"
         self._runtime_phase = "ready"
         self._current_task = ""
+        self._objective = ""
+        self._current_task_id = ""
+        self._active_actor = ""
+        self._active_step = 0
+        self._liveness = "ready"
+        self._active_operation = ""
+        self._provider_request_state = "idle"
+        self._received_bytes = 0
+        self._received_chunks = 0
+        self._received_tokens = 0
+        self._last_signal_at: float | None = None
+        self._activity_sequence = 0
+        self._live_timeline: deque[LiveActivityEntry] = deque(maxlen=80)
         self._last_tool = ""
         self._waiting_on = ""
         self._resume_action = ""
@@ -345,6 +401,11 @@ class WorkspaceUIStore:
         self._queued_count = 0
         self._should_exit = False
         self._stream_text = ""
+        self._stream_kind = "none"
+        self._stream_state = "idle"
+        self._first_byte_at: float | None = None
+        self._task_items: tuple[Mapping[str, Any], ...] = ()
+        self._next_task = ""
         self._progress = ProjectProgressSnapshot()
         self._progress_identity = ""
         self._progress_started_at: float | None = None
@@ -590,19 +651,37 @@ class WorkspaceUIStore:
         nodes = tuple((snapshot or {}).get("nodes") or ())
         agents = tuple((snapshot or {}).get("agents") or ())
         latest: dict[str, str] = {}
+        roles: dict[str, str] = {}
         for agent in agents:
-            node_id = str(getattr(agent, "work_node_id", "") or "")
-            status = str(getattr(getattr(agent, "status", ""), "value", getattr(agent, "status", "")))
+            node_id = str(
+                (agent.get("work_node_id") if isinstance(agent, Mapping) else getattr(agent, "work_node_id", ""))
+                or ""
+            )
+            raw_status = agent.get("status", "") if isinstance(agent, Mapping) else getattr(agent, "status", "")
+            status = str(getattr(raw_status, "value", raw_status))
             if node_id:
                 latest[node_id] = status.casefold()
+                raw_role = agent.get("role", "") if isinstance(agent, Mapping) else getattr(agent, "role", "")
+                roles[node_id] = " ".join(str(raw_role or "").replace("_", " ").split()).title()
         statuses: list[str] = []
+        active_labels: list[str] = []
         for node in nodes:
-            node_id = str(getattr(node, "id", "") or "")
+            node_id = str((node.get("id") if isinstance(node, Mapping) else getattr(node, "id", "")) or "")
+            raw_node_status = node.get("status", "") if isinstance(node, Mapping) else getattr(node, "status", "")
             status = latest.get(
                 node_id,
-                str(getattr(getattr(node, "status", ""), "value", getattr(node, "status", ""))).casefold(),
+                str(getattr(raw_node_status, "value", raw_node_status)).casefold(),
             )
             statuses.append(status)
+            if status in {"running", "in_progress", "planning", "testing", "reviewing", "verifying"}:
+                title = (
+                    node.get("title") or node.get("objective")
+                    if isinstance(node, Mapping)
+                    else getattr(node, "title", "") or getattr(node, "objective", "")
+                )
+                clean_title = " ".join(str(title or node_id).split())
+                role = roles.get(node_id, "")
+                active_labels.append(f"{role} · {clean_title}" if role else clean_title)
         running_values = {"running", "in_progress", "planning", "testing"}
         reviewing_values = {"reviewing", "verifying"}
         completed_values = {"completed", "done"}
@@ -614,6 +693,7 @@ class WorkspaceUIStore:
                 reviewing=sum(item in reviewing_values for item in statuses),
                 completed=sum(item in completed_values for item in statuses),
                 blocked=sum(item in blocked_values for item in statuses),
+                active_labels=tuple(active_labels[:3]),
             )
         self._notify()
 
@@ -649,7 +729,9 @@ class WorkspaceUIStore:
         tasks = tuple(getattr(view, "tasks", ()) or ())
         statuses: dict[str, str] = {}
         active_titles: list[str] = []
+        active_ids: list[str] = []
         blockers: list[str] = []
+        task_items: list[dict[str, Any]] = []
         done_values = {"done", "skipped", "completed", "complete"}
         active_values = {"in_progress", "running", "verifying", "reviewing"}
         for index, task in enumerate(tasks):
@@ -657,12 +739,29 @@ class WorkspaceUIStore:
             status = str(getattr(task, "status", "pending") or "pending").casefold()
             title = " ".join(str(getattr(task, "title", "") or task_id).split())
             statuses[task_id] = status
+            task_items.append({
+                "id": task_id,
+                "title": title,
+                "status": status,
+                "dependencies": (
+                    tuple(getattr(task, "dependencies", ()))
+                    if isinstance(getattr(task, "dependencies", ()), (list, tuple, set))
+                    else ()
+                ),
+                "evidence": " ".join(str(getattr(task, "evidence", "") or "").split()),
+            })
             if status in active_values:
                 active_titles.append(title)
+                active_ids.append(task_id)
             if status in {"blocked", "failed", "uncertain"}:
                 blockers.append(title)
         completed = sum(status in done_values for status in statuses.values())
         total = len(tasks)
+        next_title = ""
+        for item in task_items:
+            if item["status"] in {"pending", "ready", "queued"}:
+                next_title = str(item["title"])
+                break
         phase = str(getattr(view, "status", "idle") or "idle").replace("_", " ")
         retry_count = max(0, int(getattr(view, "goal_attempt", 0) or 0))
         retry_reason = " ".join(str(getattr(view, "retry_reason", "") or "").split())
@@ -686,6 +785,8 @@ class WorkspaceUIStore:
                     if started is not None:
                         self._unit_durations.append(max(0.1, now - started))
             self._task_statuses = statuses
+            self._task_items = tuple(task_items)
+            self._next_task = next_title
             elapsed = self._project_elapsed_locked(now)
             eta_low, eta_high = self._eta_locked(completed, total, elapsed)
             self._progress = ProjectProgressSnapshot(
@@ -704,6 +805,10 @@ class WorkspaceUIStore:
                 total_low_seconds=None if eta_low is None else elapsed + eta_low,
                 total_high_seconds=None if eta_high is None else elapsed + eta_high,
             )
+            self._objective = objective or self._objective
+            if active_titles:
+                self._current_task_id = active_ids[0]
+                self._current_task = f"{active_ids[0]} · {active_titles[0]}"
             self._route = str(getattr(view, "route", self._route) or self._route or "pending")
             self._execution_strategy = str(getattr(view, "execution_strategy_name", self._execution_strategy) or self._execution_strategy or "pending")
             self._runtime_phase = str(getattr(view, "runtime_phase", phase) or phase)
@@ -832,14 +937,91 @@ class WorkspaceUIStore:
                 )
             if "phase" in data:
                 self._runtime_phase = str(data.get("phase") or "ready")
+                # The compact header reads ``progress.phase`` while the
+                # recovery/footer logic reads ``runtime_phase``. Keep both
+                # projections atomic so a live routing event cannot be shown
+                # beside a stale Dashboard status such as Idle.
+                self._progress = replace(
+                    self._progress,
+                    phase=self._runtime_phase,
+                    active_operation=(
+                        str(data.get("reason") or data.get("message") or "")
+                        or self._progress.active_operation
+                    ),
+                )
             if "current_task" in data:
                 self._current_task = str(data.get("current_task") or "")
+                self._progress = replace(
+                    self._progress,
+                    current_task=self._current_task,
+                )
+            if "objective" in data:
+                self._objective = " ".join(str(data.get("objective") or "").split())
+            if "current_task_id" in data:
+                self._current_task_id = str(data.get("current_task_id") or "")
+            actor = data.get("active_actor", data.get("actor"))
+            if actor is not None:
+                self._active_actor = str(actor or "")
+            step = data.get("active_step", data.get("step"))
+            if step is not None:
+                try:
+                    self._active_step = max(0, int(step))
+                except (TypeError, ValueError):
+                    pass
             if "last_tool" in data:
                 self._last_tool = str(data.get("last_tool") or "")
             if "waiting_on" in data:
                 self._waiting_on = str(data.get("waiting_on") or "")
             if "resume_action" in data:
                 self._resume_action = str(data.get("resume_action") or "")
+            if "liveness" in data:
+                self._liveness = str(data.get("liveness") or "ready")
+            if "active_operation" in data:
+                self._active_operation = str(data.get("active_operation") or "")
+                self._progress = replace(
+                    self._progress,
+                    active_operation=self._active_operation or self._progress.active_operation,
+                )
+            if "provider_request_state" in data:
+                self._provider_request_state = str(data.get("provider_request_state") or "idle")
+            if "received_bytes" in data:
+                self._received_bytes = max(0, int(data.get("received_bytes") or 0))
+            if "received_chunks" in data:
+                self._received_chunks = max(0, int(data.get("received_chunks") or 0))
+            if "received_tokens" in data:
+                self._received_tokens = max(0, int(data.get("received_tokens") or 0))
+            if "stream_state" in data:
+                self._stream_state = str(data.get("stream_state") or "idle")
+            if "stream_kind" in data:
+                self._stream_kind = str(data.get("stream_kind") or "none")
+            if "safe_stream_preview" in data:
+                self._stream_text = str(data.get("safe_stream_preview") or "")[-20_000:]
+            if "first_byte_at" in data and data.get("first_byte_at") is not None:
+                try:
+                    self._first_byte_at = float(data.get("first_byte_at"))
+                except (TypeError, ValueError):
+                    pass
+            incoming_tasks = data.get("task_items")
+            if isinstance(incoming_tasks, (list, tuple)):
+                self._task_items = tuple(
+                    dict(item) for item in incoming_tasks if isinstance(item, Mapping)
+                )
+            if "next_task" in data:
+                self._next_task = str(data.get("next_task") or "")
+            if "last_signal_at" in data and data.get("last_signal_at") is not None:
+                try:
+                    self._last_signal_at = float(data.get("last_signal_at"))
+                except (TypeError, ValueError):
+                    pass
+            if "activity_sequence" in data:
+                self._activity_sequence = max(
+                    self._activity_sequence, int(data.get("activity_sequence") or 0)
+                )
+            preview = data.get("timeline_preview")
+            if isinstance(preview, (list, tuple)):
+                for item in preview:
+                    if isinstance(item, Mapping):
+                        self._append_live_activity_locked(item)
             heartbeat = data.get("heartbeat_at")
             if heartbeat is not None:
                 try:
@@ -883,6 +1065,34 @@ class WorkspaceUIStore:
                     self._workflow_mode = "working"
             self._composer_mode = self._workflow_mode
         self._notify()
+
+    def _append_live_activity_locked(self, data: Mapping[str, Any]) -> None:
+        sequence = max(0, int(data.get("sequence") or data.get("activity_sequence") or 0))
+        event_id = str(data.get("event_id") or "")
+        message = " ".join(str(data.get("message") or "").split())[:500]
+        if not message:
+            return
+        identity = (sequence, event_id, message)
+        for existing in reversed(self._live_timeline):
+            if (existing.sequence, "", existing.message) == (sequence, "", message):
+                return
+            if sequence and existing.sequence == sequence:
+                return
+        entry = LiveActivityEntry(
+            sequence=sequence,
+            timestamp=str(data.get("timestamp") or data.get("event_timestamp") or ""),
+            source=str(data.get("source") or data.get("source_kind") or "HARNESS").upper(),
+            phase=str(data.get("phase") or data.get("stage") or ""),
+            state=str(data.get("state") or "active"),
+            message=message,
+            actor=str(data.get("actor") or data.get("active_actor") or ""),
+            operation=str(data.get("operation") or ""),
+            received_bytes=max(0, int(data.get("received_bytes") or 0)),
+            received_chunks=max(0, int(data.get("received_chunks") or 0)),
+            received_tokens=max(0, int(data.get("received_tokens") or 0)),
+        )
+        self._live_timeline.append(entry)
+        self._activity_sequence = max(self._activity_sequence, sequence)
 
     def set_composer_mode(self, value: str) -> str:
         with self._lock:
@@ -1094,16 +1304,131 @@ class WorkspaceUIStore:
 
         data = dict(data or {})
         normalized = str(kind)
+        timeline_kinds = {
+            "provider.activity", "workflow.state", "heartbeat",
+            "approval.requested", "approval.received", "plan.approved.local_web",
+            "execution.started", "execution.boundary", "process.waiting",
+            "tool_call", "tool_result", "tool.started", "tool.completed", "tool.failed",
+            "recovery.presented", "execution.reconciled",
+        }
+        if normalized in timeline_kinds:
+            timeline_data = dict(data)
+            timeline_data.setdefault("message", message)
+            timeline_data.setdefault("source", (
+                "MODEL" if normalized in {"provider.activity", "heartbeat"}
+                else "TOOL" if normalized.startswith("tool")
+                else "PROCESS" if normalized.startswith("process")
+                else "USER" if normalized in {"approval.received", "plan.approved.local_web"}
+                else "HARNESS"
+            ))
+            timeline_message = str(message or "").lstrip().casefold()
+            timeline_data.setdefault("state", (
+                "failed"
+                if normalized in {"error", "tool.failed"}
+                or timeline_message.startswith(("error:", "permission denied", "failed:"))
+                else "completed" if normalized in {"tool_result", "tool.completed"}
+                else "waiting" if normalized in {"approval.requested", "process.waiting"}
+                else "active"
+            ))
+            with self._lock:
+                self._append_live_activity_locked(timeline_data)
+                # A tool call/result, process signal, or approval event is a
+                # real runtime heartbeat even when the provider is using an
+                # atomic structured response.  Keep the liveness clock tied to
+                # the latest authoritative event so the UI does not claim
+                # "no fresh runtime signal" while work is visibly progressing.
+                now = time.time()
+                self._last_signal_at = now
+                self._heartbeat_at = float(data.get("heartbeat_at") or now)
+                self._activity = replace(
+                    self._activity,
+                    last_signal_at=time.monotonic(),
+                )
         if normalized == "model_text":
             self.append_log("model_text: streaming response")
         elif normalized == "model_thought":
             self.append_log("model_thought: reasoning update; use /thinking for details")
         else:
             self.append_log(f"{kind}: {message}" if message else kind)
+        if normalized in {"tool.failed", "workflow.failed"} or (
+            normalized in {"error", "provider.failed"} and bool(data.get("terminal") or data.get("boundary"))
+        ):
+            reason = " ".join(str(message or data.get("reason") or "Workflow failed").split())
+            with self._lock:
+                self._status = "paused"
+                self._running = False
+                self._runtime_phase = "paused"
+                self._liveness = "stalled"
+                self._stream_state = "waiting"
+                self._progress = replace(
+                    self._progress,
+                    phase="paused",
+                    blocker=reason[:500],
+                    active_operation=f"Needs attention · {reason[:300]}",
+                )
+            self.set_activity(ActivityStage.PROBLEM, f"Paused · {reason}", running=False)
+            return
         if normalized == "workflow.state":
             if "phase" not in data and data.get("stage"):
                 data["phase"] = data.get("stage")
+            if message and "message" not in data:
+                data["message"] = message
             self.update_runtime_context(data)
+            return
+        if normalized == "provider.activity":
+            with self._lock:
+                self._provider_request_state = str(
+                    data.get("provider_state") or data.get("state") or "active"
+                )
+                self._liveness = (
+                    "receiving" if self._provider_request_state == "receiving"
+                    else "processing_response" if self._provider_request_state == "completed"
+                    else "request_sent" if self._provider_request_state in {"request_created", "request_sent", "connection_opened", "provider_connected", "client_active"}
+                    else "processing_response" if self._provider_request_state == "server_processing"
+                    else "network_unavailable" if self._provider_request_state == "network_unavailable"
+                    else "stalled" if self._provider_request_state == "failed"
+                    else "client_active"
+                )
+                self._received_bytes = max(
+                    self._received_bytes, int(data.get("received_bytes") or 0)
+                )
+                self._received_chunks = max(
+                    self._received_chunks, int(data.get("received_chunks") or 0)
+                )
+                self._received_tokens = max(
+                    self._received_tokens, int(data.get("received_tokens") or 0)
+                )
+                provider_state = self._provider_request_state
+                self._stream_state = (
+                    "receiving" if provider_state == "receiving"
+                    else "validating" if provider_state == "completed"
+                    else "waiting" if provider_state in {"network_unavailable", "failed"}
+                    else "active"
+                )
+                if provider_state == "receiving" and self._first_byte_at is None:
+                    self._first_byte_at = time.time()
+                self._active_operation = str(
+                    data.get("operation") or message or self._active_operation
+                )
+                self._progress = replace(
+                    self._progress,
+                    active_operation=self._active_operation,
+                )
+                self._last_signal_at = time.time()
+                self._heartbeat_at = float(data.get("heartbeat_at") or self._last_signal_at)
+                self._activity = replace(
+                    self._activity,
+                    last_signal_at=time.monotonic(),
+                )
+                self._resources = replace(
+                    self._resources,
+                    model_activity=(
+                        "streaming" if self._liveness == "receiving"
+                        else "processing result" if self._liveness == "processing_response"
+                        else "calling model"
+                    ),
+                )
+            self._notify()
             return
         if normalized == "heartbeat":
             with self._lock:
@@ -1113,8 +1438,33 @@ class WorkspaceUIStore:
                 )
                 if data.get("phase"):
                     self._runtime_phase = str(data.get("phase"))
+                    self._progress = replace(
+                        self._progress,
+                        phase=self._runtime_phase,
+                    )
+                    if self._runtime_phase in {
+                        "routing", "planning", "starting", "working", "reviewing"
+                    }:
+                        self._status = self._runtime_phase
+                        self._running = True
                 if data.get("waiting_on"):
                     self._waiting_on = str(data.get("waiting_on"))
+                actor = data.get("active_actor", data.get("actor"))
+                if actor is not None:
+                    self._active_actor = str(actor or "")
+                step = data.get("active_step", data.get("step"))
+                if step is not None:
+                    try:
+                        self._active_step = max(0, int(step))
+                    except (TypeError, ValueError):
+                        pass
+                if self._waiting_on == "model":
+                    elapsed = max(0, int(data.get("elapsed_seconds") or 0))
+                    actor_label = self._active_actor.replace("-", " ").replace("_", " ").title()
+                    operation = f"{actor_label or 'Model'} · waiting for response"
+                    if elapsed:
+                        operation += f" · {elapsed}s"
+                    self._progress = replace(self._progress, active_operation=operation)
                 if data.get("last_tool") or data.get("tool"):
                     self._last_tool = str(data.get("last_tool") or data.get("tool"))
                 if data.get("heartbeat_at") is not None:
@@ -1122,6 +1472,9 @@ class WorkspaceUIStore:
                         self._heartbeat_at = float(data.get("heartbeat_at"))
                     except (TypeError, ValueError):
                         pass
+                self._last_signal_at = time.time()
+                if self._provider_request_state in {"idle", "client_active"}:
+                    self._liveness = "client_active"
             self._notify()
             return
         if normalized in {"approval.requested", "approval.received", "plan.approved.local_web", "execution.started", "execution.boundary", "process.waiting", "recovery.presented", "execution.reconciled"}:
@@ -1137,7 +1490,29 @@ class WorkspaceUIStore:
                         pass
                 if data.get("workspace_mutated") is not None:
                     self._workspace_mutated = bool(data.get("workspace_mutated"))
+                if data.get("objective"):
+                    self._objective = " ".join(str(data.get("objective")).split())
+                if data.get("current_task"):
+                    self._current_task = str(data.get("current_task"))
+                    self._progress = replace(self._progress, current_task=self._current_task)
+                if data.get("current_task_id"):
+                    self._current_task_id = str(data.get("current_task_id"))
+                actor = data.get("active_actor", data.get("actor"))
+                if actor is not None:
+                    self._active_actor = str(actor or "")
             if normalized == "approval.requested":
+                with self._lock:
+                    # The approval boundary is a real state transition. Do
+                    # not leave the header saying Working while the worker is
+                    # blocked and waiting for the user.
+                    self._status = "waiting_for_approval"
+                    self._running = False
+                    self._liveness = "waiting"
+                    self._progress = replace(
+                        self._progress,
+                        phase="waiting_for_approval",
+                        active_operation=message or "Waiting for your approval",
+                    )
                 self.set_activity(
                     ActivityStage.PAUSED,
                     message or "Waiting for your approval",
@@ -1199,6 +1574,10 @@ class WorkspaceUIStore:
                 return
             with self._lock:
                 self._stream_text = (self._stream_text + str(message))[-20_000:]
+                self._stream_kind = "chat"
+                self._stream_state = "receiving"
+                if self._first_byte_at is None:
+                    self._first_byte_at = time.time()
                 self._resources = replace(self._resources, model_activity="streaming")
             self._notify()
             return
@@ -1210,7 +1589,18 @@ class WorkspaceUIStore:
         if normalized == "step":
             with self._lock:
                 self._resources = replace(self._resources, model_activity="calling model")
-            self.set_activity(ActivityStage.BUILDING, "Working on the next step")
+                actor = str(data.get("actor") or "coordinator")
+                self._active_actor = actor
+                try:
+                    self._active_step = max(0, int(data.get("step") or self._active_step))
+                except (TypeError, ValueError):
+                    pass
+                actor_label = actor.replace("-", " ").replace("_", " ").title()
+                self._progress = replace(
+                    self._progress,
+                    active_operation=f"{actor_label} · choosing the next action",
+                )
+            self.set_activity(ActivityStage.BUILDING, f"{actor_label} · choosing the next action")
             return
         if normalized == "tool_call":
             tool = str(message or data.get("tool") or "")
@@ -1232,6 +1622,8 @@ class WorkspaceUIStore:
             }
             with self._lock:
                 self._resources = replace(self._resources, model_activity="using tool")
+                self._active_actor = str(data.get("actor") or self._active_actor or "coordinator")
+                self._last_tool = tool
                 self._progress = replace(
                     self._progress,
                     active_operation=labels.get(tool, tool.replace("_", " ") or "Working"),
@@ -1240,15 +1632,64 @@ class WorkspaceUIStore:
             return
         if normalized == "tool_result":
             failed = str(message).lstrip().lower().startswith(("error:", "permission denied"))
+            planning_repair = False
             if failed:
-                # Tool failures are often handled by the coordinator. Preserve
-                # truthful running state until the durable goal actually pauses.
-                self.set_activity(
-                    self._activity.stage if self._running else ActivityStage.PROBLEM,
-                    "A step failed; checking another approach" if self._running else self.text("problem"),
-                    running=self._running,
+                # A planner contract error is an active, bounded repair phase,
+                # not successful work and not an unexplained generic spinner.
+                # Keep the worker live while the repair budget remains, but
+                # expose the real phase and operation so the user can tell what
+                # is being retried. Execution-tool failures retain the normal
+                # coordinator repair semantics below.
+                planning_repair = (
+                    str(data.get("phase") or "").casefold() == "planning"
+                    or str(data.get("tool") or "").casefold()
+                    in {"propose_plan", "propose_semantic_goal", "request_plan_input"}
                 )
-                self.append_transcript("assistant", f"Tool failure: {str(message)[:1200]}")
+                if planning_repair:
+                    with self._lock:
+                        self._resources = replace(
+                            self._resources,
+                            model_activity="repairing plan",
+                        )
+                        # Keep the planning repair worker alive, but make the
+                        # header truthful: this is recovery, not a healthy
+                        # model step.
+                        self._status = "recovering"
+                        self._waiting_on = "coordinator"
+                        self._resume_action = "Retry"
+                    self.set_activity(
+                        ActivityStage.PLANNING,
+                        "Plan contract failed — repairing the saved plan",
+                        running=self._running,
+                    )
+                else:
+                    # Keep the live worker available for the bounded repair
+                    # loop, but expose the failure as a recovery state instead
+                    # of leaving the header at ``Working``.  A durable
+                    # terminal/boundary event is handled above and becomes
+                    # ``Paused · Needs attention``.
+                    with self._lock:
+                        self._runtime_phase = "retrying"
+                        self._status = "recovering"
+                        self._waiting_on = "coordinator"
+                        self._resume_action = "Retry"
+                        self._progress = replace(
+                            self._progress,
+                            phase="retrying",
+                            retry_reason=" ".join(str(message).split())[:500],
+                            active_operation="Repairing the failed step",
+                        )
+                    self.set_activity(
+                        ActivityStage.CHECKING if self._running else ActivityStage.PROBLEM,
+                        "Repairing the failed step" if self._running else self.text("problem"),
+                        running=self._running,
+                    )
+                if planning_repair:
+                    self.append_log(f"planning repair: {str(message)[:1_200]}")
+                elif self._running:
+                    self.append_log(f"tool retry: {str(message)[:1_200]}")
+                else:
+                    self.append_transcript("assistant", f"Tool failure: {str(message)[:1200]}")
             else:
                 tool = str(data.get("tool") or "step")
                 self.set_activity(
@@ -1266,7 +1707,8 @@ class WorkspaceUIStore:
                 ):
                     self.append_transcript("assistant", f"Test result: {one_line[:1000]}")
             with self._lock:
-                self._resources = replace(self._resources, model_activity="processing result")
+                if not planning_repair:
+                    self._resources = replace(self._resources, model_activity="processing result")
             self._notify()
             return
         if normalized == "usage":
@@ -1342,17 +1784,29 @@ class WorkspaceUIStore:
             return
         if normalized == "error":
             self.append_transcript("assistant", f"Error: {message or self.text('problem')}")
+            terminal = bool(
+                data.get("planning_terminal")
+                or data.get("paused")
+                or data.get("boundary")
+                or data.get("terminal")
+            )
             with self._lock:
                 reason = " ".join(str(message or self.text("problem")).split())
-                self._progress = (
-                    replace(self._progress, retry_reason=reason)
-                    if self._running
-                    else replace(self._progress, blocker=reason)
-                )
+                if terminal:
+                    self._runtime_phase = "paused"
+                    self._status = "paused"
+                    self._running = False
+                    self._progress = replace(self._progress, blocker=reason)
+                else:
+                    self._progress = (
+                        replace(self._progress, retry_reason=reason)
+                        if self._running
+                        else replace(self._progress, blocker=reason)
+                    )
             self.set_activity(
-                self._activity.stage if self._running else ActivityStage.PROBLEM,
+                ActivityStage.PROBLEM if terminal else self._activity.stage if self._running else ActivityStage.PROBLEM,
                 message or self.text("problem"),
-                running=self._running,
+                running=False if terminal else self._running,
             )
             return
         if normalized.startswith("ultra."):
@@ -1429,6 +1883,10 @@ class WorkspaceUIStore:
                 self._stream_text = ""
         with self._lock:
             self._resources = replace(self._resources, model_activity="idle")
+            self._stream_state = "idle"
+            self._stream_kind = "none"
+            self._first_byte_at = None
+            self._stream_text = ""
             if self._progress.active_operation:
                 self._progress = replace(self._progress, active_operation="")
         self._notify()
@@ -1488,6 +1946,25 @@ class WorkspaceUIStore:
                 resume_action=self._resume_action,
                 heartbeat_at=self._heartbeat_at,
                 workspace_mutated=self._workspace_mutated,
+                objective=self._objective,
+                current_task_id=self._current_task_id,
+                active_actor=self._active_actor,
+                active_step=self._active_step,
+                liveness=self._liveness,
+                active_operation=self._active_operation,
+                provider_request_state=self._provider_request_state,
+                received_bytes=self._received_bytes,
+                received_chunks=self._received_chunks,
+                received_tokens=self._received_tokens,
+                last_signal_at=self._last_signal_at,
+                activity_sequence=self._activity_sequence,
+                live_timeline=tuple(self._live_timeline),
+                stream_state=self._stream_state,
+                stream_kind=self._stream_kind,
+                safe_stream_preview=(self._stream_text[-4_000:] if self._mode is ExperienceMode.ADVANCED else ""),
+                first_byte_at=self._first_byte_at,
+                task_items=tuple(dict(item) for item in self._task_items),
+                next_task=self._next_task,
             )
 
 

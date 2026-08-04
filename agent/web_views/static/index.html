@@ -44,6 +44,49 @@
     </header>
 
     <main id="workspace" class="workspace" tabindex="-1">
+      <section id="liveWorkflow" class="live-workflow" aria-labelledby="liveNowTitle">
+        <div class="live-now">
+          <div class="live-kicker">
+            <span id="livePulse" class="live-pulse" aria-hidden="true"></span>
+            <span>Now</span>
+            <span id="liveProvenance" class="source-chip">Harness</span>
+          </div>
+          <h1 id="liveNowTitle">Ready for your request</h1>
+          <p id="liveEvidence" class="live-evidence">No workflow is active.</p>
+          <p id="liveGoal" class="live-goal hidden"></p>
+        </div>
+        <div class="live-rail">
+          <div class="live-rail-head">
+            <span>Activity</span>
+            <button id="openActivity" class="quiet-button" type="button">View timeline</button>
+          </div>
+          <ol id="liveTimeline" class="live-timeline" aria-live="polite"></ol>
+        </div>
+      </section>
+      <section id="advancedLiveDetails" class="advanced-live-details advanced-only" aria-live="polite">
+        <div class="advanced-live-head">
+          <div>
+            <p class="eyebrow">Verified runtime detail</p>
+            <h2>Live execution</h2>
+          </div>
+          <span id="advancedStreamState" class="source-chip">Idle</span>
+        </div>
+        <div class="advanced-live-grid">
+          <section class="live-detail-section">
+            <h3>Task checklist</h3>
+            <ol id="advancedTaskList" class="task-checklist"></ol>
+          </section>
+          <section class="live-detail-section">
+            <h3>Model output</h3>
+            <pre id="advancedModelOutput" class="model-output">No safe text stream available.</pre>
+            <p id="advancedTransport" class="muted"></p>
+          </section>
+        </div>
+        <section class="live-detail-section">
+          <h3>Activity timeline</h3>
+          <ol id="advancedActivityList" class="advanced-activity-list"></ol>
+        </section>
+      </section>
       <section id="attention" class="attention hidden" aria-labelledby="attentionTitle">
         <div>
           <p id="attentionEyebrow" class="eyebrow"></p>
@@ -51,6 +94,10 @@
           <p id="attentionBody" class="muted"></p>
         </div>
         <button id="attentionAction" class="primary-button hidden" type="button"></button>
+        <div id="toolApprovalActions" class="section-actions hidden" aria-label="Tool approval actions">
+          <button id="toolAllow" class="primary-button" type="button">Allow once</button>
+          <button id="toolDeny" class="secondary-button" type="button">Deny</button>
+        </div>
       </section>
       <div id="activityBanner" class="activity-banner hidden" role="status" aria-live="polite">
         <span>New activity available.</span>

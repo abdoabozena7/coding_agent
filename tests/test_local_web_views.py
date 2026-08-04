@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import asyncio
 import tempfile
 import time
 import unittest
 from unittest import mock
 
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from agent.config import RuntimeConfig
 from agent.events import EventBus, UIEvent
@@ -131,6 +133,85 @@ class LocalWebViewTestCase(unittest.TestCase):
 
 
 class PlanStudioIntegrationTests(LocalWebViewTestCase):
+    def test_tool_approval_is_exposed_and_resolved_by_fingerprint(self):
+        fingerprint = "a" * 64
+        self.store.append_event(
+            "approval.requested",
+            goal_id=self.goal.id,
+            entity_type="tool",
+            entity_id="run_command",
+            payload={
+                "tool": "run_command",
+                "risk": "risky",
+                "action_fingerprint": fingerprint,
+            },
+        )
+        context = self.client.get(f"/api/sessions/{self.runtime.session_id}/workspace").json()
+        self.assertEqual(context["tool_approval"]["tool"], "run_command")
+        self.assertEqual(context["tool_approval"]["action_fingerprint"], fingerprint)
+        with mock.patch.object(self.runtime, "resolve_tool_approval", return_value=True) as resolver:
+            response = self.client.post(
+                f"/api/sessions/{self.runtime.session_id}/tool-approval",
+                headers=self.csrf_headers(),
+                json={"action_fingerprint": fingerprint, "decision": "allow_once"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["decision"], "allow")
+        resolver.assert_called_once_with(fingerprint, "allow_once")
+
+    def test_plan_revision_preserves_requirement_anchor_coverage(self):
+        self.store.update_goal_metadata(
+            self.goal.id,
+            semantic_goal={
+                "requirement_anchors": [
+                    {
+                        "id": "R001",
+                        "verbatim_span": "local artifact workspace",
+                        "interpreted_requirement": "Deliver the requested local workspace.",
+                        "observable_implications": ["The workspace is locally runnable."],
+                        "kind": "deliverable",
+                    }
+                ]
+            },
+        )
+        payload = self.plan_payload()
+        payload["tasks"][0]["requirement_refs"] = ["R001"]
+
+        response = self.client.post(
+            f"/api/sessions/{self.runtime.session_id}/plan/revision",
+            headers=self.csrf_headers(),
+            json=payload,
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        task = self.store.get_latest_plan(self.goal.id).tasks[0]
+        self.assertEqual(task.metadata["requirement_refs"], ["R001"])
+
+    def test_plan_revision_cannot_drop_requirement_anchor(self):
+        self.store.update_goal_metadata(
+            self.goal.id,
+            semantic_goal={
+                "requirement_anchors": [
+                    {
+                        "id": "R001",
+                        "verbatim_span": "local artifact workspace",
+                        "interpreted_requirement": "Deliver the requested local workspace.",
+                        "observable_implications": ["The workspace is locally runnable."],
+                        "kind": "deliverable",
+                    }
+                ]
+            },
+        )
+
+        response = self.client.post(
+            f"/api/sessions/{self.runtime.session_id}/plan/revision",
+            headers=self.csrf_headers(),
+            json=self.plan_payload(),
+        )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("drop user requirement anchors", response.text)
+
     def test_revision_and_approval_are_separate_explicit_actions(self):
         captured: list[UIEvent] = []
         unsubscribe = self.events.subscribe(captured.append)
@@ -288,6 +369,9 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
         ).json()
         self.assertIsNone(running["required_view"])
         self.assertEqual(running["attention"]["state"], "working")
+        self.assertIn("activity_sequence", running["runtime"])
+        self.assertIn("liveness", running["runtime"])
+        self.assertIn("timeline_preview", running["runtime"])
 
     def test_future_queue_is_not_available_before_plan_approval(self):
         response = self.client.post(
@@ -350,6 +434,59 @@ class SecurityAndLifecycleTests(LocalWebViewTestCase):
         serialized = event.to_dict()
         self.assertTrue(serialized["event_id"].startswith("event_"))
         self.assertEqual(serialized["source"], "terminal")
+        self.assertGreater(serialized["sequence"], 0)
+
+    def test_sse_begins_with_a_runtime_snapshot_and_safe_activity_sequence(self):
+        self.events.publish(
+            "provider.activity",
+            "Provider request sent",
+            source_kind="MODEL",
+            phase="planning",
+            state="started",
+            provider_state="request_sent",
+            received_bytes=0,
+            received_chunks=0,
+        )
+        route = next(
+            item for item in self.app.routes
+            if getattr(item, "path", "") == "/api/sessions/{session_id}/events"
+        )
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": f"/api/sessions/{self.runtime.session_id}/events",
+                "raw_path": b"/events",
+                "query_string": b"",
+                "headers": [(b"last-event-id", b"0")],
+                "client": ("127.0.0.1", 12345),
+                "server": ("127.0.0.1", 43210),
+            }
+        )
+
+        async def first_messages():
+            response = await route.endpoint(request, self.runtime.session_id)
+            iterator = response.body_iterator
+            try:
+                return await anext(iterator), await anext(iterator)
+            finally:
+                await iterator.aclose()
+
+        retry, snapshot = asyncio.run(first_messages())
+        self.assertEqual(retry, "retry: 1000\n")
+        self.assertIn("event: snapshot", snapshot)
+        self.assertIn('"activity_sequence"', snapshot)
+        self.assertNotIn("partial_tool_args", snapshot)
+
+    def test_workspace_assets_use_sse_and_incremental_live_regions(self):
+        html = self.client.get("/assets/index.html").text
+        script = self.client.get("/assets/app.js").text
+        self.assertIn('id="liveWorkflow"', html)
+        self.assertIn('id="liveTimeline"', html)
+        self.assertIn("new EventSource", script)
+        self.assertIn("applyLiveActivity", script)
 
     def test_local_server_stops_and_invalidates_session_with_runtime(self):
         server = LocalWebServer(self.runtime).start()

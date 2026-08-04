@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from agent.tui import (
@@ -12,6 +13,7 @@ from agent.tui import (
     SwarmInspectorState,
     UserExitRequested,
     _responsive_welcome_brand,
+    _compact_progress_lines,
     _welcome_fragments,
     inline_square_levels,
     loading_grid_levels,
@@ -85,6 +87,31 @@ class ChoiceStateTests(unittest.TestCase):
 
 
 class PersistentWorkspaceSnapshotTests(unittest.TestCase):
+    def test_activity_strip_names_goal_task_actor_and_live_wait(self):
+        store = WorkspaceUIStore()
+        store.update_runtime_context(
+            {
+                "session_mode": "working",
+                "route": "goal",
+                "execution_strategy": "staged",
+                "phase": "working",
+                "objective": "Create a Three.js 3D calculator and run it",
+                "current_task": "T001 · Initialize project and install three.js",
+                "current_task_id": "T001",
+                "active_actor": "coordinator",
+                "waiting_on": "model",
+                "reason": "Waiting for the model response",
+            }
+        )
+
+        for width in (80, 120, 200):
+            with self.subTest(width=width):
+                rendered = "\n".join(_compact_progress_lines(store.snapshot(), width))
+                self.assertIn("Coordinator", rendered)
+                self.assertIn("Goal · Create a Three.js 3D calculator", rendered)
+                self.assertIn("Task · T001 · Initialize project", rendered)
+                self.assertNotIn("Working on the next step", rendered)
+
     def test_api_key_entry_uses_masked_composer_and_never_becomes_message(self):
         from prompt_toolkit.input.defaults import create_pipe_input
         from prompt_toolkit.output import DummyOutput
@@ -147,6 +174,43 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         self.assertIn("? Help", footer_text)
         self.assertNotIn("F3", footer_text)
 
+    def test_provider_boundary_header_never_falls_back_to_idle_or_pending_route(self):
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        store.update_identity(
+            workspace="project-109",
+            model="gpt-oss:120b-cloud",
+            status="idle",
+            workflow_mode="ready",
+        )
+        store.update_runtime_context(
+            {
+                "session_mode": "working",
+                "route": "goal",
+                "execution_strategy": "staged",
+                "phase": "retrying",
+                "waiting_on": "provider",
+                "resume_action": "Retry",
+            }
+        )
+        app = PersistentWorkspaceApp(
+            store,
+            on_input=lambda _item: None,
+            on_interrupt=lambda: None,
+            on_exit=lambda: True,
+            output=io.StringIO(),
+            app_output=DummyOutput(),
+            no_color=True,
+        )
+
+        header_text = "".join(item[1] for item in app._header_fragments())
+        self.assertIn("Session WORKING", header_text)
+        self.assertIn("Route GOAL", header_text)
+        self.assertIn("Execution STAGED", header_text)
+        self.assertIn("Status Retrying", header_text)
+        self.assertNotIn("Status Idle", header_text)
+
     def test_question_mark_opens_contextual_keyboard_help(self):
         from prompt_toolkit.input.defaults import create_pipe_input
         from prompt_toolkit.output import DummyOutput
@@ -208,6 +272,63 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         text = "".join(item[1] for item in app._too_small_fragments())
         self.assertIn("80 columns by 24 rows", text)
 
+    def test_live_rail_reports_no_bytes_then_real_receiving_evidence(self):
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        store.update_runtime_context(
+            {
+                "phase": "planning",
+                "objective": "Create a Three.js 3D calculator",
+                "current_task": "Prepare a verified project plan",
+            }
+        )
+        store.handle_event(
+            "provider.activity",
+            "Provider request sent",
+            {
+                "sequence": 1,
+                "source": "MODEL",
+                "phase": "planning",
+                "provider_state": "request_sent",
+                "operation": "Preparing the project plan",
+                "received_bytes": 0,
+                "received_chunks": 0,
+            },
+        )
+        app = PersistentWorkspaceApp(
+            store,
+            on_input=lambda _item: None,
+            on_interrupt=lambda: None,
+            on_exit=lambda: True,
+            output=io.StringIO(),
+            app_output=DummyOutput(),
+            no_color=True,
+        )
+        app._terminal_size = lambda: (140, 40)
+        waiting = "".join(fragment[1] for fragment in app._live_activity_fragments())
+        self.assertIn("Preparing the project plan", waiting)
+        self.assertIn("no response bytes yet", waiting)
+        self.assertIn("Create a Three.js 3D calculator", waiting)
+
+        store.handle_event(
+            "provider.activity",
+            "First response bytes received",
+            {
+                "sequence": 2,
+                "source": "MODEL",
+                "phase": "planning",
+                "provider_state": "receiving",
+                "operation": "Receiving the project plan",
+                "received_bytes": 1024,
+                "received_chunks": 2,
+            },
+        )
+        receiving = "".join(fragment[1] for fragment in app._live_activity_fragments())
+        self.assertIn("Receiving", receiving)
+        self.assertIn("1.0 KB", receiving)
+        self.assertIn("2 chunks", receiving)
+
     def test_simple_snapshot_fits_common_terminal_sizes(self):
         store = WorkspaceUIStore()
         store.update_identity(workspace="project-090", model="gemma4:e4b", status="running")
@@ -234,6 +355,58 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         # The deterministic plain renderer reserves Advanced details for the
         # live app; the mode switch itself remains observable in snapshots.
         self.assertIn("ADVANCED", advanced)
+
+    def test_running_slash_palette_is_immediate_and_contains_sleep_actions(self):
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        store.update_identity(workspace="project", model="model", status="running")
+        store.set_activity(ActivityStage.BUILDING, "Working", running=True)
+        app = PersistentWorkspaceApp(
+            store,
+            on_input=lambda _item: None,
+            on_interrupt=lambda: None,
+            on_exit=store.mark_exit,
+            output=io.StringIO(),
+            app_output=DummyOutput(),
+            no_color=True,
+        )
+        app._buffer.text = "/"
+        self.assertTrue(app._palette_open)
+        rendered = "".join(fragment[1] for fragment in app._palette_fragments())
+        self.assertIn("/sleep on", rendered)
+        self.assertIn("Commands", rendered)
+
+    def test_advanced_activity_has_checklist_and_safe_stream(self):
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore(mode=ExperienceMode.ADVANCED)
+        store.sync_dashboard(SimpleNamespace(
+            goal_id="goal-1",
+            objective="Build a calculator",
+            status="running",
+            goal_attempt=1,
+            retry_reason="",
+            tasks=(
+                SimpleNamespace(id="T001", title="Create the UI", status="done"),
+                SimpleNamespace(id="T002", title="Verify interactions", status="in_progress"),
+            ),
+        ))
+        store.handle_event("model_text", "const result = 1 + 1", {"actor": "chat"})
+        app = PersistentWorkspaceApp(
+            store,
+            on_input=lambda _item: None,
+            on_interrupt=lambda: None,
+            on_exit=store.mark_exit,
+            output=io.StringIO(),
+            app_output=DummyOutput(),
+            no_color=True,
+        )
+        app._terminal_size = lambda: (140, 40)
+        rendered = "".join(fragment[1] for fragment in app._live_activity_fragments())
+        self.assertIn("TASK CHECKLIST", rendered)
+        self.assertIn("Create the UI", rendered)
+        self.assertIn("const result", rendered)
 
     def test_arabic_simple_snapshot_stays_compact_and_has_no_raw_log(self):
         store = WorkspaceUIStore()
@@ -416,6 +589,43 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
             app.run()
         waiter.join(1)
         self.assertEqual(answers[0].value, "allow_once")
+
+    def test_tool_approval_is_repeated_in_now_panel_and_footer(self):
+        store = WorkspaceUIStore()
+        store.present_attention(
+            AttentionRequest(
+                id="tool-approval-visible",
+                kind=AttentionKind.APPROVAL,
+                title="Allow run command?",
+                message="This command runs in the project scope.",
+                options=(
+                    AttentionOption("allow_once", "Allow once", "allow_once", shortcut="y"),
+                    AttentionOption("deny", "Deny", "deny", shortcut="n", primary=True),
+                ),
+                default_key="deny",
+                cancel_key="deny",
+                action_fingerprint="f" * 64,
+            )
+        )
+        from agent.tui import PersistentWorkspaceApp
+        from prompt_toolkit.output import DummyOutput
+
+        app = PersistentWorkspaceApp(
+            store,
+            on_input=lambda _item: None,
+            on_interrupt=lambda: None,
+            on_exit=lambda: True,
+            output=io.StringIO(),
+            app_output=DummyOutput(),
+            no_color=True,
+        )
+        now = "".join(part[1] for part in app._live_activity_fragments())
+        footer = "".join(part[1] for part in app._footer_fragments())
+        self.assertIn("APPROVAL REQUIRED", now)
+        self.assertIn("Allow run command?", now)
+        self.assertIn("/allow or /deny", now)
+        self.assertIn("Allow once", footer)
+        self.assertIn("Deny", footer)
 
     def test_custom_answer_typing_is_not_consumed_by_letter_shortcuts(self):
         from threading import Thread
