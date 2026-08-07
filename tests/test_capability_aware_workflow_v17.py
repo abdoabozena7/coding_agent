@@ -10,6 +10,7 @@ from agent.capability import (
     CapabilityBand,
     ExecutionStrategyV1,
     InteractionModeV2,
+    LocalAdaptationPolicy,
     ModelCapabilityEnvelopeV1,
     TaskDemandV1,
     select_execution_strategy,
@@ -190,6 +191,37 @@ def test_local_or_cloud_label_does_not_change_strength() -> None:
     cloud = envelope("7B", execution_class="cloud")
     assert local.capability_band is cloud.capability_band is CapabilityBand.LIMITED
     assert local.parameter_count_billions == cloud.parameter_count_billions
+
+
+def test_local_adaptation_policy_narrows_packets_without_changing_workflow_mode() -> None:
+    local = LocalAdaptationPolicy.from_envelope(
+        envelope("70B", context=128_000, execution_class="local")
+    )
+    cloud = LocalAdaptationPolicy.from_envelope(
+        envelope("70B", context=128_000, execution_class="cloud")
+    )
+
+    assert local.execution_class == "local"
+    assert local.packet_size == 2
+    assert local.context_budget_tokens == 32_000
+    assert local.max_repairs == 1
+    assert local.abstraction_level == "narrow"
+    assert local.quality_gates_unchanged is True
+    assert local.to_dict()["fingerprint"] == local.fingerprint
+    assert cloud.execution_class == "cloud"
+    assert cloud.packet_size == 4
+    assert cloud.context_budget_tokens == 64_000
+    assert cloud.max_repairs == 2
+
+
+def test_normal_strategy_stays_staged_when_capability_escalation_is_disabled() -> None:
+    decision = select_execution_strategy(
+        envelope("7B"),
+        demand(4, components=8),
+        allow_capability_escalation=False,
+    )
+    assert decision.strategy is ExecutionStrategyV1.STAGED
+    assert any("narrow packets" in reason for reason in decision.reasons)
 
 
 def test_same_task_selects_strategy_relative_to_selected_model() -> None:
@@ -409,6 +441,99 @@ def test_locked_workflow_rejects_weaker_provider_recovery_model() -> None:
                     descriptor("7B", context=32_768),
                 )
             assert runtime.model_descriptor == strong_descriptor
+        finally:
+            runtime.close()
+            store.close()
+
+
+def test_explicit_local_continuation_preserves_quality_floor_and_narrows_remaining_packets() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        store = StateStore(workspace)
+        strong = descriptor("70B", context=65_536)
+        runtime = AgentRuntime(
+            ScriptedProvider([], model="approved-cloud"),
+            store,
+            workspace,
+            model_descriptor=strong,
+            config=replace(RuntimeConfig(), repository_index_warmup_files=0),
+        )
+        try:
+            goal = store.create_goal("Keep the accepted quality floor", session_id=runtime.session_id)
+            store.transition_goal(goal.id, GoalStatus.DISCOVERING)
+            store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+            task_demand = demand(4, components=4)
+            strategy = select_execution_strategy(runtime.model_capability_envelope(), task_demand)
+            store.update_goal_metadata(
+                goal.id,
+                task_demand=task_demand.to_dict(),
+                model_capability_envelope=runtime.model_capability_envelope().to_dict(),
+                strategy_decision=strategy.to_dict(),
+                execution_strategy=strategy.strategy.value,
+                execution_policy={"mode": "normal", "strategy": strategy.strategy.value},
+            )
+            plan = store.create_plan(
+                goal.id,
+                "Implement without lowering the quality floor.",
+                [
+                    {
+                        "id": "T001",
+                        "title": "Implement the accepted behavior",
+                        "description": "Complete the approved implementation.",
+                        "depends_on": [],
+                        "acceptance_criteria": ["The accepted behavior works."],
+                        "verification": ["Run the focused executable verification."],
+                        "risk": "high",
+                    }
+                ],
+                applicability_evidence=[
+                    {
+                        "fact": "The workspace requires the accepted behavior.",
+                        "source": "test inspection",
+                        "supports_tasks": ["T001"],
+                    }
+                ],
+                execution_strategy="Implement and independently verify the accepted behavior.",
+                expected_changes=[
+                    {
+                        "path": "artifact.txt",
+                        "intent": "Implement the accepted behavior.",
+                        "supports_tasks": ["T001"],
+                        "evidence_refs": ["test inspection"],
+                    }
+                ],
+            )
+            runtime.approve_plan(plan.revision)
+            runtime.pause("test local continuation checkpoint")
+            store.update_goal_metadata(
+                goal.id,
+                retry_after_ms=30_000,
+                retry_not_before=9_999_999_999,
+                auto_retryable=True,
+            )
+            accepted_before = store.get_accepted_plan(goal.id)
+            weak_local = descriptor("7B", context=32_768)
+
+            result = runtime.continue_with_local_model(
+                ScriptedProvider([], model="local-7b"),
+                weak_local,
+            )
+
+            current = store.get_goal(goal.id)
+            policy = current.metadata["local_continuation_policy"]
+            assert result["quality_gates_unchanged"] is True
+            assert result["max_cohesive_components_per_packet"] == 2
+            assert policy["abstraction"]["level"] == "narrow"
+            assert policy["quality_floor"]["accepted_plan_fingerprint"] == accepted_before.fingerprint
+            assert policy["remaining_task_packets"][0]["acceptance_criteria"] == ["The accepted behavior works."]
+            assert store.get_accepted_plan(goal.id).fingerprint == accepted_before.fingerprint
+            assert current.metadata["retry_after_ms"] == 0
+            assert current.metadata["retry_not_before"] is None
+            assert current.metadata["auto_retryable"] is False
+            assert any(
+                event.event_type == "model.local_continuation_configured"
+                for event in store.list_events(goal.id)
+            )
         finally:
             runtime.close()
             store.close()

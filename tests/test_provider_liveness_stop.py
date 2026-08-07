@@ -189,6 +189,38 @@ def test_transport_error_is_a_single_boundary_not_a_retry_storm() -> None:
             store.close()
 
 
+def test_local_transport_error_names_the_model_runner_not_the_internet() -> None:
+    class FailingProvider(ScriptedProvider):
+        def __init__(self):
+            super().__init__([], model="local-test")
+
+        def call(self, *args, **kwargs):
+            raise ProviderRequestError(
+                ProviderDiagnostic(
+                    reachable=False,
+                    kind=ProviderFailureKind.DNS_OR_SOCKET,
+                    operation="chat",
+                    provider_message="Ollama is not reachable",
+                )
+            )
+
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        store = StateStore(workspace)
+        runtime = AgentRuntime(
+            FailingProvider(),
+            store,
+            workspace,
+            model_descriptor=ModelDescriptor("ollama", "local-test", ExecutionClass.LOCAL),
+        )
+        try:
+            with pytest.raises(ProviderUnavailableError, match="Local model runner unavailable"):
+                runtime._call_provider([], [], "system", actor="semantic-router", step=1)
+        finally:
+            runtime.close()
+            store.close()
+
+
 def test_stop_ollama_rejects_remote_endpoint() -> None:
     provider = OllamaProvider(model="gemma4:e4b", host="https://example.invalid")
     with tempfile.TemporaryDirectory() as directory:

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from agent.providers import AssistantTurn, ProviderCapabilities, ToolCall, Usage
-from agent.providers.base import coerce_tool_args
+from agent.providers.base import ProviderCallPolicyV1, coerce_tool_args
 from agent.providers.gemini_provider import GeminiProvider
 from agent.providers.ollama_provider import OllamaProvider
 from agent.local_provider import ProviderFailureKind, ProviderRequestError
@@ -354,6 +354,30 @@ class OllamaProviderTests(unittest.TestCase):
         self.assertEqual(payload["options"]["temperature"], 0.25)
         self.assertEqual(payload["think"], "medium")
         self.assertEqual(payload["format"], "json")
+
+    def test_stage_policy_reaches_transport_deadline_for_slow_local_generation(self):
+        provider = OllamaProvider(model="offline")
+        provider.capability_profile = __import__(
+            "agent.local_provider", fromlist=["ModelCapabilityProfile"]
+        ).ModelCapabilityProfile(
+            "offline", tool_call_support=True, thinking_support=True, health_status="reachable"
+        )
+        provider._post_json = Mock(
+            return_value=io.BytesIO(b'{"message":{"content":"ok"},"done":true}\n')
+        )
+        provider.call(
+            [],
+            [],
+            "system",
+            policy=ProviderCallPolicyV1(
+                stage="planner",
+                stage_deadline_seconds=600.0,
+            ),
+        )
+        self.assertEqual(
+            provider._post_json.call_args.kwargs["request_timeout"],
+            600.0,
+        )
 
     def test_internal_off_reasoning_maps_to_ollama_think_false(self):
         provider = OllamaProvider(model="offline", reasoning_effort="off")

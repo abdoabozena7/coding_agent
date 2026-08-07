@@ -221,6 +221,19 @@ class HnswEmbeddingIndex:
         self.available = hnswlib is not None
         self.last_error = "" if self.available else "hnswlib is not installed"
 
+    @property
+    def ready(self) -> bool:
+        """Whether an accelerator has already been built.
+
+        Building HNSW can be expensive for a freshly opened workspace.  Query
+        paths must never construct it synchronously because that makes the
+        first user prompt look frozen while consuming CPU/RAM.  A caller may
+        build it explicitly during an idle/background window and subsequent
+        searches will use it automatically.
+        """
+
+        return self._index is not None
+
     def build(self, vectors: Mapping[tuple[str, str, str, int], Sequence[float]]) -> bool:
         self._index = None
         self._keys = ()
@@ -286,6 +299,13 @@ class RepositoryIndex:
     # repositories, especially immediately after an incremental refresh.
     # Keep HNSW for the large-repository path it is designed to accelerate.
     _HNSW_MIN_VECTORS = 2_000
+    # Graph neighborhood expansion resolves every call graph repeatedly for
+    # selected entries.  On a large cached workspace that can dominate the
+    # first semantic route and make the UI look frozen.  Keep the fast lexical
+    # and embedding ranking available, but defer graph expansion until an idle
+    #/explicit inspection path can afford it.
+    _GRAPH_NEIGHBORHOOD_MAX_VECTORS = 20_000
+    _FAST_RETRIEVAL_MAX_TEXT_VECTORS = 20_000
     _INDEXABLE_SUFFIXES = {
         ".py", ".html", ".htm", ".js", ".jsx", ".mjs", ".cjs",
         ".ts", ".tsx", ".css", ".json",
@@ -1211,9 +1231,17 @@ class RepositoryIndex:
         terms = [term.casefold() for term in re.findall(r"[\w.-]+", query)]
         query_vector = self._vector(query)
         query_embedding = tuple(float(value) for value in self.embedding_provider.embed(query))
+        large_index = len(self._embeddings) > self._FAST_RETRIEVAL_MAX_TEXT_VECTORS
+        # Do not build HNSW in the request path.  Large cached repositories can
+        # contain tens of thousands of vectors; constructing the graph here
+        # blocks the very first routing call for minutes and hides all runtime
+        # activity from the terminal/Web surfaces.  The deterministic dense
+        # cosine fallback is bounded and immediately available.  An explicit
+        # idle/background builder can populate ``self._hnsw`` later, after
+        # which this branch uses the accelerator with no behavior change.
         hnsw_scores = (
             self._hnsw.search(query_embedding, limit=max(100, int(limit) * 8))
-            if len(self._embeddings) >= self._HNSW_MIN_VECTORS and self._ensure_hnsw()
+            if len(self._embeddings) >= self._HNSW_MIN_VECTORS and self._hnsw.ready
             else {}
         )
         scored: dict[tuple[str, str, str, int], tuple[float, IndexEntry, set[str]]] = {}
@@ -1234,7 +1262,16 @@ class RepositoryIndex:
             for item in entries:
                 if kinds and item.kind not in kinds:
                     continue
-                haystack = f"{item.kind} {item.name} {item.text}".casefold()
+                # Scanning and case-folding every stored source chunk makes a
+                # large restored cache dominate the first semantic route.  A
+                # large index still gets path/symbol lexical hits plus both
+                # compact vector channels; full source-text matching remains
+                # available for small/interactive repositories.
+                haystack = (
+                    f"{item.kind} {item.name} {item.path}"
+                    if large_index
+                    else f"{item.kind} {item.name} {item.text}"
+                ).casefold()
                 lexical = sum(1.0 for term in terms if term and term in haystack)
                 if lexical:
                     add(item, lexical * 4.0, "lexical")
@@ -1250,11 +1287,12 @@ class RepositoryIndex:
                 if embedding >= 0.08:
                     add(item, embedding * 10.0, "embedding")
 
-        for relation in self.search_graph(query, relation_kinds=relation_kinds):
-            names = {relation.source, relation.target}
-            for entry in self.entries.get(relation.path, ()):
-                if entry.name in names or any(part and part in entry.name for name in names for part in name.split(".")):
-                    add(entry, 16.0, f"graph:{relation.kind}")
+        if not large_index:
+            for relation in self.search_graph(query, relation_kinds=relation_kinds):
+                names = {relation.source, relation.target}
+                for entry in self.entries.get(relation.path, ()):
+                    if entry.name in names or any(part and part in entry.name for name in names for part in name.split(".")):
+                        add(entry, 16.0, f"graph:{relation.kind}")
 
         reciprocal_scores: dict[tuple[str, str, str, int], float] = {
             key: 0.0 for key in scored
@@ -1512,7 +1550,11 @@ class RepositoryIndex:
             add_entry(hit.entry)
         callers: dict[str, tuple[str, ...]] = {}
         callees: dict[str, tuple[str, ...]] = {}
-        if include_graph_neighborhood:
+        graph_neighborhood_enabled = (
+            bool(include_graph_neighborhood)
+            and len(self._embeddings) <= self._GRAPH_NEIGHBORHOOD_MAX_VECTORS
+        )
+        if graph_neighborhood_enabled:
             for entry in tuple(selected):
                 qualified = self._qualify_local_symbol(entry.path, entry.name)
                 caller_values = self.callers_of(qualified)
@@ -1526,7 +1568,11 @@ class RepositoryIndex:
                     if target_entry is not None:
                         add_entry(target_entry)
         selected_paths = {entry.path for entry in selected}
-        dependency_graph = self.resolved_dependency_graph()
+        dependency_graph = (
+            self.resolved_dependency_graph()
+            if graph_neighborhood_enabled
+            else {}
+        )
         dependencies = {
             path: targets
             for path, targets in dependency_graph.items()

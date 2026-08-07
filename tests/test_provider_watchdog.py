@@ -151,6 +151,17 @@ class ProviderWatchdogTests(unittest.TestCase):
         self.assertTrue(any(item.state == "receiving" for item in provider_events))
         self.assertEqual(max(item.received_chunks for item in provider_events), 2)
 
+    def test_local_stage_deadlines_allow_slow_first_structured_response(self) -> None:
+        runtime, _store = self._runtime(_SilentProvider())
+        cloud = runtime._provider_call_policy("planner")
+        runtime.model_descriptor = ModelDescriptor(
+            "ollama", "qwen2.5-coder:7b", ExecutionClass.LOCAL
+        )
+        local = runtime._provider_call_policy("planner")
+        self.assertEqual(cloud.stage_deadline_seconds, 360.0)
+        self.assertEqual(local.stage_deadline_seconds, 600.0)
+        self.assertGreater(local.stage_deadline_seconds, cloud.stage_deadline_seconds)
+
 
 if __name__ == "__main__":
     unittest.main()

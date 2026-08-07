@@ -87,6 +87,46 @@ class ChoiceStateTests(unittest.TestCase):
 
 
 class PersistentWorkspaceSnapshotTests(unittest.TestCase):
+    def test_mouse_up_on_attention_option_resolves_the_exact_choice(self):
+        from prompt_toolkit.mouse_events import MouseEventType
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        request = AttentionRequest(
+            id="mouse-approval",
+            kind=AttentionKind.APPROVAL,
+            title="Allow command?",
+            options=(
+                AttentionOption("allow_once", "Allow once", "allow_once"),
+                AttentionOption("deny", "Deny", "deny"),
+            ),
+            default_key="deny",
+            cancel_key="deny",
+        )
+        store.present_attention(request)
+        app = PersistentWorkspaceApp(
+            store,
+            on_input=lambda _item: None,
+            on_interrupt=lambda: None,
+            on_exit=lambda: True,
+            output=io.StringIO(),
+            app_output=DummyOutput(),
+            no_color=True,
+        )
+
+        fragments = list(app._attention_fragments())
+        click = next(
+            fragment[2]
+            for fragment in fragments
+            if len(fragment) == 3 and "Allow once" in fragment[1]
+        )
+        click(SimpleNamespace(event_type=MouseEventType.MOUSE_UP))
+
+        self.assertEqual(
+            store.take_attention_result(request.id).value,
+            "allow_once",
+        )
+
     def test_activity_strip_names_goal_task_actor_and_live_wait(self):
         store = WorkspaceUIStore()
         store.update_runtime_context(
@@ -271,6 +311,33 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         self.assertIs(app._root_container(), app._too_small_root)
         text = "".join(item[1] for item in app._too_small_fragments())
         self.assertIn("80 columns by 24 rows", text)
+
+    def test_live_rail_names_a_local_runner_boundary_distinctly(self):
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        store.update_runtime_profile(execution_class="local")
+        store.handle_event(
+            "provider.activity",
+            "Local model runner unavailable · saved stage unchanged",
+            {
+                "source": "MODEL",
+                "provider_state": "network_unavailable",
+                "operation": "Waiting for local model runner",
+            },
+        )
+        app = PersistentWorkspaceApp(
+            store,
+            on_input=lambda _item: None,
+            on_interrupt=lambda: None,
+            on_exit=lambda: True,
+            output=io.StringIO(),
+            app_output=DummyOutput(),
+            no_color=True,
+        )
+        app._terminal_size = lambda: (140, 40)
+        rendered = "".join(fragment[1] for fragment in app._live_activity_fragments())
+        self.assertIn("Local model runner unavailable", rendered)
 
     def test_live_rail_reports_no_bytes_then_real_receiving_evidence(self):
         from prompt_toolkit.output import DummyOutput
@@ -807,6 +874,40 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
             app.run()
         self.assertEqual(submitted, [])
         self.assertEqual(store.snapshot().workflow_mode, "ready")
+
+    def test_emergency_slash_command_remains_available_during_web_approval(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        store.set_control_surface("web")
+        store.present_attention(
+            AttentionRequest(
+                id="web-owned-approval",
+                kind=AttentionKind.APPROVAL,
+                title="Allow command?",
+                options=(
+                    AttentionOption("allow_once", "Allow once", "allow_once"),
+                    AttentionOption("deny", "Deny", "deny"),
+                ),
+            )
+        )
+        submitted = []
+        with create_pipe_input() as pipe:
+            pipe.send_text("/stop\r\x11")
+            app = PersistentWorkspaceApp(
+                store,
+                on_input=submitted.append,
+                on_interrupt=lambda: None,
+                on_exit=store.mark_exit,
+                output=io.StringIO(),
+                app_input=pipe,
+                app_output=DummyOutput(),
+                no_color=True,
+            )
+            app.run()
+
+        self.assertEqual(submitted[0].text, "/stop")
 
     def test_ordinary_enter_does_not_attach_a_mode_override(self):
         from prompt_toolkit.input.defaults import create_pipe_input

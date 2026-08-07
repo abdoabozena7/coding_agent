@@ -6,6 +6,7 @@ import io
 import hashlib
 import json
 import subprocess
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -276,6 +277,525 @@ class RuntimeTestCase(unittest.TestCase):
 
 
 class SleepModeTests(RuntimeTestCase):
+    def test_runtime_recreates_a_missing_session_envelope_from_authority(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([], model="local-test"),
+            self.store,
+            self.workspace,
+            config=self.config,
+            session_id="session-envelope-race",
+        )
+        try:
+            with self.store.transaction() as connection:
+                connection.execute(
+                    "DELETE FROM workflow_sessions WHERE id=?",
+                    (runtime.session_id,),
+                )
+            snapshot = runtime.workflow_runtime_snapshot()
+            self.assertEqual(snapshot.phase, "ready")
+            recreated = self.store.get_workflow_session(runtime.session_id)
+            self.assertEqual(recreated["id"], runtime.session_id)
+            self.assertTrue(
+                any(
+                    event.event_type == "workflow.session_recreated"
+                    for event in self.store.list_events()
+                )
+            )
+        finally:
+            runtime.close()
+
+    def test_local_snapshot_rewrites_stale_cloud_boundary_wording(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([], model="local-test"),
+            self.store,
+            self.workspace,
+            config=self.config,
+        )
+        goal = self.store.create_goal(
+            "Recover the local model",
+            session_id=runtime.session_id,
+        )
+        self.store.transition_goal(
+            goal.id,
+            GoalStatus.AWAITING_PLAN_APPROVAL,
+            reason="plan ready",
+        )
+        self.store.transition_goal(goal.id, GoalStatus.RUNNING, reason="planning")
+        self.store.update_goal_metadata(
+            goal.id,
+            retry_reason="Internet/provider unavailable; saved stage unchanged.",
+        )
+        with runtime._live_activity_lock:
+            runtime._live_provider_activity = {
+                "state": "network_unavailable",
+                "last_signal_at": time.time(),
+            }
+        snapshot = runtime.workflow_runtime_snapshot()
+        self.assertEqual(snapshot.waiting_on, "model")
+        self.assertIn("Local model runner unavailable", snapshot.reason)
+
+    def test_sleep_mode_change_is_broadcast_for_other_ui_surfaces(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]), self.store, self.workspace, config=self.config
+        )
+        captured = []
+        unsubscribe = runtime.events.subscribe(captured.append)
+        try:
+            runtime.set_sleep_mode(True, policy="full")
+        finally:
+            unsubscribe()
+        changed = [event for event in captured if event.kind == "sleep.mode_changed"]
+        self.assertEqual(len(changed), 1)
+        self.assertTrue(changed[0].data["enabled"])
+        self.assertEqual(changed[0].data["policy"], "full")
+        self.assertEqual(changed[0].data["sleep_state"], "on")
+
+    def test_pre_goal_local_continuation_updates_the_saved_semantic_turn(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([], model="cloud-model"),
+            self.store,
+            self.workspace,
+            config=self.config,
+        )
+        pending = {
+            "turn_id": "turn-pre-goal-local",
+            "original_input": "Build the saved project",
+            "status": "awaiting_provider",
+            "stage": "goal_intake",
+            "last_error": "cloud quota exhausted",
+            "model_capability_envelope": runtime.model_capability_envelope().to_dict(),
+        }
+        runtime._save_pending_semantic_turn(pending)
+        descriptor = ModelDescriptor(
+            provider="ollama",
+            model="local-coder",
+            execution_class="local",
+            capabilities=("tools", "structured_output"),
+            metadata={
+                "parameter_count_billions": 32,
+                "context_window_tokens": 65_536,
+                "maximum_output_tokens": 8_192,
+            },
+        )
+        local_provider = ScriptedProvider([], model="local-coder")
+
+        result = runtime.continue_with_local_model(local_provider, descriptor)
+
+        saved = self.store.get_workflow_session(runtime.session_id)["state"]
+        saved_pending = saved["pending_semantic_turn"]
+        self.assertEqual(saved_pending["model_capability_envelope"]["provider"], "ollama")
+        self.assertEqual(saved_pending["model_capability_envelope"]["model"], "local-coder")
+        self.assertEqual(saved_pending["last_error"], "")
+        self.assertIsNone(saved_pending["retry_not_before"])
+        self.assertTrue(
+            saved_pending["local_continuation_policy"]["quality_floor"][
+                "completion_gates_unchanged"
+            ]
+        )
+        self.assertTrue(result["quality_gates_unchanged"])
+        self.assertEqual(runtime.model_descriptor.provider, "ollama")
+        self.assertEqual(runtime.model_name, "local-coder")
+
+    def test_local_plan_reconciles_task_criteria_when_semantic_projection_is_empty(self):
+        request = (
+            "Create a small hello.txt file containing Hello from the local workflow "
+            "and verify it."
+        )
+        semantic = {
+            "original_request": request,
+            "interpreted_outcome": request,
+            "requested_effects": ["read_workspace"],
+            "required_outcomes": ["existents:hello.txt"],
+            "constraints": [],
+            "exclusions": [],
+            # This is the omission produced by the weak local model that used
+            # to crash the post-critic transition.
+            "acceptance_criteria": [],
+            "requirement_anchors": [],
+            "unresolved_decisions": [],
+            "repository_evidence_refs": ["inspection:I001"],
+            "status": "interpreted",
+        }
+        plan = {
+            "semantic_goal": semantic,
+            "summary": "Create and verify hello.txt.",
+            "tasks": [{
+                "title": "Create hello.txt",
+                "description": "Create hello.txt in the workspace root.",
+                "acceptance_criteria": ["hello.txt exists with the requested content."],
+                "verification": ["Read hello.txt and compare its contents."],
+                "depends_on": [],
+                "risk": "low",
+            }],
+            "applicability_evidence": [{
+                "fact": "The workspace is empty.",
+                "source": "inspection:I001",
+                "supports_tasks": ["1"],
+            }],
+            "execution_strategy": "Create the file and read it back for verification.",
+            "expected_changes": [{
+                "path": "hello.txt",
+                "intent": "Create the requested file.",
+                "basis": "explicit_user_requirement",
+                "evidence_refs": ["user:request"],
+                "supports_tasks": ["1"],
+            }],
+        }
+        provider = ScriptedProvider([
+            {"tool_calls": [{"name": "propose_semantic_goal", "args": semantic}]},
+            {"tool_calls": [{"name": "propose_plan", "args": plan}]},
+            {"tool_calls": [{
+                "name": "submit_plan_review",
+                "args": {"verdict": "pass", "summary": "Plan is complete.", "issues": []},
+            }]},
+        ], model="local-coder")
+        runtime = AgentRuntime(
+            provider,
+            self.store,
+            self.workspace,
+            config=self.config,
+            model_descriptor=ModelDescriptor(
+                "ollama", "local-coder", ExecutionClass.LOCAL, capabilities=("tools",)
+            ),
+        )
+        try:
+            result = runtime.start_goal(request)
+            self.assertIsNotNone(result)
+            self.assertEqual(
+                runtime.active_goal().status,
+                GoalStatus.AWAITING_PLAN_APPROVAL,
+            )
+            self.assertEqual(
+                result.tasks[0].acceptance_criteria,
+                ("hello.txt exists with the requested content.",),
+            )
+            self.assertTrue(
+                any(
+                    event.event_type == "planning.semantic_criteria_reconciled"
+                    for event in self.store.list_events(runtime.active_goal().id)
+                )
+            )
+            self.assertTrue(
+                any(
+                    event.event_type == "planning.semantic_effects_reconciled"
+                    for event in self.store.list_events(runtime.active_goal().id)
+                )
+            )
+            self.assertIn(
+                "mutate_workspace",
+                runtime.active_goal().metadata["semantic_goal"]["requested_effects"],
+            )
+            provider.assert_exhausted()
+        finally:
+            runtime.close()
+
+    def test_live_tool_resolution_is_durable_before_the_resolver_returns(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]), self.store, self.workspace, config=self.config
+        )
+        goal = self.store.create_goal("Approve a preview", session_id=runtime.session_id)
+        fingerprint = "live-" + ("f" * 64)
+        self.store.update_goal_metadata(
+            goal.id,
+            pending_tool_approval={
+                "tool": "preview_html",
+                "arguments": {"path": "index.html", "open_browser": True},
+                "risk": "high",
+                "action_fingerprint": fingerprint,
+                "policy_group": "project_preview",
+            },
+        )
+        observed: list[str] = []
+
+        def resolver(_fingerprint, _decision):
+            pending = self.store.get_goal(goal.id).metadata["pending_tool_approval"]
+            observed.append(str(pending.get("decision") or ""))
+            return True
+
+        runtime.set_external_tool_approval_resolver(resolver)
+
+        self.assertTrue(runtime.resolve_tool_approval(fingerprint, "allow_once"))
+        self.assertEqual(observed, ["allow_once"])
+
+    def test_callback_approval_clears_the_marker_it_just_created(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]),
+            self.store,
+            self.workspace,
+            config=self.config,
+            approval=lambda _name, _args, _risk: "allow_once",
+        )
+        goal = self.store.create_goal("Approve one command", session_id=runtime.session_id)
+
+        self.assertTrue(
+            runtime._approval_allowed(
+                "run_command", {"command": "python -c \"print(1)\""}, "critical"
+            )
+        )
+        self.assertEqual(
+            self.store.get_goal(goal.id).metadata.get("pending_tool_approval"), {}
+        )
+
+    def test_allow_session_is_reused_for_matching_policy_group(self):
+        decisions = iter(["allow_session"])
+        runtime = AgentRuntime(
+            ScriptedProvider([]),
+            self.store,
+            self.workspace,
+            config=self.config,
+            sleeper=lambda _seconds: None,
+            approval=lambda _name, _args, _risk: next(decisions),
+        )
+
+        self.assertTrue(
+            runtime._approval_allowed(
+                "run_command", {"command": "npm install first-package"}, "critical"
+            )
+        )
+        self.assertTrue(
+            runtime._approval_allowed(
+                "run_command", {"command": "npm install second-package"}, "critical"
+            )
+        )
+        self.assertIn("dangerous_command", runtime._approval_session_groups())
+        self.assertTrue(
+            any(item.event_type == "approval.session_reused" for item in self.store.list_events())
+        )
+
+    def test_full_auto_approves_risky_tool_and_records_audit_event(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]),
+            self.store,
+            self.workspace,
+            config=self.config,
+            sleeper=lambda _seconds: None,
+            approval=lambda _name, _args, _risk: (_ for _ in ()).throw(
+                AssertionError("Full Auto must resolve before the manual approval UI")
+            ),
+        )
+        runtime.set_sleep_mode(True, policy="full")
+
+        self.assertTrue(
+            runtime._approval_allowed(
+                "run_command",
+                {"command": "npm install an-example-package"},
+                "critical",
+            )
+        )
+        self.assertEqual(runtime.sleep_mode_policy(), "full")
+        self.assertTrue(
+            any(
+                item.event_type == "sleep.full_auto_approval"
+                for item in self.store.list_events()
+            )
+        )
+
+    def test_full_auto_approves_critic_reviewed_plan_and_records_boundary(self):
+        runtime, _provider = self.runtime([inspect_call(), plan_call(), plan_pass()])
+        plan = runtime.start_goal("Build a small verified application")
+        runtime.set_sleep_mode(True, policy="full")
+
+        self.assertEqual(runtime.auto_resolve_full_auto_boundary(), ("plan",))
+        goal = runtime.active_goal()
+        self.assertIsNotNone(goal)
+        assert goal is not None
+        self.assertEqual(goal.status, GoalStatus.RUNNING)
+        self.assertEqual(goal.active_plan_revision, plan.revision)
+        events = self.store.list_recent_events(goal.id, limit=100)
+        approval = next(
+            item for item in events if item.event_type == "sleep.full_auto_plan_approval"
+        )
+        self.assertEqual(approval.payload["approved_by"], "sleep-full-auto")
+        self.assertTrue(approval.payload["quality_gates_unchanged"])
+
+    def test_full_auto_plan_boundary_survives_runtime_restart(self):
+        runtime, _provider = self.runtime([inspect_call(), plan_call(), plan_pass()])
+        plan = runtime.start_goal("Resume unattended work after restart")
+        runtime.set_sleep_mode(True, policy="full")
+        self.store.close()
+
+        self.store = StateStore(self.workspace)
+        restarted = AgentRuntime(
+            ScriptedProvider([]),
+            self.store,
+            self.workspace,
+            config=self.config,
+            sleeper=lambda _seconds: None,
+            approval=lambda _name, _args, _risk: True,
+        )
+        self.assertEqual(restarted.sleep_mode_policy(), "full")
+        self.assertEqual(restarted.auto_resolve_full_auto_boundary(), ("plan",))
+        goal = self.store.get_goal(plan.goal_id)
+        self.assertEqual(goal.status, GoalStatus.RUNNING)
+        restarted.close()
+
+    def test_full_auto_answers_intake_question_without_showing_a_hidden_prompt(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]),
+            self.store,
+            self.workspace,
+            config=self.config,
+        )
+        runtime.set_sleep_mode(True, policy="full")
+        question = {
+            "id": "preview_target",
+            "question": "Which preview should be used?",
+            "options": [
+                {"value": "browser", "label": "Browser", "recommended": True},
+                {"value": "static", "label": "Static"},
+            ],
+        }
+        with (
+            mock.patch.object(runtime, "intake_questions", return_value=(question,)),
+            mock.patch.object(runtime, "answer_intake_question") as answer,
+        ):
+            self.assertEqual(runtime.auto_resolve_full_auto_boundary(), ("question",))
+        answer.assert_called_once_with("preview_target", "browser")
+        self.assertTrue(
+            any(
+                item.event_type == "sleep.full_auto_question_answered"
+                and item.payload["selection"] == "recommended"
+                for item in self.store.list_events()
+            )
+        )
+
+    def test_full_auto_uses_explicit_question_default_then_first_option(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]),
+            self.store,
+            self.workspace,
+            config=self.config,
+        )
+        runtime.set_sleep_mode(True, policy="full")
+        goal = self.store.create_goal("Choose a deterministic default", session_id=runtime.session_id)
+        self.store.update_goal_metadata(
+            goal.id,
+            plan_questions=[
+                {
+                    "id": "q-default",
+                    "question": "Which output?",
+                    "default": "static",
+                    "options": [
+                        {"value": "browser", "label": "Browser"},
+                        {"value": "static", "label": "Static"},
+                    ],
+                }
+            ],
+            plan_answers={},
+        )
+        with mock.patch.object(runtime, "answer_plan_question") as answer:
+            self.assertEqual(runtime.auto_resolve_full_auto_boundary(), ("question",))
+        answer.assert_called_once_with("q-default", "static")
+
+    def test_full_auto_does_not_guess_when_recommendations_conflict(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]),
+            self.store,
+            self.workspace,
+            config=self.config,
+        )
+        runtime.set_sleep_mode(True, policy="full")
+        goal = self.store.create_goal("Do not guess", session_id=runtime.session_id)
+        self.store.update_goal_metadata(
+            goal.id,
+            plan_questions=[
+                {
+                    "id": "q-conflict",
+                    "question": "Which output?",
+                    "options": [
+                        {"value": "browser", "label": "Browser", "recommended": True},
+                        {"value": "static", "label": "Static", "recommended": True},
+                    ],
+                }
+            ],
+            plan_answers={},
+        )
+        with mock.patch.object(runtime, "answer_plan_question") as answer:
+            self.assertEqual(runtime.auto_resolve_full_auto_boundary(), ())
+        answer.assert_not_called()
+        self.assertTrue(
+            any(item.event_type == "sleep.full_auto_question_blocked" for item in self.store.list_events())
+        )
+
+    def test_full_auto_resumes_durable_tool_boundary_after_restart(self):
+        runtime, _provider = self.runtime([inspect_call(), plan_call(), plan_pass()])
+        plan = runtime.start_goal("Resume an approved tool after restart")
+        runtime.approve_plan(plan.revision)
+        goal = runtime.active_goal()
+        self.assertIsNotNone(goal)
+        assert goal is not None
+        fingerprint = "restart-tool-" + ("a" * 64)
+        self.store.update_goal_metadata(
+            goal.id,
+            pending_tool_approval={
+                "tool": "run_command",
+                "arguments": {"command": "python -c pass"},
+                "risk": "critical",
+                "action_fingerprint": fingerprint,
+                "policy_group": "dangerous_command",
+            },
+        )
+        self.store.transition_goal(goal.id, GoalStatus.PAUSED, reason="tool approval checkpoint")
+        runtime.set_sleep_mode(True, policy="full")
+
+        self.assertEqual(runtime.auto_resolve_full_auto_boundary(), ("tool",))
+        resumed = self.store.get_goal(goal.id)
+        self.assertEqual(resumed.status, GoalStatus.RUNNING)
+        self.assertEqual(
+            resumed.metadata["pending_tool_approval"]["decision"],
+            "allow_once",
+        )
+
+    def test_durable_pending_tool_approval_overrides_stale_heartbeat_projection(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]),
+            self.store,
+            self.workspace,
+            config=self.config,
+        )
+        goal = self.store.create_goal(
+            "Recover a preview approval",
+            session_id=runtime.session_id,
+        )
+        self.store.transition_goal(
+            goal.id,
+            GoalStatus.AWAITING_PLAN_APPROVAL,
+            reason="plan ready",
+        )
+        self.store.transition_goal(goal.id, GoalStatus.RUNNING, reason="execution")
+        self.store.update_goal_metadata(
+            goal.id,
+            pending_tool_approval={
+                "tool": "preview_html",
+                "arguments": {"path": "public/index.html"},
+                "risk": "high",
+                "action_fingerprint": "stale-approval-" + ("a" * 64),
+            },
+        )
+        stale = time.time() - 3_600
+        self.store.append_event(
+            "workflow.heartbeat",
+            goal_id=goal.id,
+            entity_type="worker",
+            entity_id="coordinator",
+            payload={"heartbeat_at": stale, "stage": "working"},
+        )
+        for index in range(60):
+            self.store.append_event(
+                "worker.heartbeat",
+                goal_id=goal.id,
+                entity_type="worker",
+                entity_id="coordinator",
+                payload={"sequence": index},
+            )
+
+        snapshot = runtime.workflow_runtime_snapshot()
+
+        self.assertEqual(snapshot.phase, "waiting_for_approval")
+        self.assertEqual(snapshot.waiting_on, "user")
+        self.assertEqual(snapshot.liveness, "waiting")
+        self.assertIn("preview_html", snapshot.reason)
+
     def test_durable_sleep_auto_approves_safe_preview_after_ui_restart(self):
         runtime = AgentRuntime(
             ScriptedProvider([]),

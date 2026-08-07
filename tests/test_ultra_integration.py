@@ -44,6 +44,7 @@ from agent.ultra_session import (
     StateStoreUltraAdapter,
     DurableContextBuilder,
     _bind_accepted_repair_feedback,
+    _bind_repair_feedback,
     _bind_repair_architecture_authority,
     _explicit_repair_scope_paths,
     _repair_double_escaped_python_source,
@@ -82,6 +83,32 @@ def test_accepted_repair_feedback_survives_lossy_small_model_plan_wording():
     assert feedback in bound.modules[0].objective
     assert bound.modules[0].metadata["accepted_repair_feedback"] == feedback
     assert bound.modules[0].metadata["accepted_repair_feedback_bound"] is True
+
+
+def test_internal_contract_recovery_is_metadata_not_repeated_product_scope():
+    plan = MasterPlanV1(
+        summary="Build the calculator.",
+        modules=(
+            TaskContractV1(
+                id="M001",
+                title="Calculator logic",
+                objective="Implement the calculator logic.",
+                acceptance_criteria=("7 + 5 equals 12.",),
+                verification=("preview_html src/index.html",),
+                write_paths=("src/index.html",),
+            ),
+        ),
+    )
+    diagnostic = (
+        "ULTRA foundation/phase browser_scenarios failed after three targeted "
+        "typed-return repairs: browser_scenarios.modules must be a non-empty array"
+    )
+
+    bound = _bind_repair_feedback(plan, diagnostic)
+
+    assert bound.modules[0].objective == "Implement the calculator logic."
+    assert bound.modules[0].metadata["contract_recovery_diagnostic"] == diagnostic
+    assert "Accepted repair requirements" not in bound.modules[0].objective
 
 
 def test_typed_browser_scenarios_survive_lossy_small_model_plan_wording():
@@ -1772,6 +1799,178 @@ class UltraIntegrationTests(unittest.TestCase):
         # on internal tokens such as <unused50>. The harness still validates
         # and repairs the typed response without enabling that grammar.
         self.assertFalse(provider.force_json)
+
+    def test_local_master_plan_uses_one_typed_submission_tool_without_execution(self):
+        class TypedMasterPlanProvider:
+            reasoning_effort = "medium"
+            max_output_tokens = None
+            force_json = True
+
+            def __init__(self):
+                self.tools = []
+                self.system = ""
+
+            def call(self, _conversation, tools, system):
+                self.tools = tools
+                self.system = system
+                return AssistantTurn(
+                    tool_calls=[
+                        ToolCall(
+                            "plan-1",
+                            "submit_master_plan",
+                            {
+                                "summary": "Build and verify the local calculator.",
+                                "execution_strategy": "Implement, preview, then review.",
+                                "modules": [
+                                    {
+                                        "id": "M001",
+                                        "title": "Calculator experience",
+                                        "objective": "Build the approved Three.js calculator.",
+                                        "acceptance_criteria": [
+                                            "The calculator is functional and visually polished."
+                                        ],
+                                        "verification": ["preview_html index.html"],
+                                        "depends_on": [],
+                                        "write_paths": ["index.html"],
+                                    }
+                                ],
+                            },
+                        )
+                    ]
+                )
+
+        provider = TypedMasterPlanProvider()
+        executor = mock.Mock(side_effect=AssertionError("plan transport must not execute"))
+        events = EventBus()
+        captured = []
+        events.subscribe(captured.append)
+        agent = WorkspaceUltraAgent(
+            provider,
+            role=AgentRole.PLANNER,
+            provider_name="ollama",
+            model="gemma4:e4b",
+            executor=executor,
+            events=events,
+            max_steps=2,
+        )
+
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.PLANNER,
+                phase="master_plan",
+                system_prompt="Build MasterPlanV1.",
+                context={},
+                task={
+                    "goal_spec": {"objective": "Build a Three.js calculator."},
+                    "architecture": {
+                        "summary": "One-page application.",
+                        "components": [
+                            {"name": "Calculator", "responsibility": "Build it."}
+                        ],
+                    },
+                },
+            )
+        )
+
+        self.assertEqual(
+            provider.tools[0]["function"]["name"],
+            "submit_master_plan",
+        )
+        self.assertIn("call submit_master_plan exactly once", provider.system)
+        self.assertEqual(response.payload["modules"][0]["write_paths"], ["index.html"])
+        self.assertEqual(len(MasterPlanV1.from_mapping(response.payload).modules), 1)
+        executor.assert_not_called()
+        self.assertTrue(
+            any(
+                event.kind == "ultra.master_plan_transport_submitted"
+                for event in captured
+            )
+        )
+
+    def test_local_master_plan_recovers_empty_internal_token_with_minimal_packet(self):
+        class EmptyThenTypedPlanProvider:
+            reasoning_effort = "medium"
+            max_output_tokens = None
+            force_json = True
+
+            def __init__(self):
+                self.calls = 0
+                self.cache_resets = 0
+
+            def reset_model_cache(self):
+                self.cache_resets += 1
+
+            def call(self, _conversation, _tools, _system):
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantTurn(text="<unused50>")
+                return AssistantTurn(
+                    tool_calls=[
+                        ToolCall(
+                            "plan-recovered",
+                            "submit_master_plan",
+                            {
+                                "summary": "Recovered local plan.",
+                                "execution_strategy": "Implement and verify.",
+                                "modules": [
+                                    {
+                                        "id": "M001",
+                                        "title": "Calculator",
+                                        "objective": "Build the calculator.",
+                                        "acceptance_criteria": ["Calculator works."],
+                                        "verification": ["preview_html index.html"],
+                                        "depends_on": [],
+                                        "write_paths": ["index.html"],
+                                    }
+                                ],
+                            },
+                        )
+                    ]
+                )
+
+        provider = EmptyThenTypedPlanProvider()
+        events = EventBus()
+        captured = []
+        events.subscribe(captured.append)
+        agent = WorkspaceUltraAgent(
+            provider,
+            role=AgentRole.PLANNER,
+            provider_name="ollama",
+            model="gemma4:e4b",
+            executor=lambda *_args: "unused",
+            events=events,
+            max_steps=3,
+        )
+
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.PLANNER,
+                phase="master_plan",
+                system_prompt="Build MasterPlanV1.",
+                context={},
+                task={
+                    "goal_spec": {"objective": "Build it."},
+                    "architecture": {
+                        "summary": "One page.",
+                        "components": [
+                            {"name": "Calculator", "responsibility": "Build it."}
+                        ],
+                    },
+                },
+            )
+        )
+
+        self.assertEqual(provider.calls, 2)
+        self.assertEqual(provider.cache_resets, 1)
+        self.assertEqual(response.payload["summary"], "Recovered local plan.")
+        self.assertTrue(
+            any(
+                event.kind == "ultra.master_plan_transport_recovered"
+                for event in captured
+            )
+        )
 
     def test_ultra_goal_spec_runs_harness_workspace_inspection_before_provider(self):
         calls = []

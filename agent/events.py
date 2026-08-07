@@ -65,6 +65,7 @@ class LiveWorkflowEventV1:
     operation: str
     state: str
     message: str
+    provider_state: str = ""
     detail: str = ""
     elapsed_seconds: int = 0
     last_signal_age: int = 0
@@ -90,6 +91,7 @@ class LiveWorkflowEventV1:
             "actor": self.actor,
             "task": self.task,
             "operation": self.operation,
+            "provider_state": self.provider_state,
             "state": self.state,
             "message": self.message,
             "detail": self.detail,
@@ -172,6 +174,7 @@ class LiveWorkflowEventV1:
             actor=actor,
             task=str(data.get("current_task") or data.get("task") or ""),
             operation=str(data.get("operation") or data.get("provider_state") or kind),
+            provider_state=str(data.get("provider_state") or ""),
             state=state,
             message=message,
             detail=detail,

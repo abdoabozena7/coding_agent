@@ -51,7 +51,7 @@ class ReasoningEffort(str, Enum):
 
 @dataclass
 class SessionPreferences:
-    """Mutable UI preferences that intentionally last only for this process."""
+    """In-memory copy of the durable project defaults for this process."""
 
     mode: InteractionMode = InteractionMode.NORMAL
     concurrency: int = 1

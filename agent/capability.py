@@ -76,6 +76,63 @@ class CapabilityBand(str, Enum):
         return (1, 2, 4, 8)[self.level - 1]
 
 
+@dataclass(frozen=True, slots=True)
+class LocalAdaptationPolicy:
+    """Model-packet adaptation independent from the selected workflow mode.
+
+    The user chooses Normal/Plan/Ultra; this policy only controls how much
+    context and how many cohesive components one model request may carry.
+    Weak local models therefore receive narrower packets without silently
+    changing the workflow into a recursive/Ultra run.
+    """
+
+    execution_class: str
+    packet_size: int
+    context_budget_tokens: int
+    max_repairs: int
+    abstraction_level: str
+    quality_gates_unchanged: bool = True
+    version: int = 1
+
+    @classmethod
+    def from_envelope(cls, envelope: "ModelCapabilityEnvelopeV1") -> "LocalAdaptationPolicy":
+        local = str(envelope.execution_class or "local").casefold() == "local"
+        packet_size = max(1, min(int(envelope.max_cohesive_components or 1), 4))
+        if local:
+            # Keep the first local packet intentionally narrow.  The harness
+            # can widen later after a successful checkpoint, never by changing
+            # workflow_mode or execution_strategy.
+            packet_size = min(packet_size, 2)
+        context = int(envelope.context_window_tokens or (24_000 if local else 64_000))
+        context = max(8_000, min(context, 64_000 if not local else 32_000))
+        repairs = 1 if local else 2
+        level = (
+            "atomic" if packet_size == 1
+            else "narrow" if packet_size == 2
+            else "bounded"
+        )
+        return cls(
+            execution_class="local" if local else "cloud",
+            packet_size=packet_size,
+            context_budget_tokens=context,
+            max_repairs=repairs,
+            abstraction_level=level,
+        )
+
+    @property
+    def fingerprint(self) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                asdict(self), ensure_ascii=False, sort_keys=True
+            ).encode()
+        ).hexdigest()
+
+    def to_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["fingerprint"] = self.fingerprint
+        return value
+
+
 def _number(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
@@ -545,18 +602,27 @@ def select_execution_strategy(
     demand: TaskDemandV1,
     *,
     minimum: ExecutionStrategyV1 = ExecutionStrategyV1.STAGED,
+    allow_capability_escalation: bool = True,
 ) -> StrategyDecisionV1:
     reasons: list[str] = []
     requires_recursive = False
-    if demand.maximum_level > envelope.level:
+    if allow_capability_escalation and demand.maximum_level > envelope.level:
         requires_recursive = True
         reasons.append(
             f"task demand {demand.maximum_level} exceeds model capability band {envelope.level}"
         )
-    if demand.component_count > envelope.max_cohesive_components:
+    if allow_capability_escalation and demand.component_count > envelope.max_cohesive_components:
         requires_recursive = True
         reasons.append(
             f"{demand.component_count} components exceed cohesive limit {envelope.max_cohesive_components}"
+        )
+    elif not allow_capability_escalation and (
+        demand.maximum_level > envelope.level
+        or demand.component_count > envelope.max_cohesive_components
+    ):
+        reasons.append(
+            "task demand exceeds this model's cohesive envelope; keep the selected "
+            "strategy and narrow packets before mutation"
         )
     if not envelope.metadata_complete:
         reasons.append("model metadata is incomplete, so the conservative minimal envelope applies")
@@ -583,6 +649,7 @@ __all__ = [
     "CapabilityBand",
     "ExecutionStrategyV1",
     "InteractionModeV2",
+    "LocalAdaptationPolicy",
     "ModelCapabilityEnvelopeV1",
     "StrategyDecisionV1",
     "TaskDemandV1",

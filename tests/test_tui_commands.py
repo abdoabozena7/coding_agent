@@ -41,12 +41,12 @@ class CommandAvailabilityTests(unittest.TestCase):
     def test_running_palette_exposes_explicit_sleep_actions(self):
         running = SimpleNamespace(status="running", running=True, undo_available=False)
         names = {item.name for item in matching_commands("/sleep", snapshot=running)}
-        self.assertTrue({"/sleep on", "/sleep off", "/sleep status"} <= names)
+        self.assertTrue({"/sleep on", "/sleep safe", "/sleep full", "/sleep off", "/sleep status"} <= names)
 
     def test_recovery_palette_keeps_sleep_and_stop_discoverable(self):
         recovering = SimpleNamespace(status="recovering", running=True, undo_available=False)
         names = {item.name for item in matching_commands("", snapshot=recovering)}
-        self.assertTrue({"/sleep on", "/sleep off", "/sleep status", "/stop"} <= names)
+        self.assertTrue({"/sleep on", "/sleep full", "/sleep off", "/sleep status", "/stop"} <= names)
 
 
 if __name__ == "__main__":

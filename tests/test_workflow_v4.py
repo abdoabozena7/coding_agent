@@ -277,6 +277,89 @@ class PlanHarnessV4Tests(unittest.TestCase):
         with self.assertRaises(PlanDraftError):
             validate_normalized_plan(incomplete)
 
+    def test_plan_normalization_derives_missing_summary_from_authored_strategy(self):
+        normalized, actions = normalize_plan_draft(
+            {
+                "execution_strategy": "Create hello.txt and verify its exact contents.",
+                "tasks": [
+                    {
+                        "title": "Create hello.txt",
+                        "description": "Create the requested file.",
+                        "acceptance_criteria": ["hello.txt exists."],
+                        "verification": ["Read hello.txt back."],
+                    }
+                ],
+            }
+        )
+        validate_normalized_plan(normalized)
+        self.assertEqual(
+            normalized["summary"],
+            "Create hello.txt and verify its exact contents.",
+        )
+        self.assertTrue(any("summary derived" in item for item in actions))
+
+    def test_plan_normalization_derives_missing_strategy_from_complete_tasks(self):
+        normalized, actions = normalize_plan_draft(
+            {
+                "summary": "Create and verify hello.txt.",
+                "tasks": [{
+                    "title": "Create hello.txt",
+                    "description": "Create the requested file.",
+                    "acceptance_criteria": ["hello.txt exists."],
+                    "verification": ["Read hello.txt back."],
+                }],
+            }
+        )
+        validate_normalized_plan(normalized)
+        self.assertIn("dependency order", normalized["execution_strategy"])
+        self.assertTrue(any("execution_strategy derived" in item for item in actions))
+
+    def test_plan_normalization_lifts_local_task_expected_changes(self):
+        normalized, actions = normalize_plan_draft(
+            {
+                "summary": "Create and verify hello.txt.",
+                "tasks": [
+                    {
+                        "title": "Create hello.txt",
+                        "description": "Create hello.txt with the requested content.",
+                        "expected_changes": [
+                            {
+                                "path": "./hello.txt",
+                                "intent": "create the requested file",
+                                "basis": "user_request",
+                            }
+                        ],
+                        "acceptance_criteria": ["hello.txt contains Hello."],
+                        "verification": ["Read hello.txt back."],
+                    }
+                ],
+            }
+        )
+        validate_normalized_plan(normalized)
+        self.assertEqual(normalized["expected_changes"][0]["path"], "./hello.txt")
+        self.assertEqual(normalized["expected_changes"][0]["basis"], "explicit_user_requirement")
+        self.assertEqual(normalized["expected_changes"][0]["supports_tasks"], ["T001"])
+        self.assertTrue(any("expected_changes lifted" in item for item in actions))
+
+    def test_plan_normalization_rewrites_posix_content_check_for_windows(self):
+        normalized, actions = normalize_plan_draft(
+            {
+                "summary": "Verify hello.txt.",
+                "tasks": [{
+                    "title": "Verify hello.txt",
+                    "description": "Check the exact file content.",
+                    "acceptance_criteria": ["The file contains Hello."],
+                    "verification": ["run_command -c 'cat ./hello.txt' | grep -q '^Hello$'"],
+                }],
+            }
+        )
+        validate_normalized_plan(normalized)
+        verification = normalized["tasks"][0]["verification"][0]
+        if __import__("os").name == "nt":
+            self.assertIn("python -c", verification)
+            self.assertIn("read_text", verification)
+            self.assertTrue(any("normalized for Windows" in item for item in actions))
+
     def test_plan_normalization_projects_only_an_explicit_verifier_command(self):
         normalized, actions = normalize_plan_draft(
             {
@@ -545,7 +628,7 @@ class PersistenceV4Tests(unittest.TestCase):
             self.assertEqual(migrated.get_goal(goal_id).objective, "Quality test")
             check = sqlite3.connect(database)
             try:
-                self.assertEqual(check.execute("PRAGMA user_version").fetchone()[0], 14)
+                self.assertEqual(check.execute("PRAGMA user_version").fetchone()[0], 15)
             finally:
                 check.close()
             migrated._migrate_v4()

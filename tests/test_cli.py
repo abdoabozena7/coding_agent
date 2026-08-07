@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from agent.cli import (
+    _interactive_setup,
+    build_parser,
     choose_access_level,
     choose_interaction_mode,
     choose_project_protection,
@@ -23,8 +25,10 @@ from agent.config import InteractionMode, RuntimeConfig, SessionPreferences
 from agent.models import GoalStatus
 from agent.store import StateStore
 from agent.testing import ScriptedProvider
+from agent.tui import WorkspaceInput
 from agent.ui import ConsoleUI, DashboardView, WorkspaceRefreshRequested
 from agent.ui_state import WorkspaceUIStore
+from agent.version_control import GitProtectionManager
 
 
 class _TTY(io.StringIO):
@@ -35,6 +39,243 @@ class _TTY(io.StringIO):
 
 
 class CLITests(unittest.TestCase):
+    def test_new_session_flag_creates_an_empty_thread_instead_of_resuming_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with StateStore(directory) as store:
+                store.save_workflow_session(
+                    "workspace-session",
+                    goal_id=None,
+                    session_mode="normal",
+                    plan_state="none",
+                    run_state="idle",
+                    state={
+                        "model_snapshot": {
+                            "provider": "scripted",
+                            "model": "scripted",
+                            "execution_class": "local",
+                        },
+                    },
+                )
+                store.create_goal_and_bind_workflow_session(
+                    "an old request",
+                    session_id="workspace-session",
+                )
+            with mock.patch(
+                "agent.cli.ModelDescriptor.create_provider",
+                return_value=ScriptedProvider([]),
+            ):
+                code = main(
+                    [
+                        "--workspace", directory,
+                        "--new-session",
+                        "--provider", "ollama",
+                        "--model", "gemma4:e4b",
+                        "--command", "/status",
+                        "--plain",
+                        "--no-color",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            with StateStore(directory) as store:
+                sessions = store.list_workflow_sessions(limit=20)
+
+            fresh = [item for item in sessions if item["id"] != "workspace-session"]
+            self.assertEqual(len(fresh), 1)
+            self.assertTrue(fresh[0]["id"].startswith("workspace-"))
+            self.assertIsNone(fresh[0]["goal_id"])
+            self.assertEqual(
+                fresh[0]["state"]["model_snapshot"]["provider"],
+                "ollama",
+            )
+
+    def test_reopening_project_reuses_saved_setup_without_reasking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            store.save_workflow_session(
+                "workspace-session",
+                goal_id=None,
+                session_mode="normal",
+                plan_state="none",
+                run_state="idle",
+                state={
+                    "model_snapshot": {
+                        "provider": "ollama",
+                        "model": "gemma4:e4b",
+                        "execution_class": "local",
+                        "capabilities": ["tools", "structured_output"],
+                    },
+                    "access_level": "normal",
+                    "concurrency": 1,
+                    "interaction_mode": "working",
+                },
+            )
+            store.close()
+            GitProtectionManager(workspace).configure(
+                auto_checkpoint=False,
+                auto_push=False,
+                provider="snapshot",
+            )
+            args = build_parser().parse_args(
+                ["--workspace", str(workspace), "--provider", "ollama", "--plain", "--no-color"]
+            )
+            output = io.StringIO()
+            console = ConsoleUI(
+                stream=output,
+                color=False,
+                input_func=lambda prompt: (_ for _ in ()).throw(
+                    AssertionError(f"setup unexpectedly prompted: {prompt}")
+                ),
+            )
+            setup = _interactive_setup(args, console, "ollama")
+
+            self.assertIsNotNone(setup)
+            assert setup is not None
+            self.assertEqual(setup[1].id.split("@", 1)[0], "ollama:gemma4:e4b")
+            self.assertEqual(setup[3].value, "normal")
+            self.assertEqual(setup[4].concurrency, 1)
+            self.assertIn("Loaded this project's saved setup", output.getvalue())
+
+    def test_strongest_local_failover_skips_failed_model_aliases(self):
+        from agent.cli import _strongest_local_model
+        from agent.model_catalog import ExecutionClass
+
+        strongest = SimpleNamespace(
+            id="ollama:gemma4:e4b",
+            provider="ollama",
+            model="gemma4:e4b",
+            execution_class=ExecutionClass.LOCAL,
+            supports_tools=True,
+            metadata={"parameter_size": "8B", "capability_band": "high"},
+        )
+        next_best = SimpleNamespace(
+            id="ollama:qwen2.5-coder:7b",
+            provider="ollama",
+            model="qwen2.5-coder:7b",
+            execution_class=ExecutionClass.LOCAL,
+            supports_tools=True,
+            metadata={"parameter_size": "7B", "capability_band": "medium"},
+        )
+
+        self.assertIs(
+            _strongest_local_model((next_best, strongest)),
+            strongest,
+        )
+        self.assertIs(
+            _strongest_local_model((next_best, strongest), excluded={"gemma4:e4b"}),
+            next_best,
+        )
+        self.assertIsNone(
+            _strongest_local_model(
+                (next_best, strongest),
+                excluded={"ollama:gemma4:e4b", "qwen2.5-coder:7b"},
+            )
+        )
+
+    def test_first_local_project_prompt_opens_execution_workspace_immediately(self):
+        import time
+
+        from agent.cli import _persistent_interactive_loop
+
+        opened = Event()
+        executed = Event()
+        captured = {}
+
+        class FakeApp:
+            def __init__(self, _store, *, on_input, on_exit, **_kwargs):
+                captured["store"] = _store
+                self.on_input = on_input
+                self.on_exit = on_exit
+                self.overlay_kind = ""
+
+            def run(self):
+                self.on_input(
+                    WorkspaceInput(
+                        text="Build a local-first Three.js calculator",
+                    )
+                )
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if opened.is_set() and executed.is_set():
+                        break
+                    time.sleep(0.01)
+                self.on_exit()
+
+            def stop(self):
+                return None
+
+            def restore_composer(self, *_args, **_kwargs):
+                return None
+
+            def open_details(self, *_args, **_kwargs):
+                return None
+
+            def open_swarm(self, *_args, **_kwargs):
+                return None
+
+            def update_swarm(self, *_args, **_kwargs):
+                return None
+
+        runtime = mock.Mock()
+        runtime.workspace = Path("workspace")
+        runtime.session_id = "local-first-session"
+        runtime.model_name = "gemma4:e4b"
+        runtime.execution_class = "local"
+        runtime.interaction_mode = SimpleNamespace(value="working")
+        runtime.active_goal.return_value = None
+        runtime.dashboard.return_value = SimpleNamespace(
+            status="idle",
+            tasks=(),
+            objective="",
+            goal_id="",
+            plan_revision=0,
+        )
+        runtime.store.list_timeline_entries.return_value = []
+        runtime.store.count_queued_prompts.return_value = 0
+        runtime.store.list_queued_prompts.return_value = []
+        runtime.store.claim_next_prompt.return_value = None
+        runtime.store.get_workflow_session.return_value = {"state": {}}
+        runtime.store.get_accepted_plan.return_value = None
+        runtime.local_web_server.take_execution_request.return_value = False
+        runtime.version_control.diff.return_value = ""
+        console = mock.Mock()
+        console.stream = io.StringIO()
+        console.color = False
+
+        with mock.patch("agent.cli.PersistentWorkspaceApp", FakeApp), mock.patch(
+            "agent.cli.TelemetrySampler"
+        ) as telemetry, mock.patch(
+            "agent.cli.question_session", return_value=None
+        ), mock.patch(
+            "agent.cli._current_ultra_run", return_value=None
+        ), mock.patch(
+            "agent.cli._open_local_web_view",
+            side_effect=lambda *_args: (
+                captured.__setitem__("opened_after_execute", executed.is_set()),
+                opened.set(),
+            ),
+        ) as open_view, mock.patch(
+            "agent.cli.execute_command", side_effect=lambda *_args: executed.set() or True
+        ) as execute:
+            telemetry.return_value.start.return_value = None
+            telemetry.return_value.stop.return_value = None
+            _persistent_interactive_loop(runtime, console, SessionPreferences())
+
+        self.assertTrue(
+            opened.is_set(),
+            {
+                "transcript": [
+                    item.text for item in captured["store"].snapshot().transcript
+                ],
+                "log": list(captured["store"].snapshot().advanced_log),
+            },
+        )
+        self.assertTrue(executed.is_set())
+        self.assertTrue(captured["opened_after_execute"])
+        open_view.assert_called_once_with(runtime, console, "execution")
+        execute.assert_called_once()
+
     def test_session_recovery_backfills_model_snapshot_from_capability_envelope(self):
         with tempfile.TemporaryDirectory() as directory:
             with StateStore(directory) as store:
@@ -212,6 +453,9 @@ class CLITests(unittest.TestCase):
                         time.sleep(0.01)
                         continue
                     if request.kind.value == "recovery":
+                        captured["recovery_options"] = {
+                            option.value for option in request.options
+                        }
                         self.store.resolve_attention("keep")
                         self.on_exit()
                         return
@@ -263,6 +507,405 @@ class CLITests(unittest.TestCase):
         self.assertTrue(
             any("Local model stopped unexpectedly" in item.text for item in transcript)
         )
+        self.assertNotIn("local", captured["recovery_options"])
+        self.assertIn("model", captured["recovery_options"])
+
+    def test_full_auto_retries_saved_local_semantic_boundary_without_attention(self):
+        import time
+
+        from agent.cli import _persistent_interactive_loop
+        from agent.local_provider import (
+            ProviderDiagnostic,
+            ProviderFailureKind,
+            ProviderRequestError,
+        )
+
+        session = SimpleNamespace(
+            source="intake",
+            current={
+                "id": "q-local-autopilot",
+                "question": "Use the recommended architecture?",
+                "options": (
+                    {"label": "Yes", "description": "Continue", "recommended": True},
+                ),
+            },
+        )
+        failure = ProviderRequestError(
+            ProviderDiagnostic(
+                True,
+                ProviderFailureKind.MODEL_LOAD_FAILED,
+                "parse_stream",
+                provider_message="local model is reloading",
+                endpoint="http://localhost:11434/api/chat",
+            )
+        )
+        pending = {
+            "turn_id": "turn-local-autopilot",
+            "original_input": "Build the saved project",
+            "status": "awaiting_provider",
+            "stage": "goal_intake",
+            "last_error": "local model is reloading",
+        }
+        boundary_visible = {"value": False}
+
+        class FakeApp:
+            def __init__(self, store, *, on_exit, **_kwargs):
+                self.store = store
+                self.on_exit = on_exit
+                self.overlay_kind = ""
+
+            def run(self):
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if any(
+                        call.args
+                        and getattr(call.args[0], "kind", None) is CommandKind.RESUME
+                        for call in runtime.apply_command.call_args_list
+                    ):
+                        self.on_exit()
+                        return
+                    request = self.store.active_attention()
+                    if request is not None and request.kind.value != "recovery":
+                        self.store.resolve_selected_attention()
+                    time.sleep(0.01)
+                self.on_exit()
+
+            def stop(self):
+                return None
+
+            def open_details(self, *_args, **_kwargs):
+                return None
+
+            def open_swarm(self, *_args, **_kwargs):
+                return None
+
+            def update_swarm(self, *_args, **_kwargs):
+                return None
+
+        runtime = mock.Mock()
+        runtime.workspace = Path("workspace")
+        runtime.model_name = "gemma4:e4b"
+        runtime.execution_class = "local"
+        runtime.session_id = "local-autopilot-session"
+        runtime.interaction_mode = SimpleNamespace(value="working")
+        runtime.sleep_mode_policy.return_value = "full"
+        runtime.active_goal.return_value = None
+        runtime.dashboard.return_value = SimpleNamespace(
+            status="paused", tasks=(), objective="Build the saved project", goal_id="", plan_revision=0
+        )
+        runtime.store.list_timeline_entries.return_value = []
+        runtime.store.count_queued_prompts.return_value = 0
+        runtime.store.list_queued_prompts.return_value = []
+        runtime.store.claim_next_prompt.return_value = None
+        runtime.store.get_workflow_session.side_effect = lambda *_args, **_kwargs: {
+            "state": (
+                {"pending_semantic_turn": dict(pending)}
+                if boundary_visible["value"]
+                else {}
+            )
+        }
+        runtime.local_web_server.take_execution_request.return_value = False
+
+        def save_pending(value):
+            pending.clear()
+            pending.update(dict(value))
+
+        runtime._save_pending_semantic_turn.side_effect = save_pending
+
+        def fail_provider(*_args, **_kwargs):
+            boundary_visible["value"] = True
+            raise failure
+
+        console = mock.Mock()
+        console.stream = io.StringIO()
+        console.color = False
+
+        with mock.patch("agent.cli.PersistentWorkspaceApp", FakeApp), mock.patch(
+            "agent.cli.TelemetrySampler"
+        ) as telemetry, mock.patch(
+            "agent.cli.question_session", return_value=session
+        ), mock.patch(
+            "agent.cli.answer_question", side_effect=fail_provider
+        ), mock.patch(
+            "agent.cli._full_auto_retry_delay", return_value=0.0
+        ), mock.patch(
+            "agent.cli._show_runtime_state"
+        ), mock.patch(
+            "agent.cli._current_ultra_run", return_value=None
+        ):
+            telemetry.return_value.start.return_value = None
+            telemetry.return_value.stop.return_value = None
+            _persistent_interactive_loop(runtime, console, SessionPreferences())
+
+        self.assertGreaterEqual(runtime._save_pending_semantic_turn.call_count, 1)
+        self.assertEqual(pending["status"], "awaiting_provider")
+        self.assertEqual(pending["full_auto_retry_attempts"], 1)
+        resume_commands = [
+            call.args[0]
+            for call in runtime.apply_command.call_args_list
+            if call.args and getattr(call.args[0], "kind", None) is CommandKind.RESUME
+        ]
+        self.assertGreaterEqual(len(resume_commands), 1)
+        self.assertFalse(runtime.store.request_attention.called)
+
+    def test_full_auto_switches_cloud_failure_to_local_and_resumes(self):
+        import time
+
+        from agent.cli import _persistent_interactive_loop
+        from agent.local_provider import (
+            ProviderDiagnostic,
+            ProviderFailureKind,
+            ProviderRequestError,
+        )
+        from agent.model_catalog import ExecutionClass
+
+        session = SimpleNamespace(
+            source="intake",
+            current={
+                "id": "q-cloud-failure",
+                "question": "Continue with the cloud model?",
+                "options": (
+                    {"label": "Yes", "description": "Continue", "recommended": True},
+                ),
+            },
+        )
+        failure = ProviderRequestError(
+            ProviderDiagnostic(
+                True,
+                ProviderFailureKind.HTTP_4XX,
+                "provider_call",
+                status_code=429,
+                provider_message="cloud usage limit exhausted",
+                endpoint="https://provider.invalid/chat",
+            )
+        )
+
+        class FakeApp:
+            def __init__(self, store, *, on_exit, **_kwargs):
+                self.store = store
+                self.on_exit = on_exit
+
+            def run(self):
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if runtime.continue_with_local_model.called and runtime.resume.called:
+                        self.on_exit()
+                        return
+                    request = self.store.active_attention()
+                    if request is not None:
+                        self.store.resolve_selected_attention()
+                    time.sleep(0.01)
+                self.on_exit()
+
+            def stop(self):
+                return None
+
+            def open_details(self, *_args, **_kwargs):
+                return None
+
+            def open_swarm(self, *_args, **_kwargs):
+                return None
+
+            def update_swarm(self, *_args, **_kwargs):
+                return None
+
+        runtime = mock.Mock()
+        runtime.workspace = Path("workspace")
+        runtime.model_name = "gpt-oss:120b-cloud"
+        runtime.execution_class = "cloud"
+        runtime.session_id = "cloud-autopilot-session"
+        runtime.interaction_mode = SimpleNamespace(value="working")
+        runtime.sleep_mode_policy.return_value = "full"
+        runtime.dashboard.return_value = SimpleNamespace(
+            status="paused", tasks=(), objective="Build the approved project", goal_id="goal-cloud", plan_revision=1
+        )
+        runtime.active_goal.return_value = SimpleNamespace(
+            id="goal-cloud", status=GoalStatus.PAUSED, metadata={}, active_plan_revision=1
+        )
+        runtime.store.list_timeline_entries.return_value = []
+        runtime.store.count_queued_prompts.return_value = 0
+        runtime.store.list_queued_prompts.return_value = []
+        runtime.store.claim_next_prompt.return_value = None
+        runtime.store.get_workflow_session.return_value = {"state": {}}
+        runtime.store.get_accepted_plan.return_value = SimpleNamespace(fingerprint="accepted-plan")
+        runtime.local_web_server.take_execution_request.return_value = False
+        console = mock.Mock()
+        console.stream = io.StringIO()
+        console.color = False
+
+        local_descriptor = SimpleNamespace(
+            id="ollama:coder",
+            provider="ollama",
+            model="coder",
+            display_name="coder (ollama)",
+            source="ollama",
+            execution_class=ExecutionClass.LOCAL,
+            supports_tools=True,
+            metadata={"parameter_size": "70B", "capability_band": "high"},
+            create_provider=mock.Mock(return_value=ScriptedProvider([])),
+        )
+        weaker_descriptor = SimpleNamespace(
+            id="ollama:tiny",
+            provider="ollama",
+            model="tiny",
+            display_name="tiny (ollama)",
+            source="ollama",
+            execution_class=ExecutionClass.LOCAL,
+            supports_tools=True,
+            metadata={"parameter_size": "7B", "capability_band": "low"},
+            create_provider=mock.Mock(return_value=ScriptedProvider([])),
+        )
+        catalog = SimpleNamespace(
+            discover=mock.Mock(return_value=(weaker_descriptor, local_descriptor)),
+            diagnostics=(),
+        )
+
+        with mock.patch("agent.cli.PersistentWorkspaceApp", FakeApp), mock.patch(
+            "agent.cli.TelemetrySampler"
+        ) as telemetry, mock.patch(
+            "agent.cli.question_session", return_value=session
+        ), mock.patch(
+            "agent.cli.answer_question", side_effect=failure
+        ), mock.patch(
+            "agent.cli.ModelCatalog", return_value=catalog
+        ), mock.patch(
+            "agent.cli._show_runtime_state"
+        ), mock.patch(
+            "agent.cli._current_ultra_run", return_value=None
+        ):
+            telemetry.return_value.start.return_value = None
+            telemetry.return_value.stop.return_value = None
+            _persistent_interactive_loop(runtime, console, SessionPreferences())
+
+        runtime.continue_with_local_model.assert_called_once_with(
+            local_descriptor.create_provider.return_value,
+            local_descriptor,
+        )
+        runtime.resume.assert_called_once_with()
+        fallback_updates = [
+            call.kwargs
+            for call in runtime.store.update_goal_metadata.call_args_list
+            if "provider_recovery" in call.kwargs
+        ]
+        self.assertTrue(
+            any(item["provider_recovery"]["automatic_fallback"] for item in fallback_updates)
+        )
+        self.assertFalse(runtime.store.request_attention.called)
+
+    def test_full_auto_switches_cloud_planning_failure_to_local(self):
+        import time
+
+        from agent.cli import _persistent_interactive_loop
+        from agent.model_catalog import ExecutionClass
+
+        class FakeApp:
+            def __init__(self, store, *, on_exit, **_kwargs):
+                self.store = store
+                self.on_exit = on_exit
+
+            def run(self):
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if runtime.resume.called:
+                        self.on_exit()
+                        return
+                    time.sleep(0.01)
+                self.on_exit()
+
+            def stop(self):
+                return None
+
+            def open_details(self, *_args, **_kwargs):
+                return None
+
+            def open_swarm(self, *_args, **_kwargs):
+                return None
+
+            def update_swarm(self, *_args, **_kwargs):
+                return None
+
+        goal = SimpleNamespace(
+            id="goal-planning-cloud",
+            status=GoalStatus.PAUSED,
+            active_plan_revision=None,
+            metadata={
+                "provider_recovery": {
+                    "state": "paused",
+                    "error": "provider unavailable after retries: quota exhausted",
+                },
+                "waiting_question": "The provider retries were exhausted at a saved planning checkpoint.",
+            },
+        )
+        runtime = mock.Mock()
+        runtime.workspace = Path("workspace")
+        runtime.model_name = "gpt-oss:120b-cloud"
+        runtime.execution_class = "cloud"
+        runtime.provider_name = "openai"
+        runtime.reasoning_effort = "medium"
+        runtime.access_level = "normal"
+        runtime.session_id = "planning-fallback-session"
+        runtime.interaction_mode = SimpleNamespace(value="working")
+        runtime.sleep_mode_policy.return_value = "full"
+        runtime.active_goal.return_value = goal
+        runtime.dashboard.return_value = SimpleNamespace(
+            status="paused", tasks=(), objective="Build the project", goal_id=goal.id, plan_revision=0
+        )
+        runtime.session_snapshot.return_value = {}
+        runtime.store.list_timeline_entries.return_value = []
+        runtime.store.count_queued_prompts.return_value = 0
+        runtime.store.list_queued_prompts.return_value = []
+        runtime.store.claim_next_prompt.return_value = None
+        runtime.store.get_workflow_session.return_value = {"state": {}}
+        runtime.store.get_accepted_plan.return_value = None
+        runtime.local_web_server.take_execution_request.return_value = False
+
+        local_descriptor = SimpleNamespace(
+            id="ollama:coder",
+            provider="ollama",
+            model="coder",
+            display_name="coder (ollama)",
+            source="ollama",
+            execution_class=ExecutionClass.LOCAL,
+            supports_tools=True,
+            metadata={"parameter_size": "70B", "capability_band": "high"},
+            create_provider=mock.Mock(return_value=ScriptedProvider([])),
+        )
+        catalog = SimpleNamespace(discover=mock.Mock(return_value=(local_descriptor,)), diagnostics=())
+
+        def replace_provider(_provider, descriptor, **_kwargs):
+            runtime.execution_class = descriptor.execution_class.value
+
+        runtime.replace_provider.side_effect = replace_provider
+
+        console = mock.Mock()
+        console.stream = io.StringIO()
+        console.color = False
+
+        with mock.patch("agent.cli.PersistentWorkspaceApp", FakeApp), mock.patch(
+            "agent.cli.TelemetrySampler"
+        ) as telemetry, mock.patch(
+            "agent.cli.ModelCatalog", return_value=catalog
+        ), mock.patch(
+            "agent.cli.question_session", return_value=None
+        ), mock.patch(
+            "agent.cli._show_runtime_state"
+        ), mock.patch(
+            "agent.cli._current_ultra_run", return_value=None
+        ):
+            telemetry.return_value.start.return_value = None
+            telemetry.return_value.stop.return_value = None
+            _persistent_interactive_loop(runtime, console, SessionPreferences())
+
+        runtime.replace_provider.assert_called_once_with(
+            local_descriptor.create_provider.return_value,
+            local_descriptor,
+        )
+        runtime.resume.assert_called_once_with()
+        recovery_updates = [
+            call.kwargs.get("provider_recovery", {})
+            for call in runtime.store.update_goal_metadata.call_args_list
+        ]
+        self.assertTrue(any(item.get("automatic_fallback_attempted") for item in recovery_updates))
 
     def test_persistent_controller_recovers_approved_work_without_replaying_approval(self):
         import time
@@ -343,18 +986,33 @@ class CLITests(unittest.TestCase):
         output = io.StringIO()
         console = ConsoleUI(stream=output, color=False)
         runtime = mock.Mock()
+        runtime.sleep_mode_enabled.return_value = True
+        runtime.sleep_mode_policy.return_value = "safe"
         preferences = SessionPreferences(mode=InteractionMode.NORMAL)
 
         self.assertTrue(
             execute_command(runtime, console, parse_command("/sleep on"), preferences)
         )
         self.assertTrue(console.sleep_enabled)
-        runtime.set_sleep_mode.assert_called_once_with(True)
+        runtime.set_sleep_mode.assert_called_once_with(True, policy="safe")
         runtime.sleep_profile.assert_not_called()
         self.assertTrue(
             execute_command(runtime, console, parse_command("/sleep status"), preferences)
         )
         self.assertIn("safe recommended choices only", output.getvalue())
+
+    def test_full_sleep_mode_is_an_explicit_cli_action(self):
+        output = io.StringIO()
+        console = ConsoleUI(stream=output, color=False)
+        runtime = mock.Mock()
+        preferences = SessionPreferences(mode=InteractionMode.NORMAL)
+
+        self.assertTrue(
+            execute_command(runtime, console, parse_command("/sleep full"), preferences)
+        )
+
+        runtime.set_sleep_mode.assert_called_once_with(True, policy="full")
+        self.assertTrue(console.sleep_enabled)
 
     def test_ultra_sleep_gate_failure_does_not_disable_safe_ui_sleep(self):
         output = io.StringIO()
@@ -552,6 +1210,165 @@ class CLITests(unittest.TestCase):
         self.assertEqual(session["session_mode"], "normal")
         self.assertEqual(session["state"]["interaction_mode"], "working")
         self.assertEqual(session["state"]["minimum_strategy"], "recursive")
+
+    def test_normal_startup_recovers_locked_workflow_without_reapplying_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with StateStore(directory) as store:
+                store.save_workflow_session(
+                    "workspace-session",
+                    goal_id=None,
+                    session_mode="normal",
+                    plan_state="none",
+                    run_state="planning",
+                    state={
+                        "interaction_mode": "working",
+                        "pending_semantic_turn": {
+                            "status": "in_progress",
+                            "stage": "dispatching",
+                            "request": "Build the saved application",
+                        },
+                    },
+                )
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = main(
+                    [
+                        "--workspace",
+                        directory,
+                        "--provider",
+                        "ollama",
+                        "--mode",
+                        "plan",
+                        "--command",
+                        "/status",
+                        "--no-color",
+                        "--plain",
+                    ]
+                )
+
+            with StateStore(directory) as store:
+                session = store.get_workflow_session("workspace-session")
+
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertEqual(session["session_mode"], "normal")
+        self.assertEqual(session["state"]["interaction_mode"], "working")
+        self.assertIn("Recovered the active workflow with its saved", output.getvalue())
+        self.assertNotIn("fatal: Mode is locked", output.getvalue())
+
+    def test_startup_mode_race_recovers_if_workflow_locks_after_initial_read(self):
+        from agent.runtime import RuntimeStateError
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            with mock.patch(
+                "agent.runtime.AgentRuntime.workflow_mode_lock",
+                side_effect=[
+                    SimpleNamespace(locked=False),
+                    SimpleNamespace(locked=True, stage="dispatching"),
+                ],
+            ), mock.patch(
+                "agent.runtime.AgentRuntime.transition_mode",
+                side_effect=RuntimeStateError("Mode is locked until this workflow completes or is cancelled."),
+            ), redirect_stdout(output):
+                code = main(
+                    [
+                        "--workspace", directory,
+                        "--provider", "ollama",
+                        "--model", "gemma4:e4b",
+                        "--mode", "plan",
+                        "--command", "/status",
+                        "--plain",
+                        "--no-color",
+                    ]
+                )
+
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn("Another launcher started this workflow", output.getvalue())
+        self.assertNotIn("fatal: Mode is locked", output.getvalue())
+
+    def test_duplicate_launcher_attaches_to_existing_web_owner(self):
+        from agent.session_owner import SessionOwnerInfo
+
+        with tempfile.TemporaryDirectory() as directory:
+            existing = SessionOwnerInfo(
+                workspace=str(Path(directory).resolve()),
+                session_id="workspace-session",
+                pid=4321,
+                host="test-host",
+                started_at=1.0,
+                heartbeat_at=2.0,
+                web_port=54321,
+                web_token="owner-token",
+                owner_token="owner-4321",
+            )
+            output = io.StringIO()
+            with mock.patch(
+                "agent.cli.SessionOwnerLease.acquire", return_value=None
+            ), mock.patch(
+                "agent.cli.SessionOwnerLease.read_existing", return_value=existing
+            ), mock.patch(
+                "webbrowser.open", return_value=True
+            ) as open_browser, redirect_stdout(output):
+                code = main(
+                    [
+                        "--workspace", directory,
+                        "--provider", "ollama",
+                        "--model", "gemma4:e4b",
+                        "--command", "/status",
+                        "--plain", "--no-color",
+                    ]
+                )
+
+        self.assertEqual(code, 0, output.getvalue())
+        open_browser.assert_called_once()
+        opened_url = open_browser.call_args.args[0]
+        self.assertIn("127.0.0.1:54321", opened_url)
+        self.assertIn("owner-token", opened_url)
+        self.assertIn("already running", output.getvalue())
+        self.assertNotIn("fatal: Mode is locked", output.getvalue())
+
+    def test_interactive_recovery_opens_the_live_web_workspace(self):
+        from agent.model_catalog import ModelDescriptor
+        from agent.sandbox import AccessLevel, DockerSandbox
+
+        with tempfile.TemporaryDirectory() as directory:
+            with StateStore(directory) as store:
+                store.save_workflow_session(
+                    "workspace-session",
+                    goal_id=None,
+                    session_mode="normal",
+                    plan_state="none",
+                    run_state="planning",
+                    state={
+                        "interaction_mode": "working",
+                        "pending_semantic_turn": {
+                            "status": "in_progress",
+                            "stage": "dispatching",
+                            "request": "Build the saved application",
+                        },
+                    },
+                )
+            setup = (
+                Path(directory),
+                ModelDescriptor(
+                    provider="ollama",
+                    model="gemma4:e4b",
+                    execution_class="local",
+                ),
+                DockerSandbox(),
+                AccessLevel.NORMAL,
+                SessionPreferences(mode=InteractionMode.PLAN),
+            )
+            output = io.StringIO()
+            with mock.patch("agent.cli._interactive_setup", return_value=setup), mock.patch(
+                "agent.cli._open_local_web_view"
+            ) as open_view, mock.patch("agent.cli.interactive_loop"), redirect_stdout(output):
+                code = main(["--provider", "ollama", "--plain", "--no-color"])
+
+        self.assertEqual(code, 0, output.getvalue())
+        open_view.assert_called_once()
+        self.assertEqual(open_view.call_args.args[2], "execution")
 
     def test_doctor_record_command_persists_benchmark_history(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -890,6 +1707,10 @@ class CLITests(unittest.TestCase):
         request = store.active_attention()
         self.assertIsNotNone(request)
         self.assertIn("npm install package-x", request.message)
+        self.assertIn("allow_session", [item.key for item in request.options])
+        session_option = next(item for item in request.options if item.key == "allow_session")
+        self.assertEqual(session_option.label, "Always allow this session")
+        self.assertIn("until this session ends", session_option.description)
         primary = [item.key for item in request.options if item.primary]
         self.assertEqual(primary, ["deny"])
         store.resolve_selected_attention()

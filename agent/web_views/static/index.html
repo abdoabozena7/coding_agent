@@ -11,28 +11,27 @@
   <a class="skip-link" href="#workspace">Skip to workspace</a>
   <div id="app" class="app-shell" aria-busy="true">
     <header class="topbar">
-      <a class="brand" href="#" aria-label="GA3BAD workspace home">
+      <button id="workspaceHome" class="brand" type="button" aria-label="GA3BAD workspace home">
         <span class="brand-mark" aria-hidden="true">G3</span>
-        <span>GA3BAD</span>
-      </a>
-
-      <nav id="workspaceNav" class="workspace-nav" aria-label="Workspace">
-        <button class="nav-button" data-view="plan" type="button">
-          Plan <span class="nav-badge hidden" data-badge="plan"></span>
-        </button>
-        <button class="nav-button" data-view="review" type="button">
-          Review <span class="nav-badge hidden" data-badge="review"></span>
-        </button>
-        <button class="nav-button" data-view="agents" type="button">
-          Execution <span class="nav-badge hidden" data-badge="agents"></span>
-        </button>
-      </nav>
+        <span class="brand-copy"><strong>GA3BAD</strong><small id="workspaceLabel">Coding workspace</small></span>
+      </button>
 
       <div class="top-actions">
-        <div class="mode-toggle" aria-label="Detail level">
-          <button id="simpleMode" class="selected" type="button">Simple</button>
-          <button id="advancedMode" type="button">Advanced</button>
-        </div>
+        <button id="inspectorToggle" class="icon-button inspector-toggle" type="button" aria-label="Open inspector" aria-expanded="false">
+          <span aria-hidden="true">☷</span><span class="sr-only">Inspector</span>
+        </button>
+        <button id="sleepTopbar" class="sleep-topbar" type="button" aria-label="Sleep mode: Off" aria-haspopup="dialog">
+          <span class="sleep-indicator" aria-hidden="true">AUTO</span>
+        </button>
+        <button id="modelButton" class="model-button" type="button" aria-haspopup="dialog">
+          <span class="model-orbit" aria-hidden="true"></span>
+          <span><small>Model</small><strong id="modelButtonLabel">Loading…</strong></span>
+          <span aria-hidden="true">⌄</span>
+        </button>
+        <button id="projectSettingsButton" class="icon-button" type="button" aria-label="Project settings"
+                data-help="Reuse or reconfigure this project's saved setup." aria-haspopup="dialog">
+          <span aria-hidden="true">⚙</span><span class="sr-only">Project settings</span>
+        </button>
         <button id="refreshButton" class="icon-button" type="button"
                 data-help="Reload the latest durable state.">
           <span aria-hidden="true">↻</span><span class="sr-only">Refresh</span>
@@ -43,89 +42,173 @@
       </div>
     </header>
 
-    <main id="workspace" class="workspace" tabindex="-1">
-      <section id="liveWorkflow" class="live-workflow" aria-labelledby="liveNowTitle">
-        <div class="live-now">
-          <div class="live-kicker">
-            <span id="livePulse" class="live-pulse" aria-hidden="true"></span>
-            <span>Now</span>
-            <span id="liveProvenance" class="source-chip">Harness</span>
-          </div>
-          <h1 id="liveNowTitle">Ready for your request</h1>
-          <p id="liveEvidence" class="live-evidence">No workflow is active.</p>
-          <p id="liveGoal" class="live-goal hidden"></p>
-        </div>
-        <div class="live-rail">
-          <div class="live-rail-head">
-            <span>Activity</span>
-            <button id="openActivity" class="quiet-button" type="button">View timeline</button>
-          </div>
-          <ol id="liveTimeline" class="live-timeline" aria-live="polite"></ol>
-        </div>
-      </section>
-      <section id="advancedLiveDetails" class="advanced-live-details advanced-only" aria-live="polite">
-        <div class="advanced-live-head">
+    <div class="workspace-shell">
+      <aside class="workspace-sidebar" aria-label="Workspace navigation">
+        <div class="rail-project-header">
           <div>
-            <p class="eyebrow">Verified runtime detail</p>
-            <h2>Live execution</h2>
+            <p class="rail-label">Project</p>
+            <strong id="railProjectName">GA3BAD</strong>
           </div>
-          <span id="advancedStreamState" class="source-chip">Idle</span>
+          <button id="newTaskButton" class="rail-icon-button" type="button" aria-label="New task" title="New task">+</button>
         </div>
-        <div class="advanced-live-grid">
-          <section class="live-detail-section">
-            <h3>Task checklist</h3>
-            <ol id="advancedTaskList" class="task-checklist"></ol>
-          </section>
-          <section class="live-detail-section">
-            <h3>Model output</h3>
-            <pre id="advancedModelOutput" class="model-output">No safe text stream available.</pre>
-            <p id="advancedTransport" class="muted"></p>
-          </section>
-        </div>
-        <section class="live-detail-section">
-          <h3>Activity timeline</h3>
-          <ol id="advancedActivityList" class="advanced-activity-list"></ol>
-        </section>
-      </section>
-      <section id="attention" class="attention hidden" aria-labelledby="attentionTitle">
-        <div>
-          <p id="attentionEyebrow" class="eyebrow"></p>
-          <h1 id="attentionTitle"></h1>
-          <p id="attentionBody" class="muted"></p>
-        </div>
-        <button id="attentionAction" class="primary-button hidden" type="button"></button>
-        <div id="toolApprovalActions" class="section-actions hidden" aria-label="Tool approval actions">
-          <button id="toolAllow" class="primary-button" type="button">Allow once</button>
-          <button id="toolDeny" class="secondary-button" type="button">Deny</button>
-        </div>
-      </section>
-      <div id="activityBanner" class="activity-banner hidden" role="status" aria-live="polite">
-        <span>New activity available.</span>
-        <button id="applyActivity" class="secondary-button" type="button">Apply update</button>
-      </div>
+        <label class="rail-search">
+          <span class="sr-only">Search tasks</span>
+          <input id="railSearch" type="search" placeholder="Search tasks" autocomplete="off">
+        </label>
+        <div class="rail-section-label">Workflow</div>
+        <nav id="workspaceNav" class="workspace-nav" aria-label="Primary workflow">
+          <button class="nav-button" data-view="thread" type="button">
+            <span class="nav-icon" aria-hidden="true">✦</span><span>Thread</span>
+            <span class="nav-badge hidden" data-badge="thread"></span>
+          </button>
+          <button class="nav-button" data-view="plan" type="button">
+            <span class="nav-icon" aria-hidden="true">◇</span><span>Plan</span>
+            <span class="nav-badge hidden" data-badge="plan"></span>
+          </button>
+          <button class="nav-button" data-view="result" aria-label="Result" type="button">
+            <span class="nav-icon" aria-hidden="true">⌘</span><span>Result</span>
+            <span class="nav-badge hidden" data-badge="execution"></span>
+          </button>
+          <button class="nav-button" data-view="history" type="button">
+            <span class="nav-icon" aria-hidden="true">↺</span><span>History</span>
+            <span class="nav-badge hidden" data-badge="history"></span>
+          </button>
+        </nav>
 
-      <div id="loading" class="state-message">
-        <span class="loader" aria-hidden="true"></span>
-        <p>Connecting to the local workflow…</p>
-      </div>
-      <section id="errorState" class="state-message error hidden" role="alert"></section>
-      <section id="viewRoot" class="view-root hidden"></section>
+        <div class="rail-section-label rail-section-label-spaced">Project sessions</div>
+        <ol id="railTaskList" class="rail-task-list" aria-label="Project sessions">
+          <li class="rail-empty">Loading tasks…</li>
+        </ol>
+
+        <div class="sidebar-controls">
+          <div class="mode-toggle" aria-label="Detail level">
+            <button id="simpleMode" class="selected" type="button">Simple</button>
+            <button id="advancedMode" type="button">Advanced</button>
+          </div>
+          <button id="sleepToggle" class="sidebar-action" type="button">
+            <span class="sleep-indicator" aria-hidden="true">AUTO</span><span>Sleep: Off</span>
+          </button>
+        </div>
+        <div class="sidebar-meta">
+          <span id="sessionMeta">Session —</span>
+          <span id="workflowIdentity">No active goal</span>
+        </div>
+      </aside>
+
+      <main id="workspace" class="workspace" tabindex="-1">
+        <section id="liveWorkflow" class="live-workflow" aria-labelledby="liveNowTitle">
+          <div class="live-now">
+            <div class="live-kicker">
+              <span id="livePulse" class="live-pulse" aria-hidden="true"></span>
+              <span>Now</span>
+              <span id="liveProvenance" class="source-chip">Harness</span>
+            </div>
+            <h1 id="liveNowTitle">What do you want to build?</h1>
+            <p id="liveEvidence" class="live-evidence">No workflow is active.</p>
+            <p id="liveGoal" class="live-goal hidden"></p>
+            <p id="liveAutoRecovery" class="live-auto-recovery hidden" data-testid="auto-recovery-note" role="status"></p>
+          </div>
+          <div class="live-rail">
+            <div class="live-rail-head">
+              <span>Activity</span>
+              <button id="openActivity" class="quiet-button" type="button">View timeline</button>
+            </div>
+            <ol id="liveTimeline" class="live-timeline" aria-live="polite"></ol>
+          </div>
+        </section>
+
+        <section id="advancedLiveDetails" class="advanced-live-details advanced-only" aria-live="polite">
+          <div class="advanced-live-head">
+            <div><p class="eyebrow">Verified runtime detail</p><h2>Live work</h2></div>
+            <span id="advancedStreamState" class="source-chip">Idle</span>
+          </div>
+          <div class="advanced-live-grid">
+            <section class="live-detail-section">
+              <h3>Task checklist</h3><ol id="advancedTaskList" class="task-checklist"></ol>
+            </section>
+            <section class="live-detail-section">
+              <h3>Model output</h3>
+              <pre id="advancedModelOutput" class="model-output">No safe text stream available.</pre>
+              <p id="advancedTransport" class="muted"></p>
+            </section>
+          </div>
+          <section class="live-detail-section">
+            <h3>Activity timeline</h3><ol id="advancedActivityList" class="advanced-activity-list"></ol>
+          </section>
+        </section>
+
+        <section id="attention" class="attention hidden" aria-labelledby="attentionTitle">
+          <div>
+            <p id="attentionEyebrow" class="eyebrow"></p>
+            <h1 id="attentionTitle"></h1>
+            <p id="attentionBody" class="muted"></p>
+          </div>
+          <button id="attentionAction" class="primary-button hidden" type="button"></button>
+          <div id="toolApprovalActions" class="section-actions hidden" aria-label="Tool approval actions">
+            <span id="toolSessionScope" class="approval-session-scope"></span>
+            <button id="toolAllow" class="primary-button" type="button">Allow once</button>
+            <button id="toolAllowSession" class="secondary-button" type="button">Always allow this session</button>
+            <button id="toolDeny" class="secondary-button" type="button">Deny</button>
+            <button id="toolStop" class="quiet-button danger-action" type="button">Stop safely</button>
+          </div>
+        </section>
+        <section id="requiredAction" class="required-action hidden" aria-live="polite">
+          <div class="required-action-copy">
+            <p class="eyebrow">Your next action</p><strong id="requiredActionLabel"></strong>
+            <p id="requiredActionDescription" class="muted"></p>
+            <div id="requiredActionInput" class="required-action-input hidden"></div>
+            <div id="requiredActionAlternatives" class="required-action-alternatives hidden"></div>
+          </div>
+          <button id="requiredActionButton" class="primary-button" type="button"></button>
+        </section>
+        <div id="loading" class="state-message">
+          <span class="loader" aria-hidden="true"></span><p>Connecting to the local workflow…</p>
+        </div>
+        <section id="errorState" class="state-message error hidden" role="alert"></section>
+        <section id="viewRoot" class="view-root hidden"></section>
+
+        <section id="composerDock" class="composer-dock" aria-label="Send a request">
+          <div id="commandMenu" class="command-menu hidden" role="listbox" aria-label="Available commands"></div>
+          <div class="composer-surface">
+            <textarea id="globalPrompt" rows="1" placeholder="Connecting to the saved workflow…" aria-label="Request"></textarea>
+            <div class="composer-actions">
+              <div class="composer-control-strip" aria-label="Composer controls">
+                <button id="attachButton" class="composer-control" type="button">＋ Attach</button>
+                <button id="accessButton" class="composer-control" type="button">Access</button>
+                <button id="modeButton" class="composer-control" type="button">Mode</button>
+                <button id="sleepComposer" class="composer-control" type="button">Sleep</button>
+                <button id="modelComposer" class="composer-control" type="button">Model</button>
+              </div>
+              <div class="composer-hints"><span id="promptDestination">Connecting to the workspace</span><span>Type <kbd>/</kbd> for commands</span></div>
+              <button id="promptSubmit" class="send-button" type="button" aria-label="Send request"><span aria-hidden="true">↑</span></button>
+            </div>
+          </div>
+        </section>
     </main>
 
-    <footer class="footer">
-      <span id="sessionMeta">Session —</span>
-      <span>The harness remains the source of truth.</span>
-    </footer>
+      <aside id="inspector" class="workspace-inspector" aria-label="Inspector" aria-hidden="true">
+        <div class="inspector-head">
+          <div><p class="eyebrow">Workspace</p><h2>Inspector</h2></div>
+          <button id="inspectorClose" class="icon-button" type="button" aria-label="Close inspector">×</button>
+        </div>
+        <div class="inspector-tabs" role="tablist" aria-label="Inspector sections">
+          <button class="inspector-tab selected" data-inspector-section="environment" role="tab" aria-selected="true" type="button">Environment</button>
+          <button class="inspector-tab" data-inspector-section="changes" role="tab" aria-selected="false" type="button">Changes</button>
+          <button class="inspector-tab" data-inspector-section="processes" role="tab" aria-selected="false" type="button">Processes</button>
+          <button class="inspector-tab" data-inspector-section="tree" role="tab" aria-selected="false" type="button">Tree</button>
+          <button class="inspector-tab" data-inspector-section="sources" role="tab" aria-selected="false" type="button">Sources</button>
+        </div>
+        <div id="inspectorBody" class="inspector-body">
+          <p class="rail-empty">Inspector is loading…</p>
+        </div>
+      </aside>
+  </div>
   </div>
 
   <div id="drawerBackdrop" class="drawer-backdrop hidden"></div>
-  <aside id="drawer" class="drawer hidden" aria-modal="true" role="dialog"
-         aria-labelledby="drawerTitle">
+  <aside id="drawer" class="drawer hidden" aria-modal="true" role="dialog" aria-labelledby="drawerTitle">
     <div class="drawer-head">
-      <div>
-        <p id="drawerEyebrow" class="eyebrow"></p>
-        <h2 id="drawerTitle"></h2>
-      </div>
+      <div><p id="drawerEyebrow" class="eyebrow"></p><h2 id="drawerTitle"></h2></div>
       <button id="drawerClose" class="icon-button" type="button" aria-label="Close">×</button>
     </div>
     <div id="drawerBody" class="drawer-body"></div>

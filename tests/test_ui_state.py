@@ -120,6 +120,23 @@ class WorkspaceStoreTests(unittest.TestCase):
         self.assertEqual(store.toggle_mode(), ExperienceMode.ADVANCED)
         self.assertEqual(store.toggle_mode(), ExperienceMode.SIMPLE)
 
+    def test_sleep_mode_event_keeps_the_shared_terminal_projection_in_sync(self):
+        store = WorkspaceUIStore()
+        store.handle_event(
+            "sleep.mode_changed",
+            "Sleep Mode enabled.",
+            {"enabled": True, "policy": "full", "sleep_state": "on"},
+        )
+        self.assertTrue(store.sleep_enabled())
+        self.assertEqual(store.sleep_policy(), "full")
+        store.handle_event(
+            "sleep.mode_changed",
+            "Sleep Mode disabled.",
+            {"enabled": False, "policy": "off", "sleep_state": "off"},
+        )
+        self.assertFalse(store.sleep_enabled())
+        self.assertEqual(store.sleep_policy(), "off")
+
     def test_workflow_mode_is_explicit_and_invalid_values_fall_back_safely(self):
         store = WorkspaceUIStore()
         store.update_identity(
@@ -286,6 +303,30 @@ class WorkspaceStoreTests(unittest.TestCase):
         self.assertEqual(store.active_attention(), unsafe)
         store.cancel_attention()
         self.assertEqual(store.take_attention_result("unsafe").value, "no")
+
+    def test_full_auto_wakes_a_recovery_already_blocked_on_the_terminal(self):
+        store = WorkspaceUIStore()
+        recovery = AttentionRequest(
+            id="provider-recovery",
+            kind=AttentionKind.RECOVERY,
+            title="Provider unavailable",
+            options=(
+                AttentionOption("retry", "Retry", "retry", recommended=True),
+                AttentionOption("stop", "Stop safely", "stop"),
+            ),
+            default_key="retry",
+            cancel_key="stop",
+        )
+        event = store.present_attention(recovery)
+        self.assertFalse(event.is_set())
+
+        store.set_sleep_mode(True, policy="full")
+
+        self.assertTrue(event.is_set())
+        result = store.take_attention_result(recovery.id)
+        self.assertIsNotNone(result)
+        self.assertEqual((result.key, result.value, result.origin), ("retry", "retry", "sleep"))
+        self.assertIsNone(store.active_attention())
 
     def test_invalid_choice_preserves_decision_and_escape_uses_safe_cancel(self):
         store = WorkspaceUIStore()

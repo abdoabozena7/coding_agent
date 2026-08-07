@@ -54,6 +54,7 @@ class CommandKind(str, Enum):
     REVIEW = "review"
     CHAT = "chat"
     EXPLORER = "explorer"
+    OPEN_WEB = "open_web"
     ADD = "add"
     EDIT = "edit"
     REMOVE = "remove"
@@ -180,6 +181,8 @@ def parse_command(line: str) -> UserCommand:
         key = setting_parts[0]
         value = setting_parts[1] if len(setting_parts) == 2 else ""
         key = key.lower().replace("-", "_")
+        if key in {"project", "reconfigure", "setup"} and not value.strip():
+            return UserCommand(CommandKind.SETUP, {"project": True}, raw)
         return UserCommand(
             CommandKind.SETTINGS,
             {"key": key, "value": value.strip() or None},
@@ -225,14 +228,19 @@ def parse_command(line: str) -> UserCommand:
             {"resource_id": _required(rest, usage("stop-process", "ID"))},
             raw=raw,
         )
-    if name in {"tree", "memory", "trace", "insights"}:
+    if name in {"tree", "execution", "memory", "trace", "insights"}:
         kind = {
             "tree": CommandKind.TREE,
+            "execution": CommandKind.TREE,
             "memory": CommandKind.MEMORY,
             "trace": CommandKind.TRACE,
             "insights": CommandKind.INSIGHTS,
         }[name]
         return UserCommand(kind, {"target": rest or None}, raw)
+    if name == "open-web":
+        if rest:
+            raise CommandParseError(f"{prefix}open-web does not take arguments.")
+        return UserCommand(CommandKind.OPEN_WEB, raw=raw)
     if name == "thinking":
         action = rest.lower() or "show"
         if action not in {"show", "hide", "status"}:
@@ -302,14 +310,20 @@ def parse_command(line: str) -> UserCommand:
         return UserCommand(CommandKind.AGENT, {"target": rest}, raw)
     if name == "agent":
         return UserCommand(CommandKind.AGENT, {"target": rest or None}, raw)
-    if name in {"questions", "metrics", "setup"}:
+    if name in {"questions", "metrics"}:
         if rest:
             raise CommandParseError(f"{prefix}{name} does not take arguments.")
         return UserCommand(CommandKind(name), raw=raw)
+    if name == "setup":
+        if rest.casefold() in {"project", "settings", "reconfigure"}:
+            return UserCommand(CommandKind.SETUP, {"project": True}, raw=raw)
+        if rest:
+            raise CommandParseError(f"Usage: {prefix}setup [project]")
+        return UserCommand(CommandKind.SETUP, raw=raw)
     if name == "sleep":
         action = rest.lower() or "status"
-        if action not in {"on", "off", "status"}:
-            raise CommandParseError(f"Usage: {usage('sleep', 'on|off|status')}")
+        if action not in {"on", "safe", "full", "off", "status"}:
+            raise CommandParseError(f"Usage: {usage('sleep', 'on|safe|full|off|status')}")
         return UserCommand(CommandKind.SLEEP, {"action": action}, raw)
     if name == "answer":
         parts = rest.split(maxsplit=1)

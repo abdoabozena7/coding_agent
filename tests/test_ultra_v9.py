@@ -1714,7 +1714,7 @@ class PersistenceAndPickerV9Tests(unittest.TestCase):
             store.close()
             connection = sqlite3.connect(Path(directory) / ".coding-agent" / "state.db")
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 14)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 15)
                 tables = {
                     row[0]
                     for row in connection.execute(

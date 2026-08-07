@@ -48,6 +48,7 @@ def extract_first_json_object(text: str) -> Mapping[str, Any] | None:
     """Extract one balanced JSON object without trusting surrounding prose."""
     source = str(text or "")
     decoder = json.JSONDecoder()
+    fallback: Mapping[str, Any] | None = None
     for index, character in enumerate(source):
         if character != "{":
             continue
@@ -56,8 +57,59 @@ def extract_first_json_object(text: str) -> Mapping[str, Any] | None:
         except json.JSONDecodeError:
             continue
         if isinstance(value, Mapping):
-            return value
-    return None
+            # Prefer an action envelope when the provider emitted more than
+            # one JSON object.  Weak local models occasionally leave the
+            # outer ``}`` off an otherwise valid ``{name, arguments}``
+            # response; in that case the decoder can only see the nested
+            # arguments object, so keep it as a fallback while we try a
+            # bounded delimiter repair below.
+            # A typed ULTRA response legitimately contains nested objects with
+            # display ``name`` fields (for example architecture components).
+            # Only prefer a nested object when it has the complete action
+            # envelope shape; otherwise keep the outer response as fallback.
+            has_action_name = any(key in value for key in ("name", "tool", "action"))
+            has_action_arguments = any(
+                key in value for key in ("args", "arguments", "parameters")
+            )
+            if has_action_name and has_action_arguments:
+                return value
+            if fallback is None:
+                fallback = value
+
+    # A truncated model response is recoverable when the only damage is a
+    # missing closing delimiter.  Do not attempt broad text rewriting: count
+    # braces while respecting JSON strings, and only repair an object that
+    # advertises an action envelope near its beginning.  Typed validation in
+    # the caller still owns the semantic contract.
+    stripped = source.lstrip()
+    if stripped.startswith("{") and re.search(r'"(?:name|tool|action)"\s*:', stripped[:240]):
+        depth = 0
+        in_string = False
+        escaped = False
+        for character in stripped:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+                continue
+            if character == '"':
+                in_string = True
+            elif character == "{":
+                depth += 1
+            elif character == "}" and depth:
+                depth -= 1
+        if depth > 0:
+            try:
+                value, _end = decoder.raw_decode(stripped + ("}" * depth))
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(value, Mapping):
+                    return value
+    return fallback
 
 
 def repair_structured_json_object(text: str) -> tuple[Mapping[str, Any] | None, tuple[str, ...]]:
@@ -84,6 +136,14 @@ def repair_structured_json_object(text: str) -> tuple[Mapping[str, Any] | None, 
     if normalized != repaired:
         repaired = normalized
         actions.append("removed stray backslash from a known response-envelope key")
+    # JSON strings use double quotes, so ``\\'`` is never a legal escape. It
+    # is a frequent artifact of local models copying shell/Python snippets
+    # into a verification string; remove only that invalid escape so the
+    # authored apostrophe remains intact.
+    normalized = repaired.replace("\\'", "'")
+    if normalized != repaired:
+        repaired = normalized
+        actions.append("removed invalid single-quote JSON escapes")
     normalized = re.sub(r",\s*([}\]])", r"\1", repaired)
     if normalized != repaired:
         repaired = normalized

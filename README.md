@@ -141,14 +141,15 @@ while work is active it requests a checkpoint and keeps the session open. Use
 `--plain` to skip the animated intro and use the line-oriented SSH/screen-reader
 UI, or `--reduced-motion` for lower-motion setup and progress surfaces.
 
-`F6` toggles process-local **Sleep Mode** at any time. `/sleep on|off|status`
-provides the same control. Sleep chooses only an explicitly recommended option
-that the producer has also marked safe and reversible, and logs the question,
-choice, reason, and time. It never auto-approves actions or plans, destructive or
-security-sensitive work, permission/model changes, costly retries, or other unsafe
-decisions. In eligible Ultra/Full-Docker sessions `/sleep on` also tries to arm the
-existing deeper Ultra Sleep profile; failure of that stricter gate does not weaken
-it and does not disable the safe UI mode.
+`F6` toggles **Safe Auto** at any time. `/sleep on` and `/sleep safe` provide the
+same policy: explicitly recommended reversible actions continue and every choice
+is logged, while risky decisions remain manual. `/sleep full` is a separate,
+explicit Full Auto opt-in that accepts every tool approval in the selected
+workspace, including shell commands and installs, and records each automatic
+approval in durable History. The Web Sleep control requires typing `FULL AUTO`
+before enabling it. `/sleep off` disables either policy. In eligible
+Ultra/Full-Docker sessions enabling Sleep also tries to arm the deeper Ultra
+Sleep profile; failure of that stricter gate does not disable the general mode.
 
 `F7` opens Change Review for the current immutable checkpoint and `F8` (or `/explorer`) opens the exact
 selected project workspace in the operating-system file explorer. The fixed
@@ -160,10 +161,12 @@ provider. Unknown quotas and limits are shown as unavailable, never estimated.
 ## Plan mode and durable conversation
 
 `/mode plan` is a real planning-only mode. It may inspect and prepare a durable
-plan, but it cannot approve or execute tools or file changes. `/plan` opens Plan
-Studio, the only detailed plan surface. Save Draft persists a session-scoped
-draft without activating it; Apply validates and creates an exact new revision.
-Switch to Normal in the terminal before applying an executable revision.
+plan, but it cannot execute tools or file changes. `/plan` opens the primary Web
+workspace. Save Draft persists a session-scoped draft without activating it;
+Save Revision validates and creates an exact immutable revision; Approve & Start
+is the single execution gate. Model changes, pause/resume, queued guidance,
+recursive execution, review, results, and history are available in the same
+workspace at valid saved checkpoints. The terminal remains a compact fallback.
 
 `/chat` opens the read-only durable workspace timeline. Restoring a workspace
 with conversation history opens that view first; Escape returns to the working
@@ -255,7 +258,7 @@ python agent/main.py --workspace /path/to/project
    strategy, expected workspace changes, and task-bound verification.
 3. Deterministic validation checks every plan; a separate critic is used only
    for complex or high-risk work.
-4. Open `/plan`, edit the plan in Plan Studio, and use its explicit Apply action.
+4. Open `/plan`, edit or revise the plan, then use the explicit Approve & Start action.
 5. Use `/mode normal` for the cohesive durable workflow or `/mode ultra` for
    recursive specialists, architecture debate, component isolation, and consensus.
    `/mode plan` is planning-only. Normal may escalate to Ultra; an Ultra project may
@@ -306,14 +309,14 @@ opens the redacted, session-only blocks again. Use `/trace`, `/history`, or
 | `/permissions normal\|full`, `/setup` | Select approvals or initialize the fail-closed Docker Full sandbox |
 | `/skills` | Show the real local tool registry, availability, risk, and approval policy |
 | `/processes`, `/stop-process ID` | Inspect or stop agent-owned processes and HTML previews |
-| `/sleep on\|off\|status` | Control safe process-local Sleep Mode; eligible Ultra/Full-Docker sessions also arm the stricter Ultra Sleep profile |
-| `/agents` | Open the read-only Agent Tree / Execution Map local workspace |
+| `/sleep on\|safe\|full\|off\|status` | Choose Safe Auto or explicit Full Auto unattended approvals; every automatic approval is audited |
+| `/agents` | Open the recursive Execution tree, controls, agents, and recorded result |
 | `/memory [SECTION]`, `/trace [latest\|RUN_ID]` | Inspect Project Brain and redacted prompts/context/summaries |
 | `/thinking` | Expand redacted provider thoughts captured during this session |
 | `/insights [NODE]`, `/metrics` | Inspect durable findings and execution metrics |
 | `/questions`, `/answer ID VALUE` | Advanced fallback for decisions; reply normally, use `/answer 1` for the current question, or `/answer q1 1` for an explicit ID (`/ans` is an alias) |
 | plain text / `/goal TEXT` | Enter the same Intent Architect gate when idle; otherwise add durable user guidance |
-| `/plan` | Open Plan Studio, the only detailed plan editor and apply surface |
+| `/plan` | Open the primary Web workspace and its detailed plan/revision surface |
 | `/review` | Open Change Review, the only file/hunk review surface |
 | `/status` | Refresh the compact terminal working surface |
 | `/chat` | Open the durable read-only workspace conversation; typing returns to the composer |
@@ -337,6 +340,15 @@ For scripting/non-interactive inspection:
 ```bash
 python -m agent --workspace ./project --command "/status"
 python -m agent --workspace ./project --provider ollama --model gemma4:e4b --mode normal --command "/approve 2"
+```
+
+To start a genuinely empty workflow thread while reusing the selected project
+and its protection settings, add `--new-session`.  This is different from
+`--session`, which deliberately restores the saved prompt, goal, model, and
+timeline of an existing thread:
+
+```powershell
+python -m agent --workspace ./project --new-session --provider ollama --model gemma4:e4b --command "/sleep full" --command "Build the requested artifact and verify it" --auto
 ```
 
 ## Lifecycle and completion authority
@@ -457,7 +469,9 @@ All limits apply to one recoverable slice, not the lifetime of the goal:
 
 See [docs/02-architecture.md](docs/02-architecture.md) for the component and data
 flow, and [docs/03-roadmap.md](docs/03-roadmap.md) for implemented phases and
-remaining production extensions.
+remaining production extensions. The workflow-focused defect matrix, estimated
+impact, remaining hardening work, and release gates live in
+[docs/09-production-ux-audit.md](docs/09-production-ux-audit.md).
 
 Key modules:
 

@@ -13,7 +13,13 @@ from agent.models import (
     TaskGraphError,
     TaskStatus,
 )
-from agent.store import CompletionGateError, StalePlanError, StateCorruptionError, StateStore
+from agent.store import (
+    CompletionGateError,
+    StalePlanError,
+    StateCorruptionError,
+    StateStore,
+    WorkflowSessionConflictError,
+)
 
 
 def task(task_id: str, *, depends_on=()):
@@ -128,6 +134,79 @@ class StateStoreTests(unittest.TestCase):
         timeline = self.store.list_timeline_entries("session-test")
         self.assertEqual(len(timeline), 1)
 
+    def test_workflow_session_revision_rejects_stale_writers_and_preserves_goal_binding(self):
+        goal = self.store.create_goal("Keep the session projection coherent")
+        first = self.store.save_workflow_session(
+            "session-revision",
+            goal_id=goal.id,
+            session_mode="normal",
+            plan_state="none",
+            run_state="planning",
+            state={"route": "goal"},
+        )
+        second = self.store.save_workflow_session(
+            "session-revision",
+            goal_id=None,
+            session_mode="normal",
+            plan_state="none",
+            run_state="planning",
+            state={"route": "goal", "heartbeat": 2},
+        )
+        self.assertEqual(second, first + 1)
+        stored = self.store.get_workflow_session("session-revision")
+        self.assertEqual(stored["goal_id"], goal.id)
+        self.assertEqual(stored["revision"], second)
+        with self.assertRaises(WorkflowSessionConflictError):
+            self.store.save_workflow_session(
+                "session-revision",
+                goal_id=None,
+                session_mode="normal",
+                plan_state="none",
+                run_state="planning",
+                expected_revision=first,
+                state={"route": "stale"},
+            )
+        self.store.mutate_workflow_session(
+            "session-revision",
+            lambda current: {"state": {**current["state"], "route": "goal", "reduced": True}},
+            expected_revision=second,
+        )
+        latest = self.store.get_workflow_session("session-revision")
+        self.assertEqual(latest["goal_id"], goal.id)
+        self.assertEqual(latest["state"]["reduced"], True)
+
+    def test_goal_creation_binds_and_completes_semantic_turn_in_one_revision(self):
+        revision = self.store.save_workflow_session(
+            "atomic-goal",
+            goal_id=None,
+            session_mode="normal",
+            plan_state="inspecting",
+            run_state="planning",
+            state={
+                "route": "goal",
+                "pending_semantic_turn": {
+                    "turn_id": "turn-atomic",
+                    "status": "dispatching",
+                    "attempt_state": "running",
+                },
+            },
+        )
+        goal, session = self.store.create_goal_and_bind_workflow_session(
+            "Create the durable project",
+            session_id="atomic-goal",
+            metadata={"execution_policy": {"mode": "normal", "strategy": "staged"}},
+            expected_revision=revision,
+            complete_semantic_turn_id="turn-atomic",
+        )
+        self.assertEqual(goal.status, GoalStatus.DISCOVERING)
+        self.assertEqual(session["goal_id"], goal.id)
+        self.assertEqual(session["revision"], revision + 1)
+        self.assertNotIn("pending_semantic_turn", session["state"])
+        self.assertEqual(
+            session["state"]["last_semantic_turn"]["result_status"],
+            "goal_created",
+        )
+
     def test_applicability_evidence_is_persisted_and_fingerprint_bound(self):
         goal = self._pending_goal()
         first_basis = plan_basis("T001")
@@ -207,7 +286,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get_plan(goal.id, plan.revision).fingerprint, plan.fingerprint)
         migrated = sqlite3.connect(path)
         try:
-            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 14)
+            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 15)
             self.assertIsNotNone(
                 migrated.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='ultra_runs'"

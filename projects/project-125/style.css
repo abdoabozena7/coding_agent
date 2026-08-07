@@ -1,0 +1,35 @@
+/* Full‑screen background gradient */
+body {
+  margin: 0;
+  overflow: hidden;
+  background: linear-gradient(135deg, #1e1e1e, #3b3b3b);
+  font-family: sans-serif;
+}
+
+/* Container for the calculator scene */
+#calculator {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+}
+
+/* Ensure the Three.js canvas fills the container */
+canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* Overlay display showing the current value */
+#display {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  font-size: 2rem;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.5);
+  padding: 5px 10px;
+  border-radius: 5px;
+  box-shadow: 0 0 10px rgba(0,0,0,0.7);
+}
+

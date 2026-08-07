@@ -234,6 +234,34 @@ def _bind_accepted_repair_feedback(
     return replace(plan, modules=tuple(bound_modules))
 
 
+def _bind_repair_feedback(
+    plan: MasterPlanV1,
+    feedback: str,
+) -> MasterPlanV1:
+    """Separate internal contract recovery from accepted product feedback."""
+
+    accepted = str(feedback or "").strip()
+    internal_contract_failure = (
+        "ultra foundation/phase" in accepted.casefold()
+        and "failed after three targeted typed-return repairs" in accepted.casefold()
+    )
+    if not internal_contract_failure:
+        return _bind_accepted_repair_feedback(plan, accepted)
+    return replace(
+        plan,
+        modules=tuple(
+            replace(
+                module,
+                metadata={
+                    **dict(module.metadata),
+                    "contract_recovery_diagnostic": accepted,
+                },
+            )
+            for module in plan.modules
+        ),
+    )
+
+
 def _explicit_repair_scope_paths(feedback: str) -> tuple[str, ...]:
     """Extract only paths the user explicitly marks as the entire repair scope.
 
@@ -473,6 +501,167 @@ _PUBLISH_COMPONENT_TOOL = {
                 "quality": {"type": "object"},
             },
             "required": ["interface", "preview"],
+        },
+    },
+}
+
+_SUBMIT_MASTER_PLAN_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_master_plan",
+        "description": (
+            "Submit the complete approval-bound master plan. This records planning data only; "
+            "it does not execute commands or mutate the workspace."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "execution_strategy": {"type": "string"},
+                "modules": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "title": {"type": "string"},
+                            "objective": {"type": "string"},
+                            "acceptance_criteria": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "verification": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "description": (
+                                        "Literal executable verifier. preview_html must receive "
+                                        "one workspace-relative .html path without a URL query or fragment."
+                                    ),
+                                },
+                            },
+                            "depends_on": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "write_paths": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "metadata": {
+                                "type": "object",
+                                "description": (
+                                    "For interactive preview modules include browser_scenarios: "
+                                    "an array of {name, steps:[{action, role, name, text or value}], "
+                                    "assertions:[{role, name, property, equals or contains}]} objects."
+                                ),
+                            },
+                        },
+                        "required": [
+                            "id",
+                            "title",
+                            "objective",
+                            "acceptance_criteria",
+                            "verification",
+                            "depends_on",
+                            "write_paths",
+                        ],
+                    },
+                },
+            },
+            "required": ["summary", "execution_strategy", "modules"],
+        },
+    },
+}
+
+_SUBMIT_BROWSER_SCENARIOS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_browser_scenarios",
+        "description": (
+            "Submit executable browser interaction scenarios for only the listed plan modules."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "modules": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "module_id": {"type": "string"},
+                            "browser_scenarios": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "steps": {
+                                            "type": "array",
+                                            "minItems": 1,
+                                            "items": {
+                                                "type": "object",
+                                                "description": (
+                                                    "Executable step. Use action click with role/name or selector; "
+                                                    "action fill with role/name or selector plus value; or action "
+                                                    "press with key. role is an ARIA role such as textbox, button, "
+                                                    "or heading, never an HTML tag such as input or h2. Never use "
+                                                    "action type."
+                                                ),
+                                                "properties": {
+                                                    "action": {
+                                                        "type": "string",
+                                                        "enum": ["click", "fill", "press"],
+                                                    },
+                                                    "role": {"type": "string"},
+                                                    "name": {"type": "string"},
+                                                    "selector": {"type": "string"},
+                                                    "value": {"type": "string"},
+                                                    "key": {"type": "string"},
+                                                },
+                                                "required": ["action"],
+                                            },
+                                        },
+                                        "assertions": {
+                                            "type": "array",
+                                            "minItems": 1,
+                                            "items": {
+                                                "type": "object",
+                                                "description": (
+                                                    "Observable assertion with role/name or selector, property "
+                                                    "value or text, and exactly one expected value in equals or "
+                                                    "contains. Use property value only for form controls such as "
+                                                    "textbox, combobox, spinbutton, or slider; use property text "
+                                                    "for status, heading, button, and other elements. role is an "
+                                                    "ARIA role, not an HTML tag."
+                                                ),
+                                                "properties": {
+                                                    "role": {"type": "string"},
+                                                    "name": {"type": "string"},
+                                                    "selector": {"type": "string"},
+                                                    "property": {
+                                                        "type": "string",
+                                                        "enum": ["value", "text"],
+                                                    },
+                                                    "equals": {"type": "string"},
+                                                    "contains": {"type": "string"},
+                                                },
+                                                "required": ["property"],
+                                            },
+                                        },
+                                    },
+                                    "required": ["name", "steps", "assertions"],
+                                },
+                            },
+                        },
+                        "required": ["module_id", "browser_scenarios"],
+                    },
+                }
+            },
+            "required": ["modules"],
         },
     },
 }
@@ -1208,6 +1397,36 @@ _PHASE_CONTRACTS: dict[str, Mapping[str, Any]] = {
             ],
         }
     },
+    "browser_scenarios": {
+        "payload": {
+            "modules": [
+                {
+                    "module_id": "exact approved module id",
+                    "browser_scenarios": [
+                        {
+                            "name": "observable user flow",
+                            "steps": [
+                                {
+                                    "action": "click, fill, or press",
+                                    "role": "accessible role",
+                                    "name": "accessible name",
+                                    "value": "required text for fill",
+                                }
+                            ],
+                            "assertions": [
+                                {
+                                    "role": "accessible role",
+                                    "name": "accessible name",
+                                    "property": "value or text",
+                                    "equals": "expected result",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    },
     InnerPhase.MINI_PLAN.value: {
         "payload": {"steps": ["step"], "research_required": False}
     },
@@ -1904,6 +2123,7 @@ class WorkspaceUltraAgent:
             "architecture_critique",
             "architecture_judge",
             "master_plan",
+            "browser_scenarios",
         }
         effective_effort = configured_effort
         if self.provider_name == "ollama" and (
@@ -2774,6 +2994,14 @@ class WorkspaceUltraAgent:
             if request.phase in compact_foundation_phases
             else _schemas(allowed_tools)
         )
+        if request.phase == "master_plan" and self.provider_name == "ollama":
+            # Gemma-family local models are markedly more reliable when this
+            # large nested contract is transported as one native tool call.
+            # The arguments remain entirely model-authored and still pass the
+            # same MasterPlanV1 and applicability validators before approval.
+            schemas.append(dict(_SUBMIT_MASTER_PLAN_TOOL))
+        elif request.phase == "browser_scenarios" and self.provider_name == "ollama":
+            schemas.append(dict(_SUBMIT_BROWSER_SCENARIOS_TOOL))
         if component_publication_phase:
             # Gemma-family local templates are substantially more reliable
             # when the first turn has one unambiguous action. Publication is
@@ -2890,6 +3118,29 @@ class WorkspaceUltraAgent:
                         "include that exact preview target in write_paths. Choose commands and "
                         "paths from the model-authored plan; do not emit placeholders."
                     )
+                    if self.provider_name == "ollama":
+                        system_prompt += (
+                            " LOCAL MASTER PLAN TRANSPORT: call submit_master_plan exactly "
+                            "once with the complete plan. Return no prose and call no other tool. "
+                            "A preview_html verifier must end at the literal .html path with no "
+                            "query or #fragment. Put clicks, typing, and expected UI state in "
+                            "that module's metadata.browser_scenarios steps and assertions."
+                        )
+                elif request.phase == "browser_scenarios" and self.provider_name == "ollama":
+                    system_prompt += (
+                        "\n\nLOCAL BROWSER SCENARIO TRANSPORT: call "
+                        "submit_browser_scenarios exactly once. Return no prose and call no "
+                        "other tool. Preserve every exact module_id. Each scenario requires "
+                        "non-empty executable steps and observable assertions. Supported steps "
+                        "are click(role/name or selector), fill(role/name or selector plus value), "
+                        "and press(key); never emit action type. Assertions require a target, "
+                        "property value or text, and equals or contains. role values must be ARIA "
+                        "roles such as textbox, button, heading, or status, never HTML tags like "
+                        "input, h2, or div. Use property value only with form-control roles; use "
+                        "property text for status, heading, button, and other elements."
+                        " module_id belongs on each parent modules[] object, never inside an "
+                        "individual browser_scenarios[] object."
+                    )
                 if self.role is AgentRole.CODER and request.phase in {
                     InnerPhase.IMPLEMENT.value,
                     InnerPhase.FIX.value,
@@ -2988,6 +3239,78 @@ class WorkspaceUltraAgent:
                         )
             conversation.append(turn.to_message())
             if turn.tool_calls:
+                if request.phase == "master_plan" and self.provider_name == "ollama":
+                    submitted = [
+                        call
+                        for call in turn.tool_calls
+                        if call.name == "submit_master_plan"
+                    ]
+                    if len(submitted) == 1 and len(turn.tool_calls) == 1:
+                        self.events.publish(
+                            "ultra.master_plan_transport_submitted",
+                            "Local planner submitted the approval-bound plan through typed transport.",
+                            run_id=request.run_id,
+                            node_id=request.node_id,
+                            role=self.role.value,
+                            phase=request.phase,
+                        )
+                        return AgentResponse(
+                            payload=dict(submitted[0].args),
+                            summary="Local planner submitted the typed master plan.",
+                            reasoning_summary=(
+                                "Plan semantics are model-authored; the harness only bound the "
+                                "typed transport and will run the normal validators."
+                            ),
+                            usage=dict(totals),
+                            provider=self.provider_name,
+                            model=self.model,
+                        )
+                    conversation.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "The master-plan turn must contain exactly one "
+                                "submit_master_plan call. Call it now with the complete plan."
+                            ),
+                        }
+                    )
+                    continue
+                if request.phase == "browser_scenarios" and self.provider_name == "ollama":
+                    submitted = [
+                        call
+                        for call in turn.tool_calls
+                        if call.name == "submit_browser_scenarios"
+                    ]
+                    if len(submitted) == 1 and len(turn.tool_calls) == 1:
+                        self.events.publish(
+                            "ultra.browser_scenarios_transport_submitted",
+                            "Local planner submitted bounded browser scenarios through typed transport.",
+                            run_id=request.run_id,
+                            node_id=request.node_id,
+                            role=self.role.value,
+                            phase=request.phase,
+                        )
+                        return AgentResponse(
+                            payload=dict(submitted[0].args),
+                            summary="Local planner submitted bounded browser scenarios.",
+                            reasoning_summary=(
+                                "Scenario semantics are model-authored; the harness only binds "
+                                "them to exact approval-bound module ids."
+                            ),
+                            usage=dict(totals),
+                            provider=self.provider_name,
+                            model=self.model,
+                        )
+                    conversation.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Call submit_browser_scenarios exactly once for every listed "
+                                "module_id with non-empty steps and assertions."
+                            ),
+                        }
+                    )
+                    continue
                 if not schemas:
                     conversation.append(
                         {
@@ -3946,11 +4269,16 @@ class WorkspaceUltraAgent:
                 )
                 empty_transport_turn = not compact_preview and not turn.tool_calls
                 if internal_token_only or empty_transport_turn:
+                    local_foundation_transport = bool(
+                        request.phase in {"master_plan", "browser_scenarios"}
+                        and self.provider_name == "ollama"
+                    )
                     if (
                         (
                             component_publication_phase
                             or component_leaf_quality_phase
                             or component_quality_triage_phase
+                            or local_foundation_transport
                         )
                         and component_unused_retries < 2
                     ):
@@ -3963,7 +4291,40 @@ class WorkspaceUltraAgent:
                                 cache_reset = True
                             except Exception:
                                 cache_reset = False
-                        if component_publication_phase:
+                        if request.phase == "master_plan" and local_foundation_transport:
+                            recovery_content = _json(
+                                {
+                                    "goal_spec": request.task.get("goal_spec", {}),
+                                    "architecture": request.task.get("architecture", {}),
+                                    "applicability_repair": request.task.get(
+                                        "applicability_repair", []
+                                    ),
+                                    "accepted_requested_effects": request.task.get(
+                                        "accepted_requested_effects", []
+                                    ),
+                                    "required_action": (
+                                        "Call submit_master_plan exactly once with the complete "
+                                        "approval-bound plan. Return no prose and call no other tool. "
+                                        "Use literal executable verification commands. preview_html "
+                                        "must receive one .html path without a query or fragment; "
+                                        "put clicks, typing, and assertions in metadata.browser_scenarios."
+                                    ),
+                                }
+                            )
+                        elif request.phase == "browser_scenarios" and local_foundation_transport:
+                            recovery_content = _json(
+                                {
+                                    "modules": request.task.get("modules", []),
+                                    "required_action": (
+                                        "Call submit_browser_scenarios exactly once. Preserve each "
+                                        "module_id and return at least one scenario with non-empty "
+                                        "executable steps and observable assertions. Use only click, "
+                                        "fill with value, or press with key. Assertions require a target, "
+                                        "property value or text, and equals or contains."
+                                    ),
+                                }
+                            )
+                        elif component_publication_phase:
                             specialist_domain = str(
                                 contract_metadata.get("specialist_domain")
                                 or request_contract.get("title")
@@ -4014,10 +4375,17 @@ class WorkspaceUltraAgent:
                             )
                         conversation = [{"role": "user", "content": recovery_content}]
                         self.events.publish(
-                            "ultra.component_transport_recovered",
                             (
-                                f"[{request.node_id}] retried degraded local response with "
-                                f"minimal component packet ({component_unused_retries}/2); "
+                                "ultra.master_plan_transport_recovered"
+                                if request.phase == "master_plan" and local_foundation_transport
+                                else "ultra.browser_scenarios_transport_recovered"
+                                if request.phase == "browser_scenarios" and local_foundation_transport
+                                else "ultra.component_transport_recovered"
+                            ),
+                            (
+                                f"[{request.node_id or request.phase}] retried degraded local "
+                                f"response with a minimal {request.phase} packet "
+                                f"({component_unused_retries}/2); "
                                 f"model_cache_reset={cache_reset}"
                             ),
                             run_id=request.run_id,
@@ -9974,7 +10342,7 @@ class UltraSession:
                 )
             ) if not allow_scope_expansion else (),
         )
-        plan = _bind_accepted_repair_feedback(
+        plan = _bind_repair_feedback(
             plan,
             redact_text(feedback, 4_000),
         )

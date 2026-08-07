@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 import json
+import os
 import re
 from typing import Any, Iterable, Mapping
 from datetime import datetime
@@ -273,6 +274,34 @@ def _unique_text(values: Any) -> list[str]:
     return result
 
 
+def _windows_verification_step(value: str) -> str:
+    """Translate an unambiguous POSIX file-content check to Windows cmd."""
+
+    text = _text(value)
+    lowered = text.casefold()
+    if "cat " not in lowered or "grep" not in lowered:
+        return text
+    path_match = re.search(r"\bcat\s+['\"]?([./\\\w.-]+)", text, re.IGNORECASE)
+    expected_match = re.search(
+        r"grep\s+(?:-q\s+)?['\"]?\^?([^'\"$]+)\$?['\"]?",
+        text,
+        re.IGNORECASE,
+    )
+    if path_match is None or expected_match is None:
+        return text
+    path = path_match.group(1).replace("\\", "/").removeprefix("./")
+    expected = expected_match.group(1).strip()
+    if not path or not expected:
+        return text
+    escaped_path = path.replace("'", "''")
+    escaped_expected = expected.replace("'", "''")
+    return (
+        "Run python -c \"from pathlib import Path; assert "
+        f"Path('{escaped_path}').read_text(encoding='utf-8') == '{escaped_expected}'\" "
+        "and require exit code 0."
+    )
+
+
 _EARLIER_TASK = re.compile(r"^(?:task\s*)?(\d+)$", re.IGNORECASE)
 _STABLE_TASK = re.compile(r"^T(\d{1,3})$", re.IGNORECASE)
 
@@ -346,6 +375,13 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
                 actions.append(
                     f"/tasks/{index - 1}/verification projected from an "
                     "explicit command in its task contract"
+                )
+        if os.name == "nt" and verification:
+            platform_verification = [_windows_verification_step(item) for item in verification]
+            if platform_verification != verification:
+                verification = platform_verification
+                actions.append(
+                    f"/tasks/{index - 1}/verification normalized for Windows cmd"
                 )
         expected = _unique_text(item.get("expected_changes", item.get("changes")))
         requirement_refs = [value.upper() for value in _unique_text(item.get("requirement_refs"))]
@@ -436,7 +472,34 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
                 }
             )
     expected_changes: list[dict[str, Any]] = []
-    for change in raw.get("expected_changes", ()) or ():
+    raw_expected_changes = list(raw.get("expected_changes", ()) or ())
+    # A few local tool-call models understand the per-task shape more readily
+    # than the canonical plan-level mutation contract.  Lift those authored
+    # objects mechanically when the plan-level array is omitted; this keeps
+    # the path, intent, basis, and evidence model-owned while giving the
+    # deterministic semantic/applicability gates the contract they validate.
+    if not raw_expected_changes:
+        for task_index, raw_task in enumerate(tasks_raw, 1):
+            if not isinstance(raw_task, Mapping):
+                continue
+            local_changes = raw_task.get("expected_changes", raw_task.get("changes", ()))
+            if isinstance(local_changes, Mapping):
+                local_changes = (local_changes,)
+            if not isinstance(local_changes, (list, tuple)):
+                continue
+            for local_change in local_changes:
+                if not isinstance(local_change, Mapping):
+                    continue
+                lifted = dict(local_change)
+                supports = lifted.get("supports_tasks")
+                if supports in (None, "", (), []):
+                    lifted["supports_tasks"] = [f"T{task_index:03d}"]
+                raw_expected_changes.append(lifted)
+                actions.append(
+                    f"/tasks/{task_index - 1}/expected_changes lifted to the "
+                    "plan-level mutation contract"
+                )
+    for change in raw_expected_changes:
         if isinstance(change, Mapping):
             path, intent = _text(change.get("path")), _text(change.get("intent"))
             raw_basis = _text(change.get("basis"))
@@ -456,6 +519,7 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
                 "explicit user requirement": "explicit_user_requirement",
                 "explicit user": "explicit_user_requirement",
                 "explicit_user_requirement": "explicit_user_requirement",
+                "user_request": "explicit_user_requirement",
                 "user request": "explicit_user_requirement",
                 "user:request": "explicit_user_requirement",
             }
@@ -590,6 +654,34 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
         # contract unless the model supplied an exact top-level path.
         task.pop("expected_changes", None)
 
+    summary = _text(raw.get("summary", raw.get("objective")))
+    if not summary:
+        # Small local models often provide the complete execution strategy but
+        # omit the redundant top-level summary. Reuse that authored strategy
+        # as the plan heading instead of spending the bounded repair budget on
+        # a cosmetic field that carries no new product meaning.
+        summary = _text(raw.get("execution_strategy", raw.get("strategy")))
+        if summary:
+            actions.append("/summary derived from execution_strategy")
+    if not summary and tasks:
+        first_task = tasks[0]
+        summary = _text(first_task.get("description", first_task.get("title")))
+        if summary:
+            actions.append("/summary derived from the first task objective")
+
+    execution_strategy = _text(raw.get("execution_strategy", raw.get("strategy")))
+    if not execution_strategy and tasks:
+        # The strategy is an executable persistence field, not optional model
+        # decoration.  A local model can omit it while still supplying a
+        # complete task contract; derive the smallest semantics-preserving
+        # orchestration rule from those authored tasks so plan persistence
+        # does not fail after an otherwise valid review.
+        execution_strategy = (
+            "Execute the accepted tasks in dependency order, apply each bounded change, "
+            "then run every listed verification step and record authoritative evidence."
+        )
+        actions.append("/execution_strategy derived from the accepted task contract")
+
     normalized = {
         "semantic_goal": (
             dict(raw.get("semantic_goal"))
@@ -597,9 +689,9 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
             else {}
         ),
         "semantic_fingerprint": _text(raw.get("semantic_fingerprint")),
-        "summary": _text(raw.get("summary", raw.get("objective"))),
+        "summary": summary,
         "applicability_evidence": applicability,
-        "execution_strategy": _text(raw.get("execution_strategy", raw.get("strategy"))),
+        "execution_strategy": execution_strategy,
         "expected_changes": expected_changes,
         "tasks": tasks,
     }

@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 from ..store import NotFoundError, StalePlanError, StateStoreError
+from ..runtime import ProviderUnavailableError
 from ..events import LiveWorkflowEventV1
 from .schemas import (
     ExplanationRequestPayload,
@@ -30,16 +31,58 @@ from .schemas import (
     QueueReorderPayload,
     ReviewSubmissionPayload,
     ToolApprovalPayload,
+    WorkspaceActionRequest,
 )
 from .security import SessionSecurity
 from .service import CoreWebAdapter
 
 
-VIEWS = frozenset({"plan", "review", "agents"})
+VIEWS = frozenset({"thread", "plan", "review", "agents", "execution", "history", "tree", "diff"})
+
+
+def _set_web_control_connected(runtime: Any, connected: bool) -> None:
+    """Publish actual browser ownership to both runtime and terminal UI."""
+
+    value = bool(connected)
+    setattr(runtime, "web_control_connected", value)
+    sink = getattr(runtime, "web_control_state_sink", None)
+    if callable(sink):
+        sink(value)
+
+
+def _error_code(message: str, status: int) -> str:
+    value = str(message or "").casefold()
+    if status == 401:
+        return "session_expired"
+    if status == 403:
+        return "permission_denied"
+    if status == 404:
+        return "not_found"
+    if status == 409:
+        return "stale_state"
+    if any(token in value for token in ("quota", "usage limit", "limit exhausted")):
+        return "quota_exhausted"
+    if any(
+        token in value
+        for token in ("local model runner", "ollama", "local runner")
+    ) and any(token in value for token in ("unavailable", "unreachable", "offline", "connection")):
+        return "local_runner_unreachable"
+    if status == 429 or "rate limit" in value or "too many requests" in value:
+        return "rate_limited"
+    if any(token in value for token in ("network", "unreachable", "connection", "timed out")):
+        return "runtime_unreachable"
+    if status == 422:
+        return "invalid_request"
+    if status >= 500:
+        return "runtime_error"
+    return "request_failed"
 
 
 def _error(message: str, status: int, **extra: Any) -> JSONResponse:
-    return JSONResponse({"error": message, **extra}, status_code=status)
+    return JSONResponse(
+        {"error": message, "code": _error_code(message, status), **extra},
+        status_code=status,
+    )
 
 
 def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
@@ -51,6 +94,7 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
         openapi_url=None,
     )
     app.state.port = 0
+    app.state.web_connections = 0
     app.mount("/assets", StaticFiles(directory=static_dir), name="assets")
 
     @app.middleware("http")
@@ -90,6 +134,10 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
     async def validation_error(_request: Request, exc: RequestValidationError):
         return _error("Request validation failed.", 422, details=exc.errors())
 
+    @app.exception_handler(HTTPException)
+    async def http_error(_request: Request, exc: HTTPException):
+        return _error(str(exc.detail), int(exc.status_code), details=exc.detail)
+
     @app.exception_handler(NotFoundError)
     async def not_found(_request: Request, exc: NotFoundError):
         return _error(str(exc), 404)
@@ -105,6 +153,18 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
     @app.exception_handler(StateStoreError)
     async def state_conflict(_request: Request, exc: StateStoreError):
         return _error(str(exc), 409)
+
+    @app.exception_handler(ProviderUnavailableError)
+    async def provider_unavailable(_request: Request, exc: ProviderUnavailableError):
+        # Provider failures are expected workflow boundaries, not ASGI faults.
+        # Returning a named, retryable response lets the client refresh the
+        # durable checkpoint and expose Retry/local/Stop without a raw 500.
+        return _error(
+            str(exc),
+            503,
+            retryable=True,
+            saved_stage=True,
+        )
 
     @app.exception_handler(ValueError)
     async def bad_value(_request: Request, exc: ValueError):
@@ -157,6 +217,12 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
         if session_id != adapter.session_id:
             raise HTTPException(status_code=404, detail="session not found")
 
+    @app.get("/api/sessions")
+    async def get_sessions():
+        """Left-rail project/task projection for the current local owner."""
+
+        return adapter.sessions_index_snapshot()
+
     @app.get("/api/sessions/{session_id}/plan")
     async def get_plan(session_id: str):
         check_session(session_id)
@@ -166,6 +232,30 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
     async def get_workspace(session_id: str):
         check_session(session_id)
         return adapter.workspace_context()
+
+    @app.get("/api/sessions/{session_id}/thread")
+    async def get_thread(
+        session_id: str,
+        after_sequence: int = 0,
+        limit: int = 200,
+    ):
+        check_session(session_id)
+        return adapter.thread_snapshot(after_sequence=after_sequence, limit=limit)
+
+    @app.get("/api/sessions/{session_id}/inspector")
+    async def get_inspector(session_id: str, section: str | None = None):
+        check_session(session_id)
+        return adapter.inspector_snapshot(section)
+
+    @app.get("/api/sessions/{session_id}/models")
+    async def get_models(session_id: str):
+        check_session(session_id)
+        return await asyncio.to_thread(adapter.model_catalog_snapshot)
+
+    @app.get("/api/sessions/{session_id}/project-settings")
+    async def get_project_settings(session_id: str):
+        check_session(session_id)
+        return await asyncio.to_thread(adapter.project_settings_snapshot)
 
     @app.get("/api/sessions/{session_id}/events")
     async def live_events(request: Request, session_id: str):
@@ -181,10 +271,17 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
         async def stream():
             queue = adapter.events.open_queue()
             cursor = after_sequence
+            app.state.web_connections = int(app.state.web_connections) + 1
+            _set_web_control_connected(adapter.runtime, True)
             try:
                 snapshot = adapter.workspace_context()
                 latest = adapter.events.latest_sequence
                 cursor = max(cursor, latest)
+                snapshot_identity = dict(snapshot.get("workflow_identity") or {})
+                snapshot["activity_sequence"] = latest
+                snapshot["content_revision"] = snapshot_identity.get(
+                    "content_revision", 0
+                )
                 yield "retry: 1000\n"
                 yield (
                     f"id: {latest}\n"
@@ -200,16 +297,29 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
                     if item.sequence <= cursor:
                         continue
                     cursor = item.sequence
+                    payload = item.to_dict()
+                    payload["activity_sequence"] = item.sequence
+                    try:
+                        identity = dict(
+                            adapter.workspace_context().get("workflow_identity") or {}
+                        )
+                        payload["content_revision"] = identity.get(
+                            "content_revision", 0
+                        )
+                    except Exception:
+                        payload["content_revision"] = snapshot_identity.get(
+                            "content_revision", 0
+                        )
                     yield (
                         f"id: {item.sequence}\n"
                         "event: activity\n"
-                        f"data: {json.dumps(item.to_dict(), ensure_ascii=False, separators=(',', ':'))}\n\n"
+                        f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
                     )
                 while not security.expired:
                     if await request.is_disconnected():
                         break
                     try:
-                        event = await asyncio.to_thread(queue.get, True, 10.0)
+                        event = await asyncio.to_thread(queue.get, True, 1.0)
                     except Empty:
                         yield ": keepalive\n\n"
                         continue
@@ -217,13 +327,28 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
                     if item.sequence <= cursor:
                         continue
                     cursor = item.sequence
+                    payload = item.to_dict()
+                    payload["activity_sequence"] = item.sequence
+                    try:
+                        identity = dict(
+                            adapter.workspace_context().get("workflow_identity") or {}
+                        )
+                        payload["content_revision"] = identity.get(
+                            "content_revision", 0
+                        )
+                    except Exception:
+                        payload["content_revision"] = snapshot_identity.get(
+                            "content_revision", 0
+                        )
                     yield (
                         f"id: {item.sequence}\n"
                         "event: activity\n"
-                        f"data: {json.dumps(item.to_dict(), ensure_ascii=False, separators=(',', ':'))}\n\n"
+                        f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
                     )
             finally:
                 adapter.events.close_queue(queue)
+                app.state.web_connections = max(0, int(app.state.web_connections) - 1)
+                _set_web_control_connected(adapter.runtime, bool(app.state.web_connections))
 
         return StreamingResponse(
             stream(),
@@ -304,6 +429,62 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
     async def get_agents(session_id: str):
         check_session(session_id)
         return adapter.agents_snapshot()
+
+    @app.get("/api/sessions/{session_id}/execution")
+    async def get_execution(session_id: str):
+        check_session(session_id)
+        return adapter.execution_snapshot()
+
+    @app.get("/api/sessions/{session_id}/tree")
+    async def get_tree(session_id: str):
+        check_session(session_id)
+        return adapter.execution_snapshot()
+
+    @app.get("/api/sessions/{session_id}/diff")
+    async def get_diff(session_id: str, checkpoint: str | None = None):
+        check_session(session_id)
+        return adapter.review_snapshot(checkpoint)
+
+    @app.get("/api/sessions/{session_id}/history")
+    async def get_history(
+        session_id: str,
+        goal_id: str | None = None,
+        after: int = 0,
+        limit: int = 100,
+        phase: str | None = None,
+        actor: str | None = None,
+        entity_id: str | None = None,
+        failures_only: bool = False,
+    ):
+        check_session(session_id)
+        return adapter.history_snapshot(
+            goal_id=goal_id,
+            after_sequence=after,
+            limit=limit,
+            phase=phase,
+            actor=actor,
+            entity_id=entity_id,
+            failures_only=failures_only,
+        )
+
+    @app.get("/api/sessions/{session_id}/history/{sequence}")
+    async def get_history_event(session_id: str, sequence: int):
+        check_session(session_id)
+        history = adapter.history_snapshot(after_sequence=max(0, sequence - 1), limit=1)
+        items = [item for item in history.get("items", []) if item.get("sequence") == sequence]
+        if not items:
+            raise HTTPException(status_code=404, detail="history event not found")
+        return items[0]
+
+    @app.get("/api/sessions/{session_id}/plan/revisions")
+    async def get_plan_revisions(session_id: str, goal_id: str | None = None):
+        check_session(session_id)
+        return adapter.plan_revisions_snapshot(goal_id)
+
+    @app.post("/api/sessions/{session_id}/actions")
+    async def workspace_action(session_id: str, payload: WorkspaceActionRequest):
+        check_session(session_id)
+        return adapter.apply_workspace_action(payload)
 
     @app.post("/api/sessions/{session_id}/agents/explain")
     async def request_explanation(session_id: str, payload: ExplanationRequestPayload):
@@ -407,6 +588,10 @@ class LocalWebServer:
         deadline = time.monotonic() + max(0.1, timeout)
         while time.monotonic() < deadline:
             if self._server.started:
+                # A running loopback server is not the same as an attached Web
+                # control surface. The SSE stream owns this flag so terminal
+                # fallback remains available until a real browser connects.
+                _set_web_control_connected(self.runtime, False)
                 return self
             if not self._thread.is_alive():
                 break
@@ -444,6 +629,7 @@ class LocalWebServer:
         }
 
     def stop(self, timeout: float = 5.0) -> None:
+        _set_web_control_connected(self.runtime, False)
         self.security.invalidate()
         if self._unsubscribe is not None:
             self._unsubscribe()

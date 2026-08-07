@@ -12,7 +12,7 @@ from agent.durable_memory import (
 )
 from agent.goal_outcome import GoalOutcomeContractV1, GoalOutcomeState
 from agent.project_brain import ProjectBrain
-from agent.store import StateStore
+from agent.store import SCHEMA_VERSION, StateStore
 from agent.ultra_models import (
     ExecutionClass,
     TaskContractV1,
@@ -82,7 +82,7 @@ class DurableMemoryV11Tests(unittest.TestCase):
                 try:
                     self.assertEqual(
                         connection.execute("PRAGMA user_version").fetchone()[0],
-                        14,
+                        SCHEMA_VERSION,
                     )
                 finally:
                     connection.close()

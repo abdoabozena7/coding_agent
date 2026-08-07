@@ -1108,6 +1108,12 @@ def _compact_progress_lines(snapshot: WorkspaceSnapshot, width: int) -> list[str
     return lines[:3]
 
 
+def _sleep_text(snapshot: WorkspaceSnapshot) -> str:
+    if not snapshot.sleep_enabled:
+        return "Sleep off"
+    return "Sleep FULL" if snapshot.sleep_policy == "full" else "Sleep SAFE"
+
+
 def _telemetry_text(snapshot: WorkspaceSnapshot, width: int) -> str:
     resource = snapshot.resources
     if resource.execution_class == "cloud":
@@ -1127,7 +1133,7 @@ def _telemetry_text(snapshot: WorkspaceSnapshot, width: int) -> str:
         ]
         if resource.cached_tokens:
             cloud_parts.append(f"cached {resource.cached_tokens / 1000:.1f}k")
-        cloud_parts.extend((limits, "Sleep ON" if snapshot.sleep_enabled else "Sleep off"))
+        cloud_parts.extend((limits, _sleep_text(snapshot)))
         return _fit(" · ".join(cloud_parts), width).rstrip()
     if width < 80:
         parts: list[str] = []
@@ -1148,7 +1154,7 @@ def _telemetry_text(snapshot: WorkspaceSnapshot, width: int) -> str:
             "using tool": "tool",
         }.get(resource.model_activity, resource.model_activity)
         parts.append(f"mdl {activity[:8]}")
-        parts.append("Sleep ON" if snapshot.sleep_enabled else "Sleep off")
+        parts.append(_sleep_text(snapshot))
         return _fit("  ".join(parts), width).rstrip()
 
     parts: list[str] = []
@@ -1173,7 +1179,7 @@ def _telemetry_text(snapshot: WorkspaceSnapshot, width: int) -> str:
     else:
         parts.append(f"ctx {used / 1000:.1f}k · left ?")
     parts.append(f"model {resource.model_activity}")
-    parts.append("Sleep ON" if snapshot.sleep_enabled else "Sleep off")
+    parts.append(_sleep_text(snapshot))
     return _fit(" · ".join(parts), width).rstrip()
 
 
@@ -1182,7 +1188,11 @@ def _contextual_footer_text(snapshot: WorkspaceSnapshot, width: int) -> str:
 
     if snapshot.attention is not None:
         if snapshot.attention.kind.value == "approval":
-            value = "[Y] Allow once | [N] Deny | / Commands | Arrows Select | Enter Confirm"
+            value = (
+                "Decision required in Workspace | /open-web | terminal fallback only"
+                if snapshot.control_surface == "web"
+                else "[Y] Allow once | [N] Deny | / Commands | Arrows Select | Enter Confirm"
+            )
         else:
             value = "Arrows Select | Enter Confirm | Esc Back | ? Help"
     elif snapshot.runtime_phase == "waiting_for_approval":
@@ -1197,7 +1207,7 @@ def _contextual_footer_text(snapshot: WorkspaceSnapshot, width: int) -> str:
         value = "F5 Activity | /details Diagnose | /resume Retry | ? Help"
     else:
         target = "Simple" if snapshot.mode is ExperienceMode.ADVANCED else "Advanced"
-        value = f"/ Commands | F2 {target} | F5 Activity | F6 Sleep {'ON' if snapshot.sleep_enabled else 'OFF'} | ? Help"
+        value = f"/ Commands | F2 {target} | F5 Activity | F6 {_sleep_text(snapshot)} | ? Help"
     if snapshot.queued_count:
         value += f" | queued {snapshot.queued_count}"
     return _fit(value, width).rstrip()
@@ -1980,10 +1990,28 @@ class PersistentWorkspaceApp:
             if self._palette_open and self._complete_palette(execute=True):
                 event.app.invalidate()
                 return
+            if attention is not None and value:
+                command_name = value.casefold().split(maxsplit=1)[0].replace(":", "/", 1)
+                if command_name in {"/open-web", "/stop", "/sleep", "/status", "/activity"}:
+                    # Control and recovery commands must remain usable even
+                    # while an approval owns the normal composer. Otherwise
+                    # the UI can instruct the user to open/stop and then
+                    # reject the exact command it advertised.
+                    self._buffer.reset()
+                    self.on_input(WorkspaceInput(text=value))
+                    return
             if attention is not None:
+                terminal_decision_blocked = (
+                    attention.kind.value == "approval"
+                    and self.store.snapshot().control_surface == "web"
+                )
                 if value and attention.allow_custom:
                     self._buffer.reset()
                     self.store.resolve_attention("custom", text=value)
+                elif terminal_decision_blocked:
+                    self.store.set_attention_feedback(
+                        "Decision required in Workspace. Use /open-web; terminal fallback is reserved for Web outages."
+                    )
                 elif not value:
                     self.store.resolve_selected_attention()
                 else:
@@ -2136,6 +2164,11 @@ class PersistentWorkspaceApp:
                     self._buffer.insert_text(pressed)
                     return
                 if request.kind.value == "approval":
+                    if self.store.snapshot().control_surface == "web":
+                        self.store.set_attention_feedback(
+                            "Decision required in Workspace. Use /open-web; terminal fallback is reserved for Web outages."
+                        )
+                        return
                     aliases = {
                         "a": {"allow_once", "allow_session", "allow", "yes"},
                         "d": {"deny", "cancel", "no"},
@@ -2415,7 +2448,7 @@ class PersistentWorkspaceApp:
                 ))
             fragments.append((
                 "class:workspace.queue",
-                " [Y] Allow once    [N] Deny    (or type /allow or /deny)\n",
+                " Decision required in Workspace / Open Web / terminal keys are emergency fallback (/allow or /deny)\n",
             ))
         phase = str(snapshot.runtime_phase or snapshot.progress.phase or "ready").replace("_", " ").title()
         operation = (
@@ -2444,7 +2477,12 @@ class PersistentWorkspaceApp:
         elif liveness == "server_processing":
             evidence = "Ollama is actively generating · structured response is atomic"
         elif liveness == "network_unavailable":
-            evidence = "Provider/network unavailable · saved stage unchanged"
+            local_runner = snapshot.resources.execution_class != "cloud"
+            evidence = (
+                "Local model runner unavailable · saved stage unchanged"
+                if local_runner
+                else "Internet/provider unavailable · saved stage unchanged"
+            )
         elif liveness == "request_sent":
             evidence = "Request open · no response bytes yet"
         elif liveness == "stalled":
@@ -2485,6 +2523,14 @@ class PersistentWorkspaceApp:
                 ))
             if snapshot.current_task:
                 fragments.append(("class:workspace.assistant", f" Task · {_fit(snapshot.current_task, width - 8).rstrip()}\n"))
+            next_task = snapshot.next_task or "Determined by the harness after the current checkpoint"
+            needs_you = "Decision required in Workspace" if snapshot.attention is not None else "Nothing right now"
+            last = snapshot.live_timeline[-1].message if snapshot.live_timeline else "No milestone recorded yet"
+            fragments.extend((
+                ("class:workspace.muted", f" NEXT · {_fit(next_task, width - 8).rstrip()}\n"),
+                ("class:workspace.muted", f" NEEDS YOU · {_fit(needs_you, width - 8).rstrip()}\n"),
+                ("class:workspace.muted", f" LAST MILESTONE · {_fit(last, width - 17).rstrip()}\n"),
+            ))
 
         if snapshot.mode is ExperienceMode.ADVANCED:
             if snapshot.task_items:
@@ -2693,8 +2739,15 @@ class PersistentWorkspaceApp:
             if request.kind is AttentionKind.APPROVAL:
                 fragments.append((
                     "class:workspace.muted",
-                    "   Choose Allow once or Deny; nothing runs automatically.\n",
+                    "   Decision required in Workspace · Open Web. Terminal controls are emergency fallback only.\n",
                 ))
+
+        if snapshot.control_surface == "web" and request.kind is AttentionKind.APPROVAL:
+            fragments.append((
+                "class:workspace.queue",
+                "   Open Web · /open-web   (terminal approval is available only if Web is disconnected)\n",
+            ))
+            return FormattedText(fragments)
 
         page_size = 3
         total_options = len(request.options)

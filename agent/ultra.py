@@ -2236,6 +2236,157 @@ class UltraOrchestrator:
                     "final_evidence.success derived from authoritative artifact hashes, "
                     "executable checks, and accepted global review"
                 )
+        if phase == "browser_scenarios":
+            raw_modules = normalized.get("modules")
+            if not raw_modules:
+                target_modules = task.get("modules")
+                target_sequence = (
+                    target_modules
+                    if isinstance(target_modules, Sequence)
+                    and not isinstance(target_modules, (str, bytes))
+                    else ()
+                )
+                root_scenarios = normalized.get("browser_scenarios")
+                if root_scenarios is None:
+                    root_scenarios = normalized.get("scenarios")
+                if (
+                    isinstance(root_scenarios, Sequence)
+                    and not isinstance(root_scenarios, (str, bytes))
+                    and root_scenarios
+                    and len(target_sequence) == 1
+                    and isinstance(target_sequence[0], Mapping)
+                ):
+                    target_id = str(target_sequence[0].get("module_id") or "").strip()
+                    if target_id:
+                        normalized["modules"] = [
+                            {
+                                "module_id": target_id,
+                                "browser_scenarios": list(root_scenarios),
+                            }
+                        ]
+                        actions.append(
+                            "browser_scenarios root scenarios bound to the one exact requested module"
+                        )
+                elif (
+                    str(normalized.get("module_id") or "").strip()
+                    and isinstance(root_scenarios, Sequence)
+                    and not isinstance(root_scenarios, (str, bytes))
+                    and root_scenarios
+                ):
+                    normalized["modules"] = [
+                        {
+                            "module_id": str(normalized["module_id"]).strip(),
+                            "browser_scenarios": list(root_scenarios),
+                        }
+                    ]
+                    actions.append(
+                        "browser_scenarios single-module root envelope normalized"
+                    )
+            raw_modules = normalized.get("modules")
+            if isinstance(raw_modules, Sequence) and not isinstance(
+                raw_modules, (str, bytes)
+            ):
+                modules: list[Any] = []
+                for raw_module in raw_modules:
+                    if not isinstance(raw_module, Mapping):
+                        modules.append(raw_module)
+                        continue
+                    module = dict(raw_module)
+                    raw_scenarios = module.get("browser_scenarios")
+                    if isinstance(raw_scenarios, Sequence) and not isinstance(
+                        raw_scenarios, (str, bytes)
+                    ):
+                        if not str(module.get("module_id") or "").strip():
+                            nested_ids = {
+                                str(item.get("module_id") or "").strip()
+                                for item in raw_scenarios
+                                if isinstance(item, Mapping)
+                                and str(item.get("module_id") or "").strip()
+                            }
+                            if len(nested_ids) == 1:
+                                module["module_id"] = nested_ids.pop()
+                                actions.append(
+                                    "browser_scenarios nested module_id moved to parent transport envelope"
+                                )
+                        scenarios: list[Any] = []
+                        for raw_scenario in raw_scenarios:
+                            if not isinstance(raw_scenario, Mapping):
+                                scenarios.append(raw_scenario)
+                                continue
+                            scenario = dict(raw_scenario)
+                            scenario.pop("module_id", None)
+                            for field in ("steps", "assertions"):
+                                raw_items = scenario.get(field)
+                                if not isinstance(raw_items, Sequence) or isinstance(
+                                    raw_items, (str, bytes)
+                                ):
+                                    continue
+                                items: list[Any] = []
+                                for raw_item in raw_items:
+                                    if not isinstance(raw_item, Mapping):
+                                        items.append(raw_item)
+                                        continue
+                                    item = dict(raw_item)
+                                    if not str(item.get("name") or "").strip():
+                                        for alias in ("accessible name", "accessible_name"):
+                                            if str(item.get(alias) or "").strip():
+                                                item["name"] = item.pop(alias)
+                                                actions.append(
+                                                    f"browser_scenarios.{field} accessible-name alias normalized"
+                                                )
+                                                break
+                                    if field == "steps":
+                                        action = str(item.get("action") or "").strip().casefold()
+                                        if action == "type":
+                                            item["action"] = "fill"
+                                            actions.append(
+                                                "browser_scenarios.steps type action normalized to fill"
+                                            )
+                                        if (
+                                            str(item.get("action") or "").strip().casefold() == "fill"
+                                            and "value" not in item
+                                            and "text" in item
+                                        ):
+                                            item["value"] = item.pop("text")
+                                            actions.append(
+                                                "browser_scenarios.steps fill text alias normalized to value"
+                                            )
+                                        role = str(item.get("role") or "").strip().casefold()
+                                        if (
+                                            str(item.get("action") or "").strip().casefold() == "fill"
+                                            and role in {"input", "textarea"}
+                                        ):
+                                            item["role"] = "textbox"
+                                            actions.append(
+                                                "browser_scenarios.steps HTML input role normalized to textbox"
+                                            )
+                                    else:
+                                        if (
+                                            item.get("equals") is None
+                                            and item.get("contains") is None
+                                            and "value" in item
+                                        ):
+                                            item["equals"] = item.pop("value")
+                                            actions.append(
+                                                "browser_scenarios.assertions expected value alias normalized to equals"
+                                            )
+                                        role = str(item.get("role") or "").strip().casefold()
+                                        if re.fullmatch(r"h[1-6]", role):
+                                            item["role"] = "heading"
+                                            actions.append(
+                                                "browser_scenarios.assertions HTML heading role normalized to heading"
+                                            )
+                                        elif role in {"input", "textarea"}:
+                                            item["role"] = "textbox"
+                                            actions.append(
+                                                "browser_scenarios.assertions HTML input role normalized to textbox"
+                                            )
+                                    items.append(item)
+                                scenario[field] = items
+                            scenarios.append(scenario)
+                        module["browser_scenarios"] = scenarios
+                    modules.append(module)
+                normalized["modules"] = modules
         # Transport normalization is deliberately semantic-free. It may
         # unwrap the requested typed envelope, but it must never manufacture
         # an objective, path, component, quality gate, dependency, or product
@@ -2818,6 +2969,123 @@ class UltraOrchestrator:
         if phase == "master_plan":
             MasterPlanV1.from_mapping(payload)
             return
+        if phase == "browser_scenarios":
+            raw_modules = payload.get("modules", ())
+            if not isinstance(raw_modules, Sequence) or isinstance(
+                raw_modules, (str, bytes)
+            ) or not raw_modules:
+                raise AgentProtocolError("browser_scenarios.modules must be a non-empty array")
+            for index, item in enumerate(raw_modules):
+                if not isinstance(item, Mapping):
+                    raise AgentProtocolError(
+                        f"browser_scenarios.modules[{index}] must be an object"
+                    )
+                module_id = str(item.get("module_id") or "").strip()
+                scenarios = item.get("browser_scenarios", ())
+                if not module_id or not isinstance(scenarios, Sequence) or isinstance(
+                    scenarios, (str, bytes)
+                ) or not scenarios:
+                    raise AgentProtocolError(
+                        f"browser_scenarios.modules[{index}] requires module_id and scenarios"
+                    )
+                for scenario_index, scenario in enumerate(scenarios):
+                    if not isinstance(scenario, Mapping):
+                        raise AgentProtocolError(
+                            "browser_scenarios scenario must be an object"
+                        )
+                    steps = scenario.get("steps", ())
+                    assertions = scenario.get("assertions", ())
+                    if (
+                        not str(scenario.get("name") or "").strip()
+                        or not isinstance(steps, Sequence)
+                        or isinstance(steps, (str, bytes))
+                        or not steps
+                        or not isinstance(assertions, Sequence)
+                        or isinstance(assertions, (str, bytes))
+                        or not assertions
+                        or not all(isinstance(step, Mapping) for step in steps)
+                        or not all(isinstance(assertion, Mapping) for assertion in assertions)
+                    ):
+                        raise AgentProtocolError(
+                            "browser_scenarios.modules"
+                            f"[{index}].browser_scenarios[{scenario_index}] requires "
+                            "a name, typed steps, and observable assertions"
+                        )
+                    for step_index, step in enumerate(steps):
+                        action = str(step.get("action") or "").strip().casefold()
+                        if action not in {"click", "fill", "press"}:
+                            raise AgentProtocolError(
+                                "browser_scenarios.modules"
+                                f"[{index}].browser_scenarios[{scenario_index}].steps"
+                                f"[{step_index}].action must be click, fill, or press"
+                            )
+                        if action == "press":
+                            if not str(step.get("key") or "").strip():
+                                raise AgentProtocolError(
+                                    "browser scenario press step requires key"
+                                )
+                            continue
+                        if not (
+                            str(step.get("selector") or "").strip()
+                            or str(step.get("role") or "").strip()
+                        ):
+                            raise AgentProtocolError(
+                                "browser scenario click/fill step requires role or selector"
+                            )
+                        role = str(step.get("role") or "").strip().casefold()
+                        if role in {"input", "textarea", "select", "div", "span"} or re.fullmatch(
+                            r"h[1-6]", role
+                        ):
+                            raise AgentProtocolError(
+                                "browser scenario step role must be an ARIA role, not an HTML tag"
+                            )
+                        if action == "fill" and "value" not in step:
+                            raise AgentProtocolError(
+                                "browser scenario fill step requires value"
+                            )
+                    for assertion_index, assertion in enumerate(assertions):
+                        if not (
+                            str(assertion.get("selector") or "").strip()
+                            or str(assertion.get("role") or "").strip()
+                        ):
+                            raise AgentProtocolError(
+                                "browser scenario assertion requires role or selector"
+                            )
+                        prop = str(assertion.get("property") or "").strip().casefold()
+                        role = str(assertion.get("role") or "").strip().casefold()
+                        if role in {"input", "textarea", "select", "div", "span"} or re.fullmatch(
+                            r"h[1-6]", role
+                        ):
+                            raise AgentProtocolError(
+                                "browser scenario assertion role must be an ARIA role, not an HTML tag"
+                            )
+                        if prop not in {"value", "text"}:
+                            raise AgentProtocolError(
+                                "browser_scenarios.modules"
+                                f"[{index}].browser_scenarios[{scenario_index}].assertions"
+                                f"[{assertion_index}].property must be value or text"
+                            )
+                        if (
+                            prop == "value"
+                            and not str(assertion.get("selector") or "").strip()
+                            and role
+                            not in {
+                                "textbox",
+                                "combobox",
+                                "spinbutton",
+                                "slider",
+                                "searchbox",
+                            }
+                        ):
+                            raise AgentProtocolError(
+                                "browser scenario property value requires a form-control role "
+                                "or an explicit selector; use text for status and headings"
+                            )
+                        if assertion.get("equals") is None and assertion.get("contains") is None:
+                            raise AgentProtocolError(
+                                "browser scenario assertion requires equals or contains"
+                            )
+            return
         if phase == InnerPhase.DECOMPOSE.value:
             raw_children = payload.get("children", ())
             if not isinstance(raw_children, Sequence) or isinstance(
@@ -3173,6 +3441,24 @@ class UltraOrchestrator:
                     "approved_write_paths", ()
                 ),
             )
+            scenario_issues = tuple(
+                issue
+                for issue in applicability_issues
+                if "metadata.browser_scenarios" in issue
+            )
+            if scenario_issues:
+                proposed = self._bind_model_authored_browser_scenarios(
+                    prompt,
+                    proposed,
+                    scenario_issues,
+                )
+                applicability_issues = self._master_plan_applicability_issues(
+                    proposed,
+                    requested_effects=requested_effects,
+                    approved_write_paths=self.run_state.config_snapshot.get(
+                        "approved_write_paths", ()
+                    ),
+                )
             if not applicability_issues:
                 break
             self.events.publish(
@@ -3260,6 +3546,109 @@ class UltraOrchestrator:
             fingerprint=self.master_plan.fingerprint,
         )
         return self.master_plan
+
+    def _bind_model_authored_browser_scenarios(
+        self,
+        prompt: str,
+        plan: MasterPlanV1,
+        issues: Sequence[str],
+    ) -> MasterPlanV1:
+        """Ask the planner for only missing interaction transport details.
+
+        Re-emitting a complete master plan is unnecessarily brittle for a
+        small local model. The model still authors every step and assertion;
+        the harness only binds the typed result to an exact existing module.
+        """
+
+        target_ids = {
+            match.group(1)
+            for issue in issues
+            for match in [re.search(r"module '([^']+)'", str(issue))]
+            if match is not None
+        }
+        targets = tuple(module for module in plan.modules if module.id in target_ids)
+        if not targets:
+            return plan
+        batches = (
+            tuple((module,) for module in targets)
+            if self.execution_class is ExecutionClass.LOCAL
+            else (targets,)
+        )
+        repairs: dict[str, list[dict[str, Any]]] = {}
+        for batch in batches:
+            response = self._invoke(
+                AgentRole.PLANNER,
+                "browser_scenarios",
+                task={
+                    "modules": [
+                        {
+                            "module_id": module.id,
+                            "title": module.title,
+                            "objective": module.objective,
+                            "acceptance_criteria": list(module.acceptance_criteria),
+                            "verification": list(module.verification),
+                        }
+                        for module in batch
+                    ],
+                    "applicability_repair": [
+                        issue
+                        for issue in issues
+                        if any(module.id in str(issue) for module in batch)
+                    ],
+                    "instruction": (
+                        "For each exact module_id, author the smallest executable browser "
+                        "scenario that proves its interactive acceptance criteria. Use accessible "
+                        "roles and names. Every scenario requires non-empty steps and assertions."
+                    ),
+                },
+                context={"prompt": prompt, "clean_context": True},
+            )
+            for item in response.payload.get("modules", ()):
+                if not isinstance(item, Mapping):
+                    continue
+                module_id = str(item.get("module_id") or "").strip()
+                scenarios = [
+                    dict(scenario)
+                    for scenario in item.get("browser_scenarios", ())
+                    if isinstance(scenario, Mapping)
+                ]
+                if module_id and scenarios:
+                    repairs[module_id] = scenarios
+        updated_modules: list[TaskContractV1] = []
+        bound = 0
+        for module in plan.modules:
+            scenarios = repairs.get(module.id)
+            if not scenarios:
+                updated_modules.append(module)
+                continue
+            updated_modules.append(
+                replace(
+                    module,
+                    metadata={
+                        **dict(module.metadata),
+                        "browser_scenarios": scenarios,
+                        "browser_scenarios_authorship": "model_typed_micro_step",
+                    },
+                )
+            )
+            bound += 1
+        if not bound:
+            raise AgentProtocolError(
+                "browser scenario repair did not preserve an exact approval-bound module id"
+            )
+        self.events.publish(
+            "ultra.master_plan_browser_scenarios_bound",
+            f"Bound model-authored browser scenarios to {bound} plan module(s).",
+            run_id=self.run_state.id if self.run_state else "",
+            modules=bound,
+        )
+        return MasterPlanV1(
+            summary=plan.summary,
+            modules=tuple(updated_modules),
+            milestones=plan.milestones,
+            execution_strategy=plan.execution_strategy,
+            revision=plan.revision,
+        )
 
     @staticmethod
     def _master_plan_applicability_issues(

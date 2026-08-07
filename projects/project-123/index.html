@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GA3BAD ULTRA Calculator</title>
+    <style>
+        /* General body styling */
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f4f7f9;
+            font-family: 'Arial', sans-serif;
+        }
+
+        #calculator-container {
+            width: 85%; /* Constrain container width */
+            max-width: 500px;
+            height: auto;
+            /* We let Three.js handle the rendering, but this wrapper provides context */
+            border-radius: 20px;
+            box-shadow: 0 15px 40px rgba(0, 0, 0, 0.3);
+            background-color: #ffffff;
+            padding: 20px;
+        }
+
+        /* Three.js rendering will occupy the container */
+    </style>
+</head>
+<body>
+
+<div id="calculator-container"></div>
+
+
+<script type="module">
+    import { coreLogic } from './src/calculator/CoreCalculatorLogic.js';
+    import { InputEventHandler } from './src/interaction/InputEventHandler.js';
+    import { THREEJSCoreRenderer } from './src/renderer/THREEJSCoreRenderer.js';
+
+    // Initialize Components
+    const renderer = new THREEJSCoreRenderer();
+    const eventHandler = new InputEventHandler(renderer);
+
+
+    /**
+     * Test Sequence: 5 + 3 = 8
+     * This simulates a user interaction flow to test the state machine integrity.
+     */
+    function runTestSequence() {
+        console.log("--- Starting Calculator State Test: 5 + 3 = 8 ---");
+
+        // 1. Input '5'
+        eventHandler.handleInput('5');
+
+        // Wait a moment for simulated visual update (if any)
+        setTimeout(() => {
+             // 2. Operation '+'
+            eventHandler.handleInput('+');
+
+            setTimeout(() => {
+                // 3. Input '3'
+                eventHandler.handleInput('3');
+
+                setTimeout(() => {
+                    // 4. Equals '='
+                    eventHandler.handleInput('=');
+
+                    console.log("--- Test Sequence Complete ---");
+                    document.getElementById('results').innerHTML = `<h2>Test Passed: Result is ${coreLogic.getCurrentDisplayValue()}</h2>`;
+                }, 100); // Time for button press visual update delay
+            }, 200);
+        }, 300);
+    }
+
+    // Initialize rendering loop and run test after setup
+    renderer.render();
+    runTestSequence();
+
+
+</script></body></html>

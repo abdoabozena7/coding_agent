@@ -1,0 +1,16 @@
+{
+  "name": "calculator-app",
+  "version": "1.0.0",
+  "description": "3D interactive calculator application core logic.",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "jest --config ./jest.config.js"
+  },
+  "keywords": ["calculator", "three.js"],
+  "author": "Coder",
+  "license": "ISC",
+  "devDependencies": {
+    "jest": "^29.0.0"
+    // Assuming jest is the necessary test runner for 'npm test'
+  }
+}

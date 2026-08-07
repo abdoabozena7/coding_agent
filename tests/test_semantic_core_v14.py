@@ -1021,7 +1021,7 @@ class SemanticCoreV14Tests(unittest.TestCase):
                 try:
                     self.assertEqual(
                         connection.execute("PRAGMA user_version").fetchone()[0],
-                        14,
+                        15,
                     )
                 finally:
                     connection.close()
@@ -1521,6 +1521,58 @@ class SemanticCoreV14Tests(unittest.TestCase):
         change = bound["expected_changes"][0]
         self.assertEqual(change["basis"], "explicit_user_requirement")
         self.assertEqual(change["evidence_refs"], ["user:request"])
+
+    def test_explicit_user_path_with_dot_slash_gets_canonical_request_citation(self) -> None:
+        proposed = {
+            "tasks": [{"id": "T001"}],
+            "applicability_evidence": [],
+            "expected_changes": [{
+                "path": "./hello.txt",
+                "intent": "Create the requested file.",
+                "basis": "explicit_user_requirement",
+                "evidence_refs": [],
+                "supports_tasks": ["T001"],
+            }],
+        }
+        bound = AgentRuntime._bind_plan_inspection_sources(
+            proposed,
+            {"I001": {"tool": "list_files", "result": "(no files)"}},
+            original_request="Create hello.txt and verify it.",
+        )
+        self.assertEqual(bound["expected_changes"][0]["evidence_refs"], ["user:request"])
+
+    def test_placeholder_expected_change_path_reconciles_explicit_filename(self) -> None:
+        proposed = {
+            "tasks": [
+                {
+                    "id": "T001",
+                    "title": "Create hello.txt",
+                    "description": "Create hello.txt with the requested content.",
+                    "acceptance_criteria": ["hello.txt exists."],
+                    "verification": ["Read hello.txt back."],
+                }
+            ],
+            "applicability_evidence": [],
+            "expected_changes": [
+                {
+                    "path": "explicit_user_requirement",
+                    "intent": "Create the requested file.",
+                    "basis": "explicit_user_requirement",
+                    "supports_tasks": ["T001"],
+                }
+            ],
+        }
+        actions: list[str] = []
+        bound = AgentRuntime._bind_plan_inspection_sources(
+            proposed,
+            {"I001": {"tool": "list_files", "result": "(no files)"}},
+            original_request="Create hello.txt and verify it.",
+            normalization_actions=actions,
+        )
+        change = bound["expected_changes"][0]
+        self.assertEqual(change["path"], "hello.txt")
+        self.assertIn("user:request", change["evidence_refs"])
+        self.assertTrue(any("path placeholder reconciled" in item for item in actions))
 
     def test_user_request_is_not_laundered_as_workspace_applicability_evidence(self) -> None:
         proposed = {

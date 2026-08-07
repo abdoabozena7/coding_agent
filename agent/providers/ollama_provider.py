@@ -141,7 +141,13 @@ class OllamaProvider:
             self._capability_cache[key] = cached
         self.capability_profile = cached
 
-    def _post_json(self, path: str, payload: dict, on_activity=None):
+    def _post_json(
+        self,
+        path: str,
+        payload: dict,
+        on_activity=None,
+        request_timeout: float | None = None,
+    ):
         data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
         request = urllib.request.Request(
             f"{self.host}{path}",
@@ -152,8 +158,16 @@ class OllamaProvider:
         try:
             if on_activity:
                 on_activity(ProviderActivityV1(state="request_created"))
-            timeout = self.request_timeout
-            if not self._request_timeout_explicit and self.max_output_tokens is not None:
+            timeout = (
+                max(30.0, min(1_800.0, float(request_timeout)))
+                if request_timeout is not None
+                else self.request_timeout
+            )
+            if (
+                request_timeout is None
+                and not self._request_timeout_explicit
+                and self.max_output_tokens is not None
+            ):
                 timeout = max(
                     300.0,
                     min(900.0, 120.0 + (self.max_output_tokens * 0.20)),
@@ -492,6 +506,11 @@ class OllamaProvider:
                 self.reasoning_effort = str(policy.reasoning_effort)
             if policy.max_output_tokens is not None:
                 self.max_output_tokens = min(65_536, max(128, int(policy.max_output_tokens)))
+        transport_timeout = (
+            float(policy.stage_deadline_seconds)
+            if policy is not None and policy.stage_deadline_seconds
+            else None
+        )
         self._ensure_capabilities()
         tool_specs = tuple(tools or ())
         payload = self.request_compiler.compile(
@@ -535,14 +554,24 @@ class OllamaProvider:
 
         runner_replayed = False
         try:
-            response = self._post_json("/api/chat", payload, on_activity=on_activity)
+            response = self._post_json(
+                "/api/chat",
+                payload,
+                on_activity=on_activity,
+                request_timeout=transport_timeout,
+            )
         except ProviderRequestError as error:
             if self._runner_recovery_allowed(error):
                 # Keep the execution class GPU-only: unload the corrupted
                 # runner/KV cache, then replay the exact governed request once
                 # so Ollama reloads it with num_gpu unchanged.
                 self.reset_model_cache()
-                response = self._post_json("/api/chat", payload, on_activity=on_activity)
+                response = self._post_json(
+                    "/api/chat",
+                    payload,
+                    on_activity=on_activity,
+                    request_timeout=transport_timeout,
+                )
                 runner_replayed = True
             else:
                 field = error.diagnostic.incompatible_field
@@ -559,7 +588,12 @@ class OllamaProvider:
                 )
                 adapted_payload = dict(payload)
                 adapted_payload.pop(field, None)
-                response = self._post_json("/api/chat", adapted_payload, on_activity=on_activity)
+                response = self._post_json(
+                    "/api/chat",
+                    adapted_payload,
+                    on_activity=on_activity,
+                    request_timeout=transport_timeout,
+                )
 
         def consume(stream: Any) -> None:
             nonlocal malformed_chunks, valid_chunks, usage
@@ -636,7 +670,14 @@ class OllamaProvider:
             runner_replayed = True
             malformed_chunks = 0
             valid_chunks = 0
-            consume(self._post_json("/api/chat", payload, on_activity=on_activity))
+            consume(
+                self._post_json(
+                    "/api/chat",
+                    payload,
+                    on_activity=on_activity,
+                    request_timeout=transport_timeout,
+                )
+            )
 
         if malformed_chunks and not valid_chunks:
             raise ProviderRequestError(ProviderDiagnostic(

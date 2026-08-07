@@ -6,6 +6,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -13,12 +14,14 @@ import textwrap
 import time
 import traceback
 import unicodedata
+import uuid
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Thread
 from typing import Any, Callable, Iterable, Mapping, TextIO
+from urllib.parse import quote
 
 from colorama import just_fix_windows_console
 
@@ -49,8 +52,9 @@ from .model_catalog import ExecutionClass, ModelCatalog, ModelDescriptor
 from .local_provider import ProviderRequestError
 from .models import DomainError, GoalStatus
 from .providers import get_provider
-from .runtime import AgentRuntime, RuntimeErrorBase, SliceResult
+from .runtime import AgentRuntime, ProviderUnavailableError, RuntimeErrorBase, SliceResult
 from .safety import redact_text
+from .session_owner import SessionOwnerLease
 from .rock_coding_agent_intro import play_intro
 from .sandbox import AccessLevel, DockerSandbox, PermissionAdapter, SandboxError
 from .store import StateCorruptionError, StateStore, StateStoreError
@@ -131,11 +135,138 @@ def _provider_request_failure(error: BaseException) -> ProviderRequestError | No
     return None
 
 
+def _full_auto_retry_delay(attempt: int) -> float:
+    """Persistent provider retry backoff for unattended local execution."""
+
+    normalized = max(1, int(attempt))
+    return float(min(300, 5 * (2 ** min(6, normalized - 1))))
+
+
 _PALETTE_COMMANDS_NEEDING_TEXT = {
     "/goal", "/reject", "/replan", "/answer", "/add", "/edit", "/remove",
     "/done", "/todo", "/block", "/skip", "/resolve", "/cancel", "/stop-process",
     "/agent",
 }
+
+
+def _model_size_billions(value: object) -> float:
+    """Parse common Ollama parameter-size labels without trusting free text."""
+
+    text = str(value or "").strip().upper().replace(",", "")
+    match = re.search(r"(\d+(?:\.\d+)?)\s*([TGMK]?B)?", text)
+    if match is None:
+        return 0.0
+    try:
+        amount = float(match.group(1))
+    except (TypeError, ValueError):
+        return 0.0
+    multiplier = {
+        "TB": 1_000.0,
+        "GB": 1.0,
+        "MB": 0.001,
+        "KB": 0.000001,
+        # Ollama's parameter labels use ``B`` for billions (for example
+        # ``70B``), not bytes.
+        "B": 1.0,
+        None: 1.0,
+    }.get(match.group(2), 1.0)
+    return amount * multiplier
+
+
+def _local_model_strength(descriptor: ModelDescriptor) -> tuple[object, ...]:
+    """Rank local fallbacks by advertised capability, not catalog name order."""
+
+    metadata = getattr(descriptor, "metadata", {})
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    band = str(metadata.get("capability_band") or "").casefold()
+    band_score = {
+        "frontier": 4.0,
+        "high": 3.0,
+        "medium": 2.0,
+        "low": 1.0,
+    }.get(band, 0.0)
+
+    def numeric(*keys: str) -> float:
+        for key in keys:
+            raw = metadata.get(key)
+            if raw is None:
+                continue
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                parsed = _model_size_billions(raw)
+                if parsed:
+                    return parsed
+        return 0.0
+
+    # The final model name makes ties stable across providers/platforms.
+    return (
+        numeric("parameter_count_billions", "parameter_size", "parameters"),
+        numeric("active_parameter_size", "active_parameters"),
+        band_score,
+        numeric("context_window_tokens", "context_length", "num_ctx"),
+        numeric("maximum_output_tokens", "max_output_tokens", "num_predict"),
+        str(getattr(descriptor, "model", "")).casefold(),
+    )
+
+
+def _local_model_identity_keys(descriptor: object) -> frozenset[str]:
+    """Return stable aliases used to avoid retrying a failed local model."""
+
+    provider = str(getattr(descriptor, "provider", "") or "").strip().casefold()
+    model = str(getattr(descriptor, "model", "") or "").strip().casefold()
+    descriptor_id = str(getattr(descriptor, "id", "") or "").strip().casefold()
+    keys = {item for item in (model, descriptor_id) if item}
+    if provider and model:
+        keys.update({f"{provider}/{model}", f"{provider}:{model}"})
+    return frozenset(keys)
+
+
+def _runtime_model_identity_keys(runtime: object) -> frozenset[str]:
+    """Normalize the active runtime model into the same aliases as a catalog entry."""
+
+    raw_model = str(getattr(runtime, "model_name", "") or "").strip().casefold()
+    provider = str(getattr(runtime, "provider_name", "") or "").strip().casefold()
+    keys = {item for item in (raw_model,) if item}
+    model = raw_model
+    if "/" in model:
+        maybe_provider, model = model.split("/", 1)
+        keys.add(model)
+        if maybe_provider and model:
+            keys.update({f"{maybe_provider}/{model}", f"{maybe_provider}:{model}"})
+    if provider and model:
+        keys.update({f"{provider}/{model}", f"{provider}:{model}"})
+    return frozenset(keys)
+
+
+def _strongest_local_model(
+    models: Iterable[ModelDescriptor],
+    *,
+    excluded: Iterable[str] = (),
+) -> ModelDescriptor | None:
+    """Choose the strongest tool-capable local model not in the failover set."""
+
+    excluded_keys = {
+        str(item).strip().casefold()
+        for item in excluded
+        if str(item).strip()
+    }
+    candidates = tuple(
+        descriptor
+        for descriptor in models
+        if descriptor.execution_class is ExecutionClass.LOCAL
+        and descriptor.supports_tools
+        and not (_local_model_identity_keys(descriptor) & excluded_keys)
+    )
+    return max(candidates, key=_local_model_strength, default=None)
+
+
+# A transient local load/GPU timeout should get one retry before Full Auto
+# changes models.  The bounded threshold avoids silently switching on a single
+# hiccup while preventing an unattended run from retrying one broken runner
+# forever when another compatible local model is available.
+_FULL_AUTO_LOCAL_FAILOVER_AFTER = 2
 
 
 def _next_project_name(root: Path) -> str:
@@ -835,11 +966,17 @@ def choose_concurrency(
     no_color: bool = False,
     reduced_motion: bool = False,
     step_label: str = "Choose agent count",
+    initial: int | None = None,
 ) -> int:
     """Ask only when the selected model can safely run multiple workers."""
 
     if capacity.safe_max <= 1:
         return 1
+    initial_value = (
+        int(initial)
+        if initial is not None and 1 <= int(initial) <= capacity.safe_max
+        else capacity.recommended
+    )
     choices = tuple(
         ChoiceItem(
             key=str(value),
@@ -859,7 +996,7 @@ def choose_concurrency(
             choices,
             title="Choose active agent capacity",
             subtitle=capacity.reason,
-            initial_key=str(capacity.recommended),
+            initial_key=str(initial_value),
             filterable=False,
             step_label=step_label,
             action_label="Use capacity",
@@ -876,9 +1013,9 @@ def choose_concurrency(
         marker = " [Recommended]" if value == capacity.recommended else ""
         print(f"  {value}. {value} agent{'s' if value != 1 else ''}{marker}", file=output)
     while True:
-        raw = input_func(f"agents [{capacity.recommended}]> ").strip()
+        raw = input_func(f"agents [{initial_value}]> ").strip()
         if not raw:
-            return capacity.recommended
+            return initial_value
         if raw.isdigit() and 1 <= int(raw) <= capacity.safe_max:
             return int(raw)
         print(f"Choose a value from 1 to {capacity.safe_max}.", file=output)
@@ -931,6 +1068,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--session",
         help="Resume an existing session ID from --workspace without repeating model or concurrency setup.",
+    )
+    parser.add_argument(
+        "--new-session",
+        action="store_true",
+        help=(
+            "Start a fresh empty workflow thread in the selected workspace. "
+            "Project protection and files are reused, but no previous prompt, goal, or chat is loaded."
+        ),
     )
     parser.add_argument("--create-workspace", action="store_true", help="Create the path passed to --workspace.")
     parser.add_argument("--projects-root", default=os.getenv("AGENT_PROJECTS_DIR", str(DEFAULT_PROJECTS_ROOT)))
@@ -2406,6 +2551,128 @@ def _setup_sandbox(runtime: AgentRuntime, console: ConsoleUI) -> None:
     console.write(f"Full sandbox ready · {config.image} · user {config.container_user}")
 
 
+def _reconfigure_project_setup(
+    runtime: AgentRuntime,
+    console: ConsoleUI,
+    preferences: SessionPreferences,
+) -> None:
+    """Reopen the project profile at a safe checkpoint instead of restarting setup."""
+
+    goal = runtime.active_goal()
+    if goal is not None and goal.status in {
+        GoalStatus.RUNNING,
+        GoalStatus.VERIFYING,
+        GoalStatus.REVIEWING,
+        GoalStatus.RECOVERING,
+    }:
+        raise RuntimeStateError(
+            "Project settings can change only after the current work reaches a safe checkpoint."
+        )
+
+    current_descriptor = runtime.model_descriptor
+    selected_descriptor = current_descriptor
+    if current_descriptor is not None and current_descriptor.provider in {"ollama", "openai", "gemini"}:
+        selected_descriptor = choose_model(
+            ModelCatalog(),
+            input_func=console.input_func,
+            output=console.stream,
+            rich=not console.plain,
+            initial=current_descriptor.id,
+            step_label="Project settings · Model",
+            no_color=not console.color,
+            reduced_motion=console.reduced_motion,
+        )
+
+    choose_project_protection(
+        runtime.workspace,
+        input_func=console.input_func,
+        output=console.stream,
+        rich=not console.plain,
+        step_label="Project settings · Protection",
+        no_color=not console.color,
+        reduced_motion=console.reduced_motion,
+    )
+
+    assert selected_descriptor is not None
+    capacity = probe_concurrency(selected_descriptor)
+    saved = runtime.session_snapshot()
+    try:
+        initial_concurrency = int(saved.get("concurrency") or capacity.recommended)
+    except (TypeError, ValueError):
+        initial_concurrency = capacity.recommended
+    selected_concurrency = choose_concurrency(
+        capacity,
+        input_func=console.input_func,
+        output=console.stream,
+        rich=not console.plain,
+        initial=initial_concurrency,
+        step_label="Project settings · Capacity",
+        no_color=not console.color,
+        reduced_motion=console.reduced_motion,
+    )
+    selected_access = choose_access_level(
+        input_func=console.input_func,
+        output=console.stream,
+        sandbox=(
+            runtime.permission_adapter.sandbox
+            if runtime.permission_adapter is not None
+            else DockerSandbox()
+        ),
+        rich=not console.plain,
+        initial=runtime.access_level,
+        step_label="Project settings · Permissions",
+        no_color=not console.color,
+        reduced_motion=console.reduced_motion,
+    )
+    selected_mode = choose_interaction_mode(
+        input_func=console.input_func,
+        output=console.stream,
+        rich=not console.plain,
+        initial=("plan" if runtime.interaction_mode is InteractionModeV2.PLAN else "normal"),
+        step_label="Project settings · Workflow",
+        no_color=not console.color,
+        reduced_motion=console.reduced_motion,
+        ultra_disabled_reason=str(runtime.ultra_readiness_issue() or ""),
+    )
+
+    if (
+        selected_descriptor is not None
+        and current_descriptor is not None
+        and selected_descriptor.id != current_descriptor.id
+    ):
+        provider = selected_descriptor.create_provider()
+        setattr(provider, "reasoning_effort", runtime.reasoning_effort)
+        runtime.replace_provider(provider, selected_descriptor)
+    sandbox = (
+        runtime.permission_adapter.sandbox
+        if runtime.permission_adapter is not None
+        else DockerSandbox()
+    )
+    runtime.replace_permission_adapter(PermissionAdapter(selected_access, sandbox))
+    config = runtime.config
+    if runtime.execution_class == "local":
+        config = replace(config, ultra_local_concurrency=selected_concurrency)
+    else:
+        config = replace(config, ultra_cloud_concurrency=selected_concurrency)
+    runtime.replace_config(config)
+    try:
+        runtime.transition_mode(selected_mode.value)
+    except RuntimeErrorBase as exc:
+        console.write(f"Workflow mode kept at the active checkpoint ({exc}).")
+    preferences.mode = selected_mode
+    preferences.concurrency = selected_concurrency
+    console.set_mode(selected_mode)
+    console.set_runtime_identity(
+        access_level=runtime.access_level,
+        execution_class=runtime.execution_class,
+        model=runtime.model_name,
+    )
+    console.write(
+        "Project settings saved · future launches will reuse this model, protection, "
+        f"capacity ({selected_concurrency}), permissions, and workflow default."
+    )
+
+
 def _open_command_palette_inner(console: ConsoleUI, status: str) -> str | None:
     """Open a small contextual root, then one command group at a time."""
 
@@ -2507,6 +2774,10 @@ def _open_local_web_view(
         "plan": "Plan Studio",
         "review": "Change Review",
         "agents": "Agent Tree",
+        "execution": "Execution",
+        "history": "Workflow History",
+        "tree": "Execution Tree",
+        "diff": "Change Diff",
     }[view_name]
     if not isinstance(result, Mapping):
         return
@@ -2657,16 +2928,25 @@ def execute_command(
         )
         return True
     if command.kind == CommandKind.SETUP:
-        _setup_sandbox(runtime, console)
+        if command.args.get("project"):
+            _reconfigure_project_setup(runtime, console, preferences)
+        else:
+            _setup_sandbox(runtime, console)
         return True
     if command.kind == CommandKind.SLEEP:
         action = str(command.args["action"]).strip().lower()
         if action == "status":
             enabled = bool(runtime.sleep_mode_enabled())
-            console.set_sleep_mode(enabled)
+            policy_getter = getattr(runtime, "sleep_mode_policy", None)
+            policy = str(policy_getter() if callable(policy_getter) else ("safe" if enabled else "off"))
+            console.set_sleep_mode(enabled, policy=policy if enabled else "safe")
             console.write(
-                f"Sleep Mode {'on' if enabled else 'off'} · "
-                "safe recommended choices only; unsafe decisions stay manual"
+                f"Sleep Mode {policy if enabled else 'off'} · "
+                + (
+                    "critic-reviewed plans, deterministic questions, and every tool approval are accepted and audited"
+                    if policy == "full"
+                    else "safe recommended choices only; unsafe decisions stay manual"
+                )
             )
             if preferences.mode is InteractionMode.ULTRA:
                 status = runtime.sleep_profile("status", preferences.mode)
@@ -2675,19 +2955,34 @@ def execute_command(
                 )
             return True
 
-        enabled = action == "on"
-        runtime.set_sleep_mode(enabled)
-        console.set_sleep_mode(enabled)
+        enabled = action != "off"
+        policy = "full" if action == "full" else "safe"
+        runtime.set_sleep_mode(enabled, policy=policy)
+        console.set_sleep_mode(enabled, policy=policy)
         if enabled:
-            # If the workflow is already paused on a safe approval, enabling
-            # Sleep should re-evaluate that exact fingerprint immediately;
-            # risky approvals remain visible and manual.
+            # Re-evaluate only the exact durable fingerprint. Safe mode keeps
+            # policy gates; explicit Full Auto accepts the pending boundary.
             try:
-                auto_resolve = getattr(runtime, "auto_resolve_pending_sleep_approval", None)
-                if callable(auto_resolve) and auto_resolve():
-                    console.write("Sleep Mode resumed the pending safe action.")
+                auto_resolve_boundary = getattr(runtime, "auto_resolve_full_auto_boundary", None)
+                auto_resolve_tool = getattr(runtime, "auto_resolve_pending_sleep_approval", None)
+                if callable(auto_resolve_boundary) and policy == "full":
+                    candidate = auto_resolve_boundary()
+                    resolved = (
+                        tuple(str(item) for item in candidate)
+                        if isinstance(candidate, (tuple, list, set))
+                        else ()
+                    )
+                elif callable(auto_resolve_tool) and auto_resolve_tool():
+                    resolved = ("tool",)
+                else:
+                    resolved = ()
+                if resolved:
+                    console.write(
+                        f"Sleep Mode {policy} resumed the pending "
+                        + ("plan and action." if "plan" in resolved else "action.")
+                    )
             except Exception as exc:
-                console.write(f"Sleep Mode is on; pending approval remains visible ({exc}).")
+                console.write(f"Sleep Mode {policy} is on; pending approval remains visible ({exc}).")
         if action == "off":
             runtime.sleep_profile("off", preferences.mode)
         elif preferences.mode is InteractionMode.ULTRA:
@@ -2704,6 +2999,10 @@ def execute_command(
         return True
     if command.kind in {CommandKind.TREE, CommandKind.AGENTS, CommandKind.AGENT}:
         _open_local_web_view(runtime, console, "agents")
+        return True
+    if command.kind is CommandKind.OPEN_WEB:
+        _open_local_web_view(runtime, console, "execution")
+        console.write("Workspace opened. Web is the primary control surface; terminal remains a mirror.")
         return True
     if command.kind == CommandKind.MEMORY:
         _show_memory(runtime, console, command.args.get("target"))
@@ -2815,7 +3114,8 @@ def execute_command(
         _show_runtime_state(runtime, console, force=True)
         return True
     if command.kind == CommandKind.HISTORY:
-        _show_history(runtime, console)
+        _open_local_web_view(runtime, console, "history")
+        console.write("History opened in the Workspace. Use the terminal view only as a fallback mirror.")
         return True
     if command.kind == CommandKind.DIFF:
         _open_local_web_view(runtime, console, "review")
@@ -3144,11 +3444,40 @@ def _persistent_interactive_loop(
     """Own keyboard and rendering in one prompt_toolkit application for the session."""
 
     store = WorkspaceUIStore()
+    # The browser is the primary decision surface while the local web server
+    # is alive; terminal controls remain available as an emergency fallback.
+    runtime.web_control_state_sink = lambda connected: store.set_control_surface(
+        "web" if connected else "terminal_fallback"
+    )
+    store.set_control_surface(
+        "web" if bool(getattr(runtime, "web_control_connected", False)) else "terminal_fallback"
+    )
     store.update_identity(
         workspace=str(runtime.workspace),
         model=str(runtime.model_name),
         status=str(runtime.dashboard().status),
         workflow_mode=preferences.mode.value,
+    )
+    # Hydrate the presentation store from the durable session before either
+    # surface starts rendering.  Sleep can be toggled from Web while the
+    # terminal process is reconnecting; without this initial projection the
+    # terminal footer would incorrectly start at ``Sleep off`` until the next
+    # event arrived.
+    try:
+        raw_sleep_enabled = runtime.sleep_mode_enabled()
+        raw_sleep_policy = runtime.sleep_mode_policy()
+        # Test doubles and legacy runtime adapters may expose these methods
+        # without returning the durable scalar.  Treat those as unavailable
+        # rather than accidentally enabling unattended work from truthy
+        # objects such as ``Mock``.
+        durable_sleep_enabled = raw_sleep_enabled if isinstance(raw_sleep_enabled, bool) else False
+        durable_sleep_policy = raw_sleep_policy.casefold() if isinstance(raw_sleep_policy, str) else "off"
+    except (AttributeError, RuntimeError, ValueError):
+        durable_sleep_enabled = False
+        durable_sleep_policy = "off"
+    store.set_sleep_mode(
+        durable_sleep_enabled,
+        policy=durable_sleep_policy if durable_sleep_enabled else "safe",
     )
     last_loaded: tuple[str, str] | None = None
     try:
@@ -3275,6 +3604,7 @@ def _persistent_interactive_loop(
         work_transcript_count = 0
         last_swarm_refresh = 0.0
         cached_swarm_snapshot: Mapping[str, Any] = {}
+        workspace_auto_opened = False
 
         def switch_session(target_session_id: str) -> None:
             """Rebuild the runtime from one secret-free saved checkpoint."""
@@ -3333,6 +3663,9 @@ def _persistent_interactive_loop(
                 model_descriptor=descriptor,
                 permission_adapter=adapter,
                 session_id=target,
+            )
+            runtime.web_control_state_sink = lambda connected: store.set_control_surface(
+                "web" if connected else "terminal_fallback"
             )
             # Keep browser approvals attached to the newly restored runtime;
             # otherwise a session switch would leave the terminal showing the
@@ -3397,14 +3730,18 @@ def _persistent_interactive_loop(
             *,
             summary: str = "Understanding your request",
         ) -> None:
-            nonlocal active_work, last_command, last_action, next_slow_notice, work_transcript_count
+            nonlocal active_work, last_command, last_action, next_slow_notice, work_transcript_count, workspace_auto_opened
             last_action = action
+            open_workspace_after_intake = False
             if isinstance(action, UserCommand):
                 last_command = action
                 if action.kind in {CommandKind.TEXT, CommandKind.GOAL}:
                     console.set_workflow_phase(
                         "plan" if preferences.mode is InteractionMode.PLAN else "working"
                     )
+                    if not workspace_auto_opened:
+                        workspace_auto_opened = True
+                        open_workspace_after_intake = True
             next_slow_notice = 60.0
             work_transcript_count = len(store.snapshot().transcript)
             store.reset_request_context()
@@ -3419,6 +3756,22 @@ def _persistent_interactive_loop(
             work_running.set()
             store.set_activity(ActivityStage.UNDERSTANDING, summary, running=True)
             active_work.start()
+            if open_workspace_after_intake:
+                # Do not expose an empty new-request composer while the exact
+                # terminal prompt is already being accepted. Wait briefly for
+                # either the durable semantic turn or its goal to exist, then
+                # open the shared workspace. This preserves one request truth
+                # and prevents an accidental duplicate-submission race.
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    session_state = runtime.session_snapshot()
+                    if (
+                        runtime.active_goal() is not None
+                        or isinstance(session_state.get("pending_semantic_turn"), Mapping)
+                        or work_done.wait(0.02)
+                    ):
+                        break
+                _open_local_web_view(runtime, console, "execution")
 
         def sync_durable_queue() -> bool:
             """Reconcile the running item and start one ready FIFO prompt."""
@@ -3608,11 +3961,21 @@ def _persistent_interactive_loop(
             if choice.value:
                 start(parse_command(f"/permissions {choice.value}"))
 
-        def handle_model() -> bool:
+        def handle_model(
+            *,
+            local_only: bool = False,
+            automatic: bool = False,
+            exclude_model_ids: Iterable[str] = (),
+        ) -> bool:
+            excluded_model_ids = tuple(
+                str(item).strip()
+                for item in exclude_model_ids
+                if str(item).strip()
+            )
             goal = runtime.active_goal()
             if goal is not None and goal.status in {
                 GoalStatus.RUNNING, GoalStatus.VERIFYING, GoalStatus.REVIEWING, GoalStatus.RECOVERING,
-            }:
+            } and not automatic:
                 store.append_transcript(
                     "assistant",
                     "Pause at a safe checkpoint before changing models.",
@@ -3621,47 +3984,109 @@ def _persistent_interactive_loop(
             store.set_activity(ActivityStage.UNDERSTANDING, "Checking available models", running=True)
             catalog = ModelCatalog()
             models = catalog.discover()
+            if local_only:
+                models = tuple(
+                    descriptor
+                    for descriptor in models
+                    if descriptor.execution_class is ExecutionClass.LOCAL
+                    and descriptor.supports_tools
+                )
             if not models:
                 detail = "; ".join(f"{item.source}: {item.message}" for item in catalog.diagnostics)
                 store.set_activity(ActivityStage.PROBLEM, "No model is currently available", running=False)
                 store.append_transcript(
                     "assistant",
-                    "No tool-capable model is available." + (f" {detail}" if detail else ""),
+                    (
+                        (
+                            "No alternate compatible tool-capable local model is available."
+                            if excluded_model_ids
+                            else "No compatible tool-capable local model is available."
+                        )
+                        if local_only
+                        else "No tool-capable model is available."
+                    )
+                    + (f" {detail}" if detail else ""),
                 )
                 return False
-            by_key = {f"model-{index}": descriptor for index, descriptor in enumerate(models, 1)}
-            options = tuple(
-                AttentionOption(
-                    key,
-                    descriptor.display_name,
-                    key,
-                    description=(
-                        f"{descriptor.provider} · {descriptor.execution_class.value} · "
-                        + ("configured; connection is verified on first use" if descriptor.source == "environment" else "tool calling verified")
-                    ),
-                    shortcut=str(index) if index < 10 else "",
-                    primary=descriptor.model == runtime.model_name,
+            if automatic:
+                # Discovery is deterministic and Ollama-first. Rank the
+                # advertised local envelopes so a fallback does not silently
+                # choose a smaller model merely because its name sorts first.
+                descriptor = _strongest_local_model(
+                    models,
+                    excluded=excluded_model_ids,
                 )
-                for index, (key, descriptor) in enumerate(by_key.items(), 1)
-            )
-            resolution = store.request_attention(
-                AttentionRequest(
-                    id=f"model:{time.monotonic_ns()}",
-                    kind=AttentionKind.QUESTION,
-                    title="Choose a model",
-                    message="Cloud credentials are configuration evidence; connectivity is checked on first use.",
-                    options=options + (AttentionOption("cancel", "Cancel", "", shortcut="c"),),
-                    default_key="cancel",
-                    cancel_key="cancel",
+                if descriptor is None:
+                    store.set_activity(
+                        ActivityStage.PROBLEM,
+                        (
+                            "No alternate compatible local model is available"
+                            if excluded_model_ids
+                            else "No compatible local model is available"
+                        ),
+                        running=False,
+                    )
+                    return False
+            else:
+                descriptor = None
+                by_key = {f"model-{index}": descriptor for index, descriptor in enumerate(models, 1)}
+                options = tuple(
+                    AttentionOption(
+                        key,
+                        descriptor.display_name,
+                        key,
+                        description=(
+                            f"{descriptor.provider} · {descriptor.execution_class.value} · "
+                            + ("configured; connection is verified on first use" if descriptor.source == "environment" else "tool calling verified")
+                        ),
+                        shortcut=str(index) if index < 10 else "",
+                        primary=descriptor.model == runtime.model_name,
+                    )
+                    for index, (key, descriptor) in enumerate(by_key.items(), 1)
                 )
-            )
-            descriptor = by_key.get(resolution.value)
-            if descriptor is None:
-                store.set_activity(ActivityStage.PAUSED, "Model selection cancelled", running=False)
-                return False
+                resolution = store.request_attention(
+                    AttentionRequest(
+                        id=f"model:{time.monotonic_ns()}",
+                        kind=AttentionKind.QUESTION,
+                        title="Choose a model",
+                        message="Cloud credentials are configuration evidence; connectivity is checked on first use.",
+                        options=options + (AttentionOption("cancel", "Cancel", "", shortcut="c"),),
+                        default_key="cancel",
+                        cancel_key="cancel",
+                    )
+                )
+                descriptor = by_key.get(resolution.value)
+                if descriptor is None:
+                    store.set_activity(ActivityStage.PAUSED, "Model selection cancelled", running=False)
+                    return False
             provider = descriptor.create_provider()
             setattr(provider, "reasoning_effort", runtime.reasoning_effort)
-            runtime.replace_provider(provider, descriptor)
+            current_goal = runtime.active_goal()
+            accepted_scope = False
+            if current_goal is not None:
+                accepted_scope = bool(getattr(current_goal, "active_plan_revision", None))
+                if not accepted_scope:
+                    try:
+                        accepted_scope = runtime.store.get_accepted_plan(current_goal.id) is not None
+                    except (AttributeError, StateStoreError):
+                        accepted_scope = False
+            if automatic and local_only and accepted_scope:
+                runtime.continue_with_local_model(provider, descriptor)
+            else:
+                runtime.replace_provider(provider, descriptor)
+            if automatic and local_only:
+                # A provider-specific planning backoff belongs to the failed
+                # cloud endpoint.  Switching providers is an explicit recovery
+                # boundary, so the new local attempt must not inherit that
+                # stale delay.
+                current_goal = runtime.active_goal()
+                if current_goal is not None:
+                    runtime.store.update_goal_metadata(
+                        current_goal.id,
+                        retry_after_ms=0,
+                        retry_not_before=None,
+                        auto_retryable=False,
+                    )
             console.set_context_window(getattr(provider, "context_size", None))
             console.set_runtime_identity(
                 access_level=runtime.access_level,
@@ -3671,10 +4096,46 @@ def _persistent_interactive_loop(
                 workspace=str(runtime.workspace),
             )
             store.set_activity(ActivityStage.IDLE, "Ready", running=False)
-            store.append_transcript(
-                "assistant",
-                f"Model changed to {descriptor.provider}/{descriptor.model} ({descriptor.execution_class.value}).",
-            )
+            if automatic and local_only:
+                current_goal = runtime.active_goal()
+                if current_goal is not None:
+                    runtime.store.update_goal_metadata(
+                        current_goal.id,
+                        provider_recovery={
+                            "state": "switched_to_local",
+                            "automatic_fallback": True,
+                            "provider": descriptor.provider,
+                            "model": descriptor.model,
+                            "execution_class": descriptor.execution_class.value,
+                        },
+                    )
+                    runtime.store.append_event(
+                        "provider.local_fallback",
+                        goal_id=current_goal.id,
+                        entity_type="model",
+                        entity_id=descriptor.id,
+                        payload={
+                            "provider": descriptor.provider,
+                            "model": descriptor.model,
+                            "automatic": True,
+                            "quality_gates_unchanged": bool(accepted_scope),
+                        },
+                    )
+                store.append_transcript(
+                    "assistant",
+                    (
+                        "Full Auto switched to the next compatible local model "
+                        if excluded_model_ids
+                        else "Full Auto switched to local "
+                    )
+                    + f"{descriptor.provider}/{descriptor.model} and will resume the saved stage."
+                    + (" Accepted quality gates remain unchanged." if accepted_scope else ""),
+                )
+            else:
+                store.append_transcript(
+                    "assistant",
+                    f"Model changed to {descriptor.provider}/{descriptor.model} ({descriptor.execution_class.value}).",
+                )
             return True
 
         def handle_workflow_mode(*, apply: bool = True) -> str | None:
@@ -3852,6 +4313,9 @@ def _persistent_interactive_loop(
             if command.kind in {CommandKind.AGENTS, CommandKind.AGENT, CommandKind.TREE}:
                 _open_local_web_view(runtime, console, "agents")
                 return True
+            if command.kind is CommandKind.OPEN_WEB:
+                _open_local_web_view(runtime, console, "execution")
+                return True
             if command.kind is CommandKind.PLAN:
                 if runtime.active_goal() is None:
                     _set_interaction_mode(
@@ -3869,6 +4333,9 @@ def _persistent_interactive_loop(
                 return True
             if command.kind is CommandKind.DIFF:
                 _open_local_web_view(runtime, console, "review")
+                return True
+            if command.kind is CommandKind.HISTORY:
+                _open_local_web_view(runtime, console, "history")
                 return True
             if command.kind is CommandKind.CHAT:
                 entries = runtime.store.list_timeline_entries(runtime.session_id, limit=500)
@@ -4142,7 +4609,18 @@ def _persistent_interactive_loop(
                             pending_semantic = None
                         semantic_recovery = isinstance(pending_semantic, Mapping)
                         typed_provider_failure = _provider_request_failure(exc)
-                        provider_failure = typed_provider_failure is not None or semantic_recovery
+                        # Providers normally expose a typed diagnostic, but
+                        # the runtime deliberately wraps legacy/raw provider
+                        # exceptions (including plain ``429 quota`` or DNS
+                        # messages) in ProviderUnavailableError.  Treat that
+                        # wrapper as a provider boundary too; otherwise Full
+                        # Auto would surface a manual retry instead of moving
+                        # to the local fallback it was explicitly asked to use.
+                        provider_failure = (
+                            typed_provider_failure is not None
+                            or isinstance(exc, ProviderUnavailableError)
+                            or semantic_recovery
+                        )
                         local_provider = (
                             str(getattr(runtime, "execution_class", "local")).casefold()
                             != "cloud"
@@ -4233,6 +4711,275 @@ def _persistent_interactive_loop(
                             "assistant",
                             f"{title}. {message} Cause: {provider_message}",
                         )
+                        # Full Auto is an unattended contract: a cloud
+                        # provider/quota/network failure must not turn into a
+                        # hidden terminal approval prompt. Move to the best
+                        # discovered local tool-capable model at the durable
+                        # checkpoint, preserve accepted quality gates, and
+                        # resume the same saved stage. If discovery or the
+                        # local provider fails, fall through to the explicit
+                        # recovery surface with the truthful reason.
+                        try:
+                            sleep_policy = str(runtime.sleep_mode_policy()).casefold()
+                        except Exception:
+                            sleep_policy = "off"
+                        if provider_failure and not local_provider and sleep_policy == "full":
+                            fallback_goal = runtime.active_goal()
+                            try:
+                                if fallback_goal is not None and fallback_goal.status in {
+                                    GoalStatus.RUNNING,
+                                    GoalStatus.VERIFYING,
+                                    GoalStatus.REVIEWING,
+                                    GoalStatus.RECOVERING,
+                                }:
+                                    runtime.pause("cloud provider failed; preparing Full Auto local fallback")
+                                if handle_model(local_only=True, automatic=True):
+                                    start(
+                                        runtime.resume,
+                                        summary="Resuming with the strongest available local model",
+                                    )
+                                    continue
+                            except Exception as fallback_error:
+                                store.append_log(
+                                    f"automatic local fallback failed: {redact_text(str(fallback_error), 800)}"
+                                )
+                        if provider_failure and local_provider and sleep_policy == "full":
+                            # A local provider can disappear transiently while
+                            # Ollama reloads a model or the GPU recovers. Full
+                            # Auto must not turn that into a hidden modal. Save
+                            # an exponential retry checkpoint and let the idle
+                            # controller resume the exact semantic/goal stage.
+                            if semantic_recovery:
+                                pending_retry = dict(pending_semantic)
+                                retry_attempt = int(
+                                    pending_retry.get("full_auto_retry_attempts") or 0
+                                ) + 1
+                                failed_local_models = {
+                                    str(item).strip().casefold()
+                                    for item in (
+                                        pending_retry.get("full_auto_failed_local_models") or ()
+                                    )
+                                    if str(item).strip()
+                                }
+                                failed_local_models.update(
+                                    _runtime_model_identity_keys(runtime)
+                                )
+                                # After two failures, move to the next
+                                # strongest compatible local model once. The
+                                # durable continuation policy keeps the same
+                                # quality floor while narrowing only the
+                                # remaining packets for the new envelope.
+                                if retry_attempt == _FULL_AUTO_LOCAL_FAILOVER_AFTER:
+                                    try:
+                                        if handle_model(
+                                            local_only=True,
+                                            automatic=True,
+                                            exclude_model_ids=failed_local_models,
+                                        ):
+                                            latest_pending = pending_retry
+                                            try:
+                                                latest_state = runtime.store.get_workflow_session(
+                                                    runtime.session_id
+                                                ).get("state", {})
+                                                latest_raw = latest_state.get(
+                                                    "pending_semantic_turn"
+                                                )
+                                                if isinstance(latest_raw, Mapping):
+                                                    latest_pending = dict(latest_raw)
+                                            except Exception:
+                                                pass
+                                            try:
+                                                current_envelope = runtime.model_capability_envelope()
+                                                latest_pending.update(
+                                                    {
+                                                        "model_capability_envelope": current_envelope.to_dict(),
+                                                        "capability_fingerprint": current_envelope.fingerprint,
+                                                        "attempt_model": runtime.model_name,
+                                                    }
+                                                )
+                                            except Exception:
+                                                pass
+                                            latest_pending.update(
+                                                {
+                                                    "status": "awaiting_provider",
+                                                        "full_auto_retry_attempts": 0,
+                                                        "full_auto_failed_local_models": sorted(
+                                                            failed_local_models
+                                                        ),
+                                                        "full_auto_model_failover": True,
+                                                        "retry_not_before": None,
+                                                        "last_error": "",
+                                                        "failure_kind": "",
+                                                        "attempt_state": "running",
+                                                    }
+                                            )
+                                            runtime._save_pending_semantic_turn(
+                                                latest_pending
+                                            )
+                                            store.set_activity(
+                                                ActivityStage.PAUSED,
+                                                "Full Auto switched to the next compatible local model",
+                                                running=False,
+                                            )
+                                            store.append_log(
+                                                "sleep.full_auto_local_failover: "
+                                                f"semantic stage={semantic_stage or 'route'} "
+                                                f"failed={sorted(failed_local_models)}"
+                                            )
+                                            start(
+                                                parse_command("/resume"),
+                                                summary="Full Auto · resuming with the next local model",
+                                            )
+                                            continue
+                                    except Exception as failover_error:
+                                        store.append_log(
+                                            "automatic local model failover failed: "
+                                            f"{redact_text(str(failover_error), 800)}"
+                                        )
+                                retry_at = time.time() + _full_auto_retry_delay(
+                                    retry_attempt
+                                )
+                                pending_retry.update(
+                                    {
+                                        "status": "awaiting_provider",
+                                        "full_auto_retry_attempts": retry_attempt,
+                                        "full_auto_failed_local_models": sorted(
+                                            failed_local_models
+                                        ),
+                                        "retry_not_before": retry_at,
+                                        "last_error": provider_message,
+                                    }
+                                )
+                                runtime._save_pending_semantic_turn(pending_retry)
+                                store.set_activity(
+                                    ActivityStage.PAUSED,
+                                    f"Local provider unavailable · Full Auto retry {retry_attempt} is scheduled",
+                                    running=False,
+                                )
+                                store.append_log(
+                                    f"sleep.full_auto_local_retry: semantic stage={semantic_stage or 'route'} "
+                                    f"attempt={retry_attempt} retry_at={retry_at:.3f}"
+                                )
+                                continue
+                            if goal is not None:
+                                recovery_metadata = dict(
+                                    goal.metadata.get("provider_recovery") or {}
+                                )
+                                retry_attempt = int(
+                                    recovery_metadata.get("full_auto_retry_attempts")
+                                    or 0
+                                ) + 1
+                                failed_local_models = {
+                                    str(item).strip().casefold()
+                                    for item in (
+                                        recovery_metadata.get(
+                                            "full_auto_failed_local_models"
+                                        )
+                                        or ()
+                                    )
+                                    if str(item).strip()
+                                }
+                                failed_local_models.update(
+                                    _runtime_model_identity_keys(runtime)
+                                )
+                                if retry_attempt == _FULL_AUTO_LOCAL_FAILOVER_AFTER:
+                                    try:
+                                        if handle_model(
+                                            local_only=True,
+                                            automatic=True,
+                                            exclude_model_ids=failed_local_models,
+                                        ):
+                                            recovery_metadata.update(
+                                                {
+                                                    "state": "switched_to_local",
+                                                    "error": "",
+                                                    "automatic_fallback": True,
+                                                    "full_auto_retry": False,
+                                                    "full_auto_retry_attempts": 0,
+                                                    "full_auto_failed_local_models": sorted(
+                                                        failed_local_models
+                                                    ),
+                                                    "full_auto_model_failover": True,
+                                                }
+                                            )
+                                            runtime.store.update_goal_metadata(
+                                                goal.id,
+                                                retry_not_before=None,
+                                                auto_retryable=False,
+                                                provider_recovery=recovery_metadata,
+                                            )
+                                            store.set_activity(
+                                                ActivityStage.PAUSED,
+                                                "Full Auto switched to the next compatible local model",
+                                                running=False,
+                                            )
+                                            store.append_log(
+                                                "sleep.full_auto_local_failover: "
+                                                f"goal={goal.id} failed={sorted(failed_local_models)}"
+                                            )
+                                            start(
+                                                runtime.resume,
+                                                summary="Full Auto · resuming with the next local model",
+                                            )
+                                            continue
+                                    except Exception as failover_error:
+                                        store.append_log(
+                                            "automatic local model failover failed: "
+                                            f"{redact_text(str(failover_error), 800)}"
+                                        )
+                                retry_at = time.time() + _full_auto_retry_delay(
+                                    retry_attempt
+                                )
+                                recovery_metadata.update(
+                                    {
+                                        "state": "waiting",
+                                        "error": provider_message,
+                                        "automatic_fallback": False,
+                                        "full_auto_retry": True,
+                                        "full_auto_retry_attempts": retry_attempt,
+                                        "full_auto_failed_local_models": sorted(
+                                            failed_local_models
+                                        ),
+                                    }
+                                )
+                                runtime.store.update_goal_metadata(
+                                    goal.id,
+                                    retry_not_before=retry_at,
+                                    provider_recovery=recovery_metadata,
+                                )
+                                store.set_activity(
+                                    ActivityStage.PAUSED,
+                                    f"Local provider unavailable · Full Auto retry {retry_attempt} is scheduled",
+                                    running=False,
+                                )
+                                continue
+                        recovery_options = [
+                            AttentionOption(
+                                "retry", "Retry now", "retry", shortcut="r",
+                                recommended=True, primary=True,
+                                description="Continue the same saved stage without replaying accepted work.",
+                            ),
+                            AttentionOption(
+                                "wait", "Keep saved and return later", "wait", shortcut="w",
+                                description="Leave the request saved. Nothing retries automatically.",
+                            ),
+                        ]
+                        if not local_provider:
+                            recovery_options.append(
+                                AttentionOption(
+                                    "local",
+                                    "Switch to compatible local",
+                                    "local",
+                                    shortcut="l",
+                                )
+                            )
+                        recovery_options.extend(
+                            (
+                                AttentionOption("model", "Change model", "model", shortcut="m"),
+                                AttentionOption("stop", "Stop safely", "stop", shortcut="s"),
+                                AttentionOption("details", "Details", "details", shortcut="d"),
+                            )
+                        )
                         resolution = store.request_attention(
                             AttentionRequest(
                                 id=f"recovery:{time.monotonic_ns()}",
@@ -4248,26 +4995,7 @@ def _persistent_interactive_loop(
                                         else ""
                                     )
                                 ),
-                                options=(
-                                    AttentionOption(
-                                        "retry", "Retry now", "retry", shortcut="r",
-                                        recommended=True, primary=True,
-                                        description="Continue the same saved stage without replaying accepted work.",
-                                    ),
-                                    AttentionOption(
-                                        "wait", "Keep saved and return later", "wait", shortcut="w",
-                                        description="Leave the request saved. Nothing retries automatically.",
-                                    ),
-                                    AttentionOption(
-                                        "local",
-                                        "Switch to compatible local",
-                                        "local",
-                                        shortcut="l",
-                                    ),
-                                    AttentionOption("model", "Change model", "model", shortcut="m"),
-                                    AttentionOption("stop", "Stop safely", "stop", shortcut="s"),
-                                    AttentionOption("details", "Details", "details", shortcut="d"),
-                                ),
+                                options=tuple(recovery_options),
                                 default_key="retry",
                                 cancel_key="wait",
                                 auto_resolve_safe=False,
@@ -4276,14 +5004,17 @@ def _persistent_interactive_loop(
                         if resolution.value == "retry" and retry_action is not None:
                             start(retry_action, summary="Retrying the saved step")
                         elif resolution.value in {"model", "local"}:
+                            local_only = resolution.value == "local"
                             if resolution.value == "local":
                                 store.append_transcript(
                                     "assistant",
                                     "Choose a compatible local model. The saved cloud model remains in session recovery history.",
                                 )
                             if semantic_recovery:
-                                def change_model_and_resume() -> None:
-                                    if handle_model():
+                                def change_model_and_resume(
+                                    only_local: bool = local_only,
+                                ) -> None:
+                                    if handle_model(local_only=only_local):
                                         runtime.resume()
 
                                 start(
@@ -4291,7 +5022,12 @@ def _persistent_interactive_loop(
                                     summary="Changing model and resuming the saved stage",
                                 )
                             else:
-                                start(handle_model, summary="Checking available models")
+                                start(
+                                    lambda only_local=local_only: handle_model(
+                                        local_only=only_local
+                                    ),
+                                    summary="Checking available models",
+                                )
                         elif resolution.value == "wait":
                             goal = runtime.active_goal()
                             if goal is not None and not semantic_recovery:
@@ -4434,6 +5170,12 @@ def _persistent_interactive_loop(
                         callable(take_execution_request) and take_execution_request()
                     )
                     approved_goal = runtime.active_goal()
+                    if approved_goal is not None and approved_goal.status is not GoalStatus.RUNNING:
+                        # A goal that reached a durable user boundary may be
+                        # resumed later by Full Auto.  It must be eligible for
+                        # the next recovery pass; keeping the one-shot guard
+                        # forever would strand a successfully approved retry.
+                        continued_running_goals.discard(approved_goal.id)
                     recover_running_goal = bool(
                         approved_goal is not None
                         and approved_goal.status is GoalStatus.RUNNING
@@ -4465,6 +5207,63 @@ def _persistent_interactive_loop(
                                 running=True,
                             )
                             continue
+                    if str(getattr(runtime, "sleep_mode_policy", lambda: "off")()).casefold() == "full":
+                        try:
+                            auto_resolve_boundary = getattr(
+                                runtime, "auto_resolve_full_auto_boundary", None
+                            )
+                            candidate = (
+                                auto_resolve_boundary()
+                                if callable(auto_resolve_boundary)
+                                else ()
+                            )
+                            resolved_boundaries = (
+                                tuple(str(item) for item in candidate)
+                                if isinstance(candidate, (tuple, list, set))
+                                else ()
+                            )
+                        except Exception as exc:
+                            store.append_log(
+                                f"Full Auto boundary check: {redact_text(str(exc), 600)}"
+                            )
+                            resolved_boundaries = ()
+                        if resolved_boundaries:
+                            # Re-enter the loop so the normal approved-goal
+                            # recovery path starts the first ready task once,
+                            # including a tool approval restored after restart.
+                            continue
+                        try:
+                            pending_retry_state = runtime.store.get_workflow_session(
+                                runtime.session_id
+                            ).get("state", {})
+                            pending_retry_raw = pending_retry_state.get(
+                                "pending_semantic_turn"
+                            )
+                            pending_retry = (
+                                dict(pending_retry_raw)
+                                if isinstance(pending_retry_raw, Mapping)
+                                else {}
+                            )
+                        except Exception:
+                            pending_retry = {}
+                        if (
+                            str(pending_retry.get("status") or "").casefold()
+                            == "awaiting_provider"
+                        ):
+                            retry_raw = pending_retry.get("retry_not_before")
+                            try:
+                                retry_ready = (
+                                    retry_raw is None
+                                    or float(retry_raw) <= time.time()
+                                )
+                            except (TypeError, ValueError):
+                                retry_ready = True
+                            if retry_ready:
+                                start(
+                                    parse_command("/resume"),
+                                    summary="Full Auto · retrying the saved provider checkpoint",
+                                )
+                                continue
                     waiting_goal = runtime.active_goal()
                     waiting_until = (
                         waiting_goal.metadata.get("retry_not_before")
@@ -4477,6 +5276,146 @@ def _persistent_interactive_loop(
                         and isinstance(waiting_goal.metadata.get("provider_recovery"), Mapping)
                         else ""
                     )
+                    recovery_metadata = (
+                        dict(waiting_goal.metadata.get("provider_recovery") or {})
+                        if waiting_goal is not None
+                        and isinstance(waiting_goal.metadata.get("provider_recovery"), Mapping)
+                        else {}
+                    )
+                    # ``start_goal`` catches planning ProviderUnavailableError
+                    # internally and leaves a paused goal instead of raising to
+                    # the worker.  Without this branch Full Auto only handled
+                    # failures that escaped through ``work_errors`` (semantic
+                    # intake/execution), so a cloud limit during initial
+                    # planning stranded the unattended run at a retry card.
+                    planning_cloud_failure = (
+                        waiting_goal is not None
+                        and waiting_goal.status is GoalStatus.PAUSED
+                        and waiting_goal.active_plan_revision is None
+                        and str(getattr(runtime, "execution_class", "local")).casefold() == "cloud"
+                        and recovery_state == "paused"
+                        and bool(recovery_metadata.get("error"))
+                        and not bool(recovery_metadata.get("automatic_fallback_attempted"))
+                    )
+                    if (
+                        planning_cloud_failure
+                        and str(getattr(runtime, "sleep_mode_policy", lambda: "off")()).casefold() == "full"
+                    ):
+                        recovery_metadata["automatic_fallback_attempted"] = True
+                        try:
+                            runtime.store.update_goal_metadata(
+                                waiting_goal.id,
+                                provider_recovery=recovery_metadata,
+                            )
+                            if handle_model(local_only=True, automatic=True):
+                                start(
+                                    runtime.resume,
+                                    summary="Cloud planning stopped · continuing with the strongest local model",
+                                )
+                                continue
+                        except Exception as fallback_error:
+                            store.append_log(
+                                f"automatic planning local fallback failed: {redact_text(str(fallback_error), 800)}"
+                            )
+                    planning_local_failure = (
+                        waiting_goal is not None
+                        and waiting_goal.status is GoalStatus.PAUSED
+                        and waiting_goal.active_plan_revision is None
+                        and str(getattr(runtime, "execution_class", "local")).casefold()
+                        != "cloud"
+                        and recovery_state == "paused"
+                        and bool(recovery_metadata.get("error"))
+                    )
+                    if (
+                        planning_local_failure
+                        and str(
+                            getattr(runtime, "sleep_mode_policy", lambda: "off")()
+                        ).casefold()
+                        == "full"
+                    ):
+                        retry_attempt = int(
+                            recovery_metadata.get("full_auto_retry_attempts") or 0
+                        ) + 1
+                        failed_local_models = {
+                            str(item).strip().casefold()
+                            for item in (
+                                recovery_metadata.get(
+                                    "full_auto_failed_local_models"
+                                )
+                                or ()
+                            )
+                            if str(item).strip()
+                        }
+                        failed_local_models.update(_runtime_model_identity_keys(runtime))
+                        if retry_attempt == _FULL_AUTO_LOCAL_FAILOVER_AFTER:
+                            try:
+                                if handle_model(
+                                    local_only=True,
+                                    automatic=True,
+                                    exclude_model_ids=failed_local_models,
+                                ):
+                                    recovery_metadata.update(
+                                        {
+                                            "state": "switched_to_local",
+                                            "error": "",
+                                            "automatic_fallback": True,
+                                            "full_auto_retry": False,
+                                            "full_auto_retry_attempts": 0,
+                                            "full_auto_failed_local_models": sorted(
+                                                failed_local_models
+                                            ),
+                                            "full_auto_model_failover": True,
+                                        }
+                                    )
+                                    runtime.store.update_goal_metadata(
+                                        waiting_goal.id,
+                                        retry_not_before=None,
+                                        auto_retryable=False,
+                                        provider_recovery=recovery_metadata,
+                                    )
+                                    store.set_activity(
+                                        ActivityStage.PAUSED,
+                                        "Full Auto switched to the next compatible local model",
+                                        running=False,
+                                    )
+                                    store.append_log(
+                                        "sleep.full_auto_local_failover: "
+                                        f"planning goal={waiting_goal.id} "
+                                        f"failed={sorted(failed_local_models)}"
+                                    )
+                                    start(
+                                        runtime.resume,
+                                        summary="Full Auto · resuming with the next local model",
+                                    )
+                                    continue
+                            except Exception as failover_error:
+                                store.append_log(
+                                    "automatic planning local model failover failed: "
+                                    f"{redact_text(str(failover_error), 800)}"
+                                )
+                        retry_at = time.time() + _full_auto_retry_delay(retry_attempt)
+                        recovery_metadata.update(
+                            {
+                                "state": "waiting",
+                                "automatic_fallback": False,
+                                "full_auto_retry": True,
+                                "full_auto_retry_attempts": retry_attempt,
+                                "full_auto_failed_local_models": sorted(
+                                    failed_local_models
+                                ),
+                            }
+                        )
+                        runtime.store.update_goal_metadata(
+                            waiting_goal.id,
+                            retry_not_before=retry_at,
+                            provider_recovery=recovery_metadata,
+                        )
+                        store.set_activity(
+                            ActivityStage.PAUSED,
+                            f"Local provider unavailable · Full Auto retry {retry_attempt} is scheduled",
+                            running=False,
+                        )
+                        continue
                     if (
                         waiting_goal is not None
                         and waiting_goal.status is GoalStatus.PAUSED
@@ -4503,6 +5442,38 @@ def _persistent_interactive_loop(
                         if boundary_key not in shown_boundaries:
                             shown_boundaries.add(boundary_key)
                             reason = str(waiting_goal.metadata.get("waiting_question") or waiting_goal.metadata.get("retry_reason") or "The saved workflow is paused.")
+                            provider_recovery = dict(
+                                waiting_goal.metadata.get("provider_recovery") or {}
+                            )
+                            cloud_provider_boundary = bool(
+                                str(getattr(runtime, "execution_class", "local")).casefold()
+                                == "cloud"
+                                and provider_recovery.get("error")
+                            )
+                            recovery_options = [
+                                AttentionOption(
+                                    "retry", "Retry", "retry", shortcut="r",
+                                    recommended=not cloud_provider_boundary,
+                                    primary=not cloud_provider_boundary,
+                                ),
+                            ]
+                            if cloud_provider_boundary:
+                                recovery_options.append(
+                                    AttentionOption(
+                                        "local",
+                                        "Continue with strongest local model",
+                                        "local",
+                                        shortcut="l",
+                                        recommended=True,
+                                        primary=True,
+                                    )
+                                )
+                            recovery_options.extend(
+                                (
+                                    AttentionOption("inspect", "Inspect", "inspect", shortcut="i"),
+                                    AttentionOption("stop", "Pause safely", "stop", shortcut="s"),
+                                )
+                            )
                             store.set_activity(ActivityStage.PAUSED, f"Paused — {reason}", running=False)
                             resolution = store.request_attention(
                                 AttentionRequest(
@@ -4510,17 +5481,19 @@ def _persistent_interactive_loop(
                                     kind=AttentionKind.RECOVERY,
                                     title="Workflow paused",
                                     message=reason,
-                                    options=(
-                                        AttentionOption("retry", "Retry", "retry", shortcut="r", recommended=True, primary=True),
-                                        AttentionOption("inspect", "Inspect", "inspect", shortcut="i"),
-                                        AttentionOption("stop", "Pause safely", "stop", shortcut="s"),
-                                    ),
+                                    options=tuple(recovery_options),
                                     default_key="retry",
                                     cancel_key="inspect",
                                 )
                             )
                             if resolution.value == "retry":
                                 start(parse_command("/resume"), summary="Resuming saved checkpoint")
+                            elif resolution.value == "local":
+                                if handle_model(local_only=True, automatic=True):
+                                    start(
+                                        runtime.resume,
+                                        summary="Cloud checkpoint saved · continuing with the strongest local model",
+                                    )
                             elif resolution.value == "stop":
                                 try:
                                     runtime.cancel("CANCEL")
@@ -5406,6 +6379,119 @@ def interactive_loop(
         _legacy_interactive_loop(runtime, console, preferences)
 
 
+def _descriptor_from_saved_snapshot(snapshot: object) -> ModelDescriptor | None:
+    """Rehydrate a previously selected model without reopening the picker.
+
+    A project setting is only trusted when it contains a complete provider/model
+    identity.  Invalid or legacy snapshots deliberately fall back to the normal
+    picker instead of making startup fail with an opaque provider error.
+    """
+
+    if not isinstance(snapshot, Mapping):
+        return None
+    provider = str(snapshot.get("provider") or "").strip()
+    model = str(snapshot.get("model") or "").strip()
+    if not provider or not model:
+        return None
+    try:
+        return ModelDescriptor(
+            provider=provider,
+            model=model,
+            execution_class=str(snapshot.get("execution_class") or "local"),
+            host=snapshot.get("host"),
+            capabilities=tuple(snapshot.get("capabilities") or ("tools",)),
+            label=snapshot.get("label"),
+            source=str(snapshot.get("source") or "project-settings"),
+            metadata=dict(snapshot.get("metadata") or {}),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_saved_project_setup(workspace: Path) -> dict[str, Any]:
+    """Read the durable project profile used to make reopening quiet.
+
+    Model/access/mode/concurrency live in the existing workflow session state;
+    Git/GitHub protection is owned by ``version-control.json``.  Keeping those
+    sources authoritative avoids a second settings file that can drift from
+    the runtime and the terminal/Web status surfaces.
+    """
+
+    setup: dict[str, Any] = {"state": {}, "session_mode": "normal"}
+    state_db = workspace / ".coding-agent" / "state.db"
+    if state_db.is_file():
+        store: StateStore | None = None
+        try:
+            store = StateStore(workspace)
+            session: Mapping[str, Any] | None = None
+            try:
+                session = store.get_workflow_session("workspace-session")
+            except (StateStoreError, KeyError):
+                sessions = store.list_workflow_sessions(limit=20)
+                session = sessions[0] if sessions else None
+            if session is not None:
+                setup["state"] = dict(session.get("state") or {})
+                setup["session_mode"] = str(session.get("session_mode") or "normal")
+                setup["goal_id"] = session.get("goal_id")
+                setup["run_state"] = str(session.get("run_state") or "idle")
+        except (OSError, StateStoreError, ValueError, RuntimeError):
+            # A partially-created or locked state journal must not turn a
+            # project picker into a fatal error.  The missing values will be
+            # requested once and the next successful launch will persist them.
+            setup["state"] = {}
+        finally:
+            if store is not None:
+                store.close()
+
+    config_path = workspace / GitProtectionManager.CONFIG_PATH
+    if config_path.is_file():
+        try:
+            manager = GitProtectionManager(workspace)
+            config = manager.load_config()
+            provider = str(config.provider or "").strip().casefold()
+            if provider in {"github", "local_git", "snapshot"}:
+                warning = ""
+                auto_checkpoint = bool(config.auto_checkpoint)
+                auto_push = bool(config.auto_push)
+                if provider in {"github", "local_git"}:
+                    try:
+                        status = manager.inspect()
+                        if provider == "github" and not status.github_connected:
+                            fallback = "local_git" if status.dedicated_repository else "snapshot"
+                            manager.configure(
+                                auto_checkpoint=fallback == "local_git",
+                                auto_push=False,
+                                provider=fallback,
+                            )
+                            provider = fallback
+                            auto_checkpoint = fallback == "local_git"
+                            auto_push = False
+                            warning = (
+                                "Saved GitHub protection is unavailable; continuing with "
+                                + ("local Git." if fallback == "local_git" else "snapshots.")
+                            )
+                        elif provider == "local_git" and not status.dedicated_repository:
+                            manager.configure(auto_checkpoint=False, auto_push=False, provider="snapshot")
+                            provider = "snapshot"
+                            auto_checkpoint = False
+                            auto_push = False
+                            warning = "Saved local Git history is unavailable; continuing with snapshots."
+                    except (OSError, RuntimeError, VersionControlError):
+                        # Keep the saved tier if diagnostics are unavailable;
+                        # the settings surface will expose the degraded state.
+                        pass
+                setup["protection"] = {
+                    "provider": provider,
+                    "auto_checkpoint": auto_checkpoint,
+                    "auto_push": auto_push,
+                }
+                if warning:
+                    setup["protection"]["warning"] = warning
+        except (OSError, ValueError, RuntimeError):
+            pass
+    return setup
+
+
 def _interactive_setup(
     args: argparse.Namespace,
     console: ConsoleUI,
@@ -5438,7 +6524,8 @@ def _interactive_setup(
     # Chat, Action, or Goal only after seeing the request and model envelope.
     # Explicit --mode remains a compatibility/automation override.
     selected_mode: InteractionMode | None = None
-    selected_concurrency = 1
+    selected_concurrency: int | None = None
+    saved_setup: dict[str, Any] = {}
 
     if args.workspace:
         workspace = _resolve_workspace(
@@ -5447,6 +6534,68 @@ def _interactive_setup(
         )
     elif args.create_workspace:
         raise ValueError("--create-workspace requires --workspace")
+
+    def hydrate_saved_setup() -> None:
+        nonlocal descriptor, requested_access, selected_mode, selected_concurrency, saved_setup
+        if workspace is None:
+            return
+        saved_setup = _load_saved_project_setup(workspace)
+        saved_state = dict(saved_setup.get("state") or {})
+        if descriptor is None:
+            descriptor = _descriptor_from_saved_snapshot(saved_state.get("model_snapshot"))
+        if requested_access is None:
+            try:
+                if saved_state.get("access_level") is not None:
+                    requested_access = AccessLevel.parse(str(saved_state["access_level"]))
+            except ValueError:
+                requested_access = None
+        if selected_mode is None:
+            saved_mode = str(
+                saved_state.get("interaction_mode")
+                or saved_setup.get("session_mode")
+                or ""
+            ).casefold()
+            if saved_mode in {"plan", "working", "normal"}:
+                selected_mode = (
+                    InteractionMode.PLAN
+                    if saved_mode == "plan"
+                    else InteractionMode.NORMAL
+                )
+        try:
+            saved_concurrency = int(saved_state.get("concurrency"))
+            if saved_concurrency > 0:
+                selected_concurrency = saved_concurrency
+        except (TypeError, ValueError):
+            selected_concurrency = None
+        pending_saved = saved_state.get("pending_semantic_turn")
+        pending_status = (
+            str(pending_saved.get("status") or "")
+            if isinstance(pending_saved, Mapping)
+            else ""
+        )
+        if descriptor is not None and (
+            saved_setup.get("protection")
+            or saved_setup.get("goal_id")
+            or pending_status not in {"", "completed"}
+        ):
+            console.write(
+                "Loaded this project's saved setup · "
+                f"{descriptor.provider}/{descriptor.model} · "
+                f"{requested_access.value if requested_access else 'normal'} access"
+                + (
+                    f" · protection {saved_setup['protection']['provider']}"
+                    if saved_setup.get("protection")
+                    else " · existing workflow settings"
+                )
+                + (
+                    f" · {saved_setup['protection']['warning']}"
+                    if saved_setup.get("protection", {}).get("warning")
+                    else ""
+                )
+                + ". Use Project settings/Web or /settings reconfigure to change it."
+            )
+
+    hydrate_saved_setup()
 
     if args.model is not None:
         environment_provider = get_provider(selected_provider)
@@ -5461,15 +6610,21 @@ def _interactive_setup(
     if args.mode:
         selected_mode = InteractionMode.parse(args.mode)
 
-    steps = []
-    if workspace is None:
-        steps.append(("workspace", "1. Choose a workspace"))
-    steps.append(("protection", "2. Protect this project"))
-    if descriptor is None:
-        steps.append(("model", "3. Choose a model"))
-    steps.append(("concurrency", "4. Choose agent capacity"))
-    if requested_access is None:
-        steps.append(("permissions", "5. Set permissions"))
+    def build_steps() -> list[tuple[str, str]]:
+        steps: list[tuple[str, str]] = []
+        if workspace is None:
+            steps.append(("workspace", "1. Choose a workspace"))
+        if not bool(saved_setup.get("protection")):
+            steps.append(("protection", "2. Protect this project"))
+        if descriptor is None:
+            steps.append(("model", "3. Choose a model"))
+        if selected_concurrency is None:
+            steps.append(("concurrency", "4. Choose agent capacity"))
+        if requested_access is None:
+            steps.append(("permissions", "5. Set permissions"))
+        return steps
+
+    steps = build_steps()
 
     total = len(steps)
     index = 0
@@ -5487,6 +6642,14 @@ def _interactive_setup(
                     no_color=not console.color,
                     reduced_motion=console.reduced_motion,
                 )
+                hydrate_saved_setup()
+                # The workspace picker is the first decision.  Once it has
+                # resolved, rebuild the remaining steps from that project's
+                # durable profile so saved model/protection/access choices do
+                # not reappear as duplicate prompts.
+                steps = build_steps()
+                total = len(steps)
+                index = -1
             elif stage == "protection":
                 assert workspace is not None
                 choose_project_protection(
@@ -5519,6 +6682,7 @@ def _interactive_setup(
                     step_label=step_label,
                     no_color=not console.color,
                     reduced_motion=console.reduced_motion,
+                    initial=selected_concurrency,
                 )
             elif stage == "permissions":
                 requested_access = choose_access_level(
@@ -5545,6 +6709,8 @@ def _interactive_setup(
     assert workspace is not None
     assert descriptor is not None
     assert requested_access is not None
+    if selected_concurrency is None:
+        selected_concurrency = 1
     return (
         workspace,
         descriptor,
@@ -5560,6 +6726,8 @@ def _interactive_setup(
 def main(argv: Iterable[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.session and args.new_session:
+        parser.error("--session resumes an existing thread; use --new-session for a fresh thread")
     just_fix_windows_console()
     console = ConsoleUI(
         color=False if args.no_color else None,
@@ -5569,7 +6737,16 @@ def main(argv: Iterable[str] | None = None) -> int:
     preferences = SessionPreferences()
     store: StateStore | None = None
     runtime: AgentRuntime | None = None
-    session_id = "workspace-session"
+    owner_lease: SessionOwnerLease | None = None
+    # ``workspace-session`` is the durable default used for reopening an
+    # existing workspace.  A new request launched from a closed folder must
+    # never inherit that thread by accident: give it an isolated session row,
+    # timeline, goal, and Web URL while retaining the project files/settings.
+    session_id = (
+        f"workspace-{uuid.uuid4().hex[:12]}"
+        if args.new_session
+        else "workspace-session"
+    )
     try:
         load_dotenv(APP_ROOT / ".env", override=False)
         console.plain = console.plain or os.getenv("GA3BAD_PLAIN_UI", "").strip().lower() in {
@@ -5581,6 +6758,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         selected_provider = _configure_provider_environment(args.provider, args.model)
         interactive_launch = bool(args.interactive or not args.command)
         if args.session:
+            if args.provider or args.model:
+                console.write(
+                    "Note: --session restores the saved provider/model for that thread; "
+                    "the --provider/--model values are not applied. Use --new-session for a fresh local run."
+                )
             if not args.workspace:
                 raise ValueError("--session requires --workspace")
             workspace = _resolve_workspace(
@@ -5672,6 +6854,70 @@ def main(argv: Iterable[str] | None = None) -> int:
                 f"{'plan' if preferences.mode is InteractionMode.PLAN else 'working'} · "
                 f"{preferences.concurrency} agent(s)"
             )
+        elif args.new_session and not interactive_launch:
+            console.write(
+                f"Starting a new workspace thread {session_id[-12:]} · "
+                "previous prompts and goals are not loaded."
+            )
+            if args.workspace:
+                workspace = _resolve_workspace(
+                    Path(args.workspace).expanduser(),
+                    create=args.create_workspace,
+                )
+            else:
+                if args.create_workspace:
+                    raise ValueError("--create-workspace requires --workspace")
+                if not sys.stdin.isatty():
+                    raise ValueError(
+                        "--workspace is required when no interactive terminal is available"
+                    )
+                workspace = choose_workspace(
+                    args.projects_root,
+                    rich=False if args.plain else None,
+                )
+            # ``--new-session`` deliberately uses the normal setup path so
+            # the project profile can be reused, but it must not enter the
+            # recovery branch above or load the old session's model identity.
+            if args.model is None:
+                model_required = args.auto
+                for raw in args.command:
+                    try:
+                        kind = parse_command(raw).kind
+                    except CommandParseError:
+                        kind = CommandKind.TEXT
+                    if kind in {
+                        CommandKind.TEXT,
+                        CommandKind.GOAL,
+                        CommandKind.APPROVE,
+                        CommandKind.REJECT,
+                        CommandKind.REPLAN,
+                        CommandKind.RUN,
+                        CommandKind.AUTO,
+                        CommandKind.RESUME,
+                    }:
+                        model_required = True
+                if model_required:
+                    raise ValueError(
+                        "--model is required for non-interactive model work; offline inspection commands are exempt"
+                    )
+            catalog = ModelCatalog()
+            environment_provider = get_provider(selected_provider)
+            selected_model = args.model or str(getattr(environment_provider, "model", ""))
+            descriptor = _descriptor_for_explicit_model(
+                selected_provider,
+                selected_model,
+                catalog=catalog if selected_provider == "ollama" and args.model is not None else None,
+            )
+            sandbox = DockerSandbox()
+            if args.setup_sandbox:
+                sandbox.setup()
+                console.write("Full sandbox setup is ready.")
+            requested_access = (
+                AccessLevel.parse(args.permissions)
+                if args.permissions
+                else AccessLevel.NORMAL
+            )
+            preferences = SessionPreferences.from_env(args.mode)
         elif interactive_launch:
             setup = _interactive_setup(args, console, selected_provider)
             if setup is None:
@@ -5758,6 +7004,31 @@ def main(argv: Iterable[str] | None = None) -> int:
             record_workspace(workspace)
         except (OSError, RuntimeError, ValueError):
             pass
+        # One process owns the durable session, its provider loop, and its
+        # authenticated Web server.  A second launcher must attach to the
+        # existing endpoint instead of opening a competing server and then
+        # failing later with a misleading mode-lock error.
+        owner_lease = SessionOwnerLease.acquire(workspace, session_id)
+        if owner_lease is None:
+            existing = SessionOwnerLease.read_existing(workspace, session_id)
+            if existing is not None and existing.web_port and existing.web_token:
+                import webbrowser
+
+                url = (
+                    f"http://127.0.0.1:{existing.web_port}/sessions/"
+                    f"{quote(existing.session_id, safe='')}/execution?token={quote(existing.web_token, safe='')}"
+                )
+                opened = bool(webbrowser.open(url, new=2))
+                console.write(
+                    "This workspace is already running in another GA3BAD session; "
+                    + ("opened its live Web workspace." if opened else f"open {url}")
+                )
+            else:
+                console.write(
+                    "This workspace is already owned by another GA3BAD process. "
+                    "Use its terminal/Web workspace or stop it before launching again."
+                )
+            return 0
         store = StateStore(workspace)
         runtime = AgentRuntime(
             provider,
@@ -5780,18 +7051,63 @@ def main(argv: Iterable[str] | None = None) -> int:
         from .web_views import LocalWebServer
 
         runtime.local_web_server = LocalWebServer(runtime).start()
+        owner_lease.set_web_endpoint(
+            runtime.local_web_server.port,
+            runtime.local_web_server.security.token,
+        )
         console.write(
             f"Local Web Views ready on 127.0.0.1:{runtime.local_web_server.port}."
         )
         # Persist the selected next-workflow profile before semantic intake.
-        # Once a request starts, the visible in-workflow phase becomes Plan or
-        # Working while staged/recursive remains an internal strategy.
-        # A recovered session already owns its interaction phase and internal
-        # execution strategy. Re-applying a setup choice here can collide with
-        # the workflow lock (for example, a planning-only Goal stored with the
-        # normal execution engine) before /resume or /replan can run.
-        if not args.session and (interactive_launch or args.mode is not None):
-            runtime.transition_mode(preferences.mode.value)
+        # Once a request starts, the durable workflow owns its interaction
+        # phase. Recovery is determined from that durable state, not merely by
+        # the optional --session flag: the normal project picker can reopen the
+        # same workspace-session too. Re-applying a setup choice to an active
+        # dispatching/planning run would otherwise trip the mode lock and abort
+        # startup before the user can retry, inspect, or cancel it.
+        startup_lock = runtime.workflow_mode_lock()
+        recovering_workflow = startup_lock.locked
+        if recovering_workflow:
+            saved_mode = (
+                InteractionMode.PLAN
+                if runtime.interaction_mode is InteractionModeV2.PLAN
+                else InteractionMode.NORMAL
+            )
+            if not args.session and preferences.mode is not saved_mode:
+                saved_mode_label = (
+                    "plan" if saved_mode is InteractionMode.PLAN else "working"
+                )
+                console.write(
+                    "Recovered the active workflow with its saved "
+                    f"{saved_mode_label} mode; the startup mode choice was not "
+                    f"applied while {startup_lock.stage.replace('_', ' ')} is active."
+            )
+            preferences.mode = saved_mode
+        elif not args.session and (interactive_launch or args.mode is not None):
+            try:
+                runtime.transition_mode(preferences.mode.value)
+            except RuntimeErrorBase:
+                # A different launcher may have persisted the first semantic
+                # turn between our initial lock read and this transition. The
+                # durable lock is authoritative; recover the saved mode and
+                # keep the live Web workspace open instead of surfacing a
+                # misleading startup-fatal error.
+                concurrent_lock = runtime.workflow_mode_lock()
+                if not concurrent_lock.locked:
+                    raise
+                saved_mode = (
+                    InteractionMode.PLAN
+                    if runtime.interaction_mode is InteractionModeV2.PLAN
+                    else InteractionMode.NORMAL
+                )
+                preferences.mode = saved_mode
+                recovering_workflow = True
+                console.set_mode(saved_mode)
+                console.write(
+                    "Another launcher started this workflow while the session was "
+                    f"opening; recovered its saved mode ({saved_mode.value}) and "
+                    "kept the durable request unchanged."
+                )
         elif not args.session:
             preferences.mode = (
                 InteractionMode.PLAN
@@ -5843,6 +7159,11 @@ def main(argv: Iterable[str] | None = None) -> int:
             except KeyboardInterrupt:
                 runtime.checkpoint_interrupt()
                 return 130
+        if (args.interactive or not args.command) and recovering_workflow:
+            # A restarted local server owns a new port. Open its live execution
+            # view so the user cannot remain stranded on a stale browser tab
+            # while the terminal has already recovered the durable workflow.
+            _open_local_web_view(runtime, console, "execution")
         if args.interactive or not args.command:
             interactive_loop(runtime, console, preferences)
         return 0
@@ -5863,6 +7184,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     finally:
         if runtime is not None:
             runtime.close()
+        if owner_lease is not None:
+            owner_lease.release()
         if store is not None:
             store.close()
         console.close()

@@ -277,6 +277,151 @@ def test_master_plan_separates_preview_scenario_from_literal_html_target() -> No
     assert any("separated preview scenario prose" in item for item in actions)
 
 
+def test_browser_scenario_transport_normalizes_executor_aliases() -> None:
+    payload, actions = UltraOrchestrator._normalize_typed_payload(
+        "browser_scenarios",
+        {
+            "modules": [
+                {
+                    "browser_scenarios": [
+                        {
+                            "module_id": "M001",
+                            "name": "addition",
+                            "steps": [
+                                {
+                                    "action": "type",
+                                    "role": "textbox",
+                                    "accessible_name": "First number",
+                                    "text": "123",
+                                }
+                            ],
+                            "assertions": [
+                                {
+                                    "role": "h2",
+                                    "accessible name": "Result",
+                                    "property": "text",
+                                    "value": "123",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+        {},
+    )
+
+    scenario = payload["modules"][0]["browser_scenarios"][0]
+    assert payload["modules"][0]["module_id"] == "M001"
+    assert "module_id" not in scenario
+    assert scenario["steps"][0] == {
+        "action": "fill",
+        "role": "textbox",
+        "name": "First number",
+        "value": "123",
+    }
+    assert scenario["assertions"][0] == {
+        "role": "heading",
+        "name": "Result",
+        "property": "text",
+        "equals": "123",
+    }
+    assert any("type action normalized to fill" in item for item in actions)
+    UltraOrchestrator._validate_typed_response("browser_scenarios", payload)
+
+
+def test_browser_scenario_validation_rejects_fill_without_value() -> None:
+    payload = {
+        "modules": [
+            {
+                "module_id": "M001",
+                "browser_scenarios": [
+                    {
+                        "name": "addition",
+                        "steps": [{"action": "fill", "role": "textbox", "name": "Input"}],
+                        "assertions": [
+                            {
+                                "role": "status",
+                                "name": "Result",
+                                "property": "text",
+                                "equals": "123",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+    try:
+        UltraOrchestrator._validate_typed_response("browser_scenarios", payload)
+    except AgentProtocolError as exc:
+        assert "fill step requires value" in str(exc)
+    else:
+        raise AssertionError("fill without value must not reach browser execution")
+
+
+def test_browser_scenario_root_array_binds_to_exact_single_requested_module() -> None:
+    payload, actions = UltraOrchestrator._normalize_typed_payload(
+        "browser_scenarios",
+        {
+            "browser_scenarios": [
+                {
+                    "name": "addition",
+                    "steps": [
+                        {"action": "click", "role": "button", "name": "Add"}
+                    ],
+                    "assertions": [
+                        {
+                            "role": "status",
+                            "name": "Result",
+                            "property": "text",
+                            "equals": "579",
+                        }
+                    ],
+                }
+            ]
+        },
+        {"modules": [{"module_id": "M004"}]},
+    )
+
+    assert payload["modules"][0]["module_id"] == "M004"
+    assert payload["modules"][0]["browser_scenarios"][0]["name"] == "addition"
+    assert any("one exact requested module" in item for item in actions)
+    UltraOrchestrator._validate_typed_response("browser_scenarios", payload)
+
+
+def test_browser_scenario_value_assertion_requires_a_form_control() -> None:
+    payload = {
+        "modules": [
+            {
+                "module_id": "M004",
+                "browser_scenarios": [
+                    {
+                        "name": "result",
+                        "steps": [{"action": "click", "role": "button", "name": "Run"}],
+                        "assertions": [
+                            {
+                                "role": "status",
+                                "name": "Result",
+                                "property": "value",
+                                "equals": "579",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+    try:
+        UltraOrchestrator._validate_typed_response("browser_scenarios", payload)
+    except AgentProtocolError as exc:
+        assert "property value requires a form-control role" in str(exc)
+    else:
+        raise AssertionError("status.value must not reach Playwright input_value")
+
+
 def test_browser_404_repair_constraints_are_scope_preserving_for_small_models() -> None:
     constraints = UltraOrchestrator._harness_repair_constraints(
         write_paths=("index.html",),
@@ -448,6 +593,165 @@ def prepared_engine(
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_browser_scenario_repair_is_a_model_authored_micro_step(self):
+        def handler(request: AgentRequest) -> AgentResponse:
+            if request.phase == "browser_scenarios":
+                self.assertEqual(request.task["modules"][0]["module_id"], "M004")
+                return AgentResponse(
+                    payload={
+                        "modules": [
+                            {
+                                "module_id": "M004",
+                                "browser_scenarios": [
+                                    {
+                                        "name": "Enter a calculation",
+                                        "steps": [
+                                            {
+                                                "action": "click",
+                                                "role": "button",
+                                                "name": "7",
+                                            }
+                                        ],
+                                        "assertions": [
+                                            {
+                                                "role": "textbox",
+                                                "name": "Display",
+                                                "property": "value",
+                                                "equals": "7",
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                    summary="Bound one browser flow.",
+                    provider="fake",
+                    model="scripted",
+                )
+            return standard_handler(request)
+
+        factory = FakeFactory(handler)
+        engine = UltraOrchestrator(
+            factory,
+            execution_class=ExecutionClass.LOCAL,
+            config=UltraConfig(
+                min_top_modules=1,
+                max_top_modules=12,
+                provider_retries=1,
+            ),
+        )
+        engine.prepare("Build the base project")
+        plan = MasterPlanV1(
+            summary="Build and verify the calculator.",
+            modules=(
+                TaskContractV1(
+                    id="M004",
+                    title="Browser verification",
+                    objective="Click calculator buttons and verify the display.",
+                    acceptance_criteria=("Click 7 and show 7.",),
+                    verification=("preview_html index.html",),
+                    write_paths=("index.html",),
+                ),
+            ),
+        )
+
+        bound = engine._bind_model_authored_browser_scenarios(
+            "Build an interactive calculator",
+            plan,
+            (
+                "module 'M004' has interactive acceptance criteria but "
+                "metadata.browser_scenarios has no executable steps and assertions",
+            ),
+        )
+
+        scenarios = bound.modules[0].metadata["browser_scenarios"]
+        self.assertEqual(scenarios[0]["name"], "Enter a calculation")
+        self.assertEqual(
+            bound.modules[0].metadata["browser_scenarios_authorship"],
+            "model_typed_micro_step",
+        )
+        self.assertEqual(
+            [request.phase for request in factory.requests].count("browser_scenarios"),
+            1,
+        )
+
+    def test_local_browser_scenario_repair_uses_one_model_call_per_module(self):
+        def handler(request: AgentRequest) -> AgentResponse:
+            if request.phase != "browser_scenarios":
+                return standard_handler(request)
+            self.assertEqual(len(request.task["modules"]), 1)
+            module_id = request.task["modules"][0]["module_id"]
+            return AgentResponse(
+                payload={
+                    "modules": [
+                        {
+                            "module_id": module_id,
+                            "browser_scenarios": [
+                                {
+                                    "name": f"Verify {module_id}",
+                                    "steps": [
+                                        {"action": "click", "role": "button", "name": "Run"}
+                                    ],
+                                    "assertions": [
+                                        {
+                                            "role": "status",
+                                            "name": "Result",
+                                            "property": "text",
+                                            "contains": "ready",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                },
+                summary=f"Bound {module_id}",
+                provider="fake",
+                model="scripted",
+            )
+
+        factory = FakeFactory(handler)
+        engine = UltraOrchestrator(
+            factory,
+            execution_class=ExecutionClass.LOCAL,
+            config=UltraConfig(min_top_modules=1, max_top_modules=12, provider_retries=1),
+        )
+        engine.prepare("Build the base project")
+        modules = tuple(
+            TaskContractV1(
+                id=module_id,
+                title=f"Browser verification {module_id}",
+                objective="Verify one interaction.",
+                acceptance_criteria=("Click Run and observe ready.",),
+                verification=("preview_html index.html",),
+                write_paths=("index.html",),
+            )
+            for module_id in ("M004", "M005")
+        )
+        plan = MasterPlanV1(summary="Verify both browser flows.", modules=modules)
+
+        bound = engine._bind_model_authored_browser_scenarios(
+            "Build an interactive calculator",
+            plan,
+            tuple(
+                f"module '{module.id}' has interactive acceptance criteria but "
+                "metadata.browser_scenarios has no executable steps and assertions"
+                for module in modules
+            ),
+        )
+
+        scenario_requests = [
+            request for request in factory.requests if request.phase == "browser_scenarios"
+        ]
+        self.assertEqual(
+            [request.task["modules"][0]["module_id"] for request in scenario_requests],
+            ["M004", "M005"],
+        )
+        self.assertTrue(
+            all(module.metadata.get("browser_scenarios") for module in bound.modules)
+        )
+
     def test_malformed_architecture_candidate_stops_after_targeted_repairs_without_fallback(self):
         def handler(request: AgentRequest) -> AgentResponse:
             response = standard_handler(request)

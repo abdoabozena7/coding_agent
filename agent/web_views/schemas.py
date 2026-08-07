@@ -86,7 +86,7 @@ class ToolApprovalPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     action_fingerprint: str = Field(min_length=16, max_length=128)
-    decision: Literal["allow", "approve", "allow_once", "deny", "reject"]
+    decision: Literal["allow", "approve", "allow_once", "allow_session", "deny", "reject"]
 
 
 class PlanRequestPayload(BaseModel):
@@ -102,9 +102,9 @@ class WorkspaceContextPayload(BaseModel):
 
     session_id: str
     session_short: str
-    requested_view: Literal["plan", "review", "agents"]
-    required_view: Literal["plan", "review", "agents"] | None = None
-    current_view: Literal["plan", "review", "agents"]
+    requested_view: Literal["plan", "review", "agents", "execution", "history", "thread"]
+    required_view: Literal["plan", "review", "agents", "execution", "history", "thread"] | None = None
+    current_view: Literal["plan", "review", "agents", "execution", "history", "thread"]
     checkpoint_id: str | None = None
     goal: dict[str, Any] | None = None
     mode: Literal["working", "plan"]
@@ -122,6 +122,111 @@ class WorkspaceContextPayload(BaseModel):
     waiting_on: str = ""
     resume_action: str = ""
     tool_approval: dict[str, Any] | None = None
+    control_surface: Literal["web", "terminal_fallback"] = "web"
+    required_action: dict[str, Any] | None = None
+    pending_question: dict[str, Any] | None = None
+    workflow_identity: dict[str, Any] = Field(default_factory=dict)
+    history_cursor: int = 0
+    sleep_enabled: bool = False
+    sleep_policy: Literal["off", "safe", "full"] = "off"
+    local_continuation: dict[str, Any] | None = None
+    provider_recovery: dict[str, Any] | None = None
+    # Additive left-rail projection.  Keeping it in the workspace snapshot
+    # avoids a second polling race while preserving the standalone index API.
+    project_sessions: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkspaceActionRequest(BaseModel):
+    """One idempotent action submitted by the primary workspace surface."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    action: Literal[
+        "approve_plan", "allow_tool", "allow_tool_session", "deny_tool", "retry", "resume",
+        "answer", "pause", "stop", "sleep_on", "sleep_full_on", "sleep_off", "switch_model",
+        "continue_local_model", "reconfigure_protection", "reconfigure_permissions",
+        "reconfigure_mode", "reconfigure_concurrency",
+    ]
+    target_id: str | None = Field(default=None, max_length=200)
+    action_fingerprint: str = Field(default="", max_length=256)
+    expected_sequence: int | None = Field(default=None, ge=0)
+    source: Literal["web", "terminal_fallback"] = "web"
+    value: str | None = Field(default=None, max_length=20_000)
+
+
+class WorkspaceActionReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    accepted: bool
+    action: str
+    source: str
+    duplicate: bool = False
+    next_view: str | None = None
+    next_phase: str | None = None
+    event_sequence: int | None = None
+    message: str
+
+
+class ThreadItemPayload(BaseModel):
+    """Stable append-only item returned by the unified thread projection."""
+
+    model_config = ConfigDict(extra="allow")
+
+    item_id: str
+    type: Literal[
+        "user_message", "assistant_message", "workflow_status", "plan",
+        "tool_run", "approval", "change_set", "review", "recovery", "completion",
+    ]
+    kind: str
+    sequence: int = Field(ge=0)
+    content_revision: int = Field(ge=0)
+    created_at: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ThreadSnapshotPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    session_id: str
+    items: list[ThreadItemPayload] = Field(default_factory=list)
+    after_sequence: int = Field(default=0, ge=0)
+    next_sequence: int = Field(default=0, ge=0)
+    has_more: bool = False
+    activity_sequence: int = Field(default=0, ge=0)
+    content_revision: int = Field(default=0, ge=0)
+    connection: str = "connected"
+
+
+class HistoryEventPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sequence: int
+    event_id: str
+    event_type: str
+    phase: str = ""
+    actor: str = "harness"
+    summary: str
+    why: str = ""
+    evidence: list[Any] = Field(default_factory=list)
+    workspace_mutated: bool = False
+    retry_count: int = 0
+    next_state: str = ""
+    goal_id: str | None = None
+    entity_id: str | None = None
+    created_at: str
+
+
+class HistorySnapshotPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    goal_id: str | None = None
+    items: list[HistoryEventPayload] = Field(default_factory=list)
+    next_cursor: int | None = None
+    has_more: bool = False
+    filters: dict[str, Any] = Field(default_factory=dict)
+    connection: str = "connected"
+    goals: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class QueuePromptPayload(BaseModel):

@@ -402,6 +402,11 @@ without a capable visual evaluator, record the limitation and never claim visual
 quality passed.
 
 Call submit_review exactly once with pass or fail and list every task you actually
+Treat each ``observed_result`` from an authoritative tool as literal evidence;
+do not mistake trailing punctuation in a criterion sentence for file content.
+An authoritative ``run_command`` or ``run_bash`` result with ``exit code: 0``
+proves the supplied assertion command passed; ``(no output)`` is expected for
+assertion-style checks and is not evidence of failure.
 checked in checked_task_ids. Pass only when that list covers the complete accepted
 plan and evidence
 directly proves the objective and all required tasks, with no unresolved critical

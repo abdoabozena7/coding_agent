@@ -16,7 +16,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import RLock
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from .models import (
     CompletionDisposition,
@@ -105,7 +105,7 @@ from .durable_memory import (
 )
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 DEFAULT_SESSION_ID = "workspace-session"
 MAX_PENDING_PROMPTS = 10
 
@@ -115,6 +115,12 @@ MAX_PROMPT_TRACES_PER_RUN = 2_000
 
 
 class StateStoreError(RuntimeError):
+    pass
+
+
+class WorkflowSessionConflictError(StateStoreError):
+    """Raised when a stale workflow-session writer tries to overwrite state."""
+
     pass
 
 
@@ -437,6 +443,9 @@ class StateStore:
                     existing = 13
                 if existing < 14:
                     self._migrate_v14()
+                    existing = 14
+                if existing < 15:
+                    self._migrate_v15()
                 journal_columns = {
                     str(row[1])
                     for row in self._connection.execute(
@@ -1625,6 +1634,59 @@ class StateStore:
                 )
             connection.execute("PRAGMA user_version=14")
 
+    def _migrate_v15(self) -> None:
+        """Add a monotonic revision to workflow-session projections.
+
+        The revision is deliberately additive.  Existing callers can keep
+        using ``save_workflow_session`` while new reducers can reject stale
+        writes and keep Web/terminal projections on the same durable version.
+        """
+
+        columns = {
+            str(row[1])
+            for row in self._connection.execute(
+                "PRAGMA table_info(workflow_sessions)"
+            ).fetchall()
+        }
+        with self.transaction() as connection:
+            if "revision" not in columns:
+                connection.execute(
+                    "ALTER TABLE workflow_sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+                )
+            connection.execute(
+                "UPDATE workflow_sessions SET revision=0 WHERE revision IS NULL"
+            )
+            # Repair the exact stale projection seen in the live local run:
+            # the Goal row survived while an older full-row session write
+            # cleared ``goal_id``.  Rebind only when there is one unfinished
+            # Goal for the session; history and terminal Goals are untouched.
+            terminal = tuple(status.value for status in TERMINAL_GOAL_STATUSES)
+            placeholders = ",".join("?" for _ in terminal)
+            sessions = connection.execute(
+                "SELECT id FROM workflow_sessions WHERE goal_id IS NULL"
+            ).fetchall()
+            for session in sessions:
+                candidate = connection.execute(
+                    f"SELECT id FROM goals WHERE session_id=? "
+                    f"AND status NOT IN ({placeholders}) "
+                    "ORDER BY updated_at DESC,id DESC LIMIT 1",
+                    (str(session["id"]), *terminal),
+                ).fetchone()
+                if candidate is not None:
+                    connection.execute(
+                        "UPDATE workflow_sessions SET goal_id=?,revision=revision+1,updated_at=? WHERE id=?",
+                        (str(candidate["id"]), _iso(utc_now()), str(session["id"])),
+                    )
+                    self._event(
+                        connection,
+                        "workflow.goal_rebound",
+                        goal_id=str(candidate["id"]),
+                        entity_type="workflow_session",
+                        entity_id=str(session["id"]),
+                        payload={"reason": "migration_repaired_stale_goal_projection"},
+                    )
+            connection.execute("PRAGMA user_version=15")
+
     def _remove_legacy_recovery_baselines(self) -> None:
         """Remove only recorded full-copy baselines under agent-owned state."""
 
@@ -1830,6 +1892,160 @@ class StateStore:
             self._event(connection, "goal.created", goal_id=goal.id, entity_type="goal", entity_id=goal.id, payload={"objective": goal.objective})
             return goal
 
+    def create_goal_and_bind_workflow_session(
+        self,
+        objective: str,
+        *,
+        session_id: str = DEFAULT_SESSION_ID,
+        success_criteria: Iterable[str] = (),
+        constraints: Iterable[str] = (),
+        metadata: Mapping[str, Any] | None = None,
+        session_mode: str = "normal",
+        plan_state: str = "inspecting",
+        run_state: str = "planning",
+        ultra_profile: str = "standard",
+        sleep_state: str = "off",
+        state: Mapping[str, Any] | None = None,
+        expected_revision: int | None = None,
+        complete_semantic_turn_id: str | None = None,
+        initial_status: GoalStatus = GoalStatus.DISCOVERING,
+    ) -> tuple[Goal, dict[str, Any]]:
+        """Create a Goal and publish its workflow-session binding atomically.
+
+        Semantic dispatch used to create the Goal, save the session, and then
+        complete the pending turn in three independent transactions.  A stale
+        writer could consequently put ``goal_id`` back to NULL or expose an
+        older phase.  This boundary owns the durable hand-off and optionally
+        closes the exact semantic turn in the same transaction.
+        """
+
+        objective = str(objective)
+        if not objective.strip():
+            raise ValueError("goal objective must not be empty")
+        if "\x00" in objective:
+            raise ValueError("goal objective must not contain NUL bytes")
+        if len(objective) > 20_000:
+            raise ValueError("goal objective exceeds 20,000 characters")
+        target_status = GoalStatus(initial_status)
+        with self.transaction() as connection:
+            session_row = connection.execute(
+                "SELECT * FROM workflow_sessions WHERE id=?", (str(session_id),)
+            ).fetchone()
+            if session_row is None:
+                raise NotFoundError(f"workflow session not found: {session_id}")
+            current_revision = int(session_row["revision"] or 0)
+            if (
+                expected_revision is not None
+                and current_revision != int(expected_revision)
+            ):
+                raise WorkflowSessionConflictError(
+                    f"workflow session {session_id} changed from revision "
+                    f"{expected_revision} to {current_revision}"
+                )
+            terminal = tuple(status.value for status in TERMINAL_GOAL_STATUSES)
+            placeholders = ",".join("?" for _ in terminal)
+            active = connection.execute(
+                f"SELECT id FROM goals WHERE session_id=? "
+                f"AND status NOT IN ({placeholders}) LIMIT 1",
+                (str(session_id), *terminal),
+            ).fetchone()
+            if active:
+                raise ActiveGoalError(
+                    f"unfinished goal already exists in session {session_id}: {active['id']}"
+                )
+            now = utc_now()
+            goal = Goal(
+                id=new_id("goal"),
+                objective=objective,
+                success_criteria=tuple(str(item) for item in success_criteria),
+                constraints=tuple(str(item) for item in constraints),
+                status=target_status,
+                metadata=dict(metadata or {}),
+                created_at=now,
+                updated_at=now,
+            )
+            connection.execute(
+                "INSERT INTO goals("
+                "id,objective,success_criteria_json,constraints_json,status,"
+                "active_plan_revision,metadata_json,created_at,updated_at,session_id"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    goal.id,
+                    goal.objective,
+                    _json(goal.success_criteria),
+                    _json(goal.constraints),
+                    goal.status.value,
+                    goal.active_plan_revision,
+                    _json(goal.metadata),
+                    _iso(goal.created_at),
+                    _iso(goal.updated_at),
+                    str(session_id),
+                ),
+            )
+            state_value = (
+                dict(state)
+                if state is not None
+                else _loads(session_row["state_json"], {})
+            )
+            if complete_semantic_turn_id:
+                pending = state_value.get("pending_semantic_turn")
+                if isinstance(pending, Mapping) and str(
+                    pending.get("turn_id") or ""
+                ) == str(complete_semantic_turn_id):
+                    completed = dict(pending)
+                    completed.update(
+                        {
+                            "status": "completed",
+                            "result_status": "goal_created",
+                            "attempt_state": "completed",
+                        }
+                    )
+                    state_value["last_semantic_turn"] = completed
+                    state_value.pop("pending_semantic_turn", None)
+            next_revision = current_revision + 1
+            connection.execute(
+                "UPDATE workflow_sessions SET goal_id=?,session_mode=?,plan_state=?,run_state=?,"
+                "ultra_profile=?,sleep_state=?,state_json=?,revision=?,updated_at=? WHERE id=?",
+                (
+                    goal.id,
+                    str(session_mode),
+                    str(plan_state),
+                    str(run_state),
+                    str(ultra_profile),
+                    str(sleep_state),
+                    _json(state_value),
+                    next_revision,
+                    _iso(now),
+                    str(session_id),
+                ),
+            )
+            self._event(
+                connection,
+                "goal.created",
+                goal_id=goal.id,
+                entity_type="goal",
+                entity_id=goal.id,
+                payload={
+                    "objective": goal.objective,
+                    "status": goal.status.value,
+                    "session_id": str(session_id),
+                    "atomic_session_binding": True,
+                },
+            )
+            self._event(
+                connection,
+                "workflow.goal_bound",
+                goal_id=goal.id,
+                entity_type="workflow_session",
+                entity_id=str(session_id),
+                payload={
+                    "session_revision": next_revision,
+                    "phase": "planning",
+                    "semantic_turn_id": str(complete_semantic_turn_id or ""),
+                },
+            )
+        return goal, self.get_workflow_session(str(session_id))
+
     @staticmethod
     def _goal_from_row(row: sqlite3.Row) -> Goal:
         return Goal(
@@ -1850,6 +2066,16 @@ class StateStore:
         if row is None:
             raise NotFoundError(f"goal not found: {goal_id}")
         return self._goal_from_row(row)
+
+    def goal_session_id(self, goal_id: str) -> str:
+        """Return the owning session for a goal without exposing it on the domain model."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT session_id FROM goals WHERE id=?", (str(goal_id),)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"goal not found: {goal_id}")
+        return str(row[0])
 
     def load_active_goal(self, session_id: str = DEFAULT_SESSION_ID) -> Goal | None:
         terminal = tuple(status.value for status in TERMINAL_GOAL_STATUSES)
@@ -1880,6 +2106,31 @@ class StateStore:
                     (str(session_id),),
                 ).fetchone()
         return self._goal_from_row(row) if row else None
+
+    def list_goals(
+        self,
+        session_id: str | None = None,
+        *,
+        after_created_at: str | None = None,
+        limit: int = 50,
+    ) -> tuple[Goal, ...]:
+        """List durable workflow goals for history without changing the schema."""
+        sql = "SELECT * FROM goals"
+        params: list[Any] = []
+        clauses: list[str] = []
+        if session_id is not None:
+            clauses.append("session_id=?")
+            params.append(str(session_id))
+        if after_created_at:
+            clauses.append("created_at<?")
+            params.append(str(after_created_at))
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC,id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
+        with self._lock:
+            rows = self._connection.execute(sql, tuple(params)).fetchall()
+        return tuple(self._goal_from_row(row) for row in rows)
 
     def transition_goal(
         self,
@@ -1925,12 +2176,12 @@ class StateStore:
             run_state, plan_state = session_projection[target]
             if plan_state is None:
                 connection.execute(
-                    "UPDATE workflow_sessions SET run_state=?,updated_at=? WHERE goal_id=?",
+                    "UPDATE workflow_sessions SET run_state=?,revision=revision+1,updated_at=? WHERE goal_id=?",
                     (run_state, _iso(now), goal_id),
                 )
             else:
                 connection.execute(
-                    "UPDATE workflow_sessions SET run_state=?,plan_state=?,updated_at=? WHERE goal_id=?",
+                    "UPDATE workflow_sessions SET run_state=?,plan_state=?,revision=revision+1,updated_at=? WHERE goal_id=?",
                     (run_state, plan_state, _iso(now), goal_id),
                 )
             self._event(
@@ -1979,7 +2230,7 @@ class StateStore:
             )
             connection.execute(
                 "UPDATE workflow_sessions SET goal_id=NULL,plan_state='none',"
-                "run_state='cancelled',state_json=?,updated_at=? WHERE id=?",
+                "run_state='cancelled',state_json=?,revision=revision+1,updated_at=? WHERE id=?",
                 (_json(state), _iso(now), session_id),
             )
             connection.execute(
@@ -2444,6 +2695,15 @@ class StateStore:
                 "SELECT * FROM plans WHERE goal_id=? ORDER BY revision DESC LIMIT 1", (goal_id,)
             ).fetchone()
         return self._plan_from_row(row) if row else None
+
+    def list_plan_revisions(self, goal_id: str) -> tuple[Plan, ...]:
+        """Return every saved revision in stable revision order."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM plans WHERE goal_id=? ORDER BY revision ASC",
+                (goal_id,),
+            ).fetchall()
+        return tuple(self._plan_from_row(row) for row in rows)
 
     def get_accepted_plan(self, goal_id: str) -> Plan | None:
         with self._lock:
@@ -6782,10 +7042,59 @@ class StateStore:
         plan_state: str,
         run_state: str,
         ultra_profile: str = "standard",
-        sleep_state: str = "off",
+        sleep_state: str | None = None,
         state: Mapping[str, Any] | None = None,
-    ) -> None:
+        expected_revision: int | None = None,
+        clear_goal_id: bool = False,
+    ) -> int:
         with self.transaction() as connection:
+            existing_row = connection.execute(
+                "SELECT goal_id,state_json,sleep_state,revision FROM workflow_sessions WHERE id=?",
+                (session_id,),
+            ).fetchone()
+            current_revision = int(
+                existing_row["revision"] if existing_row is not None else 0
+            )
+            if (
+                expected_revision is not None
+                and current_revision != int(expected_revision)
+            ):
+                raise WorkflowSessionConflictError(
+                    f"workflow session {session_id} changed from revision "
+                    f"{expected_revision} to {current_revision}"
+                )
+            current_goal_id = (
+                str(existing_row["goal_id"])
+                if existing_row is not None and existing_row["goal_id"]
+                else None
+            )
+            # Older callers pass ``None`` while updating only runtime state.
+            # Preserve an already-bound Goal unless the caller explicitly asks
+            # to clear it.  Terminal cancellation uses the dedicated atomic
+            # cancel transition and therefore remains able to clear the link.
+            goal_id_value = (
+                goal_id
+                if goal_id is not None or clear_goal_id or current_goal_id is None
+                else current_goal_id
+            )
+            # A workflow-session update should not silently turn off an
+            # explicitly enabled unattended policy just because an older
+            # caller omitted the newer ``sleep_state`` field.  This is
+            # especially important while Full Auto is crossing provider,
+            # planning, and execution boundaries.  New sessions still start
+            # with the safe default.
+            if sleep_state is None:
+                existing_sleep = connection.execute(
+                    "SELECT sleep_state FROM workflow_sessions WHERE id=?",
+                    (session_id,),
+                ).fetchone()
+                sleep_state_value = (
+                    str(existing_sleep["sleep_state"] or "off")
+                    if existing_sleep is not None
+                    else "off"
+                )
+            else:
+                sleep_state_value = str(sleep_state)
             if state is None:
                 existing = connection.execute(
                     "SELECT state_json FROM workflow_sessions WHERE id=?",
@@ -6798,23 +7107,82 @@ class StateStore:
                 )
             else:
                 state_value = dict(state)
+            next_revision = current_revision + 1
             connection.execute(
-                "INSERT INTO workflow_sessions(id,goal_id,session_mode,plan_state,run_state,ultra_profile,sleep_state,state_json,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET goal_id=excluded.goal_id,"
+                "INSERT INTO workflow_sessions(id,goal_id,session_mode,plan_state,run_state,ultra_profile,sleep_state,state_json,revision,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET goal_id=excluded.goal_id,"
                 "session_mode=excluded.session_mode,plan_state=excluded.plan_state,run_state=excluded.run_state,"
-                "ultra_profile=excluded.ultra_profile,sleep_state=excluded.sleep_state,state_json=excluded.state_json,updated_at=excluded.updated_at",
+                "ultra_profile=excluded.ultra_profile,sleep_state=excluded.sleep_state,state_json=excluded.state_json,"
+                "revision=excluded.revision,updated_at=excluded.updated_at",
                 (
                     session_id,
-                    goal_id,
+                    goal_id_value,
                     session_mode,
                     plan_state,
                     run_state,
                     ultra_profile,
-                    sleep_state,
+                    sleep_state_value,
                     _json(state_value),
+                    next_revision,
                     _iso(utc_now()),
                 ),
             )
+            return next_revision
+
+    def mutate_workflow_session(
+        self,
+        session_id: str,
+        reducer: Callable[[dict[str, Any]], Mapping[str, Any] | None],
+        *,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Apply one revision-checked workflow-session transition atomically."""
+
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"workflow session not found: {session_id}")
+            current = {
+                **dict(row),
+                "state": _loads(row["state_json"], {}),
+            }
+            current_revision = int(current.get("revision") or 0)
+            if (
+                expected_revision is not None
+                and current_revision != int(expected_revision)
+            ):
+                raise WorkflowSessionConflictError(
+                    f"workflow session {session_id} changed from revision "
+                    f"{expected_revision} to {current_revision}"
+                )
+            candidate = dict(current)
+            candidate.pop("state_json", None)
+            result = reducer(candidate)
+            if result is not None:
+                candidate.update(dict(result))
+            state_value = candidate.get("state", {})
+            if not isinstance(state_value, Mapping):
+                raise StateStoreError("workflow session reducer must return a mapping state")
+            next_revision = current_revision + 1
+            connection.execute(
+                "UPDATE workflow_sessions SET goal_id=?,session_mode=?,plan_state=?,run_state=?,"
+                "ultra_profile=?,sleep_state=?,state_json=?,revision=?,updated_at=? WHERE id=?",
+                (
+                    candidate.get("goal_id"),
+                    str(candidate.get("session_mode") or "normal"),
+                    str(candidate.get("plan_state") or "none"),
+                    str(candidate.get("run_state") or "idle"),
+                    str(candidate.get("ultra_profile") or "standard"),
+                    str(candidate.get("sleep_state") or "off"),
+                    _json(dict(state_value)),
+                    next_revision,
+                    _iso(utc_now()),
+                    session_id,
+                ),
+            )
+        return self.get_workflow_session(session_id)
 
     def get_workflow_session(self, session_id: str) -> dict[str, Any]:
         row = self._connection.execute("SELECT * FROM workflow_sessions WHERE id=?", (session_id,)).fetchone()
@@ -6842,6 +7210,33 @@ class StateStore:
             }
             for row in rows
         )
+
+    def latest_event_sequence(self, goal_id: str | None = None) -> int:
+        sql = "SELECT COALESCE(MAX(sequence),0) FROM events"
+        params: tuple[Any, ...] = ()
+        if goal_id:
+            sql += " WHERE goal_id=?"
+            params = (goal_id,)
+        with self._lock:
+            row = self._connection.execute(sql, params).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def list_history_events(
+        self,
+        goal_id: str | None = None,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> tuple[RuntimeEvent, ...]:
+        """Named history API; unlike live events this is durable and paged."""
+        return self.list_events(goal_id, after_sequence=after_sequence, limit=limit)
+
+    def get_history_event(self, goal_id: str, sequence: int) -> RuntimeEvent:
+        items = self.list_events(goal_id, after_sequence=max(0, int(sequence) - 1), limit=2)
+        for item in items:
+            if item.sequence == int(sequence):
+                return item
+        raise NotFoundError(f"history event not found: {goal_id}:{sequence}")
 
     @staticmethod
     def _queued_prompt_from_row(row: sqlite3.Row) -> QueuedPrompt:

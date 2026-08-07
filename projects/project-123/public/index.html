@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js 3D Calculator</title>
+    <style>
+        /* General body styling */
+        body {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f4f7f9;
+            font-family: 'Arial', sans-serif;
+        }
+
+        #calculator-container {
+            width: 85%; /* Constrain container width */
+            max-width: 500px;
+            height: auto;
+            border-radius: 20px;
+            box-shadow: 0 15px 40px rgba(0, 0, 0, 0.3);
+            background-color: #ffffff;
+            padding: 20px;
+            margin-bottom: 30px; /* Space between calculator and results */
+        }
+
+        /* Style for the test result display */
+        #test-results {
+            text-align: center;
+            padding: 20px;
+            border: 1px solid #ccc;
+            background-color: #fff;
+            border-radius: 10px;
+            width: 85%;
+            max-width: 500px;
+        }
+    </style>
+</head>
+<body>
+
+<!-- Three.js rendering will occupy the container -->
+<div id="calculator-container"></div>
+
+<div id="test-results">
+    <h1>Calculator Ready</h1>
+    <p>Watch the output for 5 + 3 = 8 calculation.</p>
+    <h2 id="result-display" style="color: #007bff;">Awaiting Calculation...</h2>
+</div>
+
+
+<script type="module">
+    import { coreLogic } from './src/calculator/CoreCalculatorLogic.js';
+    import { InputEventHandler } from './src/interaction/InputEventHandler.js';
+    import { THREEJSCoreRenderer } from './src/renderer/THREEJSCoreRenderer.js';
+
+    // Initialize Components
+    const renderer = new THREEJSCoreRenderer();
+    const eventHandler = new InputEventHandler(renderer);
+
+
+    /**
+     * Test Sequence: 5 + 3 = 8
+     * Uses async timeouts to simulate staggered user interaction timing in the browser environment.
+     */
+    async function runTestSequence() {
+        console.log("--- Starting Calculator State Test: 5 + 3 = 8 ---");
+        const resultElement = document.getElementById('result-display');
+
+        // Helper for delayed execution
+        const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+        // Sequence: Click '5' -> Click '+' -> Click '3' -> Click '='
+        await delay(100);
+        console.log("Step 1/4: Pressing '5'");
+        eventHandler.handleInput('5');
+
+        await delay(200); // Short pause between inputs for visual feedback
+        console.log("Step 2/4: Pressing '+'");
+        eventHandler.handleInput('+');
+
+        await delay(300);
+        console.log("Step 3/4: Pressing '3'");
+        eventHandler.handleInput('3');
+        
+        await delay(400);
+        console.log("Step 4/4: Pressing '='");
+        // The handler reads the final state from coreLogic and updates the display
+        const finalResult = eventHandler.handleInput('=');
+
+        // Final check on the result element using the value from core logic after calculation
+        setTimeout(() => {
+             resultElement.textContent = `Final Result: ${coreLogic.getCurrentDisplayValue()}`;
+             console.log("--- Test Sequence Complete ---");
+         }, 50); // Small delay for visual confirmation display update
+
+    }
+
+    // Initialization order must be respected: Renderer first, then sequence runner.
+    renderer.render();
+    runTestSequence();
+
+
+</script>
+</body></html>

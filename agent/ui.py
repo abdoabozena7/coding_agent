@@ -1089,13 +1089,16 @@ Slash palette and modes
   /mode ultra                recursive specialists + Project Brain + full quality gates
   /settings                  show safe session settings (never secrets)
   /settings NAME VALUE       change mode, color, or a runtime limit this session
+  /settings reconfigure      reopen and update the saved project profile
   /model                     reopen the tool-capable model picker at a safe checkpoint
   /permissions normal|full   choose approvals or Docker-isolated Full access
   /setup                     build/validate the one-time Full-access sandbox
+  /setup project             reopen the saved project model/protection/profile choices
   /skills                    show actual local tools and live capability status
   /processes                 list managed processes and HTML previews
   /stop-process ID           stop a managed process or preview
-  /sleep on|off|status       safe unattended recommended choices; unsafe decisions stay manual
+  /sleep safe|full|off|status  unattended policy; Full Auto accepts reviewed plans and tools
+  /open-web                  open the primary Workspace control surface
 
 Persistent workspace keys
   F2                         Simple / Advanced details
@@ -1109,7 +1112,7 @@ Goal and plan
   /goal TEXT                 start a durable goal (plain text also works when idle)
   /plan                      open Plan Studio for the latest exact revision
   /review                    open Change Review for the current checkpoint
-  /agents                    open the live Agent Tree / Execution Map
+  /execution / /agents       open the live Execution tree (read-only)
   /chat                      open the durable read-only workspace conversation
   /questions                 show non-discoverable intake/planning decisions
   /answer ID 1|2|3|TEXT      select a suggestion or save a free-form answer
@@ -1122,7 +1125,7 @@ Execution
   /run [STEPS]               run a bounded work slice; goal remains durable
   /auto                      retry/self-prompt without limit until completion or real user input
   /pause / /resume           drain to a saved checkpoint, then continue
-  /history / /status         inspect durable execution state
+  /history / /status         inspect durable milestones in the Workspace
   /versions                  list protected accepted checkpoints and change summaries
   /diff [NUMBER|COMMIT]      show current changes or one redacted checkpoint patch
   /explorer                  open the exact selected project folder
@@ -1641,6 +1644,7 @@ class ConsoleUI:
         self.context_tokens = 0
         self.context_window_tokens: int | None = None
         self._sleep_enabled = False
+        self._sleep_policy = "off"
         self.vim_mode = False
         self.color_mode = "auto" if color is None else ("on" if color else "off")
         self.color = False
@@ -1716,7 +1720,7 @@ class ConsoleUI:
             store.set_context_window(self.context_window_tokens)
             store.update_runtime_profile(execution_class=self.execution_class)
             if self._sleep_enabled:
-                store.set_sleep_mode(True)
+                store.set_sleep_mode(True, policy=self._sleep_policy)
 
     @property
     def sleep_enabled(self) -> bool:
@@ -1724,13 +1728,19 @@ class ConsoleUI:
             return self._workspace_store.sleep_enabled()
         return self._sleep_enabled
 
-    def set_sleep_mode(self, enabled: bool) -> bool:
+    def set_sleep_mode(self, enabled: bool, *, policy: str = "safe") -> bool:
         self._sleep_enabled = bool(enabled)
+        normalized = str(policy or "safe").casefold()
+        self._sleep_policy = normalized if self._sleep_enabled and normalized in {"safe", "full"} else "off"
         if self._workspace_store is not None:
-            return self._workspace_store.set_sleep_mode(enabled)
+            return self._workspace_store.set_sleep_mode(enabled, policy=normalized)
         self.write(
             f"Sleep Mode {'enabled' if enabled else 'disabled'}. "
-            "Unsafe decisions still require you."
+            + (
+                "Full Auto accepts and audits critic-reviewed plans and every tool approval in this workspace."
+                if self._sleep_policy == "full"
+                else "Unsafe decisions still require you."
+            )
         )
         return self._sleep_enabled
 
@@ -2477,6 +2487,15 @@ class ConsoleUI:
             self._live_line(self._icon("◇", "[>]"), message, self.cyan)
 
     def on_event(self, event: UIEvent) -> None:
+        if event.kind == "sleep.mode_changed":
+            enabled = bool(event.data.get("enabled"))
+            policy = str(event.data.get("policy") or "safe").casefold()
+            if self._workspace_store is None:
+                self._sleep_enabled = enabled
+                self._sleep_policy = policy if enabled and policy in {"safe", "full"} else "off"
+            else:
+                self._workspace_store.handle_event(event.kind, event.message, event.data)
+            return
         if self._workspace_store is not None:
             self._last_event_kind = event.kind
             payload = dict(event.data)
@@ -2675,10 +2694,7 @@ class ConsoleUI:
             )
         if policy.requirement is ApprovalRequirement.AUTO:
             return ApprovalDecision.ALLOW_ONCE
-        if (
-            policy.requirement is ApprovalRequirement.SESSION
-            and policy.group in self._session_approval_groups
-        ):
+        if policy.group in self._session_approval_groups:
             return ApprovalDecision.ALLOW_SESSION
 
         canonical = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
@@ -2698,15 +2714,17 @@ class ConsoleUI:
                 shortcut="y",
             )
         ]
-        if policy.requirement is ApprovalRequirement.SESSION:
-            options.append(
-                AttentionOption(
-                    "allow_session", "Allow this session",
-                    ApprovalDecision.ALLOW_SESSION.value,
-                    description=f"Allow later actions in the {policy.group.replace('_', ' ')} group.",
-                    shortcut="s",
-                )
+        options.append(
+            AttentionOption(
+                "allow_session", "Always allow this session",
+                ApprovalDecision.ALLOW_SESSION.value,
+                description=(
+                    f"Allow later actions in the {policy.group.replace('_', ' ')} "
+                    "group until this session ends."
+                ),
+                shortcut="s",
             )
+        )
         options.append(
             AttentionOption(
                 "deny", "Deny", ApprovalDecision.DENY.value,

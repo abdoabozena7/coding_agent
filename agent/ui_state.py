@@ -275,6 +275,7 @@ class WorkspaceSnapshot:
     attention_feedback: str
     log_entries: tuple[StructuredLogEntry, ...]
     swarm: SwarmSummarySnapshot
+    sleep_policy: str = "off"
     changes: FileChangeSnapshot = FileChangeSnapshot()
     undo_available: bool = False
     workflow_mode: str = "ready"
@@ -310,6 +311,7 @@ class WorkspaceSnapshot:
     first_byte_at: float | None = None
     task_items: tuple[Mapping[str, Any], ...] = ()
     next_task: str = ""
+    control_surface: str = "terminal_fallback"
 
 
 _ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
@@ -406,6 +408,7 @@ class WorkspaceUIStore:
         self._first_byte_at: float | None = None
         self._task_items: tuple[Mapping[str, Any], ...] = ()
         self._next_task = ""
+        self._control_surface = "terminal_fallback"
         self._progress = ProjectProgressSnapshot()
         self._progress_identity = ""
         self._progress_started_at: float | None = None
@@ -417,6 +420,7 @@ class WorkspaceUIStore:
         self._unit_durations: deque[float] = deque(maxlen=12)
         self._resources = ResourceSnapshot()
         self._sleep_enabled = False
+        self._sleep_policy = "off"
         self._sleep_log: deque[str] = deque(maxlen=200)
         self._attention_feedback = ""
         self._swarm = SwarmSummarySnapshot()
@@ -697,17 +701,42 @@ class WorkspaceUIStore:
             )
         self._notify()
 
-    def set_sleep_mode(self, enabled: bool) -> bool:
+    def set_sleep_mode(self, enabled: bool, *, policy: str = "safe") -> bool:
         enabled = bool(enabled)
+        normalized = str(policy or "safe").casefold()
+        if normalized not in {"safe", "full"}:
+            normalized = "safe"
+        auto_request: AttentionRequest | None = None
         with self._lock:
-            changed = self._sleep_enabled != enabled
+            changed = self._sleep_enabled != enabled or self._sleep_policy != (normalized if enabled else "off")
             self._sleep_enabled = enabled
+            self._sleep_policy = normalized if enabled else "off"
+            if changed and enabled and normalized == "full" and self._attention is not None:
+                # Full Auto can be enabled from the Web while the terminal
+                # controller is already blocked in a recovery card.  Wake
+                # that exact request so the owner re-enters its durable
+                # boundary logic instead of waiting forever for a keyboard
+                # answer that the user has explicitly replaced with Full
+                # Auto.  Only bounded recovery/plan decisions are eligible;
+                # free-form or destructive questions remain explicit.
+                candidate = self._full_auto_attention_option(self._attention)
+                if candidate is not None:
+                    auto_request = self._attention
         if changed:
             state = "enabled" if enabled else "disabled"
-            self.append_log(f"sleep: {state}; unsafe decisions remain manual")
-            self.append_transcript("assistant", f"Sleep Mode {state}. Unsafe decisions still require you.")
+            detail = (
+                "Full Auto accepts and audits critic-reviewed plans and every tool approval in this workspace."
+                if enabled and normalized == "full"
+                else "Unsafe decisions still require you."
+            )
+            self.append_log(f"sleep: {state}; policy={self._sleep_policy}")
+            self.append_transcript("assistant", f"Sleep Mode {state}. {detail}")
         else:
             self._notify()
+        if auto_request is not None:
+            candidate = self._full_auto_attention_option(auto_request)
+            if candidate is not None:
+                self.resolve_attention(candidate.key, origin="sleep")
         return enabled
 
     def toggle_sleep_mode(self) -> bool:
@@ -718,6 +747,10 @@ class WorkspaceUIStore:
     def sleep_enabled(self) -> bool:
         with self._lock:
             return self._sleep_enabled
+
+    def sleep_policy(self) -> str:
+        with self._lock:
+            return self._sleep_policy
 
     def sync_dashboard(self, view: Any) -> None:
         """Reduce a DashboardView without exposing runtime objects to the renderer."""
@@ -908,6 +941,12 @@ class WorkspaceUIStore:
                 value = str(getattr(workflow_mode, "value", workflow_mode)).casefold()
                 self._workflow_mode = self._normalize_workflow_label(value)
                 self._composer_mode = self._workflow_mode
+        self._notify()
+
+    def set_control_surface(self, value: str) -> None:
+        """Declare which surface owns interactive decisions for this session."""
+        with self._lock:
+            self._control_surface = "web" if str(value).casefold() == "web" else "terminal_fallback"
         self._notify()
 
     def update_workflow_mode(self, value: str) -> None:
@@ -1167,6 +1206,17 @@ class WorkspaceUIStore:
                     origin="sleep",
                 )
                 self._attention_events.pop(request.id, None)
+            elif (
+                self._sleep_enabled
+                and self._sleep_policy == "full"
+                and (automatic := self._full_auto_attention_option(request)) is not None
+            ):
+                self._attention_results[request.id] = AttentionResolution(
+                    automatic.key,
+                    automatic.value,
+                    origin="sleep",
+                )
+                self._attention_events.pop(request.id, None)
             elif self._attention is None:
                 self._attention = request
                 self._attention_index = self._default_option_index(request)
@@ -1188,6 +1238,65 @@ class WorkspaceUIStore:
 
         with self._lock:
             return self._attention_results.pop(str(request_id), None)
+
+    @staticmethod
+    def _full_auto_attention_option(request: AttentionRequest) -> AttentionOption | None:
+        """Choose only bounded decisions that Full Auto is allowed to wake."""
+
+        if request.kind is AttentionKind.RECOVERY:
+            # Recovery cards use one of these stable keys across terminal and
+            # Web renderers. Prefer an explicit local continuation when the
+            # failed cloud boundary offers it. A provider-exhausted local
+            # boundary is different: retrying it automatically would hammer
+            # an unavailable runner, so leave that truthful recovery card for
+            # the user instead of treating it like a routine resume.
+            local_option = next(
+                (
+                    option
+                    for key in ("local", "continue_local_model")
+                    for option in request.options
+                    if option.key == key
+                ),
+                None,
+            )
+            if local_option is not None:
+                return local_option
+            boundary_text = " ".join(
+                str(value or "")
+                for value in (request.title, request.message, request.details)
+            ).casefold()
+            if any(
+                marker in boundary_text
+                for marker in (
+                    "provider access failed repeatedly",
+                    "provider retries were exhausted",
+                    "local model stopped unexpectedly",
+                    "local provider unavailable",
+                )
+            ):
+                return None
+            # Prefer resuming the saved stage over any inspect or stop branch;
+            # the exact durable request remains authoritative.
+            return next(
+                (
+                    option
+                    for key in ("retry", "resume", "continue", "allow")
+                    for option in request.options
+                    if option.key == key
+                ),
+                None,
+            )
+        if request.kind is AttentionKind.PLAN_REVIEW:
+            return next(
+                (
+                    option
+                    for key in ("start", "approve")
+                    for option in request.options
+                    if option.key == key
+                ),
+                None,
+            )
+        return None
 
     @staticmethod
     def _default_option_index(request: AttentionRequest) -> int:
@@ -1218,7 +1327,13 @@ class WorkspaceUIStore:
             self._attention_feedback = ""
         self._notify()
 
-    def resolve_attention(self, key: str, *, text: str = "") -> bool:
+    def resolve_attention(
+        self,
+        key: str,
+        *,
+        text: str = "",
+        origin: str = "manual",
+    ) -> bool:
         with self._lock:
             request = self._attention
             if request is None:
@@ -1233,7 +1348,7 @@ class WorkspaceUIStore:
                 event = None
             else:
                 value = text if option is None else option.value
-                self._attention_results[request.id] = AttentionResolution(key, value, text, "manual")
+                self._attention_results[request.id] = AttentionResolution(key, value, text, origin)
                 event = self._attention_events.pop(request.id, None)
                 self._attention = self._attention_queue.popleft() if self._attention_queue else None
                 self._attention_index = (
@@ -1304,6 +1419,12 @@ class WorkspaceUIStore:
 
         data = dict(data or {})
         normalized = str(kind)
+        if normalized == "sleep.mode_changed":
+            self.set_sleep_mode(
+                bool(data.get("enabled")),
+                policy=str(data.get("policy") or "safe"),
+            )
+            return
         timeline_kinds = {
             "provider.activity", "workflow.state", "heartbeat",
             "approval.requested", "approval.received", "plan.approved.local_web",
@@ -1933,6 +2054,7 @@ class WorkspaceUIStore:
                 attention_feedback=self._attention_feedback,
                 log_entries=tuple(self._log_entries),
                 swarm=self._swarm,
+                sleep_policy=self._sleep_policy,
                 changes=self._changes,
                 undo_available=self._undo_available,
                 workflow_mode=self._workflow_mode,
@@ -1965,6 +2087,7 @@ class WorkspaceUIStore:
                 first_byte_at=self._first_byte_at,
                 task_items=tuple(dict(item) for item in self._task_items),
                 next_task=self._next_task,
+                control_surface=self._control_surface,
             )
 
 

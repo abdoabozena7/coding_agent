@@ -21,7 +21,8 @@ from agent.evaluation import (
     run_single_file_3d_html_benchmark,
 )
 from agent.local_provider import (ModelCapabilityProfile, OllamaRequestCompiler, ProviderFailureKind,
-    ProviderRequestError, extract_first_json_object, normalize_action_proposal)
+    ProviderRequestError, extract_first_json_object, normalize_action_proposal,
+    repair_structured_json_object)
 from agent.providers.ollama_provider import OllamaProvider
 from agent.reasoning import evaluate_reasoning_artifact, reasoning_debate_protocol_for
 from agent.repository_index import HashingEmbeddingProvider, OllamaEmbeddingProvider, RepositoryIndex
@@ -288,6 +289,43 @@ def login(user_id):
             self.assertEqual(second.last_update_stats["reused"], 2)
             self.assertEqual(second_provider.calls, 0)
             self.assertEqual(second.hybrid_search("alpha", kinds=("py_function",))[0].name, "alpha")
+
+    def test_repository_search_does_not_build_hnsw_synchronously(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "worker.py").write_text(
+                "def enqueue_retry(job):\n    return {'retry': job}\n",
+                encoding="utf-8",
+            )
+            index = RepositoryIndex(root)
+            index.update("worker.py")
+            # Force the accelerator threshold for this small fixture.  The
+            # query must still use the deterministic dense fallback while the
+            # optional graph is not already built.
+            index._HNSW_MIN_VECTORS = 0
+            with patch.object(index, "_ensure_hnsw", side_effect=AssertionError("query built HNSW")):
+                hits = index.hybrid_search("retry worker", kinds=("py_function",))
+            self.assertEqual(hits[0].name, "enqueue_retry")
+
+    def test_large_repository_context_skips_expensive_graph_expansion(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "worker.py").write_text(
+                "def enqueue_retry(job):\n    return {'retry': job}\n",
+                encoding="utf-8",
+            )
+            index = RepositoryIndex(root)
+            index.update("worker.py")
+            # Model a restored large cache without creating thousands of files.
+            index._embeddings.update(
+                {
+                    (f"synthetic-{number}.py", "file", "worker.py", 1): (1.0,)
+                    for number in range(index._GRAPH_NEIGHBORHOOD_MAX_VECTORS + 1)
+                }
+            )
+            with patch.object(index, "callers_of", side_effect=AssertionError("graph expansion ran")):
+                context = index.context_slice("retry worker", max_entries=4)
+            self.assertTrue(context.entries)
+            self.assertEqual(context.callers, {})
+            self.assertEqual(context.callees, {})
 
     def test_repository_index_persistent_cache_invalidates_changed_file(self):
         with tempfile.TemporaryDirectory() as root:
@@ -637,6 +675,25 @@ function lerp(a,b,t){return a+(b-a)*t} function animate(){requestAnimationFrame(
     def test_non_native_tool_action_is_extracted_from_bounded_prose(self):
         candidate = extract_first_json_object('proposal:\n```json\n{"tool":"read_file","arguments":{"path":"x.py"}}\n```')
         self.assertEqual(normalize_action_proposal(candidate), ("read_file", {"path": "x.py"}))
+
+    def test_truncated_native_tool_action_repairs_missing_outer_delimiter(self):
+        candidate = extract_first_json_object(
+            '{"name":"update_task","arguments":{"task_id":"T001","status":"done"}'
+        )
+        self.assertEqual(
+            normalize_action_proposal(candidate),
+            ("update_task", {"task_id": "T001", "status": "done"}),
+        )
+
+    def test_local_json_repair_removes_invalid_single_quote_escape(self):
+        candidate, actions = repair_structured_json_object(
+            r'''{"name":"propose_plan","arguments":{"verification":"grep -q \'Hello\'"}}'''
+        )
+        self.assertEqual(
+            normalize_action_proposal(candidate),
+            ("propose_plan", {"verification": "grep -q 'Hello'"}),
+        )
+        self.assertIn("single-quote", " ".join(actions))
 
     def test_http_400_is_reachable_request_rejection(self):
         error = urllib.error.HTTPError("http://localhost:11434/api/chat", 400, "bad", {}, io.BytesIO(b'{"error":"unknown field tools; token=secret"}'))
