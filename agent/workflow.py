@@ -322,10 +322,9 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
     """Mechanically normalize a simplified or legacy proposal.
 
     Stable task IDs and all cross references are generated here.  A missing
-    description is repaired only when title, observable criteria, and
-    verification already make the task semantically complete; otherwise
-    missing objectives, criteria, or verification remain validation errors for
-    one targeted repair.
+    verification array may be projected only from the task's already-authored
+    observable acceptance criteria; this supplies transport shape without
+    weakening the independent critic or final fresh-evidence gate.
     """
 
     actions: list[str] = []
@@ -371,10 +370,17 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
                 ]
             elif re.search(r"\bpytest\b", verification_source):
                 verification = ["Run pytest and require exit code 0."]
+            else:
+                verification = [
+                    "Collect fresh executable, inspection, or managed-preview "
+                    f"evidence for this accepted criterion: {criterion}"
+                    for criterion in acceptance
+                ]
             if verification:
                 actions.append(
                     f"/tasks/{index - 1}/verification projected from an "
-                    "explicit command in its task contract"
+                    "explicit command or observable acceptance criterion in "
+                    "its task contract"
                 )
         if os.name == "nt" and verification:
             platform_verification = [_windows_verification_step(item) for item in verification]
@@ -622,13 +628,19 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
                 )
 
     # One repository fact commonly applies to the whole proposed plan (for
-    # example, an empty-workspace inspection). Filling its omitted coverage is
-    # mechanical because no fact, task, path, or outcome is created here.
-    if len(applicability) == 1 and not applicability[0].get("supports_tasks") and all_ids:
-        applicability[0]["supports_tasks"] = list(all_ids)
-        actions.append(
-            "/applicability_evidence/0/supports_tasks bound to all tasks from the sole plan fact"
-        )
+    # example, an empty-workspace inspection). Its task links are redundant
+    # transport metadata: if a weak model attaches the sole root fact only to
+    # the scaffold task, every later task would otherwise fail applicability
+    # despite sharing the same inspected workspace. Broaden only the links;
+    # never alter or invent the fact itself.
+    if len(applicability) == 1 and all_ids:
+        current_supports = list(applicability[0].get("supports_tasks") or ())
+        if current_supports != list(all_ids):
+            applicability[0]["supports_tasks"] = list(all_ids)
+            actions.append(
+                "/applicability_evidence/0/supports_tasks bound to all tasks "
+                "from the sole plan fact"
+            )
     if not expected_changes:
         path_pattern = re.compile(
             r"(?<![\w./-])([A-Za-z0-9_.-]+\."

@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Calculator Frontend (M001)</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body id="root">
+
+    <div id="calculator">
+        <!-- Display Area -->
+        <div id="display">0</div>
+        
+        <div class="buttons">
+            <!-- Row 1: AC, %, /, * -->
+            <button class="btn func-btn" data-action="AC">AC</button>
+            <button class="btn func-btn" data-action="%">%</button>
+            <button class="btn op-btn" data-value="/">/</button>
+            <button class="btn op-btn" data-value="*">*</button>
+
+            <!-- Row 2: 7, 8, 9, - -->
+            <button class="btn num-btn" data-value="7">7</button>
+            <button class="btn num-btn" data-value="8">8</button>
+            <button class="btn num-btn" data-value="9">9</button>
+            <button class="btn op-btn" data-value="-">-</button>
+
+            <!-- Row 3: 4, 5, 6, + -->
+            <button class="btn num-btn" data-value="4">4</button>
+            <button class="btn num-btn" data-value="5">5</button>
+            <button class="btn num-btn" data-value="6">6</button>
+            <button class="btn op-btn" data-value="+">+</button>
+
+            <!-- Row 4: 1, 2, 3 -->
+            <button class="btn num-btn" data-value="1">1</button>
+            <button class="btn num-btn" data-value="2">2</button>
+            <button class="btn num-btn" data-value="3">3</button>
+
+            <!-- Row 5: 0, ., =, -->
+            <button class="btn num-btn zero" data-value="0">0</button>
+            <button class="btn num-btn" data-value=".">.</button>
+            <button class="btn equal-btn" data-action="equals">=</button>
+
+        </div>
+    </div>
+
+    <!-- Core Logic: Populates calculatorLogic global variable -->
+    <script src="./calculator.js"></script>
+    
+    <script>
+        // DOM elements reference
+        const displayElement = document.getElementById('display');
+        const buttonsContainer = document.querySelector('.buttons');
+
+        /**
+         * Updates the visible display element with the current value from the calculator logic engine.
+         */
+        function updateDisplay() {
+            if (calculatorLogic) {
+                // The calculated result is now reflected directly in the state updated by calculateResult(), 
+                // and this function simply reads that state back to the DOM.
+                displayElement.textContent = calculatorLogic.getCurrentDisplay();
+            }
+        }
+
+        /**
+         * Main event handler for button clicks, directing interaction to the core logic (UIController).
+         * @param {Event} event - The click event.
+         */
+        function handleButtonClick(event) {
+            const target = event.target;
+            if (!target.matches('button')) return;
+
+            let value = target.getAttribute('data-value');
+            let action = target.getAttribute('data-action');
+            
+            // 1. Handle Function Actions (AC, %, =)
+            if (action) {
+                if (action === 'AC') {
+                    calculatorLogic.clear();
+                } else if (action === 'equals') {
+                    calculatorLogic.calculateResult();
+                } else if (action === '%') {
+                    // Percentage calculation: current value / 100
+                    const currentValue = parseFloat(calculatorLogic.getCurrentDisplay());
+                    if (!isNaN(currentValue)) {
+                        calculatorLogic.appendDigit((currentValue / 100).toString());
+                    }
+                }
+            } 
+            // 2. Handle Number/Decimal Inputs
+            else if (value !== null) {
+                const sanitizedValue = value.replace(/[^0-9.]/g, ''); // Basic sanitization for numbers and decimals
+                if (sanitizedValue === '') return;
+
+                if (target.classList.contains('zero') && !calculatorLogic.isInitialState()) {
+                    // Special handling: replacing leading zeros if user types 0 then 5 etc.
+                     calculatorLogic.appendDigit(value);
+                } else {
+                    calculatorLogic.appendDigit(value);
+                }
+
+                updateDisplay();
+            } 
+            // 3. Handle Operators (*, /, -, +)
+            else if (target.classList.contains('op-btn')) {
+                const operator = target.getAttribute('data-value');
+                if (!operator) return;
+                calculatorLogic.setOperation(operator);
+                updateDisplay();
+            }
+
+            // Re-run update after action or digit append, unless it was a dedicated function like AC
+            if (action !== 'AC' && action !== 'equals') {
+                 updateDisplay();
+            }
+        }
+
+        // Attach global event listener to the buttons container
+        buttonsContainer.addEventListener('click', handleButtonClick);
+    </script>
+</body>
+</html>

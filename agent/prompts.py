@@ -216,9 +216,12 @@ The semantic proposal must include a complete SemanticGoalV2 object. Preserve
     meaning, and lists observable implications in the finished result. A named tool or
     framework must contribute its distinctive user-visible or architectural capability;
     dependency installation/import alone is never a valid observable implication.
-    Include read_workspace after a successful repository inspection. Include mutate,
-    execute, install, network, or external effects only when the requested outcome
-    actually needs them; never infer them merely because inspection occurred.
+    Include the semantic requested-effect value ``read_workspace`` after a successful
+    repository inspection. It is an enum value, not a callable tool. For additional
+    inspection call only an advertised tool such as list_files, read_file, or grep.
+    Include mutate, execute, install, network, or external effects only when the
+    requested outcome actually needs them; never infer them merely because inspection
+    occurred.
 Never turn a mentioned example, excluded deliverable, meta-level subject, or
 classifier name into requested work. If a consequential decision remains
 unresolved, call request_plan_input instead of proposing executable work.

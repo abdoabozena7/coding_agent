@@ -174,7 +174,7 @@ def test_exact_input_bytes_remain_the_semantic_source_of_truth() -> None:
             agent.close(); store.close()
 
 
-def test_simple_calculator_is_a_normal_goal_without_ultra_agents() -> None:
+def test_simple_calculator_uses_recursive_working_policy_without_mutating_before_approval() -> None:
     prompt = "Create a simple calculator and preview it"
     with tempfile.TemporaryDirectory() as directory:
         workspace = Path(directory)
@@ -190,7 +190,8 @@ def test_simple_calculator_is_a_normal_goal_without_ultra_agents() -> None:
             decision, plan = agent.route_input(prompt)
             assert decision.kind.value == "goal"
             assert plan.goal_id == agent.active_goal().id
-            assert agent.active_goal().metadata["execution_policy"]["mode"] == "normal"
+            assert agent.active_goal().metadata["execution_policy"]["mode"] == "ultra"
+            assert agent.active_goal().metadata["execution_strategy"] == "recursive"
             assert not (workspace / "index.html").exists()
             assert store.list_agent_registry() == ()
         finally:
@@ -396,7 +397,7 @@ def test_action_tool_contract_rejects_unrequested_category_before_execution() ->
             agent.close(); store.close()
 
 
-def test_complex_goal_preserves_exact_original_and_normal_is_not_silently_ultra() -> None:
+def test_complex_goal_preserves_exact_original_and_uses_recursive_working_policy() -> None:
     prompt = "Build a coordinated API, worker, and browser client with integration tests."
     intake = semantic_goal_intake(prompt)
     with tempfile.TemporaryDirectory() as directory:
@@ -413,8 +414,8 @@ def test_complex_goal_preserves_exact_original_and_normal_is_not_silently_ultra(
             assert decision.kind.value == "goal"
             assert plan.goal_id == agent.active_goal().id
             assert agent.active_goal().objective == prompt
-            assert agent.active_goal().metadata["execution_policy"]["mode"] == "normal"
-            assert "ultra_run_id" not in agent.active_goal().metadata
+            assert agent.active_goal().metadata["execution_policy"]["mode"] == "ultra"
+            assert agent.active_goal().metadata["execution_strategy"] == "recursive"
         finally:
             agent.close(); store.close()
 
@@ -690,8 +691,8 @@ def test_plan_mode_rejects_changing_action_and_model_repairs_to_goal() -> None:
             assert decision.kind.value == "goal"
             goal = agent.active_goal()
             assert goal.metadata["interaction_mode"] == "plan"
-            assert goal.metadata["execution_policy"]["mode"] == "normal"
-            assert goal.metadata["execution_strategy"] == "staged"
+            assert goal.metadata["execution_policy"]["mode"] == "ultra"
+            assert goal.metadata["execution_strategy"] == "recursive"
             session = store.get_workflow_session(agent.session_id)
             assert session["session_mode"] == "normal"
             assert session["state"]["interaction_mode"] == "plan"

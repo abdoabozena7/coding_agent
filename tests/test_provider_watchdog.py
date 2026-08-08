@@ -5,6 +5,7 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from threading import Event, Lock
 
 from agent.config import RuntimeConfig
 from agent.model_catalog import ExecutionClass, ModelDescriptor
@@ -38,6 +39,31 @@ class _SilentProvider:
             raise error
         time.sleep(2)
         raise AssertionError("silent provider should have timed out")
+
+
+class _LateThenFreshProvider:
+    name = "openai"
+    model = "watchdog-test"
+    reasoning_effort = "high"
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.release_late = Event()
+        self._lock = Lock()
+
+    def call(self, *_args, **_kwargs):
+        with self._lock:
+            self.calls += 1
+            call_number = self.calls
+        if call_number == 1:
+            self.release_late.wait(timeout=2)
+            return AssistantTurn(text="stale")
+        return AssistantTurn(text="fresh")
+
+    def cancel_active_request(self) -> None:
+        # Simulate a transport whose underlying request cannot be interrupted.
+        # The watchdog's abandoned-result guard must still isolate the late turn.
+        return None
 
 
 class ProviderWatchdogTests(unittest.TestCase):
@@ -161,6 +187,30 @@ class ProviderWatchdogTests(unittest.TestCase):
         self.assertEqual(cloud.stage_deadline_seconds, 360.0)
         self.assertEqual(local.stage_deadline_seconds, 600.0)
         self.assertGreater(local.stage_deadline_seconds, cloud.stage_deadline_seconds)
+
+    def test_late_abandoned_response_cannot_replace_newer_response(self) -> None:
+        provider = _LateThenFreshProvider()
+        runtime, _store = self._runtime(
+            provider,
+            cloud_idle_timeout_seconds=0,
+            provider_call_timeout_seconds=10,
+            activity_heartbeat_seconds=1,
+        )
+
+        with self.assertRaisesRegex(TimeoutError, "silent"):
+            runtime._provider_call_with_watchdog(
+                [], [], "system", actor="planner", stream_text=True,
+                logical_request_id="logical-old", physical_attempt=1,
+            )
+        fresh = runtime._provider_call_with_watchdog(
+            [], [], "system", actor="planner", stream_text=True,
+            logical_request_id="logical-new", physical_attempt=1,
+        )
+        provider.release_late.set()
+        time.sleep(0.05)
+
+        self.assertEqual(fresh.text, "fresh")
+        self.assertEqual(provider.calls, 2)
 
 
 if __name__ == "__main__":

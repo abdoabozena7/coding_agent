@@ -9205,6 +9205,7 @@ class UltraSession:
         agent_steps: int,
         reasoning_effort: str = "medium",
         version_control: GitProtectionManager | None = None,
+        session_id: str | None = None,
     ) -> None:
         self.store = store
         self.workspace = workspace
@@ -9216,6 +9217,7 @@ class UltraSession:
         self.agent_steps = agent_steps
         self.reasoning_effort = str(reasoning_effort)
         self.version_control = version_control
+        self.session_id = str(session_id or "").strip() or None
         self.goal_id: str | None = None
         self.adapter: StateStoreUltraAdapter | None = None
         self.orchestrator: UltraOrchestrator | None = None
@@ -10136,16 +10138,17 @@ class UltraSession:
                 "web app",
             )
         )
+        autonomous_evidence = (
+            "final_artifact",
+            "runtime",
+            "screenshots",
+            "orchestrator_completion",
+        )
         contract = GoalOutcomeContractV1(
             goal_id=self.goal_id,
             objective=objective,
             required_evidence=(
-                (
-                    "final_artifact",
-                    "runtime",
-                    "screenshots",
-                    "codex_visual_review",
-                )
+                autonomous_evidence
                 if visual
                 else ("orchestrator_completion",)
             ),
@@ -10160,6 +10163,24 @@ class UltraSession:
                 process_token=f"pid:{os.getpid()}",
             )
         restored = GoalOutcomeContractV1.from_dict(current["contract"])
+        # Older autonomous visual contracts required ``codex_visual_review``.
+        # That evidence is intentionally recorded only by the external
+        # supervisor API, never by the local Ultra runtime.  Consequently a
+        # fully successful Playwright run could not satisfy its own contract
+        # and was changed from COMPLETED to BLOCKED during finalization.
+        # Migrate only the exact shape previously generated here; bespoke
+        # contracts that explicitly require a supervisor remain untouched.
+        if (
+            restored.required_evidence
+            == (
+                "final_artifact",
+                "runtime",
+                "screenshots",
+                "codex_visual_review",
+            )
+            and not restored.require_candidate_preferred
+        ):
+            restored = replace(restored, required_evidence=autonomous_evidence)
         return self.store.save_goal_outcome_contract(
             restored,
             ultra_run_id=self.run_id,
@@ -10183,7 +10204,14 @@ class UltraSession:
             EnginePhase.FAILED,
         }:
             raise RuntimeError("an ULTRA run is already active")
-        goal = self.store.create_goal(redact_text(objective, 20_000))
+        # The recursive foundation is part of the caller's durable workspace
+        # thread. Creating an unbound Goal made Runtime.active_goal() return
+        # None at the approval boundary, so Full Auto and resume logic could
+        # not see or approve the ready master plan.
+        goal = self.store.create_goal(
+            redact_text(objective, 20_000),
+            session_id=self.session_id,
+        )
         if requested_effects:
             self.store.update_goal_metadata(
                 goal.id,
@@ -11737,6 +11765,12 @@ class UltraSession:
                     self.store.transition_goal(self.goal_id, GoalStatus.REVIEWING, reason="ULTRA global review passed")
                 goal = self.store.get_goal(self.goal_id)
                 if goal.status is GoalStatus.REVIEWING:
+                    # Restored completed runs can enter finalization without
+                    # rebuilding their outcome contract.  Refresh/migrate it
+                    # at the acceptance boundary so a legacy, locally
+                    # undischargeable supervisor requirement cannot survive a
+                    # resume and reject otherwise complete evidence.
+                    self._ensure_outcome_contract(goal.objective)
                     self._record_automatic_outcome_evidence()
                     assert self.run_id
                     decision = self.store.evaluate_final_acceptance(

@@ -124,6 +124,84 @@ def critic_pass() -> dict:
 
 
 class SemanticCoreV14Tests(unittest.TestCase):
+    def test_missing_verification_arrays_project_from_authored_acceptance_criteria(self) -> None:
+        raw = {
+            "summary": "Build and verify the page.",
+            "execution_strategy": "Use deterministic checks and the managed preview.",
+            "applicability_evidence": [{
+                "fact": "The workspace root is empty.",
+                "source": "inspection:I001",
+            }],
+            "expected_changes": [{
+                "path": "index.html",
+                "intent": "Create the requested page.",
+                "basis": "explicit_user_requirement",
+            }],
+            "tasks": [{
+                "title": "Create the calculator",
+                "description": "Implement the accepted calculator behavior.",
+                "acceptance_criteria": [
+                    "Every calculator button produces the correct visible result.",
+                    "The Three.js interaction responds in the managed preview.",
+                ],
+                "depends_on": [],
+                "risk": "high",
+            }],
+        }
+
+        normalized, actions = normalize_plan_draft(raw)
+        validate_normalized_plan(normalized)
+
+        self.assertEqual(len(normalized["tasks"][0]["verification"]), 2)
+        self.assertTrue(
+            all(
+                item.startswith("Collect fresh executable, inspection, or managed-preview evidence")
+                for item in normalized["tasks"][0]["verification"]
+            )
+        )
+        self.assertTrue(any("verification projected" in item for item in actions))
+
+    def test_sole_workspace_fact_covers_all_tasks_even_when_model_links_only_scaffold(self) -> None:
+        raw = {
+            "summary": "Build and verify the application.",
+            "execution_strategy": "Scaffold, implement, then verify.",
+            "applicability_evidence": [{
+                "fact": "The inspected workspace root is empty.",
+                "source": "inspection:I001",
+                "supports_tasks": ["1"],
+            }],
+            "expected_changes": [{
+                "path": "index.html",
+                "intent": "Create the requested application.",
+                "basis": "explicit_user_requirement",
+                "supports_tasks": ["1", "2"],
+            }],
+            "tasks": [
+                {
+                    "title": "Scaffold index.html",
+                    "description": "Create index.html.",
+                    "acceptance_criteria": ["index.html exists."],
+                    "verification": ["Read index.html."],
+                },
+                {
+                    "title": "Verify the application",
+                    "description": "Exercise the accepted behavior.",
+                    "acceptance_criteria": ["The application works."],
+                    "verification": ["Run the managed preview checks."],
+                    "depends_on": ["1"],
+                },
+            ],
+        }
+
+        normalized, actions = normalize_plan_draft(raw)
+        validate_normalized_plan(normalized)
+
+        self.assertEqual(
+            normalized["applicability_evidence"][0]["supports_tasks"],
+            ["T001", "T002"],
+        )
+        self.assertTrue(any("sole plan fact" in item for item in actions))
+
     def test_plan_transport_omissions_bind_exact_paths_without_model_retry(self) -> None:
         raw = {
             "summary": "Create the requested calculator.",
@@ -410,8 +488,10 @@ class SemanticCoreV14Tests(unittest.TestCase):
                     semantic = goal.metadata["semantic_goal"]
                     self.assertEqual(semantic["original_request"], request)
                     self.assertIn("Do not build a game.", semantic["exclusions"])
+                    # Legacy normal/ultra inputs are aliases for the one
+                    # recursive working engine.
                     self.assertEqual(
-                        goal.metadata["execution_policy"]["mode"], mode.value
+                        goal.metadata["execution_policy"]["mode"], "ultra"
                     )
                     self.assertNotIn("ultra_run_id", goal.metadata)
                 finally:

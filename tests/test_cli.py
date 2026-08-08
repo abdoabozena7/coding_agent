@@ -1061,7 +1061,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(selected.value, "normal")
         self.assertIn("Full access is unavailable", output.getvalue())
 
-    def test_mode_picker_cannot_select_ultra_when_runtime_prerequisite_is_missing(self):
+    def test_mode_picker_exposes_only_working_and_plan(self):
         answers = iter(("2",))
         output = io.StringIO()
 
@@ -1073,8 +1073,9 @@ class CLITests(unittest.TestCase):
         )
 
         self.assertEqual(selected, InteractionMode.PLAN)
-        self.assertIn("ultra", output.getvalue().casefold())
-        self.assertIn("usable local GPU", output.getvalue())
+        rendered = output.getvalue().casefold()
+        self.assertIn("working", rendered)
+        self.assertNotIn("ultra", rendered)
 
     def test_status_command_is_offline_import_safe_and_creates_durable_state(self):
         with tempfile.TemporaryDirectory() as directory:

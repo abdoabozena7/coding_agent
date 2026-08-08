@@ -18,7 +18,12 @@ from agent.hardware import HardwareProbeResult, probe_local_gpu
 from agent.model_catalog import ExecutionClass, ModelDescriptor
 from agent.models import DelegationStatus, GoalStatus, PlanStatus, TaskStatus
 from agent.providers.base import ToolCall
-from agent.runtime import AgentRuntime, RuntimeStateError, SliceResult
+from agent.runtime import (
+    AgentRuntime,
+    RuntimeStateError,
+    SliceResult,
+    _extract_explicit_workspace_paths,
+)
 from agent.sandbox import DockerSandbox, PermissionAdapter
 from agent.store import StateStore
 from agent.testing import ScriptedProvider, semantic_goal_intake, semantic_turn
@@ -303,6 +308,33 @@ class SleepModeTests(RuntimeTestCase):
             )
         finally:
             runtime.close()
+
+    def test_active_goal_recursive_strategy_overrides_stale_staged_session_label(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([], model="local-test"),
+            self.store,
+            self.workspace,
+            config=self.config,
+        )
+        goal = self.store.create_goal(
+            "Execute through recursive nodes",
+            session_id=runtime.session_id,
+        )
+        self.store.update_goal_metadata(goal.id, execution_strategy="recursive")
+        self.store.mutate_workflow_session(
+            runtime.session_id,
+            lambda current: {
+                **current,
+                "state": {
+                    **dict(current.get("state") or {}),
+                    "execution_strategy": "staged",
+                },
+            },
+        )
+
+        snapshot = runtime.workflow_runtime_snapshot()
+
+        self.assertEqual(snapshot.execution_strategy, "recursive")
 
     def test_local_snapshot_rewrites_stale_cloud_boundary_wording(self):
         runtime = AgentRuntime(
@@ -608,6 +640,34 @@ class SleepModeTests(RuntimeTestCase):
         self.assertEqual(approval.payload["approved_by"], "sleep-full-auto")
         self.assertTrue(approval.payload["quality_gates_unchanged"])
 
+    def test_continuous_controller_approves_plan_created_after_full_auto_was_enabled(self):
+        runtime, _provider = self.runtime([inspect_call(), plan_call(), plan_pass()])
+        runtime.set_sleep_mode(True, policy="full")
+        plan = runtime.start_goal("Build a small verified application")
+        self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
+
+        with mock.patch.object(
+            runtime,
+            "_run_slice_impl",
+            return_value=SliceResult(
+                "running",
+                "Execution reached a test checkpoint.",
+                needs_user=True,
+            ),
+        ) as run_slice:
+            runtime.continue_until_boundary()
+
+        goal = runtime.active_goal()
+        self.assertEqual(goal.status, GoalStatus.RUNNING)
+        self.assertEqual(goal.active_plan_revision, plan.revision)
+        run_slice.assert_called_once()
+        self.assertTrue(
+            any(
+                event.event_type == "sleep.full_auto_plan_approval"
+                for event in self.store.list_recent_events(goal.id, limit=100)
+            )
+        )
+
     def test_full_auto_plan_boundary_survives_runtime_restart(self):
         runtime, _provider = self.runtime([inspect_call(), plan_call(), plan_pass()])
         plan = runtime.start_goal("Resume unattended work after restart")
@@ -863,6 +923,300 @@ class UltraQualityFeedbackTests(RuntimeTestCase):
 
 
 class PlanningAndCompletionTests(RuntimeTestCase):
+    def test_explicit_path_parser_does_not_treat_three_js_product_name_as_a_file(self):
+        self.assertEqual(
+            _extract_explicit_workspace_paths(
+                "Create a complete Three.js 3D calculator in index.html"
+            ),
+            ("index.html",),
+        )
+        self.assertEqual(
+            _extract_explicit_workspace_paths("Create the file named Three.js"),
+            ("Three.js",),
+        )
+
+    def test_local_replan_projects_in_scope_repair_after_empty_transport(self):
+        provider = ScriptedProvider(
+            [
+                inspect_call(),
+                plan_call(),
+                plan_pass(),
+                "",
+                "",
+                plan_pass(),
+            ],
+            model="local-coder",
+        )
+        runtime = AgentRuntime(
+            provider,
+            self.store,
+            self.workspace,
+            config=replace(self.config, no_action_limit=1, planning_steps=4),
+            model_descriptor=ModelDescriptor(
+                "ollama", "local-coder", ExecutionClass.LOCAL,
+                capabilities=("tools",),
+            ),
+        )
+        first = runtime.start_goal("Repair and verify artifact.txt")
+
+        revised = runtime.reject_plan(
+            "Use a materially different repair strategy while preserving scope."
+        )
+
+        self.assertIsNotNone(revised)
+        self.assertEqual(revised.revision, first.revision + 1)
+        self.assertEqual(revised.status, PlanStatus.PENDING_APPROVAL)
+        self.assertEqual(
+            [item["path"] for item in revised.expected_changes],
+            ["artifact.txt"],
+        )
+        self.assertIn("Repair and verify", revised.summary)
+        self.assertTrue(
+            any(
+                event.event_type == "planning.deterministic_plan_projected"
+                for event in self.store.list_recent_events(
+                    revised.goal_id, limit=100
+                )
+            )
+        )
+        provider.assert_exhausted()
+
+    def test_local_html_coordinator_is_constrained_to_missing_preview_evidence(self):
+        request = "Create and verify an interactive Three.js calculator in index.html"
+        semantic = {
+            **plan_call()["tool_calls"][0]["args"]["semantic_goal"],
+            "original_request": request,
+            "interpreted_outcome": "Create and verify the interactive calculator in index.html.",
+            "acceptance_criteria": [
+                "The calculator buttons produce the correct visible result.",
+                "The Three.js interaction passes in the managed preview.",
+            ],
+            "repository_evidence_refs": ["inspection:I001", "user:request"],
+        }
+        staged_plan = plan_call()
+        staged_args = staged_plan["tool_calls"][0]["args"]
+        staged_args.pop("semantic_goal", None)
+        staged_args["semantic_fingerprint"] = "0" * 64
+        staged_args["applicability_evidence"][0]["source"] = "inspection:I001"
+        staged_args["expected_changes"][0].update(
+            {
+                "path": "index.html",
+                "basis": "explicit_user_requirement",
+                "evidence_refs": ["user:request"],
+            }
+        )
+        staged_args["tasks"][0].update(
+            {
+                "title": "Implement and verify the interactive calculator",
+                "description": "Implement every calculator button and the Three.js interaction.",
+                "acceptance_criteria": list(semantic["acceptance_criteria"]),
+                "verification": [
+                    "Run deterministic button scenarios in the managed preview.",
+                    "Verify the Three.js interaction in the browser.",
+                ],
+            }
+        )
+
+        def assert_preview_only(provider_request):
+            advertised = {
+                schema["function"]["name"] for schema in provider_request.tools
+            }
+            self.assertEqual(advertised, {"preview_html"})
+            rendered = json.dumps(provider_request.conversation, ensure_ascii=False)
+            self.assertIn('"required_next_tool": "preview_html"', rendered)
+            self.assertIn("index.html", rendered)
+            return "Preview action checkpointed for the next slice."
+
+        def assert_failed_preview_requires_repair(provider_request):
+            advertised = {
+                schema["function"]["name"] for schema in provider_request.tools
+            }
+            self.assertEqual(
+                advertised,
+                {"read_file", "edit_file", "write_file"},
+            )
+            rendered = json.dumps(provider_request.conversation, ensure_ascii=False)
+            self.assertIn('"required_next_tool": "repair_failed_preview"', rendered)
+            self.assertIn("verification", rendered)
+            self.assertIn("failed", rendered)
+            return "Repair action checkpointed for the next slice."
+
+        provider = ScriptedProvider(
+            [
+                {"tool_calls": [{"name": "propose_semantic_goal", "args": semantic}]},
+                staged_plan,
+                plan_pass(),
+                assert_preview_only,
+                assert_failed_preview_requires_repair,
+            ],
+            model="local-coder",
+        )
+        runtime = AgentRuntime(
+            provider,
+            self.store,
+            self.workspace,
+            config=self.config,
+            model_descriptor=ModelDescriptor(
+                "ollama", "local-coder", ExecutionClass.LOCAL, capabilities=("tools",)
+            ),
+        )
+
+        plan = runtime.start_goal(request)
+        runtime.approve_plan(plan.revision)
+        legacy_changes = [
+            *plan.expected_changes,
+            {
+                "path": "Three.js",
+                "intent": "Legacy parser mistook a technology name for a file.",
+                "basis": "explicit_user_requirement",
+                "evidence_refs": ["user:request"],
+                "supports_tasks": ["T001"],
+            },
+        ]
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE plans SET expected_changes_json=? WHERE goal_id=? AND revision=?",
+                (
+                    json.dumps(legacy_changes, separators=(",", ":")),
+                    plan.goal_id,
+                    plan.revision,
+                ),
+            )
+        legacy_goal = self.store.get_goal(plan.goal_id)
+        legacy_contract = dict(legacy_goal.metadata["goal_contract"])
+        legacy_contract["artifact_expectations"] = ["index.html", "Three.js"]
+        legacy_target = dict(legacy_goal.metadata["quality_target"])
+        legacy_target["artifact_ids"] = ["index.html", "Three.js"]
+        legacy_claims = [
+            *legacy_goal.metadata.get("resource_claims", ()),
+            {
+                "purpose": "Legacy false path claim",
+                "kind": "file",
+                "supports_tasks": ["T001"],
+                "inspection_refs": ["user:request"],
+                "selector": "Three.js",
+                "resolved_paths": ["Three.js"],
+                "state": "resolved",
+            },
+        ]
+        self.store.update_goal_metadata(
+            plan.goal_id,
+            goal_contract=legacy_contract,
+            quality_target=legacy_target,
+            resource_claims=legacy_claims,
+        )
+        (self.workspace / "index.html").write_text(
+            "<!doctype html><html><body><button>1</button></body></html>",
+            encoding="utf-8",
+        )
+
+        result = runtime.run_slice(steps=1)
+
+        self.assertFalse(result.completed)
+        repaired = self.store.get_goal(plan.goal_id)
+        self.assertEqual(
+            repaired.metadata["goal_contract"]["artifact_expectations"],
+            ["index.html"],
+        )
+        self.assertEqual(
+            repaired.metadata["quality_target"]["artifact_ids"],
+            ["index.html"],
+        )
+        self.assertNotIn(
+            "Three.js",
+            [claim["selector"] for claim in repaired.metadata["resource_claims"]],
+        )
+        self.assertTrue(repaired.metadata["legacy_contract_projection_repaired"])
+
+        self.store.add_evidence(
+            goal_id=plan.goal_id,
+            plan_revision=plan.revision,
+            task_id="T001",
+            kind="tool",
+            summary="Managed preview failed its interaction assertion.",
+            data={
+                "tool": "preview_html",
+                "verification": "failed",
+                "failure_kind": "application",
+                "mutation_sequence": int(
+                    repaired.metadata.get("mutation_sequence", 0) or 0
+                ),
+                "interactions_passed": False,
+            },
+            created_by="harness",
+            verified=False,
+        )
+        rejected = runtime._control_update_task(
+            self.store.get_goal(plan.goal_id),
+            runtime.latest_plan(),
+            {
+                "task_id": "T001",
+                "status": "done",
+                "note": "The preview was attempted.",
+                "evidence": ["A preview action returned."],
+            },
+        )
+        self.assertIn("fresh passing managed preview", rejected)
+
+        action_id = self.store.begin_action(
+            plan.goal_id,
+            "preview_html",
+            {
+                "_harness_mutation_sequence": int(
+                    runtime.active_goal().metadata.get("mutation_sequence", 0) or 0
+                ),
+                "arguments": {"path": "index.html", "verify": True},
+            },
+            task_id="T001",
+            risk="medium",
+        )
+        self.store.complete_action(
+            action_id,
+            json.dumps(
+                {
+                    "verification": "failed",
+                    "page_errors": ["interaction assertion failed"],
+                    "interaction_results": [{"passed": False}],
+                }
+            ),
+        )
+
+        second = runtime.run_slice(steps=1)
+
+        self.assertFalse(second.completed)
+        provider.assert_exhausted()
+
+    def test_repeated_action_circuit_breaker_checkpoints_the_slice_immediately(self):
+        repeated = lambda index: {
+            "tool_calls": [
+                {"id": f"list-{index}", "name": "list_files", "args": {"path": "."}}
+            ]
+        }
+        runtime, provider = self.runtime(
+            [
+                inspect_call(),
+                plan_call(),
+                plan_pass(),
+                repeated(1),
+                repeated(2),
+                repeated(3),
+                "this turn must remain unconsumed",
+            ]
+        )
+        plan = runtime.start_goal("Build persistent behavior")
+        runtime.approve_plan(plan.revision)
+
+        result = runtime.run_slice(steps=8)
+
+        self.assertEqual(result.steps, 3)
+        self.assertEqual(provider.remaining, 1)
+        self.assertTrue(
+            any(
+                event.event_type == "execution.repeated_action_recovery"
+                for event in self.store.list_recent_events(plan.goal_id, limit=100)
+            )
+        )
+
     def test_repair_scope_allows_approved_capability_but_rejects_new_one(self):
         goal = self.store.create_goal("Create and verify the requested application.")
         task = {
@@ -2356,6 +2710,499 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             2,
         )
         second_provider.assert_exhausted()
+
+    def test_post_semantic_planner_can_inspect_and_read_workspace_alias_is_normalized(self):
+        request = "Create artifact.txt and verify it"
+        semantic = {
+            **plan_call()["tool_calls"][0]["args"]["semantic_goal"],
+            "original_request": request,
+            "interpreted_outcome": "Create and verify artifact.txt.",
+            "repository_evidence_refs": ["inspection:I001"],
+        }
+        staged_plan = plan_call()
+        staged_args = staged_plan["tool_calls"][0]["args"]
+        staged_args.pop("semantic_goal", None)
+        staged_args["semantic_fingerprint"] = "0" * 64
+        staged_args["applicability_evidence"][0]["source"] = "inspection:I001"
+        provider = ScriptedProvider(
+            [
+                {"tool_calls": [{"name": "propose_semantic_goal", "args": semantic}]},
+                {"tool_calls": [{"name": "read_workspace", "args": {}}]},
+                staged_plan,
+                plan_pass(),
+            ],
+            model="local-coder",
+        )
+        runtime = AgentRuntime(
+            provider,
+            self.store,
+            self.workspace,
+            config=self.config,
+            model_descriptor=ModelDescriptor(
+                "ollama", "local-coder", ExecutionClass.LOCAL, capabilities=("tools",)
+            ),
+        )
+
+        plan = runtime.start_goal(request)
+
+        self.assertIsNotNone(plan)
+        second_request_names = {
+            item["function"]["name"] for item in provider.calls[1].tools
+        }
+        self.assertIn("propose_plan", second_request_names)
+        self.assertIn("list_files", second_request_names)
+        self.assertTrue(
+            any(
+                event.event_type == "tool_contract.alias_normalized"
+                for event in self.store.list_recent_events(plan.goal_id, limit=100)
+            )
+        )
+        provider.assert_exhausted()
+
+    def test_captured_local_plan_transport_mismatches_are_mechanically_bound(self):
+        request = (
+            "Create a complete Three.js 3D calculator in index.html, verify every "
+            "button and the 3D interaction, and run deterministic checks."
+        )
+        anchors = [
+            {
+                "id": f"R{index:03d}",
+                "kind": "interaction" if index in {3, 4} else "testing",
+                "verbatim_span": label,
+                "interpreted_requirement": label,
+                "observable_implications": [label],
+            }
+            for index, label in enumerate(
+                (
+                    "index.html",
+                    "Three.js 3D calculator",
+                    "verify every button",
+                    "3D interaction",
+                    "deterministic checks",
+                ),
+                1,
+            )
+        ]
+        semantic = {
+            "original_request": request,
+            "interpreted_outcome": request,
+            "requested_effects": [
+                "read_workspace",
+                "mutate_workspace",
+                "execute_code",
+            ],
+            "required_outcomes": ["A complete verified calculator."],
+            "constraints": ["The final application entry point is index.html."],
+            "exclusions": [],
+            "acceptance_criteria": ["Every accepted requirement is verified."],
+            "requirement_anchors": anchors,
+            "unresolved_decisions": [],
+            "repository_evidence_refs": ["inspection:I001"],
+            "status": "interpreted",
+        }
+        proposal = {
+            "semantic_fingerprint": "0" * 64,
+            "summary": "Build and verify the complete Three.js calculator.",
+            "applicability_evidence": [{
+                "fact": "The local preflight inspected the workspace root.",
+                # This is the exact source label present in the captured run.
+                "source": "harness_preflight",
+                "supports_tasks": ["1"],
+            }],
+            "execution_strategy": "Implement the page, preview it, and verify every interaction.",
+            "expected_changes": [{
+                "path": "index.html",
+                "intent": "Create the calculator requested by the user.",
+                # The captured model used this provenance enum even though the
+                # exact path is verbatim in the request.
+                "basis": "model_selected_new_layout",
+                "evidence_refs": ["inspection:I001"],
+                "supports_tasks": ["1"],
+            }],
+            "tasks": [{
+                "id": "1",
+                "title": "Implement and verify the calculator",
+                "description": "Create index.html with Three.js and exercise every button and 3D interaction.",
+                "requirement_refs": ["R001", "R002", "R003", "R004"],
+                "acceptance_criteria": ["The complete calculator works in the browser preview."],
+                # R005 was present only here in the real model response.
+                "verification": "Run deterministic checks for arithmetic and interaction coverage (R005).",
+                "depends_on": [],
+                "risk": "high",
+            }],
+        }
+        provider = ScriptedProvider(
+            [
+                {"tool_calls": [{"name": "propose_semantic_goal", "args": semantic}]},
+                {"tool_calls": [{"name": "propose_plan", "args": proposal}]},
+                plan_pass(),
+            ],
+            model="local-coder",
+        )
+        runtime = AgentRuntime(
+            provider,
+            self.store,
+            self.workspace,
+            config=self.config,
+            model_descriptor=ModelDescriptor(
+                "ollama", "local-coder", ExecutionClass.LOCAL, capabilities=("tools",)
+            ),
+        )
+
+        plan = runtime.start_goal(request)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.assertIn("R005", plan.tasks[0].metadata["requirement_refs"])
+        self.assertEqual(plan.applicability_evidence[0]["source"], "inspection:I001")
+        self.assertEqual(plan.expected_changes[0]["basis"], "explicit_user_requirement")
+        self.assertEqual(plan.expected_changes[0]["evidence_refs"], ["user:request"])
+        self.assertFalse(
+            any(
+                event.event_type == "planning.validation_rejected"
+                for event in self.store.list_recent_events(plan.goal_id, limit=100)
+            )
+        )
+        provider.assert_exhausted()
+
+    def test_semantic_assumption_is_saved_as_default_not_false_user_blocker(self):
+        goal = self.store.create_goal(
+            "Create a complete calculator with every standard button",
+        )
+        semantic = {
+            "original_request": goal.objective,
+            "interpreted_outcome": "Create and verify the calculator.",
+            "requested_effects": ["mutate_workspace", "execute_code"],
+            "required_outcomes": ["The calculator works."],
+            "constraints": [],
+            "exclusions": [],
+            "acceptance_criteria": ["Every calculator button works."],
+            "requirement_anchors": [],
+            "unresolved_decisions": [
+                "The mathematical scope was not enumerated; assuming basic arithmetic "
+                "buttons based on standard practice."
+            ],
+            "repository_evidence_refs": [],
+            "status": "interpreted",
+        }
+
+        validated = AgentRuntime._validate_semantic_stage(
+            goal,
+            semantic,
+            successful_inspection_ids=frozenset({"I001"}),
+        )
+
+        self.assertEqual(validated.unresolved_decisions, ())
+        self.assertTrue(
+            any(item.startswith("Planner default:") for item in validated.constraints)
+        )
+        self.assertIn("inspection:I001", validated.repository_evidence_refs)
+        self.assertIn("read_workspace", [item.value for item in validated.requested_effects])
+
+    def test_structured_planner_progress_resets_consecutive_empty_turns(self):
+        request = "Create artifact.txt and verify it"
+        semantic = {
+            **plan_call()["tool_calls"][0]["args"]["semantic_goal"],
+            "original_request": request,
+            "interpreted_outcome": "Create and verify artifact.txt.",
+            "repository_evidence_refs": ["inspection:I001"],
+        }
+        staged_plan = plan_call()
+        staged_args = staged_plan["tool_calls"][0]["args"]
+        staged_args.pop("semantic_goal", None)
+        staged_args["semantic_fingerprint"] = "0" * 64
+        staged_args["applicability_evidence"][0]["source"] = "inspection:I001"
+        provider = ScriptedProvider(
+            [
+                "No action yet.",
+                "Still reasoning.",
+                {"tool_calls": [{"name": "propose_semantic_goal", "args": semantic}]},
+                "Preparing the structured plan.",
+                staged_plan,
+                plan_pass(),
+            ],
+            model="local-coder",
+        )
+        runtime = AgentRuntime(
+            provider,
+            self.store,
+            self.workspace,
+            config=replace(self.config, planning_steps=6, no_action_limit=3),
+            model_descriptor=ModelDescriptor(
+                "ollama", "local-coder", ExecutionClass.LOCAL, capabilities=("tools",)
+            ),
+        )
+
+        plan = runtime.start_goal(request)
+
+        self.assertIsNotNone(plan)
+        recoveries = [
+            event
+            for event in self.store.list_recent_events(plan.goal_id, limit=200)
+            if event.event_type == "planning.no_progress_recovery"
+        ]
+        self.assertEqual(recoveries, [])
+        provider.assert_exhausted()
+
+    def test_local_planner_no_progress_projects_accepted_semantic_into_reviewed_plan(self):
+        request = "Create and verify index.html"
+        semantic = {
+            **plan_call()["tool_calls"][0]["args"]["semantic_goal"],
+            "original_request": request,
+            "interpreted_outcome": "Create and verify index.html.",
+            "repository_evidence_refs": ["inspection:I001"],
+            "acceptance_criteria": [
+                "index.html exists with the requested implementation.",
+                "Fresh deterministic verification passes.",
+            ],
+        }
+        provider = ScriptedProvider(
+            [
+                {"tool_calls": [{"name": "propose_semantic_goal", "args": semantic}]},
+                "No plan transport yet.",
+                "Still no structured action.",
+                "No action after the fresh packet.",
+                "Still unable to emit the plan schema.",
+                plan_pass(),
+            ],
+            model="local-coder",
+        )
+        runtime = AgentRuntime(
+            provider,
+            self.store,
+            self.workspace,
+            config=replace(self.config, planning_steps=6, no_action_limit=2),
+            model_descriptor=ModelDescriptor(
+                "ollama", "local-coder", ExecutionClass.LOCAL, capabilities=("tools",)
+            ),
+        )
+
+        plan = runtime.start_goal(request)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.assertEqual(len(plan.tasks), 1)
+        self.assertEqual(plan.expected_changes[0]["path"], "index.html")
+        self.assertEqual(plan.expected_changes[0]["basis"], "explicit_user_requirement")
+        self.assertTrue(
+            any(
+                event.event_type == "planning.deterministic_plan_projected"
+                for event in self.store.list_recent_events(plan.goal_id, limit=200)
+            )
+        )
+        provider.assert_exhausted()
+
+    def test_planner_contract_failure_is_typed_instead_of_becoming_empty_turn(self):
+        disallowed = {
+            "tool_calls": [{"name": "delete_file", "args": {"path": "artifact.txt"}}]
+        }
+        provider = ScriptedProvider([disallowed, disallowed, disallowed], model="local-coder")
+        runtime = AgentRuntime(
+            provider,
+            self.store,
+            self.workspace,
+            config=self.config,
+            model_descriptor=ModelDescriptor(
+                "ollama", "local-coder", ExecutionClass.LOCAL, capabilities=("tools",)
+            ),
+        )
+        schemas = [
+            schema
+            for schema in runtime._planner_tools()
+            if schema["function"]["name"] == "propose_plan"
+        ]
+
+        turn = runtime._call_provider(
+            [], schemas, "planner", actor="planner", step=1
+        )
+
+        error = turn.native["tool_contract_error"]
+        self.assertEqual(error["received"], ["delete_file"])
+        self.assertEqual(error["allowed"], ["propose_plan"])
+        self.assertEqual(error["physical_attempt"], 3)
+        self.assertTrue(error["logical_request_id"].startswith("planner-1-"))
+        self.assertIsNone(turn.text)
+        self.assertEqual(turn.tool_calls, [])
+        provider.assert_exhausted()
+
+    def test_empty_response_after_rejected_tool_remains_a_typed_contract_failure(self):
+        disallowed = {
+            "tool_calls": [{"name": "propose_semantic_goal", "args": {}}]
+        }
+        provider = ScriptedProvider(
+            [disallowed, {"text": ""}, {"text": ""}],
+            model="local-coder",
+        )
+        runtime = AgentRuntime(
+            provider,
+            self.store,
+            self.workspace,
+            config=self.config,
+            model_descriptor=ModelDescriptor(
+                "ollama", "local-coder", ExecutionClass.LOCAL, capabilities=("tools",)
+            ),
+        )
+        schemas = [
+            schema
+            for schema in runtime._planner_tools()
+            if schema["function"]["name"] == "propose_plan"
+        ]
+
+        turn = runtime._call_provider([], schemas, "planner", actor="planner", step=3)
+
+        error = turn.native["tool_contract_error"]
+        self.assertEqual(error["received"], ["<no tool call after contract correction>"])
+        self.assertEqual(error["attempts"], 3)
+        self.assertEqual(error["physical_attempt"], 3)
+        self.assertEqual(turn.tool_calls, [])
+        self.assertIsNone(turn.text)
+        provider.assert_exhausted()
+
+    def test_planner_rotation_injects_full_authoritative_stage_checkpoint(self):
+        request = "Create artifact.txt and verify it"
+        semantic = {
+            **plan_call()["tool_calls"][0]["args"]["semantic_goal"],
+            "original_request": request,
+            "interpreted_outcome": "Create and verify artifact.txt.",
+            "repository_evidence_refs": ["inspection:I001"],
+        }
+        staged_plan = plan_call()
+        staged_args = staged_plan["tool_calls"][0]["args"]
+        staged_args.pop("semantic_goal", None)
+        staged_args["semantic_fingerprint"] = "0" * 64
+        staged_args["applicability_evidence"][0]["source"] = "inspection:I001"
+
+        def assert_rotated_checkpoint(provider_request):
+            rendered = json.dumps(provider_request.conversation, ensure_ascii=False)
+            self.assertIn("PROVIDER_CONTEXT_CHECKPOINT", rendered)
+            self.assertIn("planning_semantic_goal", rendered)
+            self.assertIn("planning_semantic_fingerprint", rendered)
+            self.assertIn("inspection:I001", rendered)
+            self.assertIn("plan_generation", rendered)
+            return staged_plan
+
+        provider = ScriptedProvider(
+            [
+                {"tool_calls": [{"name": "propose_semantic_goal", "args": semantic}]},
+                "I am still thinking about the plan. " + ("x" * 8_000),
+                assert_rotated_checkpoint,
+                plan_pass(),
+            ],
+            model="local-coder",
+        )
+        runtime = AgentRuntime(
+            provider,
+            self.store,
+            self.workspace,
+            config=replace(self.config, conversation_chars=4_000, no_action_limit=3),
+            model_descriptor=ModelDescriptor(
+                "ollama", "local-coder", ExecutionClass.LOCAL, capabilities=("tools",)
+            ),
+        )
+
+        plan = runtime.start_goal(request)
+
+        self.assertIsNotNone(plan)
+        # Planner rotation must not make an unmonitored second provider call
+        # before the visible/watchdog-protected planner request.
+        self.assertEqual(provider.summary_calls, [])
+        provider.assert_exhausted()
+
+    def test_resume_reuses_persisted_semantic_and_inspection_checkpoint(self):
+        request = "Create artifact.txt and verify it"
+        semantic = {
+            **plan_call()["tool_calls"][0]["args"]["semantic_goal"],
+            "original_request": request,
+            "interpreted_outcome": "Create and verify artifact.txt.",
+            "repository_evidence_refs": ["inspection:I001"],
+        }
+        first_provider = ScriptedProvider(
+            [
+                {"tool_calls": [{"name": "propose_semantic_goal", "args": semantic}]},
+                "No structured plan yet.",
+            ],
+            model="local-coder",
+        )
+        descriptor = ModelDescriptor(
+            "ollama", "local-coder", ExecutionClass.LOCAL, capabilities=("tools",)
+        )
+        runtime = AgentRuntime(
+            first_provider,
+            self.store,
+            self.workspace,
+            config=replace(self.config, planning_steps=2, no_action_limit=2),
+            model_descriptor=descriptor,
+        )
+        self.assertIsNone(runtime.start_goal(request))
+        goal_id = runtime.active_goal().id
+        inspection_count = len(
+            [
+                event
+                for event in self.store.list_recent_events(goal_id, limit=100)
+                if event.event_type == "planning.inspection_recorded"
+            ]
+        )
+        runtime.close()
+
+        staged_plan = plan_call()
+        staged_args = staged_plan["tool_calls"][0]["args"]
+        staged_args.pop("semantic_goal", None)
+        staged_args["semantic_fingerprint"] = "0" * 64
+        staged_args["applicability_evidence"][0]["source"] = "inspection:I001"
+        second_provider = ScriptedProvider([staged_plan, plan_pass()], model="local-coder")
+        resumed = AgentRuntime(
+            second_provider,
+            self.store,
+            self.workspace,
+            config=self.config,
+            model_descriptor=descriptor,
+        )
+
+        resumed.resume()
+
+        plan = resumed.latest_plan()
+        self.assertIsNotNone(plan)
+        self.assertEqual(resumed.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.assertEqual(
+            len(
+                [
+                    event
+                    for event in self.store.list_recent_events(goal_id, limit=200)
+                    if event.event_type == "planning.inspection_recorded"
+                ]
+            ),
+            inspection_count,
+        )
+        second_provider.assert_exhausted()
+        resumed.close()
+
+    def test_continuous_controller_retries_one_saved_planning_no_progress_boundary(self):
+        provider = ScriptedProvider(
+            [
+                "No action yet.",
+                "Still no action.",
+                inspect_call(),
+                plan_call(),
+                plan_pass(),
+            ]
+        )
+        runtime = AgentRuntime(
+            provider,
+            self.store,
+            self.workspace,
+            config=replace(self.config, planning_steps=2),
+            sleeper=lambda _seconds: None,
+        )
+        self.assertIsNone(runtime.start_goal("Build persistent behavior"))
+        self.assertTrue(runtime.active_goal().metadata["auto_retryable"])
+
+        result = runtime.continue_until_boundary()
+
+        self.assertIsNotNone(runtime.latest_plan())
+        self.assertEqual(runtime.active_goal().status, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.assertEqual(result.status, GoalStatus.AWAITING_PLAN_APPROVAL.value)
+        self.assertEqual(result.phase, "awaiting_approval")
+        provider.assert_exhausted()
 
 
 class DelegationAndReviewTests(RuntimeTestCase):

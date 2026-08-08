@@ -13,6 +13,7 @@ import pytest
 
 from agent.commands import parse_command
 from agent.events import EventBus
+from agent.goal_outcome import GoalOutcomeContractV1
 from agent.model_catalog import ExecutionClass, ModelDescriptor
 from agent.models import GoalStatus, TaskStatus
 from agent.providers.base import AssistantTurn, ToolCall, Usage
@@ -1497,6 +1498,121 @@ class UltraIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     hashes["artifact.txt"],
                     hashlib.sha256(b"accepted").hexdigest(),
+                )
+            finally:
+                session.close()
+                store.close()
+
+    def test_runtime_recursive_foundation_binds_goal_to_calling_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            runtime = self._runtime(workspace, store)
+            session = runtime._make_ultra_session()
+            try:
+                with mock.patch.object(
+                    session,
+                    "_prepare_existing_goal",
+                    return_value="prepared-plan",
+                ) as prepare:
+                    result = session.start("Create a verified artifact")
+
+                self.assertEqual(result, "prepared-plan")
+                goal = runtime.active_goal()
+                self.assertIsNotNone(goal)
+                self.assertEqual(
+                    store.get_latest_goal(runtime.session_id).id,
+                    goal.id,
+                )
+                prepare.assert_called_once_with(
+                    goal.id,
+                    "Create a verified artifact",
+                    requested_effects=(),
+                )
+            finally:
+                session.close()
+                runtime.close()
+                store.close()
+
+    def test_autonomous_html_contract_uses_evidence_the_runtime_can_produce(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            session = UltraSession(
+                store=store,
+                workspace=workspace,
+                descriptor=self._descriptor(),
+                permission_adapter=PermissionAdapter("normal", DockerSandbox()),
+                approval=lambda *_args: True,
+                events=EventBus(),
+                config=UltraConfig(),
+                agent_steps=2,
+            )
+            try:
+                goal = store.create_goal("Create and test a self-contained index.html")
+                session.goal_id = goal.id
+
+                saved = session._ensure_outcome_contract(goal.objective)
+
+                self.assertEqual(
+                    tuple(saved["contract"]["required_evidence"]),
+                    (
+                        "final_artifact",
+                        "runtime",
+                        "screenshots",
+                        "orchestrator_completion",
+                    ),
+                )
+                self.assertNotIn(
+                    "codex_visual_review",
+                    saved["contract"]["required_evidence"],
+                )
+            finally:
+                session.close()
+                store.close()
+
+    def test_autonomous_html_contract_migrates_the_undischargeable_legacy_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            session = UltraSession(
+                store=store,
+                workspace=workspace,
+                descriptor=self._descriptor(),
+                permission_adapter=PermissionAdapter("normal", DockerSandbox()),
+                approval=lambda *_args: True,
+                events=EventBus(),
+                config=UltraConfig(),
+                agent_steps=2,
+            )
+            try:
+                goal = store.create_goal("Create an HTML interaction")
+                session.goal_id = goal.id
+                store.save_goal_outcome_contract(
+                    GoalOutcomeContractV1(
+                        goal_id=goal.id,
+                        objective=goal.objective,
+                        required_evidence=(
+                            "final_artifact",
+                            "runtime",
+                            "screenshots",
+                            "codex_visual_review",
+                        ),
+                        require_candidate_preferred=False,
+                    ),
+                    ultra_run_id=None,
+                )
+
+                saved = session._ensure_outcome_contract(goal.objective)
+
+                self.assertEqual(
+                    tuple(saved["contract"]["required_evidence"]),
+                    (
+                        "final_artifact",
+                        "runtime",
+                        "screenshots",
+                        "orchestrator_completion",
+                    ),
                 )
             finally:
                 session.close()

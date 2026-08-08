@@ -1,11 +1,29 @@
 import unittest
 
-from agent.context import REVIVAL_MARKER, suspend_and_revive
+from agent.context import REVIVAL_MARKER, structural_summary, suspend_and_revive
 from agent.run_context import GoalContractV1
 from agent.weak_model import WeakModelPolicy
 
 
 class ContextLifecycleTests(unittest.TestCase):
+    def test_structural_summary_is_deterministic_and_does_not_need_a_provider(self):
+        messages = [
+            {"role": "user", "content": "goal"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"name": "list_files", "args": {"path": "."}}],
+            },
+            {"role": "tool", "content": "Error: temporary read failure"},
+        ]
+
+        summary = structural_summary(messages)
+
+        self.assertIn("user=1", summary)
+        self.assertIn("assistant=1", summary)
+        self.assertIn("tool=1", summary)
+        self.assertIn("list_files", summary)
+        self.assertIn("tool errors: 1", summary)
+
     def test_goal_contract_projection_is_compact_stable_and_policy_is_round_trippable(self):
         contract = GoalContractV1(
             run_id="run-1", original_objective="Build it", interpreted_objective="Build it safely",

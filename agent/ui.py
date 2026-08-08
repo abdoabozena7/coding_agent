@@ -1625,6 +1625,7 @@ class ConsoleUI:
         self._thought_sequence = 0
         self._coalesced_activity: dict[str, dict[str, Any]] = {}
         self._last_activity_key: str | None = None
+        self._plain_provider_states: dict[str, set[str]] = {}
         self._last_event_kind = ""
         self._last_status_signature: tuple[Any, ...] | None = None
         self._full_screen_depth = 0
@@ -2225,6 +2226,49 @@ class ConsoleUI:
                 self.stream.flush()
             self._stream_kind = None
 
+    def _render_plain_provider_event(self, event: UIEvent) -> None:
+        """Render each factual provider phase once in non-animated terminals."""
+
+        data = event.data
+        actor = str(data.get("actor") or data.get("active_actor") or "model")
+        request_key = str(
+            data.get("physical_request_id")
+            or data.get("logical_request_id")
+            or actor
+        )
+        provider_state = str(data.get("provider_state") or data.get("state") or "")
+        if event.kind == "workflow.state":
+            provider_state = "request_created"
+        elif event.kind == "heartbeat":
+            # A heartbeat proves liveness but is not a new user-facing phase.
+            # If no earlier request event was visible, retain one calm waiting
+            # line; otherwise it only updates durable/UI state.
+            provider_state = provider_state or "heartbeat"
+        provider_state = provider_state.casefold().strip() or event.kind
+        seen = self._plain_provider_states.setdefault(request_key, set())
+        if provider_state in seen:
+            return
+        if event.kind == "heartbeat" and seen:
+            return
+        seen.add(provider_state)
+        while len(self._plain_provider_states) > 200:
+            oldest = next(iter(self._plain_provider_states))
+            self._plain_provider_states.pop(oldest, None)
+
+        message = " ".join(str(event.message or "").split())
+        if event.kind == "heartbeat" and not message:
+            message = f"{actor} provider request remains open"
+        if not message:
+            return
+        failed = provider_state in {"failed", "network_unavailable", "stopped"}
+        self._live_line(
+            self._icon("أ—", "[X]") if failed else self._icon("â—‡", "[>]"),
+            message,
+            self.red if failed else self.cyan,
+            dedupe_key=f"plain-provider:{request_key}:{provider_state}",
+            show_count=False,
+        )
+
     @staticmethod
     def _tool_detail(name: str, args: Mapping[str, Any]) -> str:
         if name in {"list_files", "read_file", "grep", "write_file", "edit_file"}:
@@ -2513,6 +2557,23 @@ class ConsoleUI:
 
     def _render_event(self, event: UIEvent) -> None:
         self._last_event_kind = event.kind
+        if self.plain and event.kind == "checkpoint" and event.data.get("continues"):
+            # Context rotation is an internal preservation mechanism, not a
+            # user boundary.  Showing it on every local-model request made a
+            # healthy wait look like a repeated failure.
+            return
+        if self.plain and (
+            event.kind in {"provider.activity", "heartbeat"}
+            or (
+                event.kind == "workflow.state"
+                and bool(
+                    event.data.get("physical_request_id")
+                    or event.data.get("logical_request_id")
+                )
+            )
+        ):
+            self._render_plain_provider_event(event)
+            return
         if self.live_activity_enabled or event.kind in {
             "model_text",
             "model_thought",

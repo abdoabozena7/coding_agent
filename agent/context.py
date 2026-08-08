@@ -61,6 +61,36 @@ def _default_summarizer(messages: list[dict]) -> str:
     return llm.summarize(messages)
 
 
+def structural_summary(messages: list[dict]) -> str:
+    """Summarize transient protocol history without another model request.
+
+    The durable checkpoint owns goal semantics.  This summary intentionally
+    records only protocol shape so context rotation cannot create a hidden,
+    unbounded provider call before the monitored request starts.
+    """
+
+    roles = {role: 0 for role in ("user", "assistant", "tool")}
+    tools: list[str] = []
+    errors = 0
+    for message in messages:
+        role = str(message.get("role") or "")
+        if role in roles:
+            roles[role] += 1
+        for call in message.get("tool_calls") or ():
+            name = str(call.get("name") or "").strip()
+            if name and name not in tools:
+                tools.append(name)
+        if role == "tool" and str(message.get("content") or "").lstrip().startswith("Error:"):
+            errors += 1
+    tool_text = ", ".join(tools[:20]) if tools else "none"
+    return (
+        f"Suspended {len(messages)} transient protocol messages "
+        f"(user={roles['user']}, assistant={roles['assistant']}, tool={roles['tool']}); "
+        f"observed tool names: {tool_text}; tool errors: {errors}. "
+        "Use the authoritative durable checkpoint for all goal meaning and next actions."
+    )
+
+
 def maybe_compact(
     conversation: list[dict],
     summarizer: Callable[[list[dict]], str] | None = None,

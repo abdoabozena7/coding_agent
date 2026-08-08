@@ -717,6 +717,96 @@ class TerminalUITests(unittest.TestCase):
         self.assertNotIn("list_files", rendered)
         self.assertNotIn("Prepared plan", rendered)
 
+    def test_plain_provider_progress_coalesces_duplicate_events_and_heartbeats(self):
+        output = io.StringIO()
+        console = ConsoleUI(stream=output, color=False, plain=True, reduced_motion=True)
+        identity = {
+            "actor": "planner",
+            "logical_request_id": "planner-1-request",
+            "physical_request_id": "planner-1-request:p1",
+        }
+        console.on_event(
+            UIEvent("workflow.state", "Request created for planner", identity)
+        )
+        console.on_event(
+            UIEvent(
+                "provider.activity",
+                "Request created for planner",
+                {**identity, "provider_state": "request_created"},
+            )
+        )
+        console.on_event(
+            UIEvent(
+                "provider.activity",
+                "Opening local-model request for planner",
+                {**identity, "provider_state": "request_created"},
+            )
+        )
+        for _ in range(8):
+            console.on_event(
+                UIEvent(
+                    "heartbeat",
+                    "planner provider request is open",
+                    {**identity, "provider_state": "request_created"},
+                )
+            )
+            console.on_event(
+                UIEvent(
+                    "provider.activity",
+                    "Ollama is actively generating on GPU",
+                    {**identity, "provider_state": "server_processing"},
+                )
+            )
+        console.on_event(
+            UIEvent(
+                "provider.activity",
+                "Provider connected",
+                {**identity, "provider_state": "provider_connected"},
+            )
+        )
+        console.on_event(
+            UIEvent(
+                "provider.activity",
+                "First response bytes received",
+                {**identity, "provider_state": "receiving"},
+            )
+        )
+        console.on_event(
+            UIEvent(
+                "provider.activity",
+                "Model response received; validating it",
+                {**identity, "provider_state": "completed"},
+            )
+        )
+        console.on_event(
+            UIEvent(
+                "checkpoint",
+                "Provider-aware context rotation suspended 3 transient messages.",
+                {"continues": True},
+            )
+        )
+        console.on_event(
+            UIEvent(
+                "workflow.state",
+                "Retrying planner request after contract correction · attempt 2",
+                {
+                    **identity,
+                    "physical_request_id": "planner-1-request:p2",
+                    "physical_attempt": 2,
+                },
+            )
+        )
+
+        rendered = output.getvalue()
+        self.assertEqual(rendered.count("Request created for planner"), 1)
+        self.assertEqual(rendered.count("actively generating on GPU"), 1)
+        self.assertNotIn("provider request is open", rendered)
+        self.assertNotIn("context rotation suspended", rendered)
+        self.assertEqual(rendered.count("Provider connected"), 1)
+        self.assertEqual(rendered.count("First response bytes received"), 1)
+        self.assertEqual(rendered.count("validating it"), 1)
+        self.assertEqual(rendered.count("Retrying planner request"), 1)
+
     def test_concurrent_tool_results_keep_their_node_specific_details(self):
         class TTY(io.StringIO):
             encoding = "utf-8"

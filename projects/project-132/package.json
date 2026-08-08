@@ -1,0 +1,14 @@
+{
+  "name": "3d-calculator",
+  "version": "1.0.0",
+  "description": "A calculator integrated into a Three.js 3D environment.",
+  "main": "index.js",
+  "scripts": {
+    "start": "echo 'Run the application via an HTTP server.'",
+    "test": "jest --config=jest.config.js"
+  },
+  },
+  "dependencies": {
+    "three": "^0.128.0"
+  }
+}

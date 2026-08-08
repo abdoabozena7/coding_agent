@@ -10,6 +10,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path, PurePosixPath
+import re
 import secrets
 import shutil
 import subprocess
@@ -162,6 +163,81 @@ def _interaction_locator(page: Any, item: Mapping[str, Any]) -> Any:
     return page.get_by_role(role, name=name or None, exact=bool(item.get("exact", True)))
 
 
+def _require_unique_interaction_locator(page: Any, item: Mapping[str, Any]) -> Any:
+    """Resolve one target without Playwright's long actionability timeout.
+
+    A model-authored selector that matches nothing is a verification-contract
+    error, not evidence that the application failed.  Counting first makes that
+    distinction immediately instead of waiting 30 seconds per invented target.
+    """
+
+    try:
+        locator = _interaction_locator(page, item)
+        count = locator.count()
+    except Exception:
+        locator = None
+        count = 0
+    # Small structured-output models sometimes put a DOM id in the accessible
+    # ``name`` slot. Resolve that transport alias only when the live DOM proves
+    # it names exactly one element.
+    name = str(item.get("name") or "").strip()
+    if count == 0 and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]*", name):
+        id_locator = page.locator(f"#{name}")
+        if id_locator.count() == 1:
+            return id_locator
+    # For text assertions, the expected visible value itself is an
+    # authoritative locator fallback. This repairs invented labels without
+    # weakening the assertion or changing the application.
+    prop = str(item.get("property") or "")
+    expected_text = item.get("equals")
+    contains_text = item.get("contains")
+    visible_text = expected_text if expected_text is not None else contains_text
+    if count == 0 and prop in {"text", "textContent"} and visible_text is not None:
+        text_locator = page.get_by_text(
+            str(visible_text),
+            exact=expected_text is not None,
+        )
+        if text_locator.count() == 1:
+            return text_locator
+    if count == 0:
+        target = str(item.get("selector") or "").strip() or (
+            f"role={str(item.get('role') or '').strip()!r} "
+            f"name={str(item.get('name') or '').strip()!r}"
+        )
+        raise ValueError(f"interaction target matched no elements: {target}")
+    if count > 1:
+        raise ValueError(f"interaction target matched {count} elements; target must be unique")
+    return locator
+
+
+def _interaction_target_inventory(page: Any) -> list[dict[str, str]]:
+    """Return bounded, authoritative targets for a subsequent repair request."""
+
+    values = page.locator(
+        "button,input,select,textarea,a,[role],[data-value]"
+    ).evaluate_all(
+        """elements => elements.slice(0, 100).map(element => ({
+            tag: (element.tagName || '').toLowerCase(),
+            id: element.id || '',
+            role: element.getAttribute('role') || '',
+            name: element.getAttribute('aria-label') || element.innerText || element.value || '',
+            data_value: element.getAttribute('data-value') || '',
+            type: element.getAttribute('type') || ''
+        }))"""
+    )
+    inventory: list[dict[str, str]] = []
+    for raw in values if isinstance(values, list) else ():
+        if not isinstance(raw, Mapping):
+            continue
+        item = {
+            key: str(raw.get(key) or "").strip()[:240]
+            for key in ("tag", "id", "role", "name", "data_value", "type")
+        }
+        if any(item.values()):
+            inventory.append(item)
+    return inventory
+
+
 def _run_interaction_scenarios(
     page: Any,
     url: str,
@@ -184,17 +260,17 @@ def _run_interaction_scenarios(
                         raise ValueError("press interaction requires key")
                     page.keyboard.press(key)
                     continue
-                locator = _interaction_locator(page, step)
+                locator = _require_unique_interaction_locator(page, step)
                 if action == "click":
-                    locator.click()
+                    locator.click(timeout=5_000)
                 elif action == "fill":
-                    locator.fill(str(step.get("value") or ""))
+                    locator.fill(str(step.get("value") or ""), timeout=5_000)
                 else:
                     raise ValueError(f"unsupported interaction action {action!r}")
             assertions: list[dict[str, Any]] = []
             for raw_assertion in list(scenario.get("assertions") or ())[:20]:
                 assertion = dict(raw_assertion)
-                locator = _interaction_locator(page, assertion)
+                locator = _require_unique_interaction_locator(page, assertion)
                 prop = str(assertion.get("property") or "")
                 observed = locator.input_value() if prop == "value" else locator.inner_text()
                 expected = assertion.get("equals")
@@ -235,6 +311,8 @@ def _verify(url: str, screenshot_path: Path, settle_ms: int, interactions: Seque
     capability = browser_capability()
     result: dict[str, Any] = {
         "status": "unavailable",
+        "failure_kind": "",
+        "interaction_targets": [],
         "console_errors": [],
         "page_errors": [],
         "network_errors": [],
@@ -261,6 +339,7 @@ def _verify(url: str, screenshot_path: Path, settle_ms: int, interactions: Seque
             page.on("response", lambda response: result["network_errors"].append(f"HTTP {response.status} {response.url}") if response.status >= 400 else None)
             response = page.goto(url, wait_until="load", timeout=30_000)
             page.wait_for_timeout(max(0, min(int(settle_ms), 10_000)))
+            result["interaction_targets"] = _interaction_target_inventory(page)
             interaction_results = _run_interaction_scenarios(page, url, interactions)
             result["interaction_results"] = interaction_results
             for item in interaction_results:
@@ -268,6 +347,15 @@ def _verify(url: str, screenshot_path: Path, settle_ms: int, interactions: Seque
                     result["page_errors"].append(
                         f"Interaction {item.get('name')}: {item.get('error') or 'assertion failed'}"
                     )
+            failed_interactions = [
+                item for item in interaction_results if not item.get("passed")
+            ]
+            if failed_interactions:
+                result["failure_kind"] = (
+                    "contract"
+                    if all(item.get("failure_kind") == "contract" for item in failed_interactions)
+                    else "application"
+                )
             screenshot_path.parent.mkdir(parents=True, exist_ok=True)
             page.screenshot(path=str(screenshot_path), full_page=True)
             result.update({
@@ -343,6 +431,8 @@ def create(path: str, open_browser: bool = True, verify: bool = True, settle_ms:
             "browser_opened": opened,
             "browser_error": open_error,
             "verification": preview.verification.get("status"),
+            "failure_kind": preview.verification.get("failure_kind", ""),
+            "interaction_targets": preview.verification.get("interaction_targets", []),
             "console_errors": preview.verification.get("console_errors", []),
             "page_errors": preview.verification.get("page_errors", []),
             "network_errors": preview.verification.get("network_errors", []),

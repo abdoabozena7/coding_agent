@@ -163,6 +163,56 @@ READ_ONLY_TOOLS = tools.names(categories={"read"})
 MUTATING_TOOLS = tools.names(mutating=True)
 TOOL_RISK = tools.risk_map()
 
+_WORKSPACE_PATH_PATTERN = re.compile(
+    r"(?<![\w./-])([\w.-]+(?:[/\\][\w.-]+)*\."
+    r"(?:py|html?|js|ts|tsx|jsx|css|json|md|txt|ya?ml|toml))\b",
+    re.IGNORECASE,
+)
+_DOTTED_TECH_IDENTIFIERS = frozenset(
+    {
+        "angular.js",
+        "chart.js",
+        "d3.js",
+        "ember.js",
+        "next.js",
+        "node.js",
+        "nuxt.js",
+        "react.js",
+        "three.js",
+        "vue.js",
+    }
+)
+
+
+def _extract_explicit_workspace_paths(text: str) -> tuple[str, ...]:
+    """Return file-like tokens while excluding common dotted product names.
+
+    Names such as ``Three.js`` are technologies in ordinary prose, not an
+    instruction to create a second file. They remain usable as paths when the
+    user explicitly labels or quotes them as a file/path.
+    """
+
+    paths: list[str] = []
+    source = str(text or "")
+    for match in _WORKSPACE_PATH_PATTERN.finditer(source):
+        path = match.group(1).replace("\\", "/")
+        folded = path.casefold().removeprefix("./")
+        if "/" not in path and folded in _DOTTED_TECH_IDENTIFIERS:
+            prefix = source[max(0, match.start() - 40) : match.start()]
+            quoted = bool(prefix[-1:] in {"`", "'", '"'})
+            explicit_file_cue = bool(
+                re.search(
+                    r"(?:file|path)(?:\s+(?:named|called))?\s*$",
+                    prefix,
+                    re.IGNORECASE,
+                )
+            )
+            if not quoted and not explicit_file_cue:
+                continue
+        if folded not in {item.casefold().removeprefix("./") for item in paths}:
+            paths.append(path)
+    return tuple(paths)
+
 
 class RuntimeErrorBase(RuntimeError):
     pass
@@ -743,8 +793,9 @@ class AgentRuntime:
         """Return the model-aware worker limit for the active workflow.
 
         Session/UI preferences are never allowed to widen a capability decision.
-        Before routing, the conservative metadata envelope is authoritative;
-        after routing, the persisted strategy decision is authoritative.
+        During semantic dispatch the task-aware decision lives on the pending
+        turn because the Goal does not exist yet; after Goal creation the same
+        decision is copied to Goal metadata.
         """
 
         goal = self.active_goal()
@@ -755,6 +806,16 @@ class AgentRuntime:
                     return max(1, min(8, int(decision.get("max_concurrency", 1))))
                 except (TypeError, ValueError):
                     pass
+        try:
+            session = self.store.get_workflow_session(self.session_id)
+            state = dict(session.get("state") or {})
+            pending = state.get("pending_semantic_turn")
+            pending = dict(pending) if isinstance(pending, Mapping) else {}
+            decision = pending.get("strategy_decision") or state.get("strategy_decision")
+            if isinstance(decision, Mapping):
+                return max(1, min(8, int(decision.get("max_concurrency", 1))))
+        except (StateStoreError, TypeError, ValueError):
+            pass
         return max(1, min(8, int(self.model_capability_envelope().max_concurrency)))
 
     def _capability_envelope_for(
@@ -965,6 +1026,18 @@ class AgentRuntime:
                     raw_strategy = source["strategy_decision"].get("strategy")
                 if raw_strategy:
                     strategy = str(raw_strategy).casefold()
+        # Once a Goal exists its accepted execution strategy is authoritative.
+        # A session envelope can still contain the pre-route ``staged`` value;
+        # allowing that presentation cache to win made a live recursive Ultra
+        # run appear as "Execution STAGED" in the dashboard.
+        if goal is not None:
+            goal_strategy = goal.metadata.get("execution_strategy")
+            if not goal_strategy and isinstance(
+                goal.metadata.get("strategy_decision"), Mapping
+            ):
+                goal_strategy = goal.metadata["strategy_decision"].get("strategy")
+            if goal_strategy:
+                strategy = str(goal_strategy).casefold()
         # An active durable Goal is itself the authoritative route.  Older
         # sessions can retain ``route=pending`` when the route turn was
         # completed just before the goal row was created; keeping that stale
@@ -2171,6 +2244,7 @@ class AgentRuntime:
             agent_steps=self.config.subagent_steps,
             reasoning_effort=self.reasoning_effort,
             version_control=self.version_control,
+            session_id=self.session_id,
         )
 
     def start_ultra(
@@ -2178,6 +2252,7 @@ class AgentRuntime:
         objective: str,
         *,
         requested_effects: Sequence[str] = (),
+        entry_surface: str = "working",
     ) -> Any:
         """Start the Ultra foundation and checkpoint at questions/approval."""
 
@@ -2195,7 +2270,7 @@ class AgentRuntime:
             return self.start_goal(
                 redact_text(objective, 20_000),
                 execution_mode=RunMode.ULTRA,
-                entry_surface="ultra",
+                entry_surface=entry_surface,
             )
         self.ultra_session = self._make_ultra_session()
         return self.ultra_session.start(
@@ -2506,37 +2581,24 @@ class AgentRuntime:
                 reasons=tuple(dict(intake.get("complexity") or {}).get("reasons", ())),
             )
         )
-        strategy_raw = pending.get("strategy_decision")
-        explicit_ultra = RunMode.parse(brief.requested_mode) is RunMode.ULTRA
-        strategy = (
-            StrategyDecisionV1.from_mapping(strategy_raw)
-            if explicit_ultra and isinstance(strategy_raw, Mapping)
-            else select_execution_strategy(
-                capability_envelope,
-                demand,
-                allow_capability_escalation=explicit_ultra,
-            )
+        # Working has one engine: recursive specialist execution. Plan only
+        # changes the approval boundary. Legacy ``normal`` and ``ultra`` mode
+        # values remain readable, but they resolve to this same task-aware
+        # execution policy.
+        strategy = select_execution_strategy(
+            capability_envelope,
+            demand,
+            minimum=ExecutionStrategyV1.RECURSIVE,
+            allow_capability_escalation=True,
         )
         interaction_mode = (
             InteractionModeV2.PLAN
             if RunMode.parse(brief.requested_mode) is RunMode.PLAN
             else InteractionModeV2.WORKING
         )
-        # ``workflow_mode`` is the user's durable choice.  The capability
-        # strategy may narrow packets, but it must never rewrite Normal into
-        # Ultra as a side effect of a weak local model.  Recursive execution
-        # is therefore reachable here only through an explicit Ultra request.
-        requested_mode = RunMode.parse(brief.requested_mode)
-        # Plan is an interaction surface, not a stronger execution policy.
-        # Keep the durable execution mode Normal while recording the separate
-        # plan interaction mode above; otherwise a planning-only UI choice
-        # leaks into the goal policy and makes a later run look like a mode
-        # escalation.
-        routed = (
-            RunMode.ULTRA
-            if requested_mode is RunMode.ULTRA
-            else RunMode.NORMAL
-        )
+        # Keep the public durable value compatible (Plan versus Working) while
+        # routing every Goal through the recursive foundation below.
+        routed = RunMode.NORMAL
         self.store.complete_intake_session(
             str(intake["id"]),
             brief=brief.to_dict(),
@@ -2584,18 +2646,10 @@ class AgentRuntime:
             for name, enabled in route_effects.items()
             if bool(enabled)
         )
-        result = (
-            self.start_ultra(
-                brief.original_input,
-                requested_effects=requested_effects,
-            )
-            if routed is RunMode.ULTRA
-            else self.start_goal(
-                brief.original_input,
-                planning_only=False,
-                execution_mode=routed,
-                entry_surface=entry_surface,
-            )
+        result = self.start_ultra(
+            brief.original_input,
+            requested_effects=requested_effects,
+            entry_surface=entry_surface,
         )
         goal = self.active_goal()
         if goal is not None:
@@ -2965,6 +3019,52 @@ class AgentRuntime:
                 # accidentally dropping the unsafe entry.
                 paths.add(raw.replace("\\", "/"))
         return paths
+
+    @staticmethod
+    def _effective_expected_changes(goal: Goal, plan: Plan | None) -> tuple[dict[str, Any], ...]:
+        """Hide legacy explicit-path claims the request parser now disproves."""
+
+        if plan is None:
+            return ()
+        explicit_paths = {
+            path.casefold().removeprefix("./")
+            for path in _extract_explicit_workspace_paths(goal.objective)
+        }
+        effective: list[dict[str, Any]] = []
+        for raw_change in plan.expected_changes:
+            change = dict(raw_change)
+            path = str(change.get("path") or "").replace("\\", "/").strip()
+            normalized = path.casefold().removeprefix("./")
+            if (
+                explicit_paths
+                and str(change.get("basis") or "") == "explicit_user_requirement"
+                and normalized not in explicit_paths
+            ):
+                continue
+            effective.append(change)
+        return tuple(effective)
+
+    @classmethod
+    def _effective_artifact_ids(
+        cls,
+        goal: Goal,
+        plan: Plan | None,
+        artifact_ids: Iterable[str],
+    ) -> tuple[str, ...]:
+        effective_paths = {
+            str(change.get("path") or "").replace("\\", "/").casefold().removeprefix("./")
+            for change in cls._effective_expected_changes(goal, plan)
+        }
+        stale_paths = {
+            str(change.get("path") or "").replace("\\", "/").casefold().removeprefix("./")
+            for change in (() if plan is None else plan.expected_changes)
+        } - effective_paths
+        return tuple(
+            str(artifact_id)
+            for artifact_id in artifact_ids
+            if str(artifact_id).replace("\\", "/").casefold().removeprefix("./")
+            not in stale_paths
+        )
 
     @classmethod
     def _repair_revision_is_in_scope(
@@ -4376,6 +4476,7 @@ class AgentRuntime:
         step: int,
         stream_text: bool = True,
         normalization_context: Mapping[str, Any] | None = None,
+        provider_checkpoint: Mapping[str, Any] | None = None,
     ) -> AssistantTurn:
         self.events.publish("step", actor=actor, step=step)
         current_goal = self.active_goal()
@@ -4400,25 +4501,31 @@ class AgentRuntime:
                         "rules": self.weak_model_policy.applied_rules("provider_call"),
                     },
                 )
+        checkpoint_payload = (
+            {
+                "goal_id": current_goal.id,
+                "status": current_goal.status.value,
+                "semantic_goal": current_goal.metadata.get("semantic_goal", {}),
+                "active_plan_revision": current_goal.active_plan_revision,
+                **dict(provider_checkpoint or {}),
+            }
+            if current_goal is not None
+            else dict(provider_checkpoint or {})
+        )
         checkpoint = (
             state_envelope(
-                {
-                    "goal_id": current_goal.id,
-                    "status": current_goal.status.value,
-                    "semantic_goal": current_goal.metadata.get("semantic_goal", {}),
-                    "active_plan_revision": current_goal.active_plan_revision,
-                },
+                checkpoint_payload,
                 "PROVIDER_CONTEXT_CHECKPOINT",
-                max_chars=12_000,
+                max_chars=(40_000 if str(actor).casefold() == "planner" else 12_000),
             )
-            if current_goal is not None
+            if current_goal is not None or checkpoint_payload
             else "No durable goal exists yet; preserve the latest exact user turn."
         )
         provider_budget = self._provider_conversation_budget(system, schemas)
         conversation = context.suspend_and_revive(
             conversation,
             checkpoint,
-            getattr(self.provider, "summarize", None),
+            context.structural_summary,
             max_chars=provider_budget,
             on_suspend=lambda count: self.events.publish(
                 "checkpoint",
@@ -4484,11 +4591,14 @@ class AgentRuntime:
         contract_repairs = 0
         contract_repair_limit = self._structured_repair_limit()
         policy = self._provider_call_policy(actor)
+        logical_request_id = f"{actor}-{step}-{uuid.uuid4().hex[:12]}"
+        physical_request_attempt = 0
         transport_recovery_attempted = False
         transport_recovery_succeeded = False
         for attempt in range(self.config.max_provider_retries + 1):
             try:
                 while True:
+                    physical_request_attempt += 1
                     turn = self._provider_call_with_watchdog(
                         provider_conversation,
                         schemas,
@@ -4497,6 +4607,8 @@ class AgentRuntime:
                         step=step,
                         stream_text=stream_text,
                         policy=policy,
+                        logical_request_id=logical_request_id,
+                        physical_attempt=physical_request_attempt,
                     )
                     if not isinstance(turn, AssistantTurn):
                         raise TypeError(
@@ -4504,6 +4616,32 @@ class AgentRuntime:
                         )
                     receipts: list[dict[str, Any]] = []
                     for call in turn.tool_calls:
+                        if (
+                            str(actor).casefold() == "planner"
+                            and call.name == "read_workspace"
+                            and "list_files" in allowed_tools
+                        ):
+                            original_name = call.name
+                            call.name = "list_files"
+                            call.args = {
+                                **(call.args if isinstance(call.args, dict) else {}),
+                                "path": str(
+                                    (call.args if isinstance(call.args, dict) else {}).get("path")
+                                    or "."
+                                ),
+                            }
+                            if current_goal is not None:
+                                self.store.append_event(
+                                    "tool_contract.alias_normalized",
+                                    goal_id=current_goal.id,
+                                    payload={
+                                        "actor": actor,
+                                        "received": original_name,
+                                        "normalized": call.name,
+                                        "logical_request_id": logical_request_id,
+                                        "physical_attempt": physical_request_attempt,
+                                    },
+                                )
                         # V2 exposed one combined semantic return. During the
                         # V3 split, accept that already-persisted transport name
                         # only when it maps unambiguously to the sole advertised
@@ -4603,9 +4741,19 @@ class AgentRuntime:
                                 ),
                                 payload={"actor": actor, **receipt},
                             )
-                    if not invalid_names:
+                    incomplete_contract_repair = bool(
+                        contract_repairs
+                        and schemas
+                        and not turn.tool_calls
+                    )
+                    if not invalid_names and not incomplete_contract_repair:
                         break
                     contract_repairs += 1
+                    rejected_names = (
+                        invalid_names
+                        if invalid_names
+                        else ("<no tool call after contract correction>",)
+                    )
                     if current_goal is not None:
                         self.store.append_event(
                             "tool_contract.rejected",
@@ -4613,17 +4761,30 @@ class AgentRuntime:
                             payload={
                                 "actor": actor,
                                 "attempt": contract_repairs,
-                                "received": list(invalid_names),
+                                "received": list(rejected_names),
                                 "allowed": sorted(allowed_tools),
                                 "stage": actor,
+                                "logical_request_id": logical_request_id,
+                                "physical_attempt": physical_request_attempt,
                             },
                         )
                     if contract_repairs > contract_repair_limit:
                         # Never hand an unadvertised call to a downstream
-                        # dispatcher. The caller receives an empty turn and can
-                        # reach its own precise, durable stage boundary.
+                        # dispatcher. Preserve a typed failure in provider-neutral
+                        # metadata so the caller can recover or checkpoint the
+                        # exact stage instead of mistaking this for an empty model
+                        # response.
+                        contract_error = {
+                            "kind": "tool_contract",
+                            "received": list(rejected_names),
+                            "allowed": sorted(allowed_tools),
+                            "attempts": contract_repairs,
+                            "logical_request_id": logical_request_id,
+                            "physical_attempt": physical_request_attempt,
+                        }
                         turn.tool_calls.clear()
-                        turn.text = ""
+                        turn.text = None
+                        turn.native = {**dict(turn.native or {}), "tool_contract_error": contract_error}
                         break
                     provider_conversation.append(turn.to_message())
                     provider_conversation.append(
@@ -4662,6 +4823,11 @@ class AgentRuntime:
                             "tool_names": [call.name for call in turn.tool_calls],
                             "tool_calls_redacted": recorded_calls,
                             "text_excerpt": redact_text(turn.text or "", 1_000),
+                            "logical_request_id": logical_request_id,
+                            "physical_request_count": physical_request_attempt,
+                            "tool_contract_error": redact_data(
+                                dict(turn.native.get("tool_contract_error") or {})
+                            ),
                         },
                     )
                 self._emit_usage(turn)
@@ -4795,6 +4961,8 @@ class AgentRuntime:
         step: int = 0,
         stream_text: bool,
         policy: ProviderCallPolicyV1 | None = None,
+        logical_request_id: str = "",
+        physical_attempt: int = 1,
     ) -> AssistantTurn:
         """Bound a provider call and report liveness without replaying tools."""
 
@@ -4802,6 +4970,8 @@ class AgentRuntime:
             raise RuntimeStateError(
                 "another live process owns this workflow; the provider call was not replayed"
             )
+        logical_request_id = str(logical_request_id or f"{actor}-{step}-{uuid.uuid4().hex[:12]}")
+        physical_request_id = f"{logical_request_id}:p{max(1, int(physical_attempt))}"
         results: Queue[tuple[str, Any]] = Queue(maxsize=1)
         abandoned = Event()
         self._active_provider_abandon = abandoned
@@ -4820,10 +4990,18 @@ class AgentRuntime:
             f"Calling {self.model_name} for {actor}"
             + (" · structured response is atomic" if structured_call else "")
         )
+        request_message = (
+            f"Request created for {actor}"
+            if physical_attempt <= 1
+            else (
+                f"Retrying {actor} request after contract correction · "
+                f"attempt {physical_attempt}"
+            )
+        )
         provider_goal = self.active_goal()
         self.events.publish(
             "workflow.state",
-            f"Request created for {actor}",
+            request_message,
             actor=actor,
             active_actor=actor,
             active_step=step,
@@ -4833,6 +5011,9 @@ class AgentRuntime:
             objective=(provider_goal.objective if provider_goal is not None else ""),
             model=self.model_name,
             provider=self.provider_name,
+            logical_request_id=logical_request_id,
+            physical_request_id=physical_request_id,
+            physical_attempt=physical_attempt,
         )
 
         with self._live_activity_lock:
@@ -4852,7 +5033,7 @@ class AgentRuntime:
             }
         self.events.publish(
             "provider.activity",
-            f"Request created for {actor}",
+            request_message,
             source_kind="MODEL",
             actor=actor,
             phase=provider_phase,
@@ -4865,6 +5046,9 @@ class AgentRuntime:
             received_chunks=0,
             received_tokens=0,
             heartbeat_at=time.time(),
+            logical_request_id=logical_request_id,
+            physical_request_id=physical_request_id,
+            physical_attempt=physical_attempt,
         )
         self.events.publish(
             "provider.activity",
@@ -4881,6 +5065,9 @@ class AgentRuntime:
             received_chunks=0,
             received_tokens=0,
             heartbeat_at=time.time(),
+            logical_request_id=logical_request_id,
+            physical_request_id=physical_request_id,
+            physical_attempt=physical_attempt,
         )
 
         def provider_activity(activity: ProviderActivityV1) -> None:
@@ -4929,6 +5116,12 @@ class AgentRuntime:
                 if activity.state == "receiving"
                 else "Model response received; validating it"
                 if activity.state == "completed"
+                else "Provider connected"
+                if activity.state == "provider_connected"
+                else "Provider connection opened"
+                if activity.state == "connection_opened"
+                else "Provider request created"
+                if activity.state == "request_created"
                 else f"Provider {state_label}"
             )
             self.events.publish(
@@ -4947,6 +5140,9 @@ class AgentRuntime:
                 received_chunks=current["received_chunks"],
                 received_tokens=current["received_tokens"],
                 heartbeat_at=now_wall,
+                logical_request_id=logical_request_id,
+                physical_request_id=physical_request_id,
+                physical_attempt=physical_attempt,
             )
 
         def signal(kind: str, fragment: Any) -> None:
@@ -5107,6 +5303,9 @@ class AgentRuntime:
                             state="active", provider_state="server_processing",
                             operation=f"Local model generating for {actor}", waiting_on="model",
                             received_bytes=0, received_chunks=0, heartbeat_at=time.time(),
+                            logical_request_id=logical_request_id,
+                            physical_request_id=physical_request_id,
+                            physical_attempt=physical_attempt,
                         )
                     elif self.execution_class == "cloud" and not bool(diagnosis.get("reachable", True)):
                         self.events.publish(
@@ -5139,6 +5338,9 @@ class AgentRuntime:
                         received_bytes=int(live_activity.get("received_bytes") or 0),
                         received_chunks=int(live_activity.get("received_chunks") or 0),
                         received_tokens=int(live_activity.get("received_tokens") or 0),
+                        logical_request_id=logical_request_id,
+                        physical_request_id=physical_request_id,
+                        physical_attempt=physical_attempt,
                     )
                     try:
                         session = self.store.get_workflow_session(self.session_id)
@@ -5160,7 +5362,7 @@ class AgentRuntime:
                     self.events.publish(
                         "warning",
                         f"Still calling {self.model_name} for {actor}; no response bytes for "
-                        f"{int(quiet)} seconds. The request is saved and no workspace action "
+                        f"{int(quiet)} seconds. The workflow stage is saved and no workspace action "
                         "has been replayed.",
                         actor=actor,
                         non_blocking=True,
@@ -6342,6 +6544,45 @@ class AgentRuntime:
         semantic = SemanticGoalV2.from_mapping(value, original_request=goal.objective)
         if semantic.status != "interpreted":
             raise ValueError("semantic_goal.status must be interpreted")
+        assumed_defaults = tuple(
+            decision
+            for decision in semantic.unresolved_decisions
+            if re.search(
+                r"\b(?:assum(?:e|ed|ing|ption)|default(?:ing|ed)?|standard practice)\b",
+                decision,
+                re.IGNORECASE,
+            )
+        )
+        blocking_decisions = tuple(
+            decision
+            for decision in semantic.unresolved_decisions
+            if decision not in assumed_defaults
+        )
+        if assumed_defaults:
+            # A model-selected default is not unresolved user input. Preserve
+            # it as an auditable constraint while keeping genuine unanswered
+            # decisions strict. This is especially important after the clear
+            # semantic gateway has already decided no user question is needed.
+            semantic = SemanticGoalV2(
+                original_request=semantic.original_request,
+                interpreted_outcome=semantic.interpreted_outcome,
+                requested_effects=semantic.requested_effects,
+                required_outcomes=semantic.required_outcomes,
+                constraints=tuple(
+                    dict.fromkeys(
+                        (
+                            *semantic.constraints,
+                            *(f"Planner default: {item}" for item in assumed_defaults),
+                        )
+                    )
+                ),
+                exclusions=semantic.exclusions,
+                acceptance_criteria=semantic.acceptance_criteria,
+                requirement_anchors=semantic.requirement_anchors,
+                unresolved_decisions=blocking_decisions,
+                repository_evidence_refs=semantic.repository_evidence_refs,
+                status=semantic.status,
+            )
         if semantic.unresolved_decisions:
             raise ValueError(
                 "semantic interpretation still has unresolved decisions; "
@@ -6591,6 +6832,46 @@ class AgentRuntime:
         # partial/contradictory mappings strict so real coverage gaps remain
         # actionable repair boundaries.
         tasks = list(proposed.get("tasks") or ())
+        # Requirement IDs repeated verbatim inside a task's authored contract
+        # are transport-equivalent to the optional ``requirement_refs`` field.
+        # Some smaller tool-calling models put ``(R005)`` in verification but
+        # omit it from the parallel array.  Bind only exact, already-accepted
+        # anchor IDs; never infer a new requirement from keyword similarity.
+        anchor_ids = {item.id for item in semantic.requirement_anchors}
+        inline_refs_added = False
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            authored_contract = " ".join(
+                str(task.get(key) or "")
+                for key in (
+                    "title",
+                    "description",
+                    "acceptance_criteria",
+                    "verification",
+                )
+            )
+            refs = [
+                str(item).strip().upper()
+                for item in task.get("requirement_refs", ())
+                if str(item).strip()
+            ]
+            for anchor_id in sorted(anchor_ids):
+                if anchor_id in refs:
+                    continue
+                if re.search(
+                    rf"(?<![A-Za-z0-9_]){re.escape(anchor_id)}(?![A-Za-z0-9_])",
+                    authored_contract,
+                    re.IGNORECASE,
+                ):
+                    refs.append(anchor_id)
+                    inline_refs_added = True
+            task["requirement_refs"] = refs
+        if inline_refs_added:
+            proposed["tasks"] = tasks
+            if isinstance(original_proposed, dict):
+                original_proposed.clear()
+                original_proposed.update(proposed)
         if semantic.requirement_anchors and tasks and not any(
             task.get("requirement_refs") for task in tasks if isinstance(task, Mapping)
         ):
@@ -6664,7 +6945,6 @@ class AgentRuntime:
             raise ValueError(
                 "semantic goal must cite successful repository inspection references"
             )
-        anchor_ids = {item.id for item in semantic.requirement_anchors}
         covered_anchor_ids: set[str] = set()
         for index, task in enumerate(proposed.get("tasks", ())):
             refs = {
@@ -6857,13 +7137,8 @@ class AgentRuntime:
             )
         )
         explicit_request_paths = {
-            match.group(0).replace("\\", "/").casefold()
-            for match in re.finditer(
-                r"[\w.-]+(?:[/\\][\w.-]+)*\."
-                r"(?:py|html?|js|ts|tsx|jsx|css|json|md|txt|ya?ml|toml)",
-                original_request,
-                re.IGNORECASE,
-            )
+            path.casefold().removeprefix("./")
+            for path in _extract_explicit_workspace_paths(original_request)
         }
         task_ids = {task.id for task in tasks}
         evidence_coverage: set[str] = set()
@@ -6946,14 +7221,13 @@ class AgentRuntime:
                     "a new target must cite repository_convention, "
                     "model_selected_new_layout, or explicit_user_requirement"
                 )
-            normalized_request = str(original_request).replace("\\", "/").casefold()
             request_path = raw_path.casefold().removeprefix("./")
             if basis == "explicit_user_requirement":
                 if "user:request" not in evidence_refs:
                     raise ValueError(
                         "explicit-user path basis requires evidence_refs=user:request"
                     )
-                if request_path not in normalized_request:
+                if request_path not in explicit_request_paths:
                     raise ValueError(
                         "explicit-user path basis requires the exact workspace-relative "
                         "path to appear in the original request"
@@ -6963,7 +7237,7 @@ class AgentRuntime:
                     raise ValueError(
                         "model-selected-new-layout basis is valid only for a new target"
                     )
-                if request_path in normalized_request:
+                if request_path in explicit_request_paths:
                     raise ValueError(
                         "a path written verbatim by the user must use "
                         "explicit_user_requirement basis"
@@ -7011,13 +7285,35 @@ class AgentRuntime:
 
         records = dict(inspection_records)
         aliases: dict[str, str] = {}
+        source_aliases: dict[str, str | None] = {}
         for reference, record in records.items():
             canonical = f"inspection:{reference}"
             aliases[canonical.casefold()] = canonical
             aliases[f"tool:{reference}".casefold()] = canonical
-            call_id = str(record.get("call_id") or "").strip()
-            if call_id:
-                aliases[f"tool:{call_id}".casefold()] = canonical
+            source = str(record.get("source") or "").strip().casefold()
+            if source:
+                existing = source_aliases.get(source)
+                source_aliases[source] = (
+                    canonical
+                    if existing is None and source not in source_aliases
+                    else canonical
+                    if existing == canonical
+                    else None
+                )
+            call_ids = [str(record.get("call_id") or "").strip()]
+            raw_call_ids = record.get("call_ids")
+            if isinstance(raw_call_ids, (list, tuple)):
+                call_ids.extend(str(value).strip() for value in raw_call_ids)
+            for call_id in dict.fromkeys(call_ids):
+                if call_id:
+                    aliases[f"tool:{call_id}".casefold()] = canonical
+        aliases.update(
+            {
+                source: canonical
+                for source, canonical in source_aliases.items()
+                if canonical is not None
+            }
+        )
         only_reference = next(iter(records), None) if len(records) == 1 else None
         repository_reference = next(
             (
@@ -7087,12 +7383,10 @@ class AgentRuntime:
                 item["source"] = canonical
         bound["applicability_evidence"] = evidence
         changes = [dict(item) for item in proposed.get("expected_changes", ())]
-        normalized_request = original_request.replace("\\", "/").casefold()
-        path_pattern = re.compile(
-            r"(?<![\w./-])([A-Za-z0-9_.-]+\."
-            r"(?:html?|py|js|ts|tsx|jsx|css|json|md|txt|ya?ml|toml))\b",
-            re.IGNORECASE,
-        )
+        explicit_request_paths = {
+            path.casefold().removeprefix("./")
+            for path in _extract_explicit_workspace_paths(original_request)
+        }
         placeholder_paths = {
             "explicit_user_requirement",
             "explicit user requirement",
@@ -7137,7 +7431,7 @@ class AgentRuntime:
                 )
             paths: list[str] = []
             for source in sources:
-                for match in path_pattern.findall(source):
+                for match in _extract_explicit_workspace_paths(source):
                     normalized = match.replace("\\", "/")
                     if normalized.casefold() not in {
                         value.casefold() for value in paths
@@ -7183,11 +7477,26 @@ class AgentRuntime:
                 item["evidence_refs"] = inspected_path_refs
             request_path = raw_path.casefold().removeprefix("./")
             if (
+                item.get("basis") == "model_selected_new_layout"
+                and request_path
+                and (
+                    request_path in explicit_request_paths
+                )
+            ):
+                # This does not choose a path for the model.  It corrects the
+                # provenance enum for a path the user wrote verbatim, which is
+                # mechanically authoritative and already enforced below.
+                item["basis"] = "explicit_user_requirement"
+                item["evidence_refs"] = ["user:request"]
+                if normalization_actions is not None:
+                    normalization_actions.append(
+                        f"/expected_changes provenance rebound to explicit user path {raw_path}"
+                    )
+            if (
                 item.get("basis") == "explicit_user_requirement"
                 and request_path
                 and (
-                    raw_path.casefold() in normalized_request
-                    or request_path in normalized_request
+                    request_path in explicit_request_paths
                 )
             ):
                 # `user:request` is the canonical harness citation for a path
@@ -7225,6 +7534,7 @@ class AgentRuntime:
         reason: str,
         *,
         provider_failure: bool = False,
+        auto_recoverable: bool = False,
     ) -> None:
         """Checkpoint a bounded/failed planning pass as an explicit user-visible pause."""
         current = self.store.get_goal(goal.id)
@@ -7233,9 +7543,22 @@ class AgentRuntime:
         attempt = int(current.metadata.get("goal_attempt", 0)) + 1
         consecutive = int(current.metadata.get("consecutive_retries", 0)) + 1
         retry_ms = self._goal_retry_delay_ms(consecutive)
-        retryable = provider_failure and consecutive < self.config.provider_failure_limit
+        planning_auto_recovery_count = int(
+            current.metadata.get("planning_auto_recovery_count", 0) or 0
+        )
+        structured_retry = auto_recoverable and planning_auto_recovery_count < 1
+        retryable = (
+            provider_failure and consecutive < self.config.provider_failure_limit
+        ) or structured_retry
         waiting = (
-            question
+            (
+                "The planner did not produce a critic-approved structured plan in its "
+                "bounded pass. The saved semantic and inspection checkpoint supports one "
+                "automatic retry with a fresh authoritative packet when the continuous "
+                "controller is active; otherwise add guidance and use /resume or /replan."
+                if structured_retry
+                else question
+            )
             if not provider_failure or retryable
             else (
                 "Planning stopped after repeated provider failures. Check the selected "
@@ -7275,6 +7598,11 @@ class AgentRuntime:
             retry_reason=reason,
             retry_after_ms=retry_ms if retryable else 0,
             auto_retryable=retryable,
+            planning_auto_recovery_count=(
+                planning_auto_recovery_count + 1
+                if structured_retry
+                else planning_auto_recovery_count
+            ),
             **adaptation_updates,
         )
         self.store.transition_goal(goal.id, GoalStatus.PAUSED, reason=reason)
@@ -7621,15 +7949,24 @@ class AgentRuntime:
         critic_recovery_attempts = 0
         rejected_stage_fingerprints: dict[str, str] = {}
         unproductive_turns_after_inspection = 0
+        planning_recovery_attempts = 0
+        planner_contract_failures = 0
         last_plan_format_error = ""
+        last_rejected_plan_stage = ""
+        last_rejected_plan: dict[str, Any] | None = None
         exhausted_stage = ""
         plan_format_exhausted = False
         accepted_plan_for_revision = self.store.get_accepted_plan(goal.id)
         semantic_locked_to_approval = accepted_plan_for_revision is not None
-        if semantic_locked_to_approval and isinstance(
-            goal.metadata.get("semantic_goal"),
-            Mapping,
-        ):
+        durable_semantic = goal.metadata.get("semantic_goal")
+        if isinstance(durable_semantic, Mapping) and str(
+            durable_semantic.get("status") or ""
+        ) in {"interpreted", "critic_accepted"}:
+            # A critic-approved semantic contract remains authoritative when
+            # the user rejects the first pending plan. It is not conditional
+            # on an execution plan already having been approved; dropping it
+            # here made replan restart from an empty semantic stage and blocked
+            # deterministic local repair projection.
             stored_staged_semantic = dict(goal.metadata["semantic_goal"])
             stored_staged_semantic["status"] = "interpreted"
         else:
@@ -7680,10 +8017,234 @@ class AgentRuntime:
                 )
         semantic_stage_attempted = staged_semantic is not None
         plan_stage_prompted = False
-        successful_inspection_ids: set[str] = set()
+        stored_inspections = goal.metadata.get("planning_inspection_records")
         inspection_records: dict[str, dict[str, Any]] = {}
+        if isinstance(stored_inspections, Mapping):
+            for raw_reference, raw_record in stored_inspections.items():
+                if not isinstance(raw_record, Mapping):
+                    continue
+                reference = str(raw_reference).removeprefix("inspection:").strip()
+                if reference:
+                    inspection_records[reference] = dict(raw_record)
+        successful_inspection_ids: set[str] = set(inspection_records)
         inspection_cache: dict[str, str] = {}
-        if self.model_descriptor is not None and self.execution_class == "local":
+        for reference, record in inspection_records.items():
+            tool_name = str(record.get("tool") or "")
+            arguments = record.get("arguments")
+            if tool_name and isinstance(arguments, Mapping):
+                inspection_cache[
+                    f"{tool_name}:{json.dumps(dict(arguments), ensure_ascii=False, sort_keys=True, default=str)}"
+                ] = reference
+
+        def persist_inspections() -> None:
+            self.store.update_goal_metadata(
+                goal.id,
+                planning_inspection_records={
+                    reference: dict(record)
+                    for reference, record in inspection_records.items()
+                },
+            )
+
+        def plan_stage_message(*, recovery: bool = False) -> dict[str, Any]:
+            if staged_semantic is None:
+                raise RuntimeStateError("plan generation requires accepted semantic state")
+            accepted_semantic = SemanticGoalV2.from_mapping(
+                staged_semantic,
+                original_request=goal.objective,
+            )
+            return {
+                "role": "user",
+                "content": state_envelope(
+                    {
+                        "objective": goal.objective,
+                        "accepted_semantic_goal": staged_semantic,
+                        "accepted_semantic_fingerprint": accepted_semantic.fingerprint,
+                        "local_adaptation_policy": dict(planning_policy),
+                        "successful_inspections": list(inspection_records.values()),
+                        "planning_answers": planning_answers,
+                        "previous_plan": None if previous_plan is None else {
+                            "revision": previous_plan.revision,
+                            "summary": previous_plan.summary,
+                            "tasks": [_task_dict(task) for task in previous_plan.tasks],
+                        },
+                        "recovery_attempt": planning_recovery_attempts,
+                        "pending_plan_repair": (
+                            {
+                                "stage": last_rejected_plan_stage,
+                                "exact_error": last_plan_format_error,
+                                "rejected_plan": last_rejected_plan,
+                            }
+                            if last_rejected_plan_stage
+                            else None
+                        ),
+                        "required_next_action": (
+                            "Call propose_plan exactly once. The semantic stage is accepted; "
+                            "do not repeat it and do not answer with prose. "
+                            "Callable inspection tools are list_files, read_file, and the other "
+                            "advertised read-only tools; read_workspace is a semantic-effect enum, "
+                            "not a callable tool. Preserve the accepted objective: when "
+                            "requested_effects includes mutate_workspace, return at least one "
+                            "top-level expected_changes entry with a concrete workspace-relative "
+                            "path and a task whose acceptance and verification cover that mutation; "
+                            "do not submit a read-only-only plan or an empty expected_changes array."
+                        ),
+                    },
+                    "PLAN_GENERATION_RECOVERY_STAGE" if recovery else "PLAN_GENERATION_STAGE",
+                    max_chars=120_000,
+                ),
+            }
+
+        def project_local_plan_from_accepted_semantic() -> dict[str, Any] | None:
+            """Project a minimal plan when a local model cannot emit its transport.
+
+            The projection is deliberately narrower than model-authored
+            planning: one task, only paths written verbatim by the user, every
+            accepted semantic criterion, and the already-recorded inspection.
+            The independent critic still owns acceptance.
+            """
+
+            if (
+                self.execution_class != "local"
+                or staged_semantic is None
+                or not inspection_records
+            ):
+                return None
+            semantic = SemanticGoalV2.from_mapping(
+                staged_semantic,
+                original_request=goal.objective,
+            )
+            if semantic.unresolved_decisions:
+                return None
+            repair_projection = previous_plan is not None
+            previous_changes = (
+                list(self._effective_expected_changes(goal, previous_plan))
+                if previous_plan is not None
+                else []
+            )
+            explicit_paths = list(_extract_explicit_workspace_paths(goal.objective))
+            effects = set(semantic.requested_effects)
+            if (
+                RequestedEffect.MUTATE_WORKSPACE in effects
+                and not explicit_paths
+                and not previous_changes
+            ):
+                return None
+            criteria = list(semantic.acceptance_criteria)
+            if not criteria:
+                criteria = list(
+                    dict.fromkeys(
+                        implication
+                        for anchor in semantic.requirement_anchors
+                        for implication in anchor.observable_implications
+                    )
+                )
+            if not criteria:
+                return None
+            reference, inspection = next(iter(inspection_records.items()))
+            task_id = "T001"
+            failure_evidence = [
+                str(item.get("message") or item.get("hypothesis") or "").strip()
+                for item in goal.metadata.get("failed_attempts", ())[-3:]
+                if isinstance(item, Mapping)
+                and str(item.get("message") or item.get("hypothesis") or "").strip()
+            ]
+            expected_changes = (
+                [
+                    {
+                        **dict(change),
+                        "supports_tasks": [task_id],
+                    }
+                    for change in previous_changes
+                ]
+                if repair_projection
+                else [
+                    {
+                        "path": path,
+                        "intent": f"Implement the accepted outcome in {path}.",
+                        "basis": "explicit_user_requirement",
+                        "evidence_refs": ["user:request"],
+                        "supports_tasks": [task_id],
+                    }
+                    for path in explicit_paths
+                ]
+            )
+            return {
+                "semantic_fingerprint": semantic.fingerprint,
+                "semantic_goal": semantic.to_dict(),
+                "_semantic_source": "deterministic_local_projection",
+                "summary": (
+                    f"Repair and verify {semantic.interpreted_outcome}"
+                    if repair_projection
+                    else f"Implement and verify {semantic.interpreted_outcome}"
+                ),
+                "applicability_evidence": [
+                    {
+                        "fact": (
+                            "The workspace was inspected before planning. "
+                            + str(inspection.get("result") or "")[:600]
+                        ),
+                        "source": f"inspection:{reference}",
+                        "supports_tasks": [task_id],
+                    }
+                ],
+                "execution_strategy": (
+                    (
+                        "Use the recorded failed-strategy evidence to replace the "
+                        "non-improving implementation within the already-approved paths. "
+                        + (
+                            "Latest failure evidence: " + " | ".join(failure_evidence) + ". "
+                            if failure_evidence
+                            else ""
+                        )
+                        if repair_projection
+                        else "Implement the accepted outcome only in the explicit user paths. "
+                    )
+                    +
+                    "then collect fresh deterministic, managed-preview, interaction, "
+                    "and file-hash evidence required by every accepted criterion."
+                ),
+                "expected_changes": expected_changes,
+                "tasks": [
+                    {
+                        "id": task_id,
+                        "title": (
+                            "Repair and verify the accepted outcome"
+                            if repair_projection
+                            else "Implement and verify the accepted outcome"
+                        ),
+                        "description": (
+                            semantic.interpreted_outcome
+                            + (
+                                " Correct the implementation using the recorded failed "
+                                "strategy evidence before rerunning verification."
+                                if repair_projection
+                                else ""
+                            )
+                        ),
+                        "requirement_refs": [
+                            anchor.id for anchor in semantic.requirement_anchors
+                        ],
+                        "acceptance_criteria": criteria,
+                        "verification": [
+                            "Collect fresh executable, inspection, or managed-preview "
+                            f"evidence for this accepted criterion: {criterion}"
+                            for criterion in criteria
+                        ],
+                        "depends_on": [],
+                        "risk": (
+                            "high"
+                            if RequestedEffect.EXECUTE_CODE in effects
+                            else "medium"
+                        ),
+                    }
+                ],
+            }
+
+        if (
+            self.model_descriptor is not None
+            and self.execution_class == "local"
+            and not inspection_records
+        ):
             # Smaller local models frequently jump straight to the semantic
             # proposal even though the planner contract requires an inspection
             # first.  Seed one deterministic, read-only workspace fact so the
@@ -7724,12 +8285,14 @@ class AgentRuntime:
                 inspection_records[reference] = {
                     "reference": f"inspection:{reference}",
                     "call_id": preflight_call.id,
+                    "call_ids": [preflight_call.id],
                     "tool": preflight_call.name,
                     "arguments": redact_data(preflight_call.args),
                     "result": redact_text(preflight_result, 4_000),
                     "source": "harness_preflight",
                 }
                 successful_inspection_ids.add(reference)
+                persist_inspections()
                 self.store.append_event(
                     "planning.inspection_recorded",
                     goal_id=goal.id,
@@ -7766,81 +8329,39 @@ class AgentRuntime:
             if staged_semantic is not None and inspection_records:
                 planner_tools = []
                 for schema in self._planner_tools():
+                    if (
+                        _tool_name(schema) not in READ_ONLY_TOOLS
+                        and _tool_name(schema) != "propose_plan"
+                    ):
+                        continue
                     if _tool_name(schema) != "propose_plan":
+                        planner_tools.append(schema)
                         continue
                     staged_schema = copy.deepcopy(schema)
                     parameters = staged_schema["function"]["parameters"]
                     parameters["properties"].pop("semantic_goal", None)
-                    parameters["properties"]["applicability_evidence"] = {
-                        "type": "array",
-                        "description": (
-                            "Repository facts with fact, source, and "
-                            "supports_tasks fields."
-                        ),
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": True,
-                        },
-                    }
-                    parameters["properties"]["expected_changes"] = {
-                        "type": "array",
-                        "description": (
-                            "Files or directories with path, intent, basis, "
-                            "evidence_refs, and supports_tasks fields."
-                        ),
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": True,
-                        },
-                    }
-                    parameters["properties"]["tasks"] = {
-                        "type": "array",
-                        "minItems": 1,
-                        "description": (
-                            "Task objects using the exact keys title, "
-                            "description, acceptance_criteria, verification, "
-                            "depends_on, and risk."
-                        ),
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": True,
-                        },
-                    }
+                    parameters["properties"]["applicability_evidence"]["description"] = (
+                        "Repository facts using the exact fact, source, and supports_tasks fields."
+                    )
+                    parameters["properties"]["expected_changes"]["description"] = (
+                        "Files or directories using the exact path, intent, basis, "
+                        "evidence_refs, and supports_tasks fields."
+                    )
+                    parameters["properties"]["tasks"]["description"] = (
+                        "Task objects using the exact title, description, requirement_refs, "
+                        "acceptance_criteria, verification, depends_on, and risk fields."
+                    )
+                    parameters["required"] = [
+                        "semantic_fingerprint",
+                        "summary",
+                        "applicability_evidence",
+                        "execution_strategy",
+                        "expected_changes",
+                        "tasks",
+                    ]
                     planner_tools.append(staged_schema)
                 if not plan_stage_prompted:
-                    accepted_semantic = SemanticGoalV2.from_mapping(
-                        staged_semantic,
-                        original_request=goal.objective,
-                    )
-                    conversation = [{
-                        "role": "user",
-                        "content": state_envelope(
-                            {
-                                "objective": goal.objective,
-                                "accepted_semantic_goal": staged_semantic,
-                                "accepted_semantic_fingerprint": accepted_semantic.fingerprint,
-                                "local_adaptation_policy": dict(planning_policy),
-                                "successful_inspections": list(inspection_records.values()),
-                                "planning_answers": planning_answers,
-                                "previous_plan": None if previous_plan is None else {
-                                    "revision": previous_plan.revision,
-                                    "summary": previous_plan.summary,
-                                    "tasks": [_task_dict(task) for task in previous_plan.tasks],
-                                },
-                                "required_next_action": (
-                                    "Call propose_plan exactly once. The semantic stage is accepted; "
-                                    "do not repeat it and do not answer with prose. "
-                                    "Preserve the accepted objective: when requested_effects includes "
-                                    "mutate_workspace, return at least one top-level expected_changes "
-                                    "entry with a concrete workspace-relative path and a task whose "
-                                    "acceptance and verification cover that mutation; do not submit a "
-                                    "read-only-only plan or an empty expected_changes array."
-                                ),
-                            },
-                            "PLAN_GENERATION_STAGE",
-                            max_chars=120_000,
-                        ),
-                    }]
+                    conversation = [plan_stage_message()]
                     plan_stage_prompted = True
             turn = self._call_provider(
                 conversation,
@@ -7848,10 +8369,74 @@ class AgentRuntime:
                 PLANNER_SYSTEM_PROMPT,
                 actor="planner",
                 step=step,
+                provider_checkpoint={
+                    "planning_substage": (
+                        "plan_generation"
+                        if staged_semantic is not None and inspection_records
+                        else "semantic_interpretation"
+                    ),
+                    "planning_semantic_goal": dict(staged_semantic or {}),
+                    "planning_semantic_fingerprint": (
+                        SemanticGoalV2.from_mapping(
+                            staged_semantic,
+                            original_request=goal.objective,
+                        ).fingerprint
+                        if staged_semantic is not None
+                        else ""
+                    ),
+                    "planning_inspections": list(inspection_records.values()),
+                    "required_next_action": (
+                        "propose_plan"
+                        if staged_semantic is not None and inspection_records
+                        else "inspect_or_propose_semantic_goal"
+                    ),
+                    "advertised_tools": [
+                        _tool_name(schema) for schema in planner_tools if _tool_name(schema)
+                    ],
+                },
             )
+            contract_error = turn.native.get("tool_contract_error")
+            if isinstance(contract_error, Mapping):
+                planner_contract_failures += 1
+                received = ", ".join(str(item) for item in contract_error.get("received", ()))
+                allowed = ", ".join(str(item) for item in contract_error.get("allowed", ()))
+                last_plan_format_error = (
+                    f"planner requested unavailable tool(s): {received or 'unknown'}; "
+                    f"advertised tools: {allowed or 'none'}"
+                )
+                rejected_stage_fingerprints["tool_contract"] = workflow_fingerprint(
+                    dict(contract_error)
+                )
+                self.store.append_event(
+                    "planning.contract_recovery",
+                    goal_id=goal.id,
+                    payload={
+                        "attempt": planner_contract_failures,
+                        "error": last_plan_format_error,
+                        "recovery": "fresh_authoritative_plan_packet",
+                    },
+                )
+                if planner_contract_failures > repair_limit:
+                    exhausted_stage = "tool_contract"
+                    break
+                if staged_semantic is not None and inspection_records:
+                    planning_recovery_attempts += 1
+                    conversation = [plan_stage_message(recovery=True)]
+                else:
+                    conversation.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Tool contract failure: {last_plan_format_error}. "
+                                "Use exactly one advertised action."
+                            ),
+                        }
+                    )
+                continue
             if turn.tool_calls or str(turn.text or "").strip():
                 conversation.append(turn.to_message())
             proposed: dict[str, Any] | None = None
+            normalization_actions: tuple[str, ...] = ()
             requested_questions: list[dict[str, Any]] | None = None
             for call in turn.tool_calls:
                 self.events.publish("tool_call", call.name, args=redact_data(call.args), actor="planner")
@@ -8205,6 +8790,19 @@ class AgentRuntime:
                         record = inspection_records[existing_reference]
                         result = str(record["result"])
                         reference = existing_reference
+                        call_ids = [
+                            str(value).strip()
+                            for value in record.get("call_ids", ())
+                            if str(value).strip()
+                        ]
+                        original_call_id = str(record.get("call_id") or "").strip()
+                        if original_call_id:
+                            call_ids.insert(0, original_call_id)
+                        if call.id not in call_ids:
+                            record["call_ids"] = list(
+                                dict.fromkeys((*call_ids, call.id))
+                            )
+                            persist_inspections()
                     else:
                         call.args = normalized_args
                         result = self._execute_workspace_tool(goal, call, task_id=None, actor="planner")
@@ -8216,10 +8814,12 @@ class AgentRuntime:
                             inspection_records[reference] = {
                                 "reference": f"inspection:{reference}",
                                 "call_id": call.id,
+                                "call_ids": [call.id],
                                 "tool": call.name,
                                 "arguments": redact_data(normalized_args),
                                 "result": redact_text(result, 4_000),
                             }
+                            persist_inspections()
                             self.store.append_event(
                                 "planning.inspection_recorded",
                                 goal_id=goal.id,
@@ -8273,7 +8873,12 @@ class AgentRuntime:
                 self._pause_for_plan_questions(goal, requested_questions)
                 return None
 
-            if proposed is None and requested_questions is None and inspection_records:
+            if (
+                proposed is None
+                and requested_questions is None
+                and inspection_records
+                and not turn.tool_calls
+            ):
                 unproductive_turns_after_inspection += 1
                 if staged_semantic is not None:
                     fingerprint = SemanticGoalV2.from_mapping(
@@ -8295,6 +8900,73 @@ class AgentRuntime:
                             ),
                         }
                     )
+                if unproductive_turns_after_inspection >= self.config.no_action_limit:
+                    if planning_recovery_attempts < 1 and staged_semantic is not None:
+                        planning_recovery_attempts += 1
+                        unproductive_turns_after_inspection = 0
+                        conversation = [plan_stage_message(recovery=True)]
+                        self.store.append_event(
+                            "planning.no_progress_recovery",
+                            goal_id=goal.id,
+                            payload={
+                                "attempt": planning_recovery_attempts,
+                                "strategy": "fresh_authoritative_plan_packet",
+                                "inspection_refs": [
+                                    f"inspection:{reference}" for reference in inspection_records
+                                ],
+                            },
+                        )
+                        continue
+                    projected = project_local_plan_from_accepted_semantic()
+                    if projected is not None:
+                        proposed = projected
+                        unproductive_turns_after_inspection = 0
+                        planning_recovery_attempts = 0
+                        last_rejected_plan_stage = ""
+                        last_rejected_plan = None
+                        self.store.append_event(
+                            "planning.deterministic_plan_projected",
+                            goal_id=goal.id,
+                            payload={
+                                "reason": "local planner produced no usable plan transport",
+                                "paths": [
+                                    item["path"]
+                                    for item in projected["expected_changes"]
+                                ],
+                                "criteria_count": len(
+                                    projected["tasks"][0]["acceptance_criteria"]
+                                ),
+                                "inspection_refs": [
+                                    f"inspection:{reference}"
+                                    for reference in inspection_records
+                                ],
+                            },
+                        )
+                    elif last_rejected_plan_stage:
+                        last_plan_format_error = (
+                            f"planner did not repair {last_rejected_plan_stage} after "
+                            f"{self.config.no_action_limit} empty turns and one "
+                            "authoritative repair-context reset; exact validator error: "
+                            f"{last_plan_format_error}"
+                        )
+                        exhausted_stage = last_rejected_plan_stage
+                    else:
+                        last_plan_format_error = (
+                            "planner returned no propose_plan action after "
+                            f"{self.config.no_action_limit} post-inspection turns and one "
+                            "authoritative context reset"
+                        )
+                        exhausted_stage = "planner_response"
+                    if proposed is None:
+                        break
+
+            if turn.tool_calls:
+                # A structured action is real forward progress even when a
+                # later deterministic validator asks for a targeted repair.
+                # No-progress is consecutive, not cumulative across semantic,
+                # inspection, or proposal milestones.
+                unproductive_turns_after_inspection = 0
+                planning_recovery_attempts = 0
 
             if proposed is not None:
                 if planning_answers:
@@ -8338,6 +9010,18 @@ class AgentRuntime:
                     if not duplicate_rejection:
                         dag_repairs += 1
                     last_plan_format_error = redact_text(exc, 1_000)
+                    last_rejected_plan_stage = "task_dag"
+                    last_rejected_plan = copy.deepcopy(proposed)
+                    self.store.append_event(
+                        "planning.validation_rejected",
+                        goal_id=goal.id,
+                        payload={
+                            "stage": last_rejected_plan_stage,
+                            "attempt": dag_repairs,
+                            "error": last_plan_format_error,
+                            "rejected_fingerprint": rejected_fingerprint,
+                        },
+                    )
                     conversation.append(
                         {
                             "role": "user",
@@ -8369,6 +9053,18 @@ class AgentRuntime:
                     if not duplicate_rejection:
                         semantic_mapping_repairs += 1
                     last_plan_format_error = redact_text(exc, 1_000)
+                    last_rejected_plan_stage = "semantic_mapping"
+                    last_rejected_plan = copy.deepcopy(proposed)
+                    self.store.append_event(
+                        "planning.validation_rejected",
+                        goal_id=goal.id,
+                        payload={
+                            "stage": last_rejected_plan_stage,
+                            "attempt": semantic_mapping_repairs,
+                            "error": last_plan_format_error,
+                            "rejected_fingerprint": rejected_fingerprint,
+                        },
+                    )
                     conversation.append(
                         {
                             "role": "user",
@@ -8406,6 +9102,18 @@ class AgentRuntime:
                     if not duplicate_rejection:
                         applicability_repairs += 1
                     last_plan_format_error = redact_text(exc, 1_000)
+                    last_rejected_plan_stage = "applicability"
+                    last_rejected_plan = copy.deepcopy(proposed)
+                    self.store.append_event(
+                        "planning.validation_rejected",
+                        goal_id=goal.id,
+                        payload={
+                            "stage": last_rejected_plan_stage,
+                            "attempt": applicability_repairs,
+                            "error": last_plan_format_error,
+                            "rejected_fingerprint": rejected_fingerprint,
+                        },
+                    )
                     conversation.append(
                         {
                             "role": "user",
@@ -8539,6 +9247,8 @@ class AgentRuntime:
                         failed_attempts=[],
                         workflow_stage_checkpoint={},
                         boundary_kind="",
+                        planning_inspection_records={},
+                        planning_auto_recovery_count=0,
                     )
                     def reduce_plan_session(current: dict[str, Any]) -> Mapping[str, Any]:
                         plan_session_state = {
@@ -8677,6 +9387,8 @@ class AgentRuntime:
             "task_dag": dag_repairs,
             "applicability": applicability_repairs,
             "independent_critic": critic_repairs,
+            "tool_contract": planner_contract_failures,
+            "planner_response": unproductive_turns_after_inspection,
         }.get(exhausted_stage, 0)
         stage_checkpoint = WorkflowStageCheckpointV1(
             stage=exhausted_stage or "planning",
@@ -8696,8 +9408,13 @@ class AgentRuntime:
                     else ""
                 )
             ),
-            semantic_fingerprint=str(
-                goal.metadata.get("planning_semantic_fingerprint") or ""
+            semantic_fingerprint=(
+                SemanticGoalV2.from_mapping(
+                    staged_semantic,
+                    original_request=goal.objective,
+                ).fingerprint
+                if staged_semantic is not None
+                else str(goal.metadata.get("planning_semantic_fingerprint") or "")
             ),
             inspection_refs=tuple(
                 f"inspection:{reference}" for reference in inspection_records
@@ -8770,7 +9487,12 @@ class AgentRuntime:
                 "The planner did not produce a critic-approved structured plan in its "
                 "bounded pass. Add guidance, then use /resume or /replan."
             )
-        self._pause_planning(goal, pause_question, checkpoint_reason)
+        self._pause_planning(
+            goal,
+            pause_question,
+            checkpoint_reason,
+            auto_recoverable=True,
+        )
         return None
 
     def _lock_strategy_after_approval(self, goal: Goal, plan: Plan) -> None:
@@ -8921,7 +9643,8 @@ class AgentRuntime:
                 if task_key:
                     applicability_refs_by_task.setdefault(task_key, []).append(source)
         resource_claims = []
-        for change in accepted.expected_changes:
+        effective_changes = self._effective_expected_changes(current, accepted)
+        for change in effective_changes:
             if not isinstance(change, Mapping):
                 continue
             path = str(change.get("path") or "").strip()
@@ -8975,7 +9698,7 @@ class AgentRuntime:
             ))
             artifact_paths = tuple(dict.fromkeys(
                 str(change.get("path") or change.get("artifact") or "").strip()
-                for change in accepted.expected_changes if isinstance(change, Mapping)
+                for change in effective_changes if isinstance(change, Mapping)
             ))
             artifact_paths = tuple(dict.fromkeys((*contract.artifact_expectations, *(path for path in artifact_paths if path))))
             declared_risks = {
@@ -9528,7 +10251,11 @@ class AgentRuntime:
             evaluation["user_visual_acceptance_evidence_id"] = item.id
             evaluation["confidence"] = "user_accepted_subjective"
             evaluation["accepted_artifact_hashes"] = self._current_artifact_hashes(
-                latest.metadata.get("quality_target", {}).get("artifact_ids", ())
+                self._effective_artifact_ids(
+                    latest,
+                    plan,
+                    latest.metadata.get("quality_target", {}).get("artifact_ids", ()),
+                )
             )
             self.store.update_goal_metadata(
                 goal.id,
@@ -10629,6 +11356,11 @@ class AgentRuntime:
             )
             focus_tasks = [_task_dict(task) for task in focus[:8]]
         raw_claims = goal.metadata.get("resource_claims") or ()
+        effective_changes = self._effective_expected_changes(goal, plan)
+        effective_scope = {
+            str(change.get("path") or "").replace("\\", "/").casefold().removeprefix("./")
+            for change in effective_changes
+        }
         approved_resource_claims = [
             {
                 "path": str(item.get("selector") or path).replace("\\", "/"),
@@ -10648,6 +11380,11 @@ class AgentRuntime:
             if isinstance(item, Mapping)
             for path in (str(item.get("selector") or "").strip(),)
             if path
+            and (
+                not effective_scope
+                or path.replace("\\", "/").casefold().removeprefix("./")
+                in effective_scope
+            )
         ]
         return {
             "goal": {
@@ -10672,7 +11409,7 @@ class AgentRuntime:
                 "fingerprint": plan.fingerprint,
                 "applicability_evidence": list(plan.applicability_evidence),
                 "execution_strategy": plan.execution_strategy,
-                "expected_changes": list(plan.expected_changes),
+                "expected_changes": list(effective_changes),
                 "tasks": task_summaries,
                 "focus_task_details": focus_tasks,
             },
@@ -10767,6 +11504,7 @@ class AgentRuntime:
             if isinstance(target, Mapping)
             else ()
         )
+        artifact_ids = self._effective_artifact_ids(goal, plan, artifact_ids)
         payload = {
             "goal_status": goal.status.value,
             "active_plan_revision": goal.active_plan_revision,
@@ -10922,6 +11660,86 @@ class AgentRuntime:
                 resource_claims_repaired=True,
             )
 
+    def _repair_legacy_contract_projection(self, goal: Goal, plan: Plan) -> None:
+        """Remove disproved legacy path claims from persisted execution gates.
+
+        Older plans could interpret a dotted technology name such as Three.js
+        as an explicitly requested file. The accepted plan is immutable audit
+        history, so execution uses the effective projection and this migration
+        repairs only the derived approval artifacts that would otherwise keep
+        leasing, verifying, or awaiting that nonexistent file.
+        """
+
+        effective_paths = {
+            str(change.get("path") or "").replace("\\", "/").casefold().removeprefix("./")
+            for change in self._effective_expected_changes(goal, plan)
+            if str(change.get("path") or "").strip()
+        }
+        accepted_paths = {
+            str(change.get("path") or "").replace("\\", "/").casefold().removeprefix("./")
+            for change in plan.expected_changes
+            if str(change.get("path") or "").strip()
+        }
+        stale_paths = accepted_paths - effective_paths
+        if not stale_paths:
+            return
+
+        updates: dict[str, Any] = {}
+        raw_claims = goal.metadata.get("resource_claims") or ()
+        claims = [
+            dict(item)
+            for item in raw_claims
+            if isinstance(item, Mapping)
+            and str(item.get("selector") or "").replace("\\", "/").casefold().removeprefix("./")
+            not in stale_paths
+        ]
+        if len(claims) != len(tuple(raw_claims)):
+            updates["resource_claims"] = claims
+
+        contract_data = goal.metadata.get("goal_contract")
+        if isinstance(contract_data, Mapping):
+            contract = GoalContractV1.from_dict(contract_data)
+            artifacts = tuple(
+                path
+                for path in contract.artifact_expectations
+                if str(path).replace("\\", "/").casefold().removeprefix("./")
+                not in stale_paths
+            )
+            if artifacts != contract.artifact_expectations:
+                contract = GoalContractV1(
+                    **{**contract.to_dict(), "artifact_expectations": artifacts}
+                )
+                updates["goal_contract"] = contract.to_dict()
+                updates["goal_contract_fingerprint"] = contract.fingerprint
+
+        target_data = goal.metadata.get("quality_target")
+        if isinstance(target_data, Mapping):
+            target = dict(target_data)
+            artifacts = tuple(
+                str(path)
+                for path in target.get("artifact_ids", ())
+                if str(path).replace("\\", "/").casefold().removeprefix("./")
+                not in stale_paths
+            )
+            normalized_artifacts = artifacts or ("workspace",)
+            if tuple(target.get("artifact_ids", ())) != normalized_artifacts:
+                target["artifact_ids"] = list(normalized_artifacts)
+                updates["quality_target"] = target
+
+        if not updates:
+            return
+        self.store.update_goal_metadata(
+            goal.id,
+            **updates,
+            legacy_contract_projection_repaired=True,
+            legacy_contract_projection_removed=sorted(stale_paths),
+        )
+        self.store.append_event(
+            "contract_projection.repaired",
+            goal_id=goal.id,
+            payload={"removed_paths": sorted(stale_paths)},
+        )
+
     def _activate_ready_task(self, goal: Goal, plan: Plan) -> tuple[Plan, Task | None]:
         """Bind the slice to one dependency-ready task without model cooperation.
 
@@ -10949,6 +11767,8 @@ class AgentRuntime:
                     actor="harness",
                 )
         plan = self.store.get_latest_plan(goal.id)
+        self._repair_legacy_contract_projection(goal, plan)
+        goal = self.store.get_goal(goal.id)
         self._repair_legacy_resource_claims(goal, plan)
         active_id = self._current_task_id(plan)
         if active_id is not None:
@@ -11377,6 +12197,7 @@ class AgentRuntime:
             if call.name in MUTATING_TOOLS else {}
         )
         mutation_observed = False
+        preview_payload: dict[str, Any] = {}
         if pre_path:
             pre_candidate = (self.workspace / pre_path).resolve(strict=False)
             if pre_candidate.is_file() and pre_candidate.is_relative_to(self.workspace):
@@ -11407,12 +12228,23 @@ class AgentRuntime:
                 else:
                     raw_result = tools.run_tool(call.name, args)
             result = redact_text(raw_result, 50_000)
+            if call.name == "preview_html" and not result.startswith("Error:"):
+                try:
+                    parsed_preview = json.loads(result)
+                    if isinstance(parsed_preview, Mapping):
+                        preview_payload = dict(parsed_preview)
+                except json.JSONDecodeError:
+                    preview_payload = {}
             if call.name in {"run_bash", "run_command"}:
                 shell_exit = re.search(r"(?im)^exit code:\s*(-?\d+)", result)
                 if shell_exit and int(shell_exit.group(1)) != 0:
                     result = "Error: shell command failed; " + result
             terminal = "failed" if result.startswith("Error:") else "completed"
-            self.store.complete_action(action_id, redact_text(result, 2_000), status=terminal)
+            self.store.complete_action(
+                action_id,
+                redact_text(result, 10_000 if call.name == "preview_html" else 2_000),
+                status=terminal,
+            )
             self.store.update_goal_metadata(
                 goal.id,
                 last_tool=call.name,
@@ -11589,7 +12421,34 @@ class AgentRuntime:
                     "tool": call.name,
                     "arguments": redact_data(args),
                     "result": redact_text(result, 4_000),
+                    "mutation_sequence": int(
+                        journal_args.get("_harness_mutation_sequence", 0) or 0
+                    ),
                 }
+                evidence_verified = True
+                if call.name == "preview_html":
+                    interaction_results = list(
+                        preview_payload.get("interaction_results") or ()
+                    )
+                    interactions_passed = bool(interaction_results) and all(
+                        isinstance(item, Mapping) and bool(item.get("passed"))
+                        for item in interaction_results
+                    )
+                    evidence_data.update(
+                        {
+                            "verification": str(
+                                preview_payload.get("verification") or ""
+                            ),
+                            "failure_kind": str(
+                                preview_payload.get("failure_kind") or ""
+                            ),
+                            "interaction_count": len(interaction_results),
+                            "interactions_passed": interactions_passed,
+                        }
+                    )
+                    evidence_verified = (
+                        preview_payload.get("verification") == "passed"
+                    )
                 path_value = str(args.get("path", "")).strip()
                 if path_value:
                     candidate = (self.workspace / path_value).resolve(strict=False)
@@ -11609,7 +12468,7 @@ class AgentRuntime:
                     summary=f"{call.name} completed with authoritative harness evidence",
                     data=evidence_data,
                     created_by="harness",
-                    verified=True,
+                    verified=evidence_verified,
                 )
         except (KeyboardInterrupt, SystemExit):
             # Deliberately leave the action running; restart recovery will mark
@@ -11769,9 +12628,78 @@ class AgentRuntime:
             "blocked": TaskStatus.BLOCKED,
         }
         target = mapping[args["status"]]
+        selected_task = next(
+            (
+                item
+                for item in plan.tasks
+                if item.id == str(args["task_id"]).upper()
+            ),
+            None,
+        )
+        task_contract = (
+            "\n".join(
+                (
+                    selected_task.title,
+                    selected_task.description,
+                    *selected_task.acceptance_criteria,
+                    *selected_task.verification,
+                )
+            ).casefold()
+            if selected_task is not None
+            else ""
+        )
+        requires_preview = any(
+            marker in task_contract
+            for marker in (
+                "managed preview",
+                "managed-preview",
+                "browser",
+                "three.js",
+                "3d",
+                "interaction",
+            )
+        )
+        requires_interactions = any(
+            marker in task_contract
+            for marker in ("button", "interaction", "click", "3d")
+        )
         if target == TaskStatus.COMPLETED and not args["evidence"]:
             return "Error: done requires concrete evidence; verify the work first."
         if target == TaskStatus.COMPLETED:
+            if requires_preview:
+                current_mutation_sequence = int(
+                    goal.metadata.get("mutation_sequence", 0) or 0
+                )
+                def preview_is_current(item: Evidence) -> bool:
+                    try:
+                        return int(item.data.get("mutation_sequence", -1)) == current_mutation_sequence
+                    except (TypeError, ValueError):
+                        return False
+
+                passed_previews = [
+                    item
+                    for item in self.store.list_evidence(
+                        goal.id, task_id=args["task_id"]
+                    )
+                    if item.plan_revision == plan.revision
+                    and item.verified
+                    and item.data.get("tool") == "preview_html"
+                    and item.data.get("verification") == "passed"
+                    and preview_is_current(item)
+                ]
+                if not passed_previews:
+                    return (
+                        "Error: done requires a fresh passing managed preview for "
+                        "the current artifact mutation. Keep the task in progress."
+                    )
+                if requires_interactions and not any(
+                    bool(item.data.get("interactions_passed"))
+                    for item in passed_previews
+                ):
+                    return (
+                        "Error: done requires fresh passing interaction scenarios, "
+                        "not a baseline-only preview. Keep the task in progress."
+                    )
             task_evidence = [
                 item
                 for item in self.store.list_evidence(goal.id, task_id=args["task_id"])
@@ -12198,6 +13126,7 @@ class AgentRuntime:
             if isinstance(target, Mapping)
             else ()
         )
+        artifact_ids = self._effective_artifact_ids(goal, plan, artifact_ids)
         _checks, visual_blocker = self._visual_operational_checks(
             goal,
             artifact_ids,
@@ -12332,7 +13261,9 @@ class AgentRuntime:
                             "summary": plan.summary,
                             "applicability_evidence": list(plan.applicability_evidence),
                             "execution_strategy": plan.execution_strategy,
-                            "expected_changes": list(plan.expected_changes),
+                            "expected_changes": list(
+                                self._effective_expected_changes(goal, plan)
+                            ),
                             "task_count": len(plan.tasks),
                         },
                         "completion_claim": claim,
@@ -12532,6 +13463,9 @@ class AgentRuntime:
             }
             target = fresh_goal.metadata.get("quality_target", {})
             target_artifacts = tuple(target.get("artifact_ids", ())) if isinstance(target, Mapping) else ()
+            target_artifacts = self._effective_artifact_ids(
+                fresh_goal, plan, target_artifacts
+            )
             current_hashes = self._current_artifact_hashes(target_artifacts)
             hashes.update(current_hashes)
             visual_target = any(str(path).casefold().endswith((".html", ".htm")) for path in target_artifacts)
@@ -12966,6 +13900,7 @@ class AgentRuntime:
                     "harness_selected_task": None if selected is None else _task_dict(selected),
                     "selection_rule": "Work only on the harness-selected first dependency-ready task.",
                 }
+                request_schemas = schemas
                 local_checkpoint_message = ""
                 if (
                     self.execution_class == "local"
@@ -12973,11 +13908,43 @@ class AgentRuntime:
                     and plan.tasks
                     and all(task.status is TaskStatus.COMPLETED for task in plan.tasks)
                 ):
-                    local_checkpoint_message = (
-                        "All accepted checklist tasks are complete and have authoritative evidence. "
-                        "Do not delegate, invent a new task, or repeat verification. Call finish_goal "
-                        "now with a concise summary and the concrete evidence already recorded."
+                    completion_blocker = self._completion_precheck(goal, plan)
+                    needs_html_preview = bool(
+                        completion_blocker
+                        and completion_blocker.startswith(
+                            "HTML completion requires a successful real-browser preview"
+                        )
                     )
+                    if needs_html_preview:
+                        local_checkpoint_message = (
+                            "All checklist items are marked complete, but the deterministic "
+                            "HTML completion gate still needs a fresh successful managed-browser "
+                            "preview of the current artifact. Call preview_html now; do not "
+                            "delegate or rewrite the implementation unless that preview returns "
+                            "application-failure evidence."
+                        )
+                        state_payload["required_next_tool"] = "preview_html"
+                    else:
+                        local_checkpoint_message = (
+                            "All accepted checklist tasks are complete. Do not delegate or invent "
+                            "a new task. Call finish_goal now when the deterministic completion "
+                            "gate is clear; update_task may reopen invalidated work, and request_user "
+                            "is reserved for a true external or scope blocker."
+                        )
+                        state_payload["required_next_tool"] = "finish_goal"
+                    state_payload["local_checkpoint_instruction"] = local_checkpoint_message
+                    allowed_completion_tools = {
+                        "finish_goal",
+                        "request_user",
+                        "update_task",
+                    }
+                    if needs_html_preview:
+                        allowed_completion_tools.add("preview_html")
+                    request_schemas = [
+                        schema
+                        for schema in schemas
+                        if _tool_name(schema) in allowed_completion_tools
+                    ]
                 if (
                     selected is not None
                     and self.execution_class == "local"
@@ -13013,8 +13980,9 @@ class AgentRuntime:
                     # has created it.  The accepted expected-change contract
                     # is the source of truth for this ordering guard; no
                     # content is invented here.
+                    effective_changes = self._effective_expected_changes(goal, plan)
                     missing_paths: list[str] = []
-                    for change in plan.expected_changes:
+                    for change in effective_changes:
                         if not isinstance(change, Mapping):
                             continue
                         supports = {
@@ -13044,6 +14012,218 @@ class AgentRuntime:
                             "the selected task, then run its verification."
                         )
                         state_payload["local_checkpoint_instruction"] = local_checkpoint_message
+                    else:
+                        task_contract = "\n".join(
+                            (
+                                selected.title,
+                                selected.description,
+                                *selected.acceptance_criteria,
+                                *selected.verification,
+                            )
+                        ).casefold()
+                        html_paths = [
+                            normalize_contract_path(str(change.get("path") or ""))
+                            for change in effective_changes
+                            if isinstance(change, Mapping)
+                            and str(change.get("path") or "").casefold().endswith(
+                                (".html", ".htm")
+                            )
+                            and (
+                                not change.get("supports_tasks")
+                                or selected.id.upper()
+                                in {
+                                    str(item).strip().upper()
+                                    for item in change.get("supports_tasks", ())
+                                }
+                            )
+                        ]
+                        requires_preview = bool(html_paths) and any(
+                            marker in task_contract
+                            for marker in (
+                                "managed preview",
+                                "managed-preview",
+                                "browser",
+                                "three.js",
+                                "3d",
+                                "interaction",
+                            )
+                        )
+                        requires_interactions = any(
+                            marker in task_contract
+                            for marker in ("button", "interaction", "click", "3d")
+                        )
+                        all_task_actions = [
+                            item
+                            for item in self.store.list_actions(goal.id)
+                            if str(item.get("task_id") or "").upper()
+                            == selected.id.upper()
+                        ]
+                        task_actions = [
+                            item
+                            for item in all_task_actions
+                            if str(item.get("status") or "") == "completed"
+                        ]
+                        previews = [
+                            item
+                            for item in task_actions
+                            if item.get("tool_name") == "preview_html"
+                        ]
+                        latest_preview = previews[-1] if previews else None
+                        latest_preview_summary = str(
+                            (latest_preview or {}).get("result_summary") or ""
+                        )
+                        preview_passed = bool(
+                            latest_preview
+                            and (
+                                '"verification": "passed"' in latest_preview_summary
+                                or '"status": "passed"' in latest_preview_summary
+                            )
+                        )
+                        interaction_passed = bool(
+                            latest_preview
+                            and '"interaction_results": []' not in latest_preview_summary
+                            and '"interaction_results": [' in latest_preview_summary
+                            and '"passed": true' in latest_preview_summary.casefold()
+                            and '"passed": false' not in latest_preview_summary.casefold()
+                        )
+                        latest_preview_failed = bool(
+                            latest_preview
+                            and (
+                                '"verification": "failed"' in latest_preview_summary
+                                or '"status": "failed"' in latest_preview_summary
+                            )
+                        )
+                        latest_preview_contract_failure = bool(
+                            latest_preview_failed
+                            and '"failure_kind": "contract"'
+                            in latest_preview_summary.casefold()
+                        )
+                        failed_preview_index = (
+                            all_task_actions.index(latest_preview)
+                            if latest_preview_failed and latest_preview in all_task_actions
+                            else -1
+                        )
+                        post_failure_reads = any(
+                            item.get("tool_name") == "read_file"
+                            and str(item.get("status") or "") == "completed"
+                            for item in all_task_actions[failed_preview_index + 1 :]
+                        ) if failed_preview_index >= 0 else False
+                        post_failure_patch_failed = any(
+                            item.get("tool_name") == "edit_file"
+                            and str(item.get("status") or "") == "failed"
+                            for item in all_task_actions[failed_preview_index + 1 :]
+                        ) if failed_preview_index >= 0 else False
+                        try:
+                            latest_preview_args = json.loads(
+                                str((latest_preview or {}).get("args_json") or "{}")
+                            )
+                        except json.JSONDecodeError:
+                            latest_preview_args = {}
+                        preview_mutation_sequence = int(
+                            latest_preview_args.get("_harness_mutation_sequence", -1)
+                            if isinstance(latest_preview_args, Mapping)
+                            else -1
+                        )
+                        current_mutation_sequence = int(
+                            goal.metadata.get("mutation_sequence", 0) or 0
+                        )
+                        failed_against_current_artifact = bool(
+                            latest_preview_failed
+                            and not latest_preview_contract_failure
+                            and preview_mutation_sequence >= current_mutation_sequence
+                        )
+                        preview_complete = preview_passed and (
+                            interaction_passed or not requires_interactions
+                        )
+                        if requires_preview and latest_preview_contract_failure:
+                            entry_path = html_paths[0]
+                            local_checkpoint_message = (
+                                f"The application at {entry_path} loaded, but the latest "
+                                "model-authored interaction contract used a selector, role, "
+                                "or name that does not resolve uniquely. This does not prove "
+                                "the application is broken. Do not rewrite the artifact. Call "
+                                "preview_html again with corrected scenarios using only exact "
+                                "targets from the authoritative interaction_targets inventory "
+                                "in this failure evidence: "
+                                + latest_preview_summary[:3_000]
+                            )
+                            state_payload["local_checkpoint_instruction"] = local_checkpoint_message
+                            state_payload["required_next_tool"] = (
+                                "preview_html_contract_repair"
+                            )
+                            request_schemas = [
+                                schema
+                                for schema in schemas
+                                if _tool_name(schema) == "preview_html"
+                            ]
+                        elif requires_preview and failed_against_current_artifact:
+                            entry_path = html_paths[0]
+                            local_checkpoint_message = (
+                                f"The latest managed-preview interaction verification for "
+                                f"{entry_path} failed against the current artifact. Do not rerun "
+                                "the same preview. "
+                                + (
+                                    "A precise edit already failed because its old text did not "
+                                    "match; replace the corrected file with write_file now."
+                                    if post_failure_patch_failed
+                                    else
+                                    "The file was already read after that failure; patch the "
+                                    "implementation now with edit_file or write_file."
+                                    if post_failure_reads
+                                    else "Read the current file once if needed, then patch the "
+                                    "implementation with edit_file or write_file."
+                                )
+                                + " Failure evidence: "
+                                + latest_preview_summary[:1_500]
+                            )
+                            state_payload["local_checkpoint_instruction"] = local_checkpoint_message
+                            state_payload["required_next_tool"] = "repair_failed_preview"
+                            allowed_focus = (
+                                {"write_file"}
+                                if post_failure_patch_failed
+                                else {"edit_file", "write_file"}
+                                if post_failure_reads
+                                else {"read_file", "edit_file", "write_file"}
+                            )
+                            request_schemas = [
+                                schema
+                                for schema in schemas
+                                if _tool_name(schema) in allowed_focus
+                            ]
+                        elif requires_preview and not preview_complete:
+                            entry_path = html_paths[0]
+                            local_checkpoint_message = (
+                                f"The accepted HTML artifact {entry_path} exists. The next "
+                                "evidence-producing action is preview_html with path="
+                                f"{entry_path!r}, open_browser=false, and verify=true. "
+                                + (
+                                    "Include deterministic interaction scenarios that exercise "
+                                    "every accepted button/interaction criterion and assert the "
+                                    "visible result; a baseline-only preview is insufficient."
+                                    if requires_interactions
+                                    else "Collect the baseline managed-browser evidence now."
+                                )
+                            )
+                            state_payload["local_checkpoint_instruction"] = local_checkpoint_message
+                            state_payload["required_next_tool"] = "preview_html"
+                            request_schemas = [
+                                schema
+                                for schema in schemas
+                                if _tool_name(schema) == "preview_html"
+                            ]
+                        elif preview_complete:
+                            local_checkpoint_message = (
+                                f"Task {selected.id} has passed managed-preview and interaction "
+                                "evidence. Do not list or rewrite files again. Call update_task "
+                                "with status=done and cite the recorded preview evidence."
+                            )
+                            state_payload["local_checkpoint_instruction"] = local_checkpoint_message
+                            state_payload["required_next_tool"] = "update_task"
+                            request_schemas = [
+                                schema
+                                for schema in schemas
+                                if _tool_name(schema) == "update_task"
+                            ]
                 request_conversation = [
                     *self._work_conversation,
                     {
@@ -13061,7 +14241,7 @@ class AgentRuntime:
                 try:
                     turn = self._call_provider(
                         request_conversation,
-                        schemas,
+                        request_schemas,
                         COORDINATOR_SYSTEM_PROMPT,
                         actor="coordinator",
                         step=step,
@@ -13089,6 +14269,42 @@ class AgentRuntime:
                     ))
                 self._work_conversation.append(turn.to_message())
 
+                execution_contract_error = turn.native.get("tool_contract_error")
+                if isinstance(execution_contract_error, Mapping):
+                    self.store.append_event(
+                        "execution.contract_recovery",
+                        goal_id=goal.id,
+                        payload={
+                            "actor": "coordinator",
+                            "error": dict(execution_contract_error),
+                            "required_next_tool": state_payload.get(
+                                "required_next_tool", ""
+                            ),
+                        },
+                    )
+                    self._work_conversation = [
+                        {
+                            "role": "user",
+                            "content": state_envelope(
+                                {
+                                    **state_payload,
+                                    "last_contract_error": dict(execution_contract_error),
+                                    "instruction": (
+                                        local_checkpoint_message
+                                        or "Choose one advertised evidence-producing action."
+                                    ),
+                                },
+                                "EXECUTION_CONTRACT_RECOVERY",
+                            ),
+                        }
+                    ]
+                    self.events.publish(
+                        "warning",
+                        "Coordinator tool choice was rejected; the next slice will "
+                        "resume from the saved verification checkpoint.",
+                    )
+                    break
+
                 if not turn.tool_calls:
                     no_action += 1
                     self._work_conversation.append(
@@ -13107,6 +14323,7 @@ class AgentRuntime:
                     continue
 
                 no_action = 0
+                repeated_action_blocked = False
                 for call in turn.tool_calls:
                     self.events.publish("tool_call", call.name, args=redact_data(call.args), actor="coordinator")
                     current_goal = self.store.get_goal(goal.id)
@@ -13126,6 +14343,46 @@ class AgentRuntime:
                         {"role": "tool", "id": call.id, "name": call.name, "content": result}
                     )
                     self.events.publish("tool_result", result, tool=call.name, actor="coordinator")
+                    if result.startswith(
+                        "Error: persistent no-progress circuit breaker:"
+                    ) or result.startswith("Error: no-progress circuit breaker:"):
+                        repeated_action_blocked = True
+                        self.store.append_event(
+                            "execution.repeated_action_recovery",
+                            goal_id=goal.id,
+                            payload={
+                                "tool": call.name,
+                                "task_id": self._current_task_id(current_plan),
+                                "required_next_tool": state_payload.get(
+                                    "required_next_tool", ""
+                                ),
+                            },
+                        )
+                        break
+                if repeated_action_blocked:
+                    self._work_conversation = [
+                        {
+                            "role": "user",
+                            "content": state_envelope(
+                                {
+                                    **state_payload,
+                                    "rejected_repeated_action": call.name,
+                                    "instruction": (
+                                        local_checkpoint_message
+                                        or "Do not repeat the rejected action. Choose a different "
+                                        "evidence-producing tool from the advertised contract."
+                                    ),
+                                },
+                                "EXECUTION_NO_PROGRESS_RECOVERY",
+                            ),
+                        }
+                    ]
+                    self.events.publish(
+                        "warning",
+                        "Repeated action rejected; slice checkpointed for a different "
+                        "verification action.",
+                    )
+                    break
                 durable_checkpoint = state_envelope(self._state_payload(
                     self.store.get_goal(goal.id),
                     self.store.get_latest_plan(goal.id),
@@ -13133,10 +14390,10 @@ class AgentRuntime:
                 self._work_conversation = context.suspend_and_revive(
                     self._work_conversation,
                     durable_checkpoint,
-                    getattr(self.provider, "summarize", None),
+                    context.structural_summary,
                     max_chars=self._provider_conversation_budget(
                         COORDINATOR_SYSTEM_PROMPT,
-                        schemas,
+                        request_schemas,
                     ),
                     on_suspend=lambda count: self.events.publish(
                         "checkpoint",
@@ -13248,7 +14505,15 @@ class AgentRuntime:
         goal = self.active_goal()
         if goal is None:
             return self._decorate_slice_result(SliceResult("idle", "There is no active goal.", phase="ready"))
-        if goal.status is GoalStatus.RUNNING and not self._claim_execution_lease(goal):
+        execution_lease_claimed = False
+
+        def claim_execution_or_boundary(current_goal: Goal) -> SliceResult | None:
+            nonlocal execution_lease_claimed
+            if execution_lease_claimed:
+                return None
+            if self._claim_execution_lease(current_goal):
+                execution_lease_claimed = True
+                return None
             result = SliceResult(
                 "paused",
                 "Another worker owns the active execution lease; this worker will not replay actions.",
@@ -13260,10 +14525,15 @@ class AgentRuntime:
             )
             self.store.append_event(
                 "execution.boundary",
-                goal_id=goal.id,
+                goal_id=current_goal.id,
                 payload={"status": "lease_conflict", "worker_id": self._worker_id},
             )
             return self._decorate_slice_result(result)
+
+        if goal.status is GoalStatus.RUNNING:
+            lease_boundary = claim_execution_or_boundary(goal)
+            if lease_boundary is not None:
+                return lease_boundary
         if goal.metadata.get("ultra_run_id"):
             session = self._ensure_ultra_session()
             if session.running:
@@ -13301,6 +14571,27 @@ class AgentRuntime:
             if goal is None:
                 self._release_execution_lease(stage="no-goal", state="boundary")
                 return last
+            if (
+                self.sleep_mode_policy() == "full"
+                and goal.status in {
+                    GoalStatus.AWAITING_PLAN_APPROVAL,
+                    GoalStatus.PAUSED,
+                }
+            ):
+                resolved = self.auto_resolve_full_auto_boundary()
+                if resolved:
+                    goal = self.active_goal()
+                    if goal is None:
+                        self._release_execution_lease(stage="no-goal", state="boundary")
+                        return last
+                    if goal.status is GoalStatus.RUNNING:
+                        lease_boundary = claim_execution_or_boundary(goal)
+                        if lease_boundary is not None:
+                            return lease_boundary
+                    # A question answer may produce another deterministic Full
+                    # Auto boundary (most commonly the plan itself). Re-read the
+                    # durable state and resolve that boundary in the next pass.
+                    continue
             if goal.status is GoalStatus.PAUSED and bool(
                 goal.metadata.get("auto_retryable")
             ):
@@ -13317,7 +14608,42 @@ class AgentRuntime:
                 continue
             if goal.status is not GoalStatus.RUNNING:
                 self._release_execution_lease(stage=f"{goal.status.value}-boundary", state="boundary")
-                return self._decorate_slice_result(last)
+                needs_user = goal.status in {
+                    GoalStatus.AWAITING_PLAN_APPROVAL,
+                    GoalStatus.PAUSED,
+                    GoalStatus.BLOCKED,
+                }
+                return self._decorate_slice_result(
+                    SliceResult(
+                        goal.status.value,
+                        f"Goal is {goal.status.value}.",
+                        completed=goal.status is GoalStatus.COMPLETED,
+                        needs_user=needs_user,
+                        phase=(
+                            "awaiting_approval"
+                            if goal.status is GoalStatus.AWAITING_PLAN_APPROVAL
+                            else "paused"
+                            if needs_user
+                            else goal.status.value
+                        ),
+                        reason=str(
+                            goal.metadata.get("waiting_question")
+                            or goal.metadata.get("retry_reason")
+                            or ""
+                        ),
+                        waiting_on=("user" if needs_user else ""),
+                        resume_action=(
+                            "Approve"
+                            if goal.status is GoalStatus.AWAITING_PLAN_APPROVAL
+                            else "Retry"
+                            if needs_user
+                            else ""
+                        ),
+                    )
+                )
+            lease_boundary = claim_execution_or_boundary(goal)
+            if lease_boundary is not None:
+                return lease_boundary
             self._update_execution_lease(stage="working", state="active")
             self.wait_for_scheduled_retry()
             heartbeat_stop, heartbeat_thread = self._start_execution_heartbeat(

@@ -213,6 +213,78 @@ class ExecutionToolTests(unittest.TestCase):
             )
             tools.run_tool("stop_preview", {"preview_id": payload["preview_id"]})
 
+    def test_preview_normalizes_small_model_dom_id_and_textcontent_transport(self):
+        capability = tools.web_preview.browser_capability()
+        if not capability["available"] or not capability["playwright"]:
+            self.skipTest("Playwright plus Chrome/Edge/Chromium is unavailable")
+        with tempfile.TemporaryDirectory() as directory, tools.workspace_context(directory):
+            Path(directory, "index.html").write_text(
+                """<!doctype html><h1 id='counter'>Count: 0</h1>
+                <button id='increment'>Click to Increment</button>
+                <script>document.querySelector('#increment').onclick=()=>{
+                document.querySelector('#counter').textContent='Count: 1'}</script>""",
+                encoding="utf-8",
+            )
+            payload = json.loads(tools.run_tool("preview_html", {
+                "path": "index.html",
+                "open_browser": False,
+                "verify": True,
+                "settle_ms": 0,
+                "interactions": [{
+                    "name": "captured local-model scenario",
+                    # The model placed the DOM id in the accessible-name slot.
+                    "steps": [{"action": "click", "role": "button", "name": "increment"}],
+                    # It also emitted a DOM property spelling and an invented
+                    # label while preserving the exact asserted visible value.
+                    "assertions": [{
+                        "role": "text",
+                        "name": "Visible Count After One Click",
+                        "property": "textContent",
+                        "equals": "Count: 1",
+                    }],
+                }],
+            }))
+            self.addCleanup(tools.web_preview.shutdown_workspace, directory)
+            self.assertEqual(payload["verification"], "passed")
+            self.assertEqual(
+                payload["interaction_results"][0]["assertions"][0]["observed"],
+                "Count: 1",
+            )
+            tools.run_tool("stop_preview", {"preview_id": payload["preview_id"]})
+
+    def test_preview_reports_missing_model_selector_as_contract_failure_without_action_timeout(self):
+        capability = tools.web_preview.browser_capability()
+        if not capability["available"] or not capability["playwright"]:
+            self.skipTest("Playwright plus Chrome/Edge/Chromium is unavailable")
+        with tempfile.TemporaryDirectory() as directory, tools.workspace_context(directory):
+            Path(directory, "index.html").write_text(
+                "<!doctype html><button data-value='5'>5</button><input id='display' value='0'>",
+                encoding="utf-8",
+            )
+            payload = json.loads(tools.run_tool("preview_html", {
+                "path": "index.html",
+                "open_browser": False,
+                "verify": True,
+                "settle_ms": 0,
+                "interactions": [{
+                    "name": "invented selector",
+                    "steps": [{"action": "click", "selector": "#button-5"}],
+                    "assertions": [{
+                        "selector": "#display",
+                        "property": "value",
+                        "equals": "5",
+                    }],
+                }],
+            }))
+            self.addCleanup(tools.web_preview.shutdown_workspace, directory)
+            self.assertEqual(payload["verification"], "failed")
+            self.assertEqual(payload["failure_kind"], "contract")
+            self.assertIn("matched no elements", payload["interaction_results"][0]["error"])
+            self.assertTrue(
+                any(item["data_value"] == "5" for item in payload["interaction_targets"])
+            )
+            tools.run_tool("stop_preview", {"preview_id": payload["preview_id"]})
+
     def test_dependency_install_auto_detects_npm_without_global_install(self):
         with tempfile.TemporaryDirectory() as directory, tools.workspace_context(directory):
             Path(directory, "package.json").write_text('{"name":"x"}', encoding="utf-8")

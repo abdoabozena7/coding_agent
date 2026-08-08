@@ -887,10 +887,10 @@ def choose_interaction_mode(
             (
                 ChoiceItem(
                     key=InteractionMode.NORMAL.value,
-                    label="Goal",
+                    label="Working",
                     description=(
-                        "Start a durable Goal. The harness chooses staged or recursive "
-                        "execution from the selected model's metadata and task demand."
+                        "Start a durable recursive Goal. The harness chooses specialist "
+                        "count and concurrency from task demand and safe model capacity."
                     ),
                     meta="Current" if selected_mode is InteractionMode.NORMAL else "Recommended",
                     value=InteractionMode.NORMAL,
@@ -905,25 +905,13 @@ def choose_interaction_mode(
                     meta="Current" if selected_mode is InteractionMode.PLAN else "Plan first",
                     value=InteractionMode.PLAN,
                 ),
-                ChoiceItem(
-                    key=InteractionMode.ULTRA.value,
-                    label="Ultra",
-                    description=(
-                        "Force recursive specialist depth for the next Goal. Local models may "
-                        "run those specialists sequentially."
-                    ),
-                    meta="Current" if selected_mode is InteractionMode.ULTRA else "Deeper minimum",
-                    value=InteractionMode.ULTRA,
-                    disabled=bool(ultra_disabled_reason),
-                    disabled_reason=ultra_disabled_reason,
-                ),
             ),
             title="Choose the next workflow",
-            subtitle="Inside an active workflow the visible phase becomes Plan or Working and is locked.",
+            subtitle="Working always uses recursive specialists; Plan adds a review boundary.",
             initial_key=(
-                InteractionMode.NORMAL.value
-                if selected_mode is InteractionMode.ULTRA and ultra_disabled_reason
-                else selected_mode.value
+                InteractionMode.PLAN.value
+                if selected_mode is InteractionMode.PLAN
+                else InteractionMode.NORMAL.value
             ),
             filterable=False,
             step_label=step_label,
@@ -937,24 +925,19 @@ def choose_interaction_mode(
             raise PickerBack()
         return selected.value
     print("Mode", file=output)
-    print("  1. goal   durable goal with automatic model-aware execution depth", file=output)
+    print("  1. working   durable recursive goal with dynamic specialist count", file=output)
     print("  2. plan   review the same goal before workspace mutation", file=output)
-    print(
-        "  3. ultra  "
-        + (f"unavailable: {ultra_disabled_reason}" if ultra_disabled_reason else "force recursive specialist depth"),
-        file=output,
-    )
     while True:
         choice = input_func("mode> ").strip().lower()
-        aliases = {"1": "normal", "2": "plan", "3": "ultra"}
+        aliases = {"1": "normal", "2": "plan"}
         choice = aliases.get(choice, choice)
-        choice = {"working": "normal", "work": "normal", "goal": "normal"}.get(choice, choice)
-        if choice == "ultra" and ultra_disabled_reason:
-            print(f"Ultra is unavailable: {ultra_disabled_reason}", file=output)
-            continue
-        if choice in {"normal", "chat", "plan", "ultra"}:
+        choice = {
+            "working": "normal", "work": "normal", "goal": "normal",
+            "ultra": "normal", "deep": "normal", "max": "normal",
+        }.get(choice, choice)
+        if choice in {"normal", "chat", "plan"}:
             return InteractionMode.parse(choice)
-        print("Choose goal, plan, or ultra.", file=output)
+        print("Choose working or plan.", file=output)
 
 
 def choose_concurrency(
@@ -1084,10 +1067,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         type=lambda value: InteractionMode.parse(value).value,
-        metavar="{goal,plan,ultra}",
+        metavar="{working,plan}",
         help=(
-            "Compatibility override for scripts. Omit it for automatic semantic routing "
-            "and model-aware execution depth; use plan only for planning-first automation."
+            "Optional interaction boundary. Omit it for recursive working mode; use plan "
+            "only to require plan review before workspace mutation. Legacy normal/ultra "
+            "spellings remain accepted as working-mode aliases."
         ),
     )
     parser.add_argument(
@@ -2595,21 +2579,9 @@ def _reconfigure_project_setup(
 
     assert selected_descriptor is not None
     capacity = probe_concurrency(selected_descriptor)
-    saved = runtime.session_snapshot()
-    try:
-        initial_concurrency = int(saved.get("concurrency") or capacity.recommended)
-    except (TypeError, ValueError):
-        initial_concurrency = capacity.recommended
-    selected_concurrency = choose_concurrency(
-        capacity,
-        input_func=console.input_func,
-        output=console.stream,
-        rich=not console.plain,
-        initial=initial_concurrency,
-        step_label="Project settings · Capacity",
-        no_color=not console.color,
-        reduced_motion=console.reduced_motion,
-    )
+    # Capacity is a safety ceiling, not a user-selected agent count. The
+    # semantic task-demand decision chooses the actual concurrency per Goal.
+    selected_concurrency = capacity.safe_max
     selected_access = choose_access_level(
         input_func=console.input_func,
         output=console.stream,
@@ -2669,7 +2641,7 @@ def _reconfigure_project_setup(
     )
     console.write(
         "Project settings saved · future launches will reuse this model, protection, "
-        f"capacity ({selected_concurrency}), permissions, and workflow default."
+        f"automatic capacity (up to {selected_concurrency}), permissions, and workflow default."
     )
 
 
@@ -3182,6 +3154,18 @@ def execute_command(
         result = runtime.apply_command(command)
     if isinstance(result, SliceResult):
         console.write(result.message)
+    if (
+        result is not None
+        and runtime.sleep_mode_policy() == "full"
+        and runtime.active_goal() is not None
+        and runtime.active_goal().status
+        in {GoalStatus.AWAITING_PLAN_APPROVAL, GoalStatus.PAUSED}
+    ):
+        resolved = runtime.auto_resolve_full_auto_boundary()
+        if resolved:
+            console.write(
+                "Full Auto resolved the saved " + ", ".join(resolved) + " boundary."
+            )
     if (
         result is not None
         and runtime.active_goal() is not None
@@ -6618,10 +6602,8 @@ def _interactive_setup(
             steps.append(("protection", "2. Protect this project"))
         if descriptor is None:
             steps.append(("model", "3. Choose a model"))
-        if selected_concurrency is None:
-            steps.append(("concurrency", "4. Choose agent capacity"))
         if requested_access is None:
-            steps.append(("permissions", "5. Set permissions"))
+            steps.append(("permissions", "4. Set permissions"))
         return steps
 
     steps = build_steps()
@@ -6672,18 +6654,6 @@ def _interactive_setup(
                     no_color=not console.color,
                     reduced_motion=console.reduced_motion,
                 )
-            elif stage == "concurrency":
-                assert descriptor is not None
-                selected_concurrency = choose_concurrency(
-                    probe_concurrency(descriptor),
-                    input_func=console.input_func,
-                    output=console.stream,
-                    rich=rich,
-                    step_label=step_label,
-                    no_color=not console.color,
-                    reduced_motion=console.reduced_motion,
-                    initial=selected_concurrency,
-                )
             elif stage == "permissions":
                 requested_access = choose_access_level(
                     input_func=console.input_func,
@@ -6709,8 +6679,10 @@ def _interactive_setup(
     assert workspace is not None
     assert descriptor is not None
     assert requested_access is not None
-    if selected_concurrency is None:
-        selected_concurrency = 1
+    # Recompute the model/hardware ceiling at launch. The Goal's semantic
+    # demand selects 1..safe_max workers after intake; no mode tuning or agent
+    # count prompt is required.
+    selected_concurrency = probe_concurrency(descriptor).safe_max
     return (
         workspace,
         descriptor,

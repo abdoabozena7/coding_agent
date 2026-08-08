@@ -312,6 +312,50 @@ def test_recursive_strategy_is_a_one_way_minimum_before_approval() -> None:
     assert decision.lock().locked is True
 
 
+def test_recursive_foundation_reads_task_aware_concurrency_before_goal_creation() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        store = StateStore(workspace)
+        runtime = AgentRuntime(
+            ScriptedProvider([], model="dynamic-workers"),
+            store,
+            workspace,
+            model_descriptor=ModelDescriptor(
+                provider="ollama",
+                model="dynamic-workers",
+                execution_class=ExecutionClass.LOCAL,
+                capabilities=("tools",),
+                metadata={"parameter_size": "70B", "context_window_tokens": 65536},
+            ),
+            permission_adapter=PermissionAdapter("normal", DockerSandbox()),
+            config=replace(RuntimeConfig(), ultra_local_concurrency=8),
+        )
+        try:
+            session = store.get_workflow_session(runtime.session_id)
+            store.mutate_workflow_session(
+                runtime.session_id,
+                lambda current: {
+                    "state": {
+                        **dict(current.get("state") or {}),
+                        "pending_semantic_turn": {
+                            "strategy_decision": {
+                                "strategy": "recursive",
+                                "max_concurrency": 3,
+                            }
+                        },
+                    }
+                },
+                expected_revision=int(session["revision"]),
+            )
+
+            assert runtime.active_goal() is None
+            assert runtime._workflow_concurrency_limit() == 3
+            assert runtime._make_ultra_session().config.max_concurrency == 3
+        finally:
+            runtime.close()
+            store.close()
+
+
 def test_chat_route_is_never_promoted_because_model_is_weak() -> None:
     original = "Explain how a calculator app works"
     decision = SemanticTurnDecisionV2.from_mapping(
