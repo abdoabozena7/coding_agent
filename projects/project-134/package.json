@@ -1,0 +1,13 @@
+{
+  "name": "ga3bad-ultra",
+  "version": "1.0.0",
+  "description": "Calculator frontend with 3D Visualization integration.",
+  "main": "index.js",
+  "scripts": {
+    "start": "echo \"Development build setup complete. Run index.html directly.\""
+  },
+  "dependencies": {
+    "three": "^0.128.0" 
+  }, 
+  "devDependencies": {}
+}

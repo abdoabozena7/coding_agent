@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 from agent.runtime import AgentRuntime
+from agent.chat_runtime import SemanticTurnDecisionV2
 from agent.events import EventBus
 from agent.store import StateStore
 from agent.testing import ScriptedProvider, semantic_turn
@@ -28,17 +29,48 @@ class ChatExecutionTests(unittest.TestCase):
             runtime.close()
             store.close()
 
+    def bounded_action(self, runtime, prompt: str, *, effects):
+        """Exercise the legacy bounded executor below the recursive router."""
+        raw = semantic_turn("action", original=prompt, effects=effects)
+        decision = SemanticTurnDecisionV2.from_mapping(
+            raw["tool_calls"][0]["args"],
+            original_input=prompt,
+            parse_goal_intake=False,
+        )
+        turn_id = "test-bounded-action"
+        runtime._save_pending_semantic_turn(
+            {
+                "turn_id": turn_id,
+                "original_input": prompt,
+                "requested_mode": "normal",
+                "interaction_mode": "working",
+                "minimum_strategy": "recursive",
+                "status": "dispatching",
+                "stage": "action",
+                "action_records": [],
+            }
+        )
+        result = runtime.chat(
+            prompt,
+            _route_checked=True,
+            semantic_decision=decision,
+            semantic_turn_id=turn_id,
+        )
+        runtime._complete_semantic_turn(turn_id, result_status=result.status)
+        return result
+
     def test_background_thread_tool_execution_has_workspace_context(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.runtime(directory, [
-                semantic_turn("action", original="save it to index.html", effects=("write",)),
                 {"tool_calls": [{"id": "write", "name": "write_file", "args": {
                     "path": "index.html", "content": "<!doctype html><title>ok</title>",
                 }}]},
                 "Done.",
             ]) as (runtime, store, _provider):
                 results = []
-                thread = threading.Thread(target=lambda: results.append(runtime.chat("save it to index.html")))
+                thread = threading.Thread(target=lambda: results.append(
+                    self.bounded_action(runtime, "save it to index.html", effects=("write",))
+                ))
                 thread.start(); thread.join(timeout=10)
 
                 self.assertFalse(thread.is_alive())
@@ -52,7 +84,6 @@ class ChatExecutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             Path(directory, "index.html").write_text("<!doctype html><title>ok</title>", encoding="utf-8")
             with self.runtime(directory, [
-                semantic_turn("action", original="run index.html", effects=("preview",)),
                 "I am text-based and cannot launch a browser. Open it yourself.",
                 {"tool_calls": [{"id": "preview", "name": "preview_html", "args": {"path": "index.html"}}]},
                 "Done.",
@@ -64,10 +95,12 @@ class ChatExecutionTests(unittest.TestCase):
                 "console_errors": [], "page_errors": [], "network_errors": [],
                 })
                 with mock.patch("agent.tools.web_preview.create", return_value=payload) as preview:
-                    result = runtime.chat("run index.html")
+                    result = self.bounded_action(
+                        runtime, "run index.html", effects=("preview",)
+                    )
 
                 preview.assert_called_once()
-                self.assertEqual(len(provider.calls), 4)
+                self.assertEqual(len(provider.calls), 3)
                 self.assertIn("http://127.0.0.1:43210", result.message)
                 self.assertIn("verification passed", result.message)
                 self.assertNotIn("Open it yourself", result.message)
@@ -75,16 +108,17 @@ class ChatExecutionTests(unittest.TestCase):
     def test_advertised_native_tool_json_text_is_normalized_and_executed(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.runtime(directory, [
-                semantic_turn("action", original="create hello.txt", effects=("write",)),
                 '{"name":"write_file","arguments":{"path":"hello.txt","content":"hello"}}',
                 "Done.",
             ]) as (runtime, store, provider):
                 provider.capability_profile = type("Capabilities", (), {"tool_call_support": True})()
-                result = runtime.chat("create hello.txt")
+                result = self.bounded_action(
+                    runtime, "create hello.txt", effects=("write",)
+                )
 
                 self.assertEqual(Path(directory, "hello.txt").read_text(encoding="utf-8"), "hello")
                 self.assertIn("write_file", result.message)
-                self.assertEqual(len(provider.calls), 3)
+                self.assertEqual(len(provider.calls), 2)
                 self.assertEqual(store.list_session_actions(runtime.session_id)[0]["status"], "completed")
 
     def test_native_write_repairs_double_escaped_document_layout(self):
@@ -95,13 +129,12 @@ class ChatExecutionTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             with self.runtime(directory, [
-                semantic_turn("action", original="create index.html", effects=("write",)),
                 {"tool_calls": [{"id": "write", "name": "write_file", "args": {
                     "path": "index.html", "content": escaped_html,
                 }}]},
                 "Done.",
             ]) as (runtime, _store, _provider):
-                runtime.chat("create index.html")
+                self.bounded_action(runtime, "create index.html", effects=("write",))
 
                 written = Path(directory, "index.html").read_text(encoding="utf-8")
                 self.assertIn("<!DOCTYPE html>\n<html>\n<body>", written)
@@ -111,13 +144,12 @@ class ChatExecutionTests(unittest.TestCase):
     def test_failed_write_is_not_mutation_or_artifact_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.runtime(directory, [
-                semantic_turn("action", original="save it", effects=("write",)),
                 {"tool_calls": [{"id": "bad", "name": "write_file", "args": {
                     "path": "../escape.txt", "content": "bad",
                 }}]},
                 "Done.", "Done.", "Done.",
             ]) as (runtime, store, _provider):
-                result = runtime.chat("save it")
+                result = self.bounded_action(runtime, "save it", effects=("write",))
 
                 self.assertNotIn("BELOW_TARGET", result.message)
                 action = store.list_session_actions(runtime.session_id)[0]
@@ -137,7 +169,6 @@ class ChatExecutionTests(unittest.TestCase):
             first.close()
 
             second = AgentRuntime(ScriptedProvider([
-                semantic_turn("action", original="save it to index.html", effects=("write",)),
                 {"tool_calls": [{"id": "save", "name": "materialize_artifact", "args": {
                     "artifact_id": artifact["id"], "path": "index.html",
                     "expected_sha256": artifact["content_hash"],
@@ -145,7 +176,9 @@ class ChatExecutionTests(unittest.TestCase):
                 "Saved.",
             ]), store, directory, approval=lambda *_: True)
             try:
-                result = second.chat("save it to index.html")
+                result = self.bounded_action(
+                    second, "save it to index.html", effects=("write",)
+                )
                 self.assertEqual(Path(directory, "index.html").read_text(encoding="utf-8"), code)
                 self.assertIn(artifact["id"], result.message)
                 self.assertTrue(any("CHAT_ARTIFACT" in str(item.get("content")) for item in second._chat_conversation))
@@ -164,7 +197,6 @@ class ChatExecutionTests(unittest.TestCase):
                 runtime.chat("show the generated HTML")
                 artifact = store.list_chat_artifacts(runtime.session_id)[0]
                 provider._turns.extend([
-                    semantic_turn("action", original="put it in index.html and run it", effects=("write", "preview")),
                     "The code block is the runnable artifact. Save it and open it yourself.",
                     {"tool_calls": [
                         {"id": "save", "name": "materialize_artifact", "args": {
@@ -182,7 +214,11 @@ class ChatExecutionTests(unittest.TestCase):
                     "console_errors": [], "page_errors": [], "network_errors": [],
                 })
                 with mock.patch("agent.tools.web_preview.create", return_value=preview_payload):
-                    result = runtime.chat("put it in index.html and run it")
+                    result = self.bounded_action(
+                        runtime,
+                        "put it in index.html and run it",
+                        effects=("write", "preview"),
+                    )
                 self.assertEqual(Path(directory, "index.html").read_text(encoding="utf-8"), code)
                 self.assertIn("http://127.0.0.1:45678", result.message)
                 self.assertNotIn("open it yourself", result.message.casefold())
@@ -233,12 +269,13 @@ class ChatExecutionTests(unittest.TestCase):
             store = StateStore(directory)
             adapter = Adapter()
             runtime = AgentRuntime(ScriptedProvider([
-                semantic_turn("action", original="run the command echo ok", effects=("run",)),
                 {"tool_calls": [{"id": "run", "name": "run_command", "args": {"command": "echo ok"}}]},
                 "Done.",
             ]), store, directory, permission_adapter=adapter)
             try:
-                result = runtime.chat("run the command echo ok")
+                result = self.bounded_action(
+                    runtime, "run the command echo ok", effects=("run",)
+                )
                 self.assertEqual(adapter.calls, [("echo ok", str(Path(directory).resolve()))])
                 self.assertIn("exit code: 0", result.message)
             finally:

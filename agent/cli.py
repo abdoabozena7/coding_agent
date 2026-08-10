@@ -21,7 +21,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Thread
 from typing import Any, Callable, Iterable, Mapping, TextIO
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from colorama import just_fix_windows_console
 
@@ -29,7 +29,15 @@ from . import tools
 from dotenv import load_dotenv
 
 from . import __version__
-from .commands import CommandKind, CommandParseError, UnknownCommandParseError, UserCommand, parse_command
+from .commands import (
+    CommandKind,
+    CommandParseError,
+    InternalActionKind,
+    UnknownCommandParseError,
+    UserCommand,
+    internal_action,
+    parse_command,
+)
 from .capability import InteractionModeV2
 from .config import (
     InteractionMode,
@@ -96,6 +104,7 @@ from .ui import (
     COMMAND_GROUPS,
     SLASH_COMMANDS,
     ConsoleUI,
+    DashboardView,
     HELP_TEXT,
     WorkspaceRefreshRequested,
     render_agent_detail,
@@ -140,13 +149,6 @@ def _full_auto_retry_delay(attempt: int) -> float:
 
     normalized = max(1, int(attempt))
     return float(min(300, 5 * (2 ** min(6, normalized - 1))))
-
-
-_PALETTE_COMMANDS_NEEDING_TEXT = {
-    "/goal", "/reject", "/replan", "/answer", "/add", "/edit", "/remove",
-    "/done", "/todo", "/block", "/skip", "/resolve", "/cancel", "/stop-process",
-    "/agent",
-}
 
 
 def _model_size_billions(value: object) -> float:
@@ -280,7 +282,11 @@ def _resolve_workspace(path: str | os.PathLike[str], *, create: bool = False) ->
     candidate = Path(path).expanduser()
     try:
         if create:
-            candidate.mkdir(parents=True, exist_ok=False)
+            # ``--create-workspace`` is an ensure operation: shell commands
+            # should remain repeatable after the first invocation creates the
+            # directory or after a later setup step leaves durable metadata in
+            # it. An existing non-directory is still rejected below.
+            candidate.mkdir(parents=True, exist_ok=True)
         resolved = candidate.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise ValueError(f"workspace does not exist or is invalid: {candidate}") from exc
@@ -634,7 +640,7 @@ def choose_access_level(
         selected = select_choice(
             choices,
             title="Choose access",
-            subtitle="You can change this later with F4 or /permissions.",
+            subtitle="You can change this later with F4 or in Settings.",
             initial_key=(
                 initial_level.value
                 if initial_level is AccessLevel.NORMAL or status.ready
@@ -887,27 +893,27 @@ def choose_interaction_mode(
             (
                 ChoiceItem(
                     key=InteractionMode.NORMAL.value,
-                    label="Working",
+                    label="Ultra",
                     description=(
-                        "Start a durable recursive Goal. The harness chooses specialist "
-                        "count and concurrency from task demand and safe model capacity."
+                        "Run the recursive agent workflow from the terminal. The harness "
+                        "chooses specialist count from the approved task demand."
                     ),
                     meta="Current" if selected_mode is InteractionMode.NORMAL else "Recommended",
                     value=InteractionMode.NORMAL,
                 ),
                 ChoiceItem(
                     key=InteractionMode.PLAN.value,
-                    label="Plan",
+                    label="Ultra Plan",
                     description=(
-                        "Prepare and review the next Goal before any workspace mutation. "
-                        "Approve & work continues that same Goal."
+                        "Open the calm planning workspace, refine the plan and first-layer "
+                        "agents, then hand the approved Goal back to the terminal."
                     ),
                     meta="Current" if selected_mode is InteractionMode.PLAN else "Plan first",
                     value=InteractionMode.PLAN,
                 ),
             ),
             title="Choose the next workflow",
-            subtitle="Working always uses recursive specialists; Plan adds a review boundary.",
+            subtitle="Both use Ultra execution; Ultra Plan adds the browser planning boundary.",
             initial_key=(
                 InteractionMode.PLAN.value
                 if selected_mode is InteractionMode.PLAN
@@ -925,11 +931,11 @@ def choose_interaction_mode(
             raise PickerBack()
         return selected.value
     print("Mode", file=output)
-    print("  1. working   durable recursive goal with dynamic specialist count", file=output)
-    print("  2. plan   review the same goal before workspace mutation", file=output)
+    print("  1. ultra        recursive goal controlled from the terminal", file=output)
+    print("  2. ultra-plan   browser planning, then the same Ultra engine", file=output)
     while True:
         choice = input_func("mode> ").strip().lower()
-        aliases = {"1": "normal", "2": "plan"}
+        aliases = {"1": "normal", "2": "plan", "ultra-plan": "plan", "ultraplan": "plan"}
         choice = aliases.get(choice, choice)
         choice = {
             "working": "normal", "work": "normal", "goal": "normal",
@@ -937,7 +943,7 @@ def choose_interaction_mode(
         }.get(choice, choice)
         if choice in {"normal", "chat", "plan"}:
             return InteractionMode.parse(choice)
-        print("Choose working or plan.", file=output)
+        print("Choose ultra or ultra-plan.", file=output)
 
 
 def choose_concurrency(
@@ -1060,18 +1066,21 @@ def build_parser() -> argparse.ArgumentParser:
             "Project protection and files are reused, but no previous prompt, goal, or chat is loaded."
         ),
     )
-    parser.add_argument("--create-workspace", action="store_true", help="Create the path passed to --workspace.")
+    parser.add_argument(
+        "--create-workspace",
+        action="store_true",
+        help="Create the path passed to --workspace when it does not already exist.",
+    )
     parser.add_argument("--projects-root", default=os.getenv("AGENT_PROJECTS_DIR", str(DEFAULT_PROJECTS_ROOT)))
     parser.add_argument("--provider", choices=("openai", "gemini", "ollama"), help="Override LLM_PROVIDER.")
     parser.add_argument("--model", help="Override the selected provider's model for this run.")
     parser.add_argument(
         "--mode",
         type=lambda value: InteractionMode.parse(value).value,
-        metavar="{working,plan}",
+        metavar="{ultra,ultra-plan}",
         help=(
-            "Optional interaction boundary. Omit it for recursive working mode; use plan "
-            "only to require plan review before workspace mutation. Legacy normal/ultra "
-            "spellings remain accepted as working-mode aliases."
+            "Choose terminal-first Ultra or Ultra Plan, which opens browser planning before "
+            "the same recursive execution engine. Legacy normal/working/plan spellings remain accepted."
         ),
     )
     parser.add_argument(
@@ -1089,7 +1098,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="TEXT",
-        help="Run a UI command (repeatable), for example --command '/status'.",
+        help="Run a public UI command (repeatable), for example --command '/help'.",
     )
     parser.add_argument(
         "--auto",
@@ -1161,7 +1170,7 @@ def _show_history(runtime: AgentRuntime, console: ConsoleUI) -> None:
             )
     uncertain = runtime.store.list_actions(goal.id, status="uncertain")
     if uncertain:
-        console.write("Uncertain actions (inspect, then /resolve ACTION_ID applied|not-run NOTE)")
+        console.write("Uncertain actions (inspect and resolve from the recovery card)")
         for action in uncertain:
             console.write(
                 f"  {action['id']}  {action['tool_name']} task={action['task_id'] or '-'} risk={action['risk']}"
@@ -1170,7 +1179,7 @@ def _show_history(runtime: AgentRuntime, console: ConsoleUI) -> None:
         worker for worker in delegations if worker.status.value == "uncertain"
     ]
     if uncertain_workers:
-        console.write("Uncertain workers (inspect, then /resolve DELEGATION_ID applied|not-run NOTE)")
+        console.write("Uncertain workers (inspect and resolve from the recovery card)")
         for worker in uncertain_workers:
             console.write(
                 f"  {worker.id}  task={worker.task_id} role={worker.role.name}"
@@ -1275,8 +1284,8 @@ def _set_interaction_mode(
         return needs_ultra_foundation
     if selected == InteractionMode.PLAN:
         console.write(
-            "PLAN input active: the next request opens Plan Workspace. Nothing changes "
-            "until you choose Approve & work; the same Goal then continues in Working."
+            "ULTRA PLAN active: the browser planning workspace owns the next request. "
+            "Nothing changes until the plan and first-layer agents are approved."
         )
         return needs_ultra_foundation
     suffix = (
@@ -1352,7 +1361,7 @@ def _show_settings(
     for name, value in runtime_values.items():
         console.write(f"  {name:<27} = {value}")
     console.write(
-        "Change limits with /settings NAME VALUE; use /api-key PROVIDER for a masked key entry."
+        "Use the interactive Settings hub to change limits or enter masked credentials."
     )
 
 
@@ -1365,7 +1374,7 @@ def _execute_settings(
     key = command.args.get("key")
     value = command.args.get("value")
     if key is None:
-        _show_settings(runtime, console, preferences)
+        _open_settings_hub(runtime, console, preferences)
         return
     if key == "mode":
         if value is None:
@@ -1379,8 +1388,7 @@ def _execute_settings(
     if key == "api_key":
         if value is None:
             console.write(
-                "API key values are never shown. Use /api-key openai, "
-                "/api-key gemini, or /api-key ollama."
+                "API key values are never shown. Choose Providers in Settings to enter one."
             )
             return
         provider = normalize_api_key_provider(value)
@@ -1391,7 +1399,7 @@ def _execute_settings(
         variable = save_provider_api_key(APP_ROOT / ".env", provider, secret)
         console.write(
             f"{provider} credential saved as {variable}. "
-            "Use /model to select or reconnect the provider; the key is never added to chat history."
+            "Choose Runtime / Model in Settings to reconnect; the key is never added to chat history."
         )
         return
     if key == "color":
@@ -1409,7 +1417,7 @@ def _execute_settings(
         return
     if key in {"provider", "workspace", "model"}:
         if value is not None:
-            hint = "Use /model NAME." if key == "model" else "Restart with the matching CLI option."
+            hint = "Choose Runtime / Model in Settings." if key == "model" else "Restart with the matching CLI option."
             raise ValueError(f"{key} is read-only here. {hint}")
         _show_settings(runtime, console, preferences, key)
         return
@@ -1420,6 +1428,226 @@ def _execute_settings(
     runtime.replace_config(updated)
     canonical = normalize_runtime_setting_name(key)
     console.write(f"{canonical} = {getattr(updated, canonical)} (session only)")
+
+
+def _manage_processes_settings(runtime: AgentRuntime, console: ConsoleUI) -> None:
+    with tools.workspace_context(runtime.workspace):
+        processes = tools.process_manager.list_processes()
+        previews = tools.web_preview.list_previews()
+    resources = [
+        ChoiceItem(
+            key=str(item["process_id"]),
+            label=str(item["process_id"]),
+            description=str(item.get("command") or "managed process"),
+            meta=str(item.get("status") or "process"),
+        )
+        for item in processes
+    ]
+    resources.extend(
+        ChoiceItem(
+            key=str(item["preview_id"]),
+            label=str(item["preview_id"]),
+            description=str(item.get("url") or "managed preview"),
+            meta="preview",
+        )
+        for item in previews
+    )
+    if not resources:
+        console.write("No managed processes or previews are active.")
+        return
+    selected = select_choice(
+        resources,
+        title="Managed processes",
+        subtitle="Select one resource to stop it; Esc leaves everything running.",
+        filterable=True,
+        step_label="Settings · Diagnostics",
+        action_label="Stop",
+        input_func=console.input_func,
+        output=console.stream,
+        no_color=not console.color,
+        reduced_motion=console.reduced_motion,
+    )
+    if selected is None:
+        return
+    execute_command(
+        runtime,
+        console,
+        internal_action(
+            InternalActionKind.STOP_PROCESS,
+            resource_id=str(selected.resolved_value),
+        ),
+        SessionPreferences(),
+    )
+
+
+def _change_runtime_limit_settings(runtime: AgentRuntime, console: ConsoleUI) -> None:
+    names = tuple(runtime_setting_names())
+    selected = select_choice(
+        tuple(
+            ChoiceItem(
+                key=name,
+                label=name.replace("_", " ").title(),
+                description=f"Current: {getattr(runtime.config, name)}",
+                meta="Runtime",
+            )
+            for name in names
+        ),
+        title="Runtime limits",
+        subtitle="Choose one bounded session value. Esc keeps the current configuration.",
+        filterable=True,
+        step_label="Settings · Runtime",
+        action_label="Edit",
+        input_func=console.input_func,
+        output=console.stream,
+        no_color=not console.color,
+        reduced_motion=console.reduced_motion,
+    )
+    if selected is None:
+        return
+    name = str(selected.resolved_value)
+    value = prompt_text(
+        title=name.replace("_", " ").title(),
+        subtitle=f"Current value: {getattr(runtime.config, name)}",
+        step_label="Settings · Runtime",
+        input_func=console.input_func,
+        output=console.stream,
+        no_color=not console.color,
+    )
+    if not value:
+        return
+    updated = update_runtime_config(runtime.config, name, value)
+    runtime.replace_config(updated)
+    console.write(f"{name} = {getattr(updated, name)} (session only)")
+
+
+def _open_settings_hub(
+    runtime: AgentRuntime,
+    console: ConsoleUI,
+    preferences: SessionPreferences,
+) -> None:
+    """One progressive-disclosure surface for every non-workflow setting."""
+
+    rich = rich_terminal_available(
+        input_func=console.input_func,
+        output=console.stream,
+    ) and not bool(getattr(console, "plain", False))
+    if not rich:
+        _show_settings(runtime, console, preferences)
+        console.write(
+            "Open /settings in an interactive terminal to change Runtime, Providers, "
+            "Project, Terminal, or Diagnostics values."
+        )
+        return
+
+    actions = (
+        ChoiceItem("model", "Model & reasoning", "Choose a capable model and effort.", "Runtime"),
+        ChoiceItem("access", "Permissions", "Choose Normal or Full sandbox access.", "Runtime"),
+        ChoiceItem("sleep", "Sleep Mode", "Choose off, safe, or full unattended policy.", "Runtime"),
+        ChoiceItem("limits", "Runtime limits", "Edit concurrency and bounded engine limits.", "Runtime"),
+        ChoiceItem("api", "Provider credentials", "Add or replace a masked API key.", "Providers"),
+        ChoiceItem("provider_health", "Provider readiness", "Run local and provider readiness checks.", "Providers"),
+        ChoiceItem("project", "Project profile", "Reconfigure model, protection, access, and workflow.", "Project"),
+        ChoiceItem("sandbox", "Full-access sandbox", "Build or validate the isolated sandbox.", "Project"),
+        ChoiceItem("color", "Terminal color", "Choose auto, on, or off.", "Terminal"),
+        ChoiceItem("keymap", "Keyboard reference", "Show the current TUI key map.", "Terminal"),
+        ChoiceItem("tools", "Tools & approval policy", "Inspect available local capabilities.", "Diagnostics"),
+        ChoiceItem("processes", "Managed processes", "Inspect and stop processes or previews.", "Diagnostics"),
+        ChoiceItem("doctor", "Architecture doctor", "Run the bounded readiness audit.", "Diagnostics"),
+    )
+    with console.full_screen_modal():
+        selected = select_choice(
+            actions,
+            title="Settings",
+            subtitle="Runtime · Providers · Project · Terminal · Diagnostics",
+            filterable=True,
+            step_label="Settings",
+            action_label="Open",
+            input_func=console.input_func,
+            output=console.stream,
+            no_color=not console.color,
+            reduced_motion=console.reduced_motion,
+        )
+        if selected is None:
+            return
+        action = str(selected.resolved_value)
+        if action == "model":
+            _execute_model(runtime, console, None, None)
+        elif action == "access":
+            _execute_permissions(runtime, console, None)
+        elif action == "sleep":
+            choice = select_choice(
+                (
+                    ChoiceItem("off", "Off", "Every approval remains manual."),
+                    ChoiceItem("safe", "Safe", "Accept recommended safe choices only."),
+                    ChoiceItem("full", "Full", "Accept audited plans and tool actions."),
+                ),
+                title="Sleep Mode",
+                subtitle="The policy applies to this workspace session.",
+                initial_key=(runtime.sleep_mode_policy() if runtime.sleep_mode_enabled() else "off"),
+                step_label="Settings · Runtime",
+                action_label="Apply",
+                input_func=console.input_func,
+                output=console.stream,
+                no_color=not console.color,
+                reduced_motion=console.reduced_motion,
+            )
+            if choice is not None:
+                execute_command(
+                    runtime,
+                    console,
+                    internal_action(InternalActionKind.SLEEP, action=str(choice.resolved_value)),
+                    preferences,
+                )
+        elif action == "limits":
+            _change_runtime_limit_settings(runtime, console)
+        elif action == "api":
+            provider = select_choice(
+                tuple(ChoiceItem(name, name.title(), "Masked local credential") for name in ("openai", "gemini", "ollama")),
+                title="Provider credentials",
+                subtitle="Values are hidden and never enter chat history.",
+                step_label="Settings · Providers",
+                action_label="Continue",
+                input_func=console.input_func,
+                output=console.stream,
+                no_color=not console.color,
+                reduced_motion=console.reduced_motion,
+            )
+            if provider is not None:
+                _execute_settings(
+                    runtime,
+                    console,
+                    preferences,
+                    UserCommand(
+                        CommandKind.SETTINGS,
+                        {"key": "api_key", "value": str(provider.resolved_value)},
+                    ),
+                )
+        elif action in {"provider_health", "doctor"}:
+            _show_doctor(runtime, console, live=False, record=False)
+        elif action == "project":
+            _reconfigure_project_setup(runtime, console, preferences)
+        elif action == "sandbox":
+            _setup_sandbox(runtime, console)
+        elif action == "color":
+            color = select_choice(
+                tuple(ChoiceItem(value, value.title()) for value in ("auto", "on", "off")),
+                title="Terminal color",
+                initial_key=console.color_mode,
+                step_label="Settings · Terminal",
+                action_label="Apply",
+                input_func=console.input_func,
+                output=console.stream,
+                no_color=not console.color,
+                reduced_motion=console.reduced_motion,
+            )
+            if color is not None:
+                console.set_color(str(color.resolved_value))
+        elif action == "keymap":
+            execute_command(runtime, console, internal_action(InternalActionKind.KEYMAP), preferences)
+        elif action == "tools":
+            execute_command(runtime, console, internal_action(InternalActionKind.SKILLS), preferences)
+        elif action == "processes":
+            _manage_processes_settings(runtime, console)
 
 
 def _choose_reasoning_effort(console: ConsoleUI, initial: str = "medium") -> str:
@@ -1757,7 +1985,10 @@ def _review_pending_plan_with_picker(
     if selected is None or selected.key == "back":
         return None
     if selected.key == "approve":
-        return parse_command(f"/approve {view.plan_revision}")
+        return internal_action(
+            InternalActionKind.APPROVE,
+            revision=view.plan_revision,
+        )
     if selected.key == "view":
         console.write(render_plan(view))
         return None
@@ -1769,7 +2000,11 @@ def _review_pending_plan_with_picker(
         output=console.stream,
         no_color=not console.color,
     )
-    return parse_command(f"/replan {feedback}") if feedback else None
+    return (
+        internal_action(InternalActionKind.REPLAN, feedback=feedback)
+        if feedback
+        else None
+    )
 
 
 def _swarm_inspector_snapshot(runtime: AgentRuntime, run: Any) -> Mapping[str, Any]:
@@ -1935,7 +2170,7 @@ def _show_agent(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -
     if selected_node is None and selected_agent is None:
         console.write(
             f"Specialist view | READ ONLY\n  No unique agent or specialist matches {target!r}.\n"
-            "  Use /agents or /agents --all to copy a number or id."
+            "  Open Live for the concise team view or Advanced Tracing for every agent id."
         )
         return
     if selected_node is not None and selected_agent is None:
@@ -2216,7 +2451,7 @@ def _ultra_details_text(runtime: AgentRuntime, console: ConsoleUI) -> str:
         )
         diff = (
             f"{len(paths)} file(s) · +{additions} / -{deletions}. "
-            "Open /review for the immutable checkpoint."
+            "Open the focused review action for the immutable checkpoint."
         )
     except Exception as exc:
         diff = f"(diff unavailable: {redact_text(exc, 300)})"
@@ -2741,22 +2976,44 @@ def _open_local_web_view(
     if not isinstance(running, bool) or not running:
         console.write("The local web workspace is not running.")
         return
-    result = server.open_view(view_name)
+    public_view = (
+        view_name
+        if view_name in {"plan", "live", "show-diff", "advanced-tracing"}
+        else "live"
+    )
+    result = server.open_view(public_view)
     label = {
-        "plan": "Plan Studio",
+        "plan": "Ultra Plan",
+        "live": "Ultra Live",
+        "show-diff": "Workflow Diff",
         "review": "Change Review",
         "agents": "Agent Tree",
         "execution": "Execution",
         "history": "Workflow History",
         "tree": "Execution Tree",
         "diff": "Change Diff",
-    }[view_name]
+        "advanced-tracing": "Advanced Tracing",
+    }.get(view_name, "Ultra Live")
     if not isinstance(result, Mapping):
         return
     if result["browser_opened"]:
         console.write(f"{label} opened in your browser. You can continue chatting.")
     else:
         console.write(f"Open {label}:\n{result['manual_url']}")
+
+
+def _uses_plan_web_workspace(runtime: AgentRuntime) -> bool:
+    """Return the durable user-selected Web planning mode.
+
+    Internal planning is part of every Working goal and must never be treated
+    as permission to open a browser. Only the persisted public interaction
+    mode owns automatic Plan workspace presentation.
+    """
+
+    try:
+        return str(runtime.interaction_mode.value).casefold() == "plan"
+    except (StateStoreError, ValueError, TypeError, KeyError, AttributeError):
+        return False
 
 
 def execute_command(
@@ -2768,7 +3025,7 @@ def execute_command(
     """Execute one parsed command. Return False when the session should exit."""
     if command.kind == CommandKind.QUIT:
         return False
-    if command.kind is CommandKind.CANCEL and not str(command.args.get("confirmation") or "").strip():
+    if command.kind is InternalActionKind.CANCEL and not str(command.args.get("confirmation") or "").strip():
         goal = runtime.active_goal()
         if goal is None and not runtime.session_snapshot().get("pending_semantic_turn"):
             console.write("There is no active workflow to cancel.")
@@ -2803,9 +3060,6 @@ def execute_command(
             ) or bool(getattr(console, "plain", False)):
                 console.write(render_slash_menu())
             return True
-        if selected_command in _PALETTE_COMMANDS_NEEDING_TEXT:
-            console.prefill_prompt(selected_command + " ")
-            return True
         return execute_command(
             runtime,
             console,
@@ -2815,7 +3069,7 @@ def execute_command(
     if command.kind == CommandKind.HELP:
         console.write(HELP_TEXT.rstrip())
         return True
-    if command.kind == CommandKind.MODE:
+    if command.kind == InternalActionKind.MODE:
         selected = command.args.get("mode")
         if selected is None:
             console.write(
@@ -2832,23 +3086,23 @@ def execute_command(
                 )
                 runtime.prepare_ultra_from_existing_goal()
         return True
-    if command.kind == CommandKind.SETTINGS:
+    if command.kind in {CommandKind.SETTINGS, InternalActionKind.SETTINGS_UPDATE}:
         _execute_settings(runtime, console, preferences, command)
         return True
-    if command.kind == CommandKind.MODEL:
+    if command.kind == InternalActionKind.MODEL:
         _execute_model(runtime, console, command.args.get("model"), command.args.get("effort"))
         return True
-    if command.kind == CommandKind.PERMISSIONS:
+    if command.kind == InternalActionKind.PERMISSIONS:
         _execute_permissions(runtime, console, command.args.get("level"))
         return True
-    if command.kind == CommandKind.KEYMAP:
+    if command.kind == InternalActionKind.KEYMAP:
         console.write(
             "Keymap: F2 Simple/Advanced display, F3 model, F4 permissions, "
             "F5 activity, F6 Sleep, F7 diff, F8 project folder, Ctrl+K actions, Ctrl+C "
             "cooperative pause, Ctrl+Q checkpoint-safe exit."
         )
         return True
-    if command.kind == CommandKind.SKILLS:
+    if command.kind == InternalActionKind.SKILLS:
         rows = tools.capability_report()
         lines = ["Available local agent capabilities"]
         for item in rows:
@@ -2860,7 +3114,7 @@ def execute_command(
             )
         console.write("\n".join(lines))
         return True
-    if command.kind == CommandKind.DOCTOR:
+    if command.kind == InternalActionKind.DOCTOR:
         _show_doctor(
             runtime,
             console,
@@ -2868,7 +3122,7 @@ def execute_command(
             record=bool(command.args.get("record")),
         )
         return True
-    if command.kind == CommandKind.PROCESSES:
+    if command.kind == InternalActionKind.PROCESSES:
         with tools.workspace_context(runtime.workspace):
             processes = tools.process_manager.list_processes()
             previews = tools.web_preview.list_previews()
@@ -2880,7 +3134,7 @@ def execute_command(
             lines.extend(f"  {item['preview_id']} · preview · {item['url']}" for item in previews)
             console.write("\n".join(lines))
         return True
-    if command.kind == CommandKind.STOP_PROCESS:
+    if command.kind == InternalActionKind.STOP_PROCESS:
         resource_id = str(command.args["resource_id"])
         with tools.workspace_context(runtime.workspace):
             result = (
@@ -2899,13 +3153,13 @@ def execute_command(
             + (" Ollama shutdown was requested." if command.args.get("shutdown_ollama") else "")
         )
         return True
-    if command.kind == CommandKind.SETUP:
+    if command.kind == InternalActionKind.SETUP:
         if command.args.get("project"):
             _reconfigure_project_setup(runtime, console, preferences)
         else:
             _setup_sandbox(runtime, console)
         return True
-    if command.kind == CommandKind.SLEEP:
+    if command.kind == InternalActionKind.SLEEP:
         action = str(command.args["action"]).strip().lower()
         if action == "status":
             enabled = bool(runtime.sleep_mode_enabled())
@@ -2969,23 +3223,23 @@ def execute_command(
                     f"{exc}"
                 )
         return True
-    if command.kind in {CommandKind.TREE, CommandKind.AGENTS, CommandKind.AGENT}:
+    if command.kind in {InternalActionKind.TREE, InternalActionKind.AGENTS, InternalActionKind.AGENT}:
         _open_local_web_view(runtime, console, "agents")
         return True
-    if command.kind is CommandKind.OPEN_WEB:
+    if command.kind is InternalActionKind.OPEN_WEB:
         _open_local_web_view(runtime, console, "execution")
         console.write("Workspace opened. Web is the primary control surface; terminal remains a mirror.")
         return True
-    if command.kind == CommandKind.MEMORY:
+    if command.kind == InternalActionKind.MEMORY:
         _show_memory(runtime, console, command.args.get("target"))
         return True
-    if command.kind == CommandKind.PROJECT_BRAIN:
+    if command.kind == InternalActionKind.PROJECT_BRAIN:
         console.write(_project_brain_text(runtime, command.args.get("target")))
         return True
-    if command.kind == CommandKind.QUEUE:
+    if command.kind == InternalActionKind.QUEUE:
         console.write(_queue_text(runtime))
         return True
-    if command.kind == CommandKind.ENQUEUE:
+    if command.kind == InternalActionKind.ENQUEUE:
         item = runtime.store.enqueue_prompt(
             runtime.session_id,
             str(command.args["text"]),
@@ -2995,32 +3249,32 @@ def execute_command(
             f"Queued {item.id[-8:]} · {item.mode.upper()} · position {item.sequence}"
         )
         return True
-    if command.kind == CommandKind.GUIDE:
+    if command.kind == InternalActionKind.GUIDE:
         runtime.add_guidance(str(command.args["text"]))
         console.write("Guidance saved for the current goal.")
         return True
-    if command.kind == CommandKind.EFFECTIVE_PLAN:
+    if command.kind == InternalActionKind.EFFECTIVE_PLAN:
         _open_local_web_view(runtime, console, "plan")
         return True
-    if command.kind == CommandKind.ULTRA_DETAILS:
+    if command.kind == InternalActionKind.ULTRA_DETAILS:
         console.write(_ultra_details_text(runtime, console))
         return True
-    if command.kind == CommandKind.SESSIONS:
+    if command.kind == InternalActionKind.SESSIONS:
         console.write(_sessions_text(runtime))
         return True
-    if command.kind == CommandKind.TRACE:
+    if command.kind == InternalActionKind.TRACE:
         _show_trace(runtime, console, command.args.get("target"))
         return True
-    if command.kind == CommandKind.THINKING:
+    if command.kind == InternalActionKind.THINKING:
         _show_thinking(console)
         return True
-    if command.kind == CommandKind.DETAILS:
+    if command.kind == InternalActionKind.DETAILS:
         console.write(
             "Details\n  The persistent workspace opens collapsed messages and diagnostics here. "
-            "In plain mode use /thinking, /trace, /status, or /history for the corresponding detail."
+            "In plain mode use /live for progress or /advanced-tracing for the complete trace."
         )
         return True
-    if command.kind == CommandKind.ACTIVITY:
+    if command.kind == InternalActionKind.ACTIVITY:
         snapshot = runtime.workflow_runtime_snapshot()
         lines = [
             f"Live workflow activity · {snapshot.phase} · {snapshot.liveness}",
@@ -3039,13 +3293,13 @@ def execute_command(
             )
         console.write("\n".join(lines))
         return True
-    if command.kind == CommandKind.INSIGHTS:
+    if command.kind == InternalActionKind.INSIGHTS:
         _show_insights(runtime, console, command.args.get("target"))
         return True
-    if command.kind == CommandKind.QUESTIONS:
+    if command.kind == InternalActionKind.QUESTIONS:
         _show_questions(runtime, console)
         return True
-    if command.kind == CommandKind.METRICS:
+    if command.kind == InternalActionKind.METRICS:
         _show_metrics(runtime, console)
         return True
     if command.kind == CommandKind.PLAN:
@@ -3055,10 +3309,19 @@ def execute_command(
             )
         _open_local_web_view(runtime, console, "plan")
         return True
-    if command.kind == CommandKind.REVIEW:
+    if command.kind == CommandKind.LIVE:
+        _open_local_web_view(runtime, console, "live")
+        return True
+    if command.kind == CommandKind.SHOW_DIFF:
+        _open_local_web_view(runtime, console, "show-diff")
+        return True
+    if command.kind == CommandKind.ADVANCED_TRACING:
+        _open_local_web_view(runtime, console, "advanced-tracing")
+        return True
+    if command.kind == InternalActionKind.REVIEW:
         _open_local_web_view(runtime, console, "review")
         return True
-    if command.kind == CommandKind.CHAT:
+    if command.kind == InternalActionKind.CHAT:
         entries = runtime.store.list_timeline_entries(runtime.session_id, limit=500)
         if not entries:
             console.write("No durable conversation has been recorded yet.")
@@ -3072,7 +3335,7 @@ def execute_command(
                     f"{message.get('content', '')}"
                 )
         return True
-    if command.kind == CommandKind.EXPLORER:
+    if command.kind == InternalActionKind.EXPLORER:
         path = str(Path(runtime.workspace).resolve(strict=True))
         if os.name == "nt":
             os.startfile(path)  # type: ignore[attr-defined]
@@ -3082,17 +3345,17 @@ def execute_command(
             subprocess.Popen(["xdg-open", path])
         console.write(f"Opened project folder: {path}")
         return True
-    if command.kind == CommandKind.STATUS:
+    if command.kind == InternalActionKind.STATUS:
         _show_runtime_state(runtime, console, force=True)
         return True
-    if command.kind == CommandKind.HISTORY:
+    if command.kind == InternalActionKind.HISTORY:
         _open_local_web_view(runtime, console, "history")
         console.write("History opened in the Workspace. Use the terminal view only as a fallback mirror.")
         return True
-    if command.kind == CommandKind.DIFF:
-        _open_local_web_view(runtime, console, "review")
+    if command.kind == InternalActionKind.DIFF:
+        _open_local_web_view(runtime, console, "show-diff")
         return True
-    if command.kind == CommandKind.VERSIONS:
+    if command.kind == InternalActionKind.VERSIONS:
         _show_versions(runtime, console)
         return True
     if command.kind == CommandKind.UNDO:
@@ -3102,7 +3365,7 @@ def execute_command(
             "The undo itself is preserved in Git history."
         )
         return True
-    if command.kind == CommandKind.AUTO:
+    if command.kind == InternalActionKind.AUTO:
         if preferences.mode == InteractionMode.ULTRA:
             console.write("ULTRA execution already runs in the background after master approval.")
             _show_runtime_state(runtime, console)
@@ -3111,7 +3374,7 @@ def execute_command(
         return True
 
     if command.kind in {
-        CommandKind.GOAL,
+        InternalActionKind.GOAL,
         CommandKind.TEXT,
     }:
         text = command.args.get("objective", command.args.get("text", "")).strip()
@@ -3147,8 +3410,8 @@ def execute_command(
             )
         else:
             result = runtime.apply_command(command)
-    elif preferences.mode == InteractionMode.ULTRA and command.kind == CommandKind.RUN:
-        console.write("ULTRA module waves run in the background; use /agents, /tree, or /pause.")
+    elif preferences.mode == InteractionMode.ULTRA and command.kind == InternalActionKind.RUN:
+        console.write("ULTRA module waves run in the background; use /live, /advanced-tracing, or /pause.")
         result = None
     else:
         result = runtime.apply_command(command)
@@ -3170,6 +3433,7 @@ def execute_command(
         result is not None
         and runtime.active_goal() is not None
         and runtime.active_goal().status == GoalStatus.AWAITING_PLAN_APPROVAL
+        and _uses_plan_web_workspace(runtime)
     ):
         view = runtime.dashboard()
         console.write(f"Plan r{view.plan_revision} is ready. Opening Plan Studio…")
@@ -3190,8 +3454,8 @@ def execute_command(
         _show_questions(runtime, console)
     _show_runtime_state(runtime, console)
     goal_mode_triggers = {
-        CommandKind.GOAL,
-        CommandKind.APPROVE,
+        InternalActionKind.GOAL,
+        InternalActionKind.APPROVE,
         CommandKind.RESUME,
         CommandKind.TEXT,
     }
@@ -3204,10 +3468,10 @@ def execute_command(
         goal = runtime.active_goal()
         if goal is not None and goal.status == GoalStatus.RUNNING:
             reason = {
-                CommandKind.APPROVE: "plan approved",
+                InternalActionKind.APPROVE: "plan approved",
                 CommandKind.RESUME: "goal resumed",
                 CommandKind.TEXT: "guidance received",
-                CommandKind.GOAL: "goal submitted",
+                InternalActionKind.GOAL: "goal submitted",
             }[command.kind]
             console.write(f"Working: {reason}; continuing automatically.")
             _run_auto(runtime, console)
@@ -3325,19 +3589,19 @@ def _plan_attention(
         message=message,
         options=(
             AttentionOption(
-                "open", "Open and review", "open",
-                description="Open the complete plan before deciding whether it should run.",
-                shortcut="o", recommended=True,
-            ),
-            AttentionOption(
                 "start", "Approve and start", "start",
                 description="Approve exactly this revision and begin execution.",
-                shortcut="s",
+                shortcut="a", recommended=True,
             ),
             AttentionOption(
-                "change", "Request changes", "change",
-                description="Describe what the plan should change before any work starts.",
-                shortcut="c",
+                "open", "Review or edit", "open",
+                description="Open the complete plan here; Ctrl+E edits it before approval.",
+                shortcut="r",
+            ),
+            AttentionOption(
+                "web", "Open in website", "web",
+                description="Review the same saved revision and approve it in Plan Studio.",
+                shortcut="w",
             ),
             AttentionOption(
                 "cancel", "Keep paused", "cancel",
@@ -3347,6 +3611,70 @@ def _plan_attention(
         details="\n".join(reasons) or "Every implementation plan requires explicit approval.",
         default_key="cancel",
         cancel_key="cancel",
+        auto_resolve_safe=False,
+    )
+
+
+def _completion_attention(
+    view: DashboardView,
+    *,
+    preview_available: bool = False,
+) -> AttentionRequest:
+    """Offer a small, safe handoff after verified work completes."""
+
+    tasks = tuple(getattr(view, "tasks", ()) or ())
+    completed = sum(
+        str(getattr(task, "status", "")).casefold() in {"done", "completed", "skipped"}
+        for task in tasks
+    )
+    options = [
+        AttentionOption(
+            "explorer",
+            "Open project folder",
+            "explorer",
+            description="Open the finished workspace in the system file explorer.",
+            shortcut="o",
+            recommended=True,
+        )
+    ]
+    if preview_available:
+        options.append(
+            AttentionOption(
+                "preview",
+                "Open running preview",
+                "preview",
+                description="Open the managed local preview recorded by this run.",
+                shortcut="p",
+            )
+        )
+    options.extend(
+        (
+            AttentionOption(
+                "changes",
+                "Review changes",
+                "changes",
+                description="Inspect the final project diff without changing it.",
+                shortcut="r",
+            ),
+            AttentionOption(
+                "dismiss",
+                "Done",
+                "dismiss",
+                description="Close this handoff and return to the composer.",
+                shortcut="d",
+            ),
+        )
+    )
+    count = f"{completed}/{len(tasks)} planned steps complete" if tasks else "Verified work complete"
+    return AttentionRequest(
+        id=f"complete:{getattr(view, 'goal_id', 'goal')}:{time.monotonic_ns()}",
+        kind=AttentionKind.QUESTION,
+        title="Work complete",
+        message=f"{count}. Choose what you want to inspect next.",
+        options=tuple(options),
+        details="The result is saved. These actions only open local read-only views or the recorded preview.",
+        default_key="dismiss",
+        cancel_key="dismiss",
         auto_resolve_safe=False,
     )
 
@@ -3589,6 +3917,88 @@ def _persistent_interactive_loop(
         last_swarm_refresh = 0.0
         cached_swarm_snapshot: Mapping[str, Any] = {}
         workspace_auto_opened = False
+        pending_plan_attention_id = ""
+        pending_plan_key = ""
+        pending_completion_attention_id = ""
+        pending_completion_goal_id = ""
+
+        def clear_pending_plan_attention(*, origin: str = "controller") -> None:
+            """Retire a stale plan card after approval, editing, or cancellation."""
+
+            nonlocal pending_plan_attention_id, pending_plan_key
+            request_id = pending_plan_attention_id
+            if not request_id:
+                return
+            active = store.active_attention()
+            if active is not None and active.id == request_id:
+                store.resolve_attention("cancel", origin=origin)
+            store.take_attention_result(request_id)
+            pending_plan_attention_id = ""
+            pending_plan_key = ""
+
+        def clear_pending_completion_attention(*, origin: str = "controller") -> None:
+            """Retire the completion handoff when a new goal or state takes over."""
+
+            nonlocal pending_completion_attention_id, pending_completion_goal_id
+            request_id = pending_completion_attention_id
+            if not request_id:
+                return
+            active = store.active_attention()
+            if active is not None and active.id == request_id:
+                store.resolve_attention("dismiss", origin=origin)
+            store.take_attention_result(request_id)
+            pending_completion_attention_id = ""
+            pending_completion_goal_id = ""
+
+        def managed_preview_url() -> str:
+            """Return one recorded loopback preview without trusting arbitrary URLs."""
+
+            try:
+                with tools.workspace_context(runtime.workspace):
+                    previews = tools.web_preview.list_previews()
+            except Exception:
+                return ""
+            for preview in tuple(previews or ()):
+                if not isinstance(preview, Mapping):
+                    continue
+                value = str(preview.get("url") or "").strip()
+                parsed = urlsplit(value)
+                if (
+                    parsed.scheme in {"http", "https"}
+                    and (parsed.hostname or "").casefold()
+                    in {"127.0.0.1", "localhost", "::1"}
+                    and parsed.username is None
+                    and parsed.password is None
+                ):
+                    return parsed._replace(fragment="").geturl()
+            return ""
+
+        def open_managed_preview(url: str) -> None:
+            """Open a preview only after the user selects the completion action."""
+
+            if not url:
+                store.append_transcript(
+                    "assistant",
+                    "No managed preview is running. The project folder and final diff are still available.",
+                )
+                return
+            try:
+                import webbrowser
+
+                opened = bool(webbrowser.open(url, new=2))
+            except Exception as exc:
+                store.append_transcript(
+                    "assistant",
+                    f"Could not open the managed preview: {redact_text(exc, 500)}",
+                )
+                return
+            store.append_transcript(
+                "assistant",
+                "Opened the managed preview in your browser."
+                if opened
+                else f"Open the managed preview manually: {url}",
+                event_key=f"completion-preview:{time.monotonic_ns()}",
+            )
 
         def switch_session(target_session_id: str) -> None:
             """Rebuild the runtime from one secret-free saved checkpoint."""
@@ -3719,11 +4129,14 @@ def _persistent_interactive_loop(
             open_workspace_after_intake = False
             if isinstance(action, UserCommand):
                 last_command = action
-                if action.kind in {CommandKind.TEXT, CommandKind.GOAL}:
+                if action.kind in {CommandKind.TEXT, InternalActionKind.GOAL}:
                     console.set_workflow_phase(
                         "plan" if preferences.mode is InteractionMode.PLAN else "working"
                     )
-                    if not workspace_auto_opened:
+                    if (
+                        _uses_plan_web_workspace(runtime)
+                        and not workspace_auto_opened
+                    ):
                         workspace_auto_opened = True
                         open_workspace_after_intake = True
             next_slow_notice = 60.0
@@ -3943,7 +4356,12 @@ def _persistent_interactive_loop(
                 )
             )
             if choice.value:
-                start(parse_command(f"/permissions {choice.value}"))
+                start(
+                    internal_action(
+                        InternalActionKind.PERMISSIONS,
+                        level=choice.value,
+                    )
+                )
 
         def handle_model(
             *,
@@ -4230,11 +4648,11 @@ def _persistent_interactive_loop(
             elif action == "stop":
                 interrupt()
             elif action == "changes":
-                start(parse_command("/diff"))
+                start(internal_action(InternalActionKind.DIFF, target=None))
             elif action == "result":
-                start(parse_command("/processes"))
+                start(internal_action(InternalActionKind.PROCESSES))
             elif action == "status":
-                start(parse_command("/status"))
+                start(internal_action(InternalActionKind.STATUS))
             elif action == "permissions":
                 handle_permissions()
             elif action == "new":
@@ -4287,17 +4705,35 @@ def _persistent_interactive_loop(
             """Open read-only workspace overlays without touching live engine objects."""
 
             nonlocal cached_swarm_snapshot, last_swarm_refresh
-            if command.kind is CommandKind.ACTIVITY:
+            if command.kind is InternalActionKind.ACTIVITY:
                 app.open_details(
                     "Live workflow activity",
                     app._activity_timeline_text(),
                     kind="activity",
                 )
                 return True
-            if command.kind in {CommandKind.AGENTS, CommandKind.AGENT, CommandKind.TREE}:
-                _open_local_web_view(runtime, console, "agents")
+            if command.kind in {InternalActionKind.AGENTS, InternalActionKind.AGENT, InternalActionKind.TREE}:
+                run = _current_ultra_run(runtime)
+                if run is None:
+                    cached_swarm_snapshot = {
+                        "run_id": "",
+                        "status": "idle",
+                        "nodes": (),
+                        "agents": (),
+                        "profiles": {},
+                        "traces": {},
+                    }
+                else:
+                    cached_swarm_snapshot = _swarm_inspector_snapshot(runtime, run)
+                    store.update_swarm_summary(cached_swarm_snapshot)
+                last_swarm_refresh = time.monotonic()
+                app.open_swarm(
+                    cached_swarm_snapshot,
+                    tab="tree" if command.kind is InternalActionKind.TREE else "agents",
+                    target=str(command.args.get("target") or "") or None,
+                )
                 return True
-            if command.kind is CommandKind.OPEN_WEB:
+            if command.kind is InternalActionKind.OPEN_WEB:
                 _open_local_web_view(runtime, console, "execution")
                 return True
             if command.kind is CommandKind.PLAN:
@@ -4312,16 +4748,28 @@ def _persistent_interactive_loop(
                     store.update_workflow_mode("plan")
                 _open_local_web_view(runtime, console, "plan")
                 return True
-            if command.kind is CommandKind.REVIEW:
+            if command.kind is CommandKind.LIVE:
+                _open_local_web_view(runtime, console, "live")
+                return True
+            if command.kind is CommandKind.SHOW_DIFF:
+                _open_local_web_view(runtime, console, "show-diff")
+                return True
+            if command.kind is CommandKind.ADVANCED_TRACING:
+                _open_local_web_view(runtime, console, "advanced-tracing")
+                return True
+            if command.kind is CommandKind.SETTINGS:
+                _execute_settings(runtime, console, preferences, command)
+                return True
+            if command.kind is InternalActionKind.REVIEW:
                 _open_local_web_view(runtime, console, "review")
                 return True
-            if command.kind is CommandKind.DIFF:
-                _open_local_web_view(runtime, console, "review")
+            if command.kind is InternalActionKind.DIFF:
+                _open_local_web_view(runtime, console, "show-diff")
                 return True
-            if command.kind is CommandKind.HISTORY:
+            if command.kind is InternalActionKind.HISTORY:
                 _open_local_web_view(runtime, console, "history")
                 return True
-            if command.kind is CommandKind.CHAT:
+            if command.kind is InternalActionKind.CHAT:
                 entries = runtime.store.list_timeline_entries(runtime.session_id, limit=500)
                 lines: list[str] = []
                 last_message: tuple[str, str] | None = None
@@ -4349,7 +4797,7 @@ def _persistent_interactive_loop(
                     kind="chat",
                 )
                 return True
-            if command.kind is CommandKind.EXPLORER:
+            if command.kind is InternalActionKind.EXPLORER:
                 try:
                     path = str(Path(runtime.workspace).resolve(strict=True))
                     if os.name == "nt":
@@ -4364,21 +4812,7 @@ def _persistent_interactive_loop(
                 except Exception as exc:
                     store.append_transcript("assistant", f"Could not open the project folder: {exc}")
                 return True
-            if command.kind is CommandKind.DIFF:
-                target = command.args.get("target")
-                app.open_details("Changes", "Loading the project diff…", kind="diff")
-
-                def load_diff() -> None:
-                    try:
-                        value = runtime.version_control.diff(target)
-                    except Exception as exc:
-                        value = f"Diff unavailable: {exc}"
-                    publish_change_summary(value)
-                    app.open_details("Project changes", value, kind="diff")
-
-                Thread(target=load_diff, name="ga3bad-diff-observer", daemon=True).start()
-                return True
-            if command.kind is CommandKind.THINKING:
+            if command.kind is InternalActionKind.THINKING:
                 action = str(command.args.get("action") or "show")
                 if action == "hide":
                     if app.overlay_kind == "thinking":
@@ -4411,24 +4845,24 @@ def _persistent_interactive_loop(
                     kind="thinking",
                 )
                 return True
-            if command.kind is CommandKind.QUEUE:
+            if command.kind is InternalActionKind.QUEUE:
                 app.open_details("Prompt Queue", _queue_text(runtime), kind="queue")
                 return True
-            if command.kind in {CommandKind.MEMORY, CommandKind.PROJECT_BRAIN}:
+            if command.kind in {InternalActionKind.MEMORY, InternalActionKind.PROJECT_BRAIN}:
                 app.open_details(
                     "Project Brain",
                     _project_brain_text(runtime, command.args.get("target")),
                     kind="project_brain",
                 )
                 return True
-            if command.kind is CommandKind.EFFECTIVE_PLAN:
+            if command.kind is InternalActionKind.EFFECTIVE_PLAN:
                 app.open_details(
                     "Effective Plan",
                     _effective_plan_text(runtime),
                     kind="effective_plan",
                 )
                 return True
-            if command.kind is CommandKind.SESSIONS:
+            if command.kind is InternalActionKind.SESSIONS:
                 if command.args.get("target"):
                     return False
                 app.open_details(
@@ -4437,14 +4871,14 @@ def _persistent_interactive_loop(
                     kind="sessions",
                 )
                 return True
-            if command.kind is CommandKind.ULTRA_DETAILS:
+            if command.kind is InternalActionKind.ULTRA_DETAILS:
                 app.open_details(
                     "Execution details",
                     _ultra_details_text(runtime, console),
                     kind="ultra_details",
                 )
                 return True
-            if command.kind is CommandKind.DETAILS:
+            if command.kind is InternalActionKind.DETAILS:
                 snapshot = store.snapshot()
                 target = str(command.args.get("target") or "").strip()
                 entry = None
@@ -5053,9 +5487,9 @@ def _persistent_interactive_loop(
                         break
                     if pending_controls:
                         control = pending_controls.pop(0)
-                        if control.kind is CommandKind.MODEL and not control.args.get("model") and not control.args.get("effort"):
+                        if control.kind is InternalActionKind.MODEL and not control.args.get("model") and not control.args.get("effort"):
                             start(handle_model, summary="Checking available models")
-                        elif control.kind is CommandKind.PERMISSIONS and not control.args.get("level"):
+                        elif control.kind is InternalActionKind.PERMISSIONS and not control.args.get("level"):
                             handle_permissions()
                         else:
                             start(control, summary="Applying the queued session change")
@@ -5168,6 +5602,7 @@ def _persistent_interactive_loop(
                     )
                     if web_execution_requested or recover_running_goal:
                         if approved_goal is not None and approved_goal.status is GoalStatus.RUNNING:
+                            clear_pending_plan_attention(origin="web")
                             continued_running_goals.add(approved_goal.id)
                             console.set_workflow_phase(runtime.interaction_mode.value)
                             console.set_runtime_snapshot(
@@ -5526,20 +5961,125 @@ def _persistent_interactive_loop(
 
                     goal = runtime.active_goal()
                     goal_id = str(getattr(goal, "id", ""))
+                    if pending_plan_attention_id and (
+                        goal is None
+                        or goal.status != GoalStatus.AWAITING_PLAN_APPROVAL
+                    ):
+                        clear_pending_plan_attention(origin="state_change")
                     if goal is not None and goal.status == GoalStatus.AWAITING_PLAN_APPROVAL:
                         view = runtime.dashboard()
                         plan_key = f"{goal_id}:r{view.plan_revision}"
-                        if plan_key not in reviewed_plans:
-                            reviewed_plans.add(plan_key)
-                            store.set_activity(ActivityStage.PAUSED, "Review the plan", running=False)
-                            store.append_transcript(
-                                "assistant",
-                                f"Plan r{view.plan_revision} is ready. Plan Studio opened in your browser.",
+                        if (
+                            pending_plan_attention_id
+                            and pending_plan_key
+                            and pending_plan_key != plan_key
+                        ):
+                            clear_pending_plan_attention(origin="plan_revision_changed")
+                        if pending_plan_attention_id:
+                            resolution = store.take_attention_result(
+                                pending_plan_attention_id
                             )
-                            _open_local_web_view(runtime, console, "plan")
+                            if resolution is not None:
+                                resolved_request = pending_plan_attention_id
+                                pending_plan_attention_id = ""
+                                pending_plan_key = ""
+                                if resolution.value == "start":
+                                    start(
+                                        internal_action(
+                                            InternalActionKind.APPROVE,
+                                            revision=view.plan_revision,
+                                        ),
+                                        summary=(
+                                            f"Approving plan r{view.plan_revision} "
+                                            "and starting work"
+                                        ),
+                                    )
+                                elif resolution.value == "open":
+                                    try:
+                                        document = runtime.plan_document()
+                                    except Exception as exc:
+                                        document = (
+                                            "The saved plan could not be opened here.\n\n"
+                                            f"{redact_text(exc, 800)}"
+                                        )
+                                    app.open_details(
+                                        f"Plan r{view.plan_revision}",
+                                        document,
+                                        kind="plan",
+                                    )
+                                    reviewed_plans.discard(plan_key)
+                                elif resolution.value == "web":
+                                    store.append_transcript(
+                                        "assistant",
+                                        (
+                                            f"Opening Plan r{view.plan_revision} in Plan Studio. "
+                                            "You can approve the same saved revision there or return to this terminal card."
+                                        ),
+                                        event_key=f"plan-web:{plan_key}:{resolved_request}",
+                                    )
+                                    _open_local_web_view(runtime, console, "plan")
+                                    reviewed_plans.discard(plan_key)
+                                else:
+                                    store.set_activity(
+                                        ActivityStage.PAUSED,
+                                        f"Plan r{view.plan_revision} remains paused",
+                                        running=False,
+                                    )
+                                continue
+                        elif plan_key not in reviewed_plans:
+                            reviewed_plans.add(plan_key)
+                            request = _plan_attention(
+                                view,
+                                plan_review_reasons(view),
+                                plan_only=False,
+                            )
+                            pending_plan_attention_id = request.id
+                            pending_plan_key = plan_key
+                            store.set_activity(
+                                ActivityStage.PAUSED,
+                                f"Plan r{view.plan_revision} needs your approval",
+                                running=False,
+                            )
+                            store.present_attention(request)
+
+                    goal_completed = (
+                        goal is not None
+                        and str(goal.status.value) == "completed"
+                    )
+                    if pending_completion_attention_id and (
+                        not goal_completed
+                        or goal_id != pending_completion_goal_id
+                    ):
+                        clear_pending_completion_attention(origin="state_change")
+                    if goal_completed and pending_completion_attention_id:
+                        resolution = store.take_attention_result(
+                            pending_completion_attention_id
+                        )
+                        if resolution is not None:
+                            pending_completion_attention_id = ""
+                            pending_completion_goal_id = ""
+                            if resolution.value == "explorer":
+                                open_live_observer(
+                                    internal_action(InternalActionKind.EXPLORER)
+                                )
+                            elif resolution.value == "preview":
+                                open_managed_preview(managed_preview_url())
+                            elif resolution.value == "changes":
+                                open_live_observer(
+                                    internal_action(InternalActionKind.DIFF, target=None)
+                                )
+                            if resolution.value != "dismiss":
+                                view = runtime.dashboard()
+                                request = _completion_attention(
+                                    view,
+                                    preview_available=bool(managed_preview_url()),
+                                )
+                                pending_completion_attention_id = request.id
+                                pending_completion_goal_id = goal_id
+                                store.present_attention(request)
                             continue
 
-                    if goal is not None and str(goal.status.value) == "completed" and goal_id not in completed_goals:
+                    if goal_completed and goal_id not in completed_goals:
                         completed_goals.add(goal_id)
                         view = runtime.dashboard()
                         completed = sum(task.status in {"done", "skipped"} for task in view.tasks)
@@ -5570,11 +6110,18 @@ def _persistent_interactive_loop(
                             "assistant",
                             (
                                 f"Done. {completed}/{len(view.tasks)} planned steps completed. "
-                                + files_receipt
-                                + verification_receipt
-                                + " Press Ctrl+K for status, changes, and managed previews."
+                                 + files_receipt
+                                 + verification_receipt
+                                + " Choose a result action below."
                             ),
                         )
+                        request = _completion_attention(
+                            view,
+                            preview_available=bool(managed_preview_url()),
+                        )
+                        pending_completion_attention_id = request.id
+                        pending_completion_goal_id = goal_id
+                        store.present_attention(request)
 
                     if sync_durable_queue():
                         continue
@@ -5614,7 +6161,7 @@ def _persistent_interactive_loop(
                             "assistant",
                             (
                                 f"{item.target} credential saved as {variable}. "
-                                "Use /model at the next checkpoint to select or reconnect it. "
+                                "Use Runtime / Model in Settings at the next checkpoint to reconnect it. "
                                 "The key was not added to chat history."
                             ),
                             event_key=f"api-key:{item.target}:{time.monotonic_ns()}",
@@ -5623,6 +6170,7 @@ def _persistent_interactive_loop(
                 text = item.text.strip()
                 if item.kind == "plan_save" and text:
                     if active_work is None:
+                        clear_pending_plan_attention(origin="plan_edit")
                         app.close_overlay()
                         start(
                             lambda value=item.text: runtime.replace_plan_document(value),
@@ -5648,7 +6196,13 @@ def _persistent_interactive_loop(
                         if active_work is None:
                             start(handle_model, summary="Checking available models")
                         else:
-                            pending_controls[:] = [parse_command("/model")]
+                            pending_controls[:] = [
+                                internal_action(
+                                    InternalActionKind.MODEL,
+                                    model=None,
+                                    effort=None,
+                                )
+                            ]
                             interrupt()
                             store.append_transcript(
                                 "assistant",
@@ -5658,7 +6212,12 @@ def _persistent_interactive_loop(
                         if active_work is None:
                             handle_permissions()
                         else:
-                            pending_controls[:] = [parse_command("/permissions")]
+                            pending_controls[:] = [
+                                internal_action(
+                                    InternalActionKind.PERMISSIONS,
+                                    level=None,
+                                )
+                            ]
                             interrupt()
                             store.append_transcript(
                                 "assistant",
@@ -5676,6 +6235,18 @@ def _persistent_interactive_loop(
                             )
                     elif item.kind == "sleep_toggle":
                         console.toggle_sleep_mode()
+                    elif item.kind == "diff":
+                        start(internal_action(InternalActionKind.DIFF, target=None))
+                    elif item.kind == "explorer":
+                        start(internal_action(InternalActionKind.EXPLORER))
+                    elif item.kind == "agents":
+                        start(
+                            internal_action(
+                                InternalActionKind.AGENTS,
+                                target=None,
+                                all=True,
+                            )
+                        )
                     continue
                 if item.kind == "actions":
                     if active_work is None:
@@ -5749,40 +6320,46 @@ def _persistent_interactive_loop(
                 if active_work is not None:
                     try:
                         active_command = parse_command(text)
-                    except UnknownCommandParseError:
-                        active_command = UserCommand(CommandKind.TEXT, {"text": text, "unknown_command": True}, raw=text)
+                    except UnknownCommandParseError as exc:
+                        store.append_transcript("assistant", str(exc))
+                        continue
                     except CommandParseError as exc:
                         store.append_transcript("assistant", f"I couldn’t understand that: {exc}")
                         continue
                     observer_kinds = {
-                        CommandKind.STATUS, CommandKind.PLAN, CommandKind.REVIEW, CommandKind.DIFF,
-                        CommandKind.CHAT, CommandKind.EXPLORER,
-                        CommandKind.PROCESSES, CommandKind.THINKING, CommandKind.AGENTS,
-                        CommandKind.AGENT, CommandKind.TREE, CommandKind.METRICS,
-                        CommandKind.MEMORY, CommandKind.TRACE, CommandKind.INSIGHTS,
-                        CommandKind.HISTORY, CommandKind.VERSIONS, CommandKind.HELP,
-                        CommandKind.KEYMAP, CommandKind.SLEEP, CommandKind.DETAILS,
-                        CommandKind.ACTIVITY,
-                        CommandKind.QUEUE, CommandKind.PROJECT_BRAIN,
-                        CommandKind.EFFECTIVE_PLAN, CommandKind.ULTRA_DETAILS,
-                        CommandKind.SESSIONS,
+                        InternalActionKind.STATUS, CommandKind.PLAN, CommandKind.LIVE,
+                        CommandKind.ADVANCED_TRACING, InternalActionKind.REVIEW, InternalActionKind.DIFF,
+                        CommandKind.SETTINGS,
+                        InternalActionKind.CHAT, InternalActionKind.EXPLORER,
+                        InternalActionKind.PROCESSES, InternalActionKind.THINKING, InternalActionKind.AGENTS,
+                        InternalActionKind.AGENT, InternalActionKind.TREE, InternalActionKind.METRICS,
+                        InternalActionKind.MEMORY, InternalActionKind.TRACE, InternalActionKind.INSIGHTS,
+                        InternalActionKind.HISTORY, InternalActionKind.VERSIONS, CommandKind.HELP,
+                        InternalActionKind.KEYMAP, InternalActionKind.SLEEP, InternalActionKind.DETAILS,
+                        InternalActionKind.ACTIVITY,
+                        InternalActionKind.QUEUE, InternalActionKind.PROJECT_BRAIN,
+                        InternalActionKind.EFFECTIVE_PLAN, InternalActionKind.ULTRA_DETAILS,
+                        InternalActionKind.SESSIONS,
                     }
                     if active_command.kind is CommandKind.MENU and text == "/":
                         active_command = UserCommand(CommandKind.TEXT, {"text": text}, raw=text)
                     if active_command.kind in {
-                        CommandKind.MODE,
-                        CommandKind.MODEL,
-                        CommandKind.PERMISSIONS,
+                        InternalActionKind.MODE,
+                        InternalActionKind.MODEL,
+                        InternalActionKind.PERMISSIONS,
                     }:
                         if (
-                            active_command.kind is CommandKind.MODE
+                            active_command.kind is InternalActionKind.MODE
                             and not active_command.args.get("mode")
                         ):
                             selected_mode = handle_workflow_mode(apply=False)
                             if not selected_mode:
                                 continue
-                            active_command = parse_command(f"/mode {selected_mode}")
-                        if active_command.kind is CommandKind.MODE:
+                            active_command = internal_action(
+                                InternalActionKind.MODE,
+                                mode=selected_mode,
+                            )
+                        if active_command.kind is InternalActionKind.MODE:
                             issue = runtime.mode_transition_issue(
                                 str(active_command.args.get("mode") or "")
                             )
@@ -5804,7 +6381,7 @@ def _persistent_interactive_loop(
                         continue
                     if active_command.kind in observer_kinds:
                         if (
-                            active_command.kind is CommandKind.SESSIONS
+                            active_command.kind is InternalActionKind.SESSIONS
                             and active_command.args.get("target")
                         ):
                             pending_session_switch[:] = [
@@ -5818,7 +6395,7 @@ def _persistent_interactive_loop(
                             continue
                         if open_live_observer(active_command):
                             pass
-                        elif active_command.kind is CommandKind.STATUS:
+                        elif active_command.kind is InternalActionKind.STATUS:
                             current = store.snapshot()
                             progress = current.progress
                             count = (
@@ -5833,7 +6410,7 @@ def _persistent_interactive_loop(
                                 "This is the latest presentation snapshot; work is still active.",
                             )
                         elif active_command.kind in {
-                            CommandKind.HELP, CommandKind.KEYMAP, CommandKind.SLEEP,
+                            CommandKind.HELP, InternalActionKind.KEYMAP, InternalActionKind.SLEEP,
                         }:
                             execute_command(runtime, console, active_command, preferences)
                         else:
@@ -5843,7 +6420,7 @@ def _persistent_interactive_loop(
                                 "That detail view is queued for the next safe checkpoint so it cannot race the active worker.",
                             )
                         continue
-                    if active_command.kind is CommandKind.ENQUEUE:
+                    if active_command.kind is InternalActionKind.ENQUEUE:
                         try:
                             queued_item = runtime.store.enqueue_prompt(
                                 runtime.session_id,
@@ -5861,7 +6438,7 @@ def _persistent_interactive_loop(
                                 f"Queued {queued_item.id[-8:]} in {queued_item.mode.upper()} mode.",
                             )
                         continue
-                    if active_command.kind is CommandKind.GUIDE:
+                    if active_command.kind is InternalActionKind.GUIDE:
                         try:
                             runtime.add_guidance(str(active_command.args["text"]))
                             store.append_transcript(
@@ -5890,7 +6467,7 @@ def _persistent_interactive_loop(
                         except Exception as exc:
                             store.append_transcript("assistant", f"Stop could not be completed: {redact_text(exc, 500)}")
                         continue
-                    if active_command.kind is CommandKind.CANCEL:
+                    if active_command.kind is InternalActionKind.CANCEL:
                         # Ask for confirmation on the input thread; the worker
                         # is only checkpointed, never replayed or force-killed.
                         interrupt()
@@ -5975,8 +6552,9 @@ def _persistent_interactive_loop(
                     continue
                 try:
                     command = parse_command(text)
-                except UnknownCommandParseError:
-                    command = UserCommand(CommandKind.TEXT, {"text": text, "unknown_command": True}, raw=text)
+                except UnknownCommandParseError as exc:
+                    store.append_transcript("assistant", str(exc))
+                    continue
                 except CommandParseError as exc:
                     store.append_transcript("assistant", f"I couldn’t understand that: {exc}")
                     continue
@@ -6000,16 +6578,16 @@ def _persistent_interactive_loop(
                         continue
                 if open_live_observer(command):
                     continue
-                if command.kind is CommandKind.MODEL and not command.args.get("model") and not command.args.get("effort"):
+                if command.kind is InternalActionKind.MODEL and not command.args.get("model") and not command.args.get("effort"):
                     start(handle_model, summary="Checking available models")
                     continue
-                if command.kind is CommandKind.PERMISSIONS and not command.args.get("level"):
+                if command.kind is InternalActionKind.PERMISSIONS and not command.args.get("level"):
                     handle_permissions()
                     continue
-                if command.kind is CommandKind.MODE and not command.args.get("mode"):
+                if command.kind is InternalActionKind.MODE and not command.args.get("mode"):
                     handle_workflow_mode()
                     continue
-                if command.kind is CommandKind.MODE:
+                if command.kind is InternalActionKind.MODE:
                     issue = runtime.mode_transition_issue(
                         str(command.args.get("mode") or "")
                     )
@@ -6017,7 +6595,7 @@ def _persistent_interactive_loop(
                         store.append_transcript("assistant", issue)
                         continue
                 if (
-                    command.kind is CommandKind.SESSIONS
+                    command.kind is InternalActionKind.SESSIONS
                     and command.args.get("target")
                 ):
                     try:
@@ -6178,34 +6756,37 @@ def _legacy_interactive_loop(
 
     background_kinds = {
         CommandKind.TEXT,
-        CommandKind.GOAL,
-        CommandKind.RUN,
-        CommandKind.AUTO,
-        CommandKind.APPROVE,
+        InternalActionKind.GOAL,
+        InternalActionKind.RUN,
+        InternalActionKind.AUTO,
+        InternalActionKind.APPROVE,
         CommandKind.RESUME,
     }
     active_observer_kinds = {
-        CommandKind.STATUS,
-        CommandKind.THINKING,
-        CommandKind.DETAILS,
-        CommandKind.ACTIVITY,
-        CommandKind.AGENTS,
-        CommandKind.AGENT,
-        CommandKind.TREE,
+        InternalActionKind.STATUS,
+        InternalActionKind.THINKING,
+        InternalActionKind.DETAILS,
+        InternalActionKind.ACTIVITY,
+        InternalActionKind.AGENTS,
+        InternalActionKind.AGENT,
+        InternalActionKind.TREE,
         CommandKind.PLAN,
-        CommandKind.QUESTIONS,
-        CommandKind.METRICS,
-        CommandKind.MEMORY,
-        CommandKind.TRACE,
-        CommandKind.INSIGHTS,
-        CommandKind.HISTORY,
-        CommandKind.DIFF,
-        CommandKind.VERSIONS,
-        CommandKind.PROCESSES,
+        CommandKind.LIVE,
+        CommandKind.ADVANCED_TRACING,
+        CommandKind.SETTINGS,
+        InternalActionKind.QUESTIONS,
+        InternalActionKind.METRICS,
+        InternalActionKind.MEMORY,
+        InternalActionKind.TRACE,
+        InternalActionKind.INSIGHTS,
+        InternalActionKind.HISTORY,
+        InternalActionKind.DIFF,
+        InternalActionKind.VERSIONS,
+        InternalActionKind.PROCESSES,
         CommandKind.HELP,
-        CommandKind.KEYMAP,
+        InternalActionKind.KEYMAP,
         CommandKind.PAUSE,
-        CommandKind.SLEEP,
+        InternalActionKind.SLEEP,
     }
     while True:
         if console.has_pending_approval() is True:
@@ -6259,7 +6840,11 @@ def _legacy_interactive_loop(
                     and goal.status == GoalStatus.AWAITING_PLAN_APPROVAL
                     else None
                 )
-                if plan_key and plan_key != deferred_plan_review:
+                if (
+                    plan_key
+                    and plan_key != deferred_plan_review
+                    and _uses_plan_web_workspace(runtime)
+                ):
                     deferred_plan_review = plan_key
                     view = runtime.dashboard()
                     console.write(
@@ -6302,7 +6887,7 @@ def _legacy_interactive_loop(
                 continue
             if active_work is not None and command.kind not in active_observer_kinds:
                 console.write(
-                    "This action waits for a safe checkpoint. Use /status to inspect work "
+                    "This action waits for a safe checkpoint. Use /live to inspect work "
                     "or /pause to stop cooperatively."
                 )
                 continue
@@ -6476,6 +7061,53 @@ def _load_saved_project_setup(workspace: Path) -> dict[str, Any]:
     return setup
 
 
+def _latest_recoverable_session_id(workspace: Path) -> str | None:
+    """Select the newest goal-owning session for an explicit resume command.
+
+    ``workspace-session`` is a valid empty landing thread, but it must not hide
+    a durable goal stored in another session. This lookup is intentionally used
+    only for explicit recovery; ordinary commands keep their stable default
+    thread and ``--new-session`` remains fully isolated.
+    """
+
+    recoverable_statuses = {
+        "new",
+        "discovering",
+        "awaiting_plan_approval",
+        "running",
+        "revising",
+        "verifying",
+        "reviewing",
+        "paused",
+        "recovering",
+        "blocked",
+    }
+    recovery_store: StateStore | None = None
+    try:
+        recovery_store = StateStore(workspace)
+        candidates = []
+        for session in recovery_store.list_workflow_sessions(limit=100):
+            goal_id = str(session.get("goal_id") or "").strip()
+            goal_status = str(session.get("goal_status") or "").casefold()
+            if not goal_id:
+                # Legacy/crash-window rows can lose the denormalized
+                # workflow_sessions.goal_id even though goals.session_id still
+                # owns the durable goal. Recover from the authoritative Goal
+                # relation so an empty default row cannot hide that session.
+                legacy_goal = recovery_store.get_latest_goal(str(session["id"]))
+                if legacy_goal is not None:
+                    goal_id = legacy_goal.id
+                    goal_status = legacy_goal.status.value
+            if goal_id and goal_status in recoverable_statuses:
+                candidates.append(session)
+    except (OSError, StateStoreError, ValueError, RuntimeError):
+        return None
+    finally:
+        if recovery_store is not None:
+            recovery_store.close()
+    return str(candidates[0]["id"]) if candidates else None
+
+
 def _interactive_setup(
     args: argparse.Namespace,
     console: ConsoleUI,
@@ -6533,7 +7165,10 @@ def _interactive_setup(
                     requested_access = AccessLevel.parse(str(saved_state["access_level"]))
             except ValueError:
                 requested_access = None
-        if selected_mode is None:
+        # Workflow presentation is a per-session choice. A fresh thread may
+        # reuse the project's model, protection, and permission profile, but
+        # it must not silently inherit an old Ultra Plan selection.
+        if selected_mode is None and not args.new_session:
             saved_mode = str(
                 saved_state.get("interaction_mode")
                 or saved_setup.get("session_mode")
@@ -6729,6 +7364,28 @@ def main(argv: Iterable[str] | None = None) -> int:
         ).strip().lower() in {"1", "true", "yes", "on"}
         selected_provider = _configure_provider_environment(args.provider, args.model)
         interactive_launch = bool(args.interactive or not args.command)
+        explicit_resume_requested = False
+        for raw in args.command:
+            try:
+                explicit_resume_requested = (
+                    parse_command(raw).kind is CommandKind.RESUME
+                    or explicit_resume_requested
+                )
+            except CommandParseError:
+                continue
+        if (
+            explicit_resume_requested
+            and not args.session
+            and not args.new_session
+            and args.workspace
+        ):
+            recovery_workspace = _resolve_workspace(
+                Path(args.workspace).expanduser(),
+                create=False,
+            )
+            detected_session = _latest_recoverable_session_id(recovery_workspace)
+            if detected_session:
+                args.session = detected_session
         if args.session:
             if args.provider or args.model:
                 console.write(
@@ -6859,12 +7516,12 @@ def main(argv: Iterable[str] | None = None) -> int:
                         kind = CommandKind.TEXT
                     if kind in {
                         CommandKind.TEXT,
-                        CommandKind.GOAL,
-                        CommandKind.APPROVE,
-                        CommandKind.REJECT,
-                        CommandKind.REPLAN,
-                        CommandKind.RUN,
-                        CommandKind.AUTO,
+                        InternalActionKind.GOAL,
+                        InternalActionKind.APPROVE,
+                        InternalActionKind.REJECT,
+                        InternalActionKind.REPLAN,
+                        InternalActionKind.RUN,
+                        InternalActionKind.AUTO,
                         CommandKind.RESUME,
                     }:
                         model_required = True
@@ -6924,12 +7581,12 @@ def main(argv: Iterable[str] | None = None) -> int:
                         kind = CommandKind.TEXT
                     if kind in {
                         CommandKind.TEXT,
-                        CommandKind.GOAL,
-                        CommandKind.APPROVE,
-                        CommandKind.REJECT,
-                        CommandKind.REPLAN,
-                        CommandKind.RUN,
-                        CommandKind.AUTO,
+                        InternalActionKind.GOAL,
+                        InternalActionKind.APPROVE,
+                        InternalActionKind.REJECT,
+                        InternalActionKind.REPLAN,
+                        InternalActionKind.RUN,
+                        InternalActionKind.AUTO,
                         CommandKind.RESUME,
                     }:
                         model_required = True
@@ -6984,16 +7641,24 @@ def main(argv: Iterable[str] | None = None) -> int:
         if owner_lease is None:
             existing = SessionOwnerLease.read_existing(workspace, session_id)
             if existing is not None and existing.web_port and existing.web_token:
-                import webbrowser
-
+                plan_workspace_requested = preferences.mode is InteractionMode.PLAN
+                view = "plan" if plan_workspace_requested else "live"
                 url = (
                     f"http://127.0.0.1:{existing.web_port}/sessions/"
-                    f"{quote(existing.session_id, safe='')}/execution?token={quote(existing.web_token, safe='')}"
+                    f"{quote(existing.session_id, safe='')}/{view}?token={quote(existing.web_token, safe='')}"
                 )
-                opened = bool(webbrowser.open(url, new=2))
+                opened = False
+                if plan_workspace_requested:
+                    import webbrowser
+
+                    opened = bool(webbrowser.open(url, new=2))
                 console.write(
                     "This workspace is already running in another GA3BAD session; "
-                    + ("opened its live Web workspace." if opened else f"open {url}")
+                    + (
+                        "opened its Ultra Plan workspace."
+                        if opened
+                        else f"open {url} explicitly if you want the Web observer"
+                    )
                 )
             else:
                 console.write(
@@ -7093,6 +7758,16 @@ def main(argv: Iterable[str] | None = None) -> int:
                 f"{runtime.execution_class} · {runtime.access_level} · state .coding-agent/state.db"
             )
 
+        if (
+            interactive_launch
+            and preferences.mode is InteractionMode.PLAN
+            and not recovering_workflow
+            and runtime.active_goal() is None
+            and not args.command
+        ):
+            console.write("Ultra Plan is opening in your browser.")
+            _open_local_web_view(runtime, console, "plan")
+
         for raw in args.command:
             try:
                 if not execute_command(runtime, console, parse_command(raw), preferences):
@@ -7131,11 +7806,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             except KeyboardInterrupt:
                 runtime.checkpoint_interrupt()
                 return 130
-        if (args.interactive or not args.command) and recovering_workflow:
+        if (
+            (args.interactive or not args.command)
+            and recovering_workflow
+            and _uses_plan_web_workspace(runtime)
+        ):
             # A restarted local server owns a new port. Open its live execution
             # view so the user cannot remain stranded on a stale browser tab
             # while the terminal has already recovered the durable workflow.
-            _open_local_web_view(runtime, console, "execution")
+            _open_local_web_view(runtime, console, "plan")
         if args.interactive or not args.command:
             interactive_loop(runtime, console, preferences)
         return 0

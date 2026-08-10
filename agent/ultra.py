@@ -109,6 +109,244 @@ def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
+def _canonical_browser_property(value: Any) -> str:
+    """Normalize browser-assertion aliases without changing their meaning."""
+
+    raw = str(value or "").strip()
+    key = re.sub(r"[\s_-]+", "", raw).casefold()
+    if key == "value":
+        return "value"
+    if key == "text":
+        return "text"
+    if key in {"textcontent", "innertext"}:
+        return "textContent"
+    if key in {"id", "elementid"}:
+        return "id"
+    if key in {"visible", "isvisible", "visibility"}:
+        return "visible"
+    if key in {"checked", "ischecked"}:
+        return "checked"
+    if key in {"count", "elementcount"}:
+        return "count"
+    if key in {"visiblecount", "visibleelementcount"}:
+        return "visibleCount"
+    if key in {"dataobjectcount", "objectcount"}:
+        return "dataObjectCount"
+    if key in {"datavisualstate", "visualstate"}:
+        return "dataVisualState"
+    return raw
+
+
+def _normalize_browser_scenario_transport(
+    value: Mapping[str, Any],
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Canonicalize transport-only browser aliases before tool validation.
+
+    This deliberately does not invent a target, action, or expected value. It
+    only moves equivalent fields and removes empty keys that the stricter
+    ``preview_html`` tool schema cannot accept. Keeping this boundary shared
+    by planning repair and deterministic execution prevents a scenario from
+    passing ULTRA validation and then failing the tool with a different
+    contract.
+    """
+
+    scenario = dict(value)
+    actions: list[str] = []
+    scenario.pop("module_id", None)
+    normalized_steps: list[Any] = []
+    for raw_step in scenario.get("steps", ()):
+        if not isinstance(raw_step, Mapping):
+            normalized_steps.append(raw_step)
+            continue
+        step = dict(raw_step)
+        if not str(step.get("name") or "").strip():
+            for alias in ("accessible name", "accessible_name"):
+                if str(step.get(alias) or "").strip():
+                    step["name"] = step.pop(alias)
+                    actions.append(
+                        "browser_scenarios.steps accessible-name alias normalized"
+                    )
+                    break
+        action = str(step.get("action") or "").strip().casefold()
+        if action == "type":
+            step["action"] = "fill"
+            action = "fill"
+            actions.append("browser_scenarios.steps type action normalized to fill")
+        if action == "fill" and "value" not in step and "text" in step:
+            step["value"] = step.pop("text")
+            actions.append(
+                "browser_scenarios.steps fill text alias normalized to value"
+            )
+        elif "text" in step:
+            text_value = str(step.get("text") or "").strip()
+            name_value = str(step.get("name") or "").strip()
+            if not text_value:
+                step.pop("text", None)
+                actions.append(
+                    "browser_scenarios.steps empty text transport key removed"
+                )
+            elif not name_value and action == "click":
+                step["name"] = step.pop("text")
+                actions.append(
+                    "browser_scenarios.steps click text alias normalized to name"
+                )
+            elif text_value == name_value:
+                step.pop("text", None)
+                actions.append(
+                    "browser_scenarios.steps duplicate text transport key removed"
+                )
+        role = str(step.get("role") or "").strip().casefold()
+        if role == "canvas" and not str(step.get("selector") or "").strip():
+            step["selector"] = "canvas"
+            step.pop("role", None)
+            step.pop("name", None)
+            actions.append(
+                "browser_scenarios.steps canvas HTML tag normalized to CSS selector"
+            )
+            role = ""
+        if action == "fill" and role in {"input", "textarea"}:
+            step["role"] = "textbox"
+            actions.append(
+                "browser_scenarios.steps HTML input role normalized to textbox"
+            )
+        allowed_step_keys = {
+            "press": {"action", "key"},
+            "click": {"action", "role", "name", "selector", "exact"},
+            "fill": {
+                "action",
+                "role",
+                "name",
+                "selector",
+                "value",
+                "exact",
+            },
+        }.get(action, {"action", "role", "name", "selector", "key", "value", "exact"})
+        for key in tuple(step):
+            if key not in allowed_step_keys and (
+                step.get(key) is None or step.get(key) == ""
+            ):
+                step.pop(key, None)
+                actions.append(
+                    f"browser_scenarios.steps empty {key} transport key removed"
+                )
+        normalized_steps.append(step)
+    scenario["steps"] = normalized_steps
+
+    normalized_assertions: list[Any] = []
+    for raw_assertion in scenario.get("assertions", ()):
+        if not isinstance(raw_assertion, Mapping):
+            normalized_assertions.append(raw_assertion)
+            continue
+        assertion = dict(raw_assertion)
+        if not str(assertion.get("name") or "").strip():
+            for alias in ("accessible name", "accessible_name"):
+                if str(assertion.get(alias) or "").strip():
+                    assertion["name"] = assertion.pop(alias)
+                    actions.append(
+                        "browser_scenarios.assertions accessible-name alias normalized"
+                    )
+                    break
+        canonical_property = _canonical_browser_property(assertion.get("property"))
+        if canonical_property and canonical_property != assertion.get("property"):
+            assertion["property"] = canonical_property
+            actions.append(
+                "browser_scenarios.assertions property alias normalized"
+            )
+        expected_alias = next(
+            (
+                alias
+                for alias in ("expected", "value")
+                if alias in assertion and assertion.get(alias) is not None
+            ),
+            None,
+        )
+        if assertion.get("equals") is None and expected_alias is not None:
+            assertion["equals"] = assertion.pop(expected_alias)
+            actions.append(
+                "browser_scenarios.assertions expected value alias normalized to equals"
+            )
+        elif expected_alias is not None and str(assertion.get("equals")) == str(
+            assertion.get(expected_alias)
+        ):
+            assertion.pop(expected_alias, None)
+            actions.append(
+                "browser_scenarios.assertions duplicate expected alias removed"
+            )
+        if (
+            assertion.get("equals") is not None
+            and assertion.get("contains") is not None
+            and str(assertion.get("equals")) == str(assertion.get("contains"))
+        ):
+            assertion.pop("contains", None)
+            actions.append(
+                "browser_scenarios.assertions duplicate contains comparator removed"
+            )
+        for comparator in ("equals", "contains"):
+            value = assertion.get(comparator)
+            if isinstance(value, bool):
+                assertion[comparator] = "true" if value else "false"
+                actions.append(
+                    f"browser_scenarios.assertions {comparator} boolean normalized to string"
+                )
+            elif isinstance(value, (int, float)):
+                assertion[comparator] = str(value)
+                actions.append(
+                    f"browser_scenarios.assertions {comparator} number normalized to string"
+                )
+        asserted_id = str(assertion.get("equals") or "").strip()
+        if (
+            assertion.get("property") == "id"
+            and asserted_id
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]*", asserted_id)
+        ):
+            # This does not invent a target: an exact id equality already
+            # identifies the one DOM element whose existence is being asserted.
+            selector = f"#{asserted_id}"
+            if assertion.get("selector") != selector:
+                assertion["selector"] = selector
+                actions.append(
+                    "browser_scenarios.assertions asserted id normalized to exact selector"
+                )
+            assertion.pop("role", None)
+            assertion.pop("name", None)
+        role = str(assertion.get("role") or "").strip().casefold()
+        if role == "canvas" and not str(assertion.get("selector") or "").strip():
+            assertion["selector"] = "canvas"
+            assertion.pop("role", None)
+            assertion.pop("name", None)
+            actions.append(
+                "browser_scenarios.assertions canvas HTML tag normalized to CSS selector"
+            )
+            role = ""
+        if re.fullmatch(r"h[1-6]", role):
+            assertion["role"] = "heading"
+            actions.append(
+                "browser_scenarios.assertions HTML heading role normalized to heading"
+            )
+        elif role in {"input", "textarea"}:
+            assertion["role"] = "textbox"
+            actions.append(
+                "browser_scenarios.assertions HTML input role normalized to textbox"
+            )
+        for key in tuple(assertion):
+            if key not in {
+                "role",
+                "name",
+                "selector",
+                "property",
+                "equals",
+                "contains",
+                "exact",
+            } and (assertion.get(key) is None or assertion.get(key) == ""):
+                assertion.pop(key, None)
+                actions.append(
+                    f"browser_scenarios.assertions empty {key} transport key removed"
+                )
+        normalized_assertions.append(assertion)
+    scenario["assertions"] = normalized_assertions
+    return scenario, tuple(actions)
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -1431,6 +1669,30 @@ class UltraOrchestrator:
         self.control.checkpoint()
         phase_value = phase.value if isinstance(phase, InnerPhase) else str(phase)
         system = _SYSTEM_PROMPT.format(role=role.value, phase=phase_value).strip()
+        if phase_value == InnerPhase.DECOMPOSE.value:
+            system += (
+                "\n\nADAPTIVE RECURSIVE HARNESS CONTRACT: size the work tree from the "
+                "approved contract, not from a fixed agent count. Return children: [] when "
+                "one specialist can implement and verify this cohesive bounded leaf. Create "
+                "children only for independently implementable, independently verifiable "
+                "subsystems with a real dependency or interface boundary. Use more children "
+                "for broader multi-domain work, while staying inside the parent scope and "
+                "remaining node budget. Never create child nodes merely to represent planning, "
+                "testing, reviewing, security review, or integration; the harness attaches "
+                "those quality roles to every executed leaf automatically."
+            )
+        if phase_value == "master_plan":
+            system += (
+                "\n\nMASTER PLAN REQUIREMENT FIDELITY: the complete accepted goal is the "
+                "execution contract, never a loose entry point. Preserve every material "
+                "deliverable, constraint, exclusion, named technology, interaction, "
+                "quality attribute, acceptance signal, and supplied implementation detail "
+                "in concrete module contracts and verification. Never compress information "
+                "out of a detailed request. Expand a short request into a complete bounded "
+                "plan without inventing scope. Document detail is independent from tree "
+                "size: a cohesive small project can have one richly specified module, while "
+                "a broad project must expose real subsystem and dependency boundaries."
+            )
         safe_context = redact_data(dict(context))
         safe_task = redact_data(dict(task))
         if phase_value == "master_plan":
@@ -1449,6 +1711,7 @@ class UltraOrchestrator:
         )
         last_error: Exception | None = None
         typed_repair_attempts = 0
+        rejected_payload_counts: dict[str, int] = defaultdict(int)
         # A typed contract gets one original attempt plus three targeted
         # repairs.  ``range`` excludes its upper bound, so ``+ 4`` is
         # required when provider_retries is the default single attempt.
@@ -1525,6 +1788,17 @@ class UltraOrchestrator:
                         phase=phase_value,
                         actions=list(normalization_actions),
                     )
+                if (
+                    bool(response.payload.get("abstained"))
+                    and phase_value in {"review", "global_review"}
+                ):
+                    response = replace(
+                        response,
+                        summary=(
+                            f"{role.value} abstained: no typed quality verdict "
+                            "or blocking finding was returned."
+                        ),
+                    )
                 # Typed returns are validated before the lifecycle can become
                 # COMPLETED.  This prevents an empty GoalSpec (and equivalent
                 # malformed review/worker payloads) from being accepted and
@@ -1586,6 +1860,13 @@ class UltraOrchestrator:
                 )
                 return response
             except AgentProtocolError as exc:
+                response_fingerprint = (
+                    _fingerprint(dict(response.payload))
+                    if response is not None
+                    else "no-payload"
+                )
+                rejected_payload_counts[response_fingerprint] += 1
+                repeated_response = rejected_payload_counts[response_fingerprint] > 1
                 self.state.save_agent_run(
                     AgentRunV1(
                         id=agent_id,
@@ -1804,17 +2085,41 @@ class UltraOrchestrator:
                         f"targeted typed-return repairs: {exc}"
                     ) from exc
                 typed_repair_attempts += 1
+                repair_instruction = (
+                    "Return one complete corrected payload. Repair only the listed "
+                    "contract defects."
+                )
+                if repeated_response:
+                    repair_instruction += (
+                        " The previous response fingerprint was repeated unchanged; "
+                        "do not replay it. Rebuild the smallest valid envelope from "
+                        "the authoritative task packet and exact allowed fields."
+                    )
+                    self.events.publish(
+                        "ultra.typed_return_repeat_detected",
+                        f"{role.value} repeated an invalid {phase_value} payload; "
+                        "the next request uses a minimal corrected packet and resets "
+                        "the local model cache when available.",
+                        run_id=self.run_state.id,
+                        node_id=node_id,
+                        role=role.value,
+                        phase=phase_value,
+                        response_fingerprint=response_fingerprint,
+                        repeat_count=rejected_payload_counts[response_fingerprint],
+                    )
                 repair_task = {
                     **safe_task,
                     "typed_return_repair": {
                         "contract": phase_value,
                         "errors": [str(exc)],
+                        "response_fingerprint": response_fingerprint,
+                        "repeated_response": repeated_response,
                         "previous_payload": (
                             redact_data(dict(response.payload))
                             if response is not None
                             else {}
                         ),
-                        "instruction": "Return one complete corrected payload. Repair only the listed contract defects.",
+                        "instruction": repair_instruction,
                     },
                 }
                 request = replace(request, task=repair_task)
@@ -1972,6 +2277,15 @@ class UltraOrchestrator:
         if isinstance(nested, Mapping):
             normalized = dict(nested)
             actions.append(f"{phase} envelope unwrapped")
+        # Transport-only collection drift is mechanically reversible. Keep
+        # each model-authored item unchanged while restoring the typed array
+        # envelope expected by lifecycle validation.
+        for field in ("evidence", "findings", "issues", "test_results", "artifacts"):
+            raw_collection = normalized.get(field)
+            if field not in normalized or isinstance(raw_collection, (list, tuple)):
+                continue
+            normalized[field] = [] if raw_collection is None else [raw_collection]
+            actions.append(f"{phase}.{field} scalar normalized to array")
         # Weak structured-output models sometimes serialize an explicit typed
         # verdict as a JSON string.  Coerce only exact boolean/verdict tokens;
         # prose, missing values, and ambiguous words still require repair.
@@ -2189,7 +2503,7 @@ class UltraOrchestrator:
                     normalized["passed"] = True
                     normalized["abstained"] = True
                     actions.append(
-                        f"{phase} reviewer abstained because no typed verdict "
+                        f"{phase} stage: reviewer abstained because no typed verdict "
                         "or blocking finding was returned"
                     )
         if phase in {"integrate", "global_integration", "final_evidence"} and not isinstance(
@@ -2361,6 +2675,16 @@ class UltraOrchestrator:
                                                 "browser_scenarios.steps HTML input role normalized to textbox"
                                             )
                                     else:
+                                        canonical_property = _canonical_browser_property(
+                                            item.get("property")
+                                        )
+                                        if canonical_property and canonical_property != item.get(
+                                            "property"
+                                        ):
+                                            item["property"] = canonical_property
+                                            actions.append(
+                                                "browser_scenarios.assertions property alias normalized"
+                                            )
                                         if (
                                             item.get("equals") is None
                                             and item.get("contains") is None
@@ -2383,15 +2707,19 @@ class UltraOrchestrator:
                                             )
                                     items.append(item)
                                 scenario[field] = items
+                            scenario, transport_actions = (
+                                _normalize_browser_scenario_transport(scenario)
+                            )
+                            actions.extend(transport_actions)
                             scenarios.append(scenario)
                         module["browser_scenarios"] = scenarios
                     modules.append(module)
                 normalized["modules"] = modules
         # Transport normalization is deliberately semantic-free. It may
-        # unwrap the requested typed envelope, but it must never manufacture
-        # an objective, path, component, quality gate, dependency, or product
-        # topology. Missing fields are repaired by the same model stage in
-        # ``_invoke`` and checkpointed if its bounded repair budget expires.
+        # unwrap the requested typed envelope and canonicalize exact aliases,
+        # but it must never manufacture an objective, path, component,
+        # quality gate, dependency, or product topology. Missing semantic
+        # fields are repaired by the same model stage in ``_invoke``.
         return normalized, tuple(actions)
         if phase == "goal_spec" and not str(normalized.get("objective", "")).strip():
             authoritative_prompt = str(task.get("prompt", "")).strip()
@@ -2880,7 +3208,7 @@ class UltraOrchestrator:
                     normalized["passed"] = True
                     normalized["abstained"] = True
                     actions.append(
-                        f"{phase} reviewer abstained because no typed verdict "
+                        f"{phase} stage: reviewer abstained because no typed verdict "
                         "or finding was returned"
                     )
                 else:
@@ -3033,7 +3361,7 @@ class UltraOrchestrator:
                                 "browser scenario click/fill step requires role or selector"
                             )
                         role = str(step.get("role") or "").strip().casefold()
-                        if role in {"input", "textarea", "select", "div", "span"} or re.fullmatch(
+                        if role in {"input", "textarea", "select", "div", "span", "canvas"} or re.fullmatch(
                             r"h[1-6]", role
                         ):
                             raise AgentProtocolError(
@@ -3044,6 +3372,20 @@ class UltraOrchestrator:
                                 "browser scenario fill step requires value"
                             )
                     for assertion_index, assertion in enumerate(assertions):
+                        unknown_assertion_keys = set(assertion) - {
+                            "role",
+                            "name",
+                            "selector",
+                            "property",
+                            "equals",
+                            "contains",
+                            "exact",
+                        }
+                        if unknown_assertion_keys:
+                            raise AgentProtocolError(
+                                "browser scenario assertion has unknown transport keys: "
+                                + ", ".join(sorted(unknown_assertion_keys))
+                            )
                         if not (
                             str(assertion.get("selector") or "").strip()
                             or str(assertion.get("role") or "").strip()
@@ -3051,19 +3393,34 @@ class UltraOrchestrator:
                             raise AgentProtocolError(
                                 "browser scenario assertion requires role or selector"
                             )
-                        prop = str(assertion.get("property") or "").strip().casefold()
+                        prop = _canonical_browser_property(
+                            assertion.get("property")
+                        ).casefold()
                         role = str(assertion.get("role") or "").strip().casefold()
-                        if role in {"input", "textarea", "select", "div", "span"} or re.fullmatch(
+                        if role in {"input", "textarea", "select", "div", "span", "canvas"} or re.fullmatch(
                             r"h[1-6]", role
                         ):
                             raise AgentProtocolError(
                                 "browser scenario assertion role must be an ARIA role, not an HTML tag"
                             )
-                        if prop not in {"value", "text"}:
+                        if prop not in {
+                            "value",
+                            "text",
+                            "textcontent",
+                            "id",
+                            "visible",
+                            "checked",
+                            "count",
+                            "visiblecount",
+                            "dataobjectcount",
+                            "datavisualstate",
+                        }:
                             raise AgentProtocolError(
                                 "browser_scenarios.modules"
                                 f"[{index}].browser_scenarios[{scenario_index}].assertions"
-                                f"[{assertion_index}].property must be value or text"
+                                f"[{assertion_index}].property must be value, text, "
+                                "textContent, id, visible, checked, count, visibleCount, "
+                                "dataObjectCount, or dataVisualState"
                             )
                         if (
                             prop == "value"
@@ -3081,9 +3438,13 @@ class UltraOrchestrator:
                                 "browser scenario property value requires a form-control role "
                                 "or an explicit selector; use text for status and headings"
                             )
-                        if assertion.get("equals") is None and assertion.get("contains") is None:
+                        comparator_count = sum(
+                            assertion.get(key) is not None
+                            for key in ("equals", "contains")
+                        )
+                        if comparator_count != 1:
                             raise AgentProtocolError(
-                                "browser scenario assertion requires equals or contains"
+                                "browser scenario assertion requires exactly one of equals or contains"
                             )
             return
         if phase == InnerPhase.DECOMPOSE.value:
@@ -5658,6 +6019,7 @@ class UltraOrchestrator:
             InnerPhase.FIX,
             InnerPhase.INTEGRATE,
             InnerPhase.MEMORY_WRITEBACK,
+            InnerPhase.REPLAN,
         }:
             # This leaf crossed the durable decomposition boundary before a
             # process interruption. Re-planning it can invent a different
@@ -5974,6 +6336,51 @@ class UltraOrchestrator:
 
     def _quality_gate_passed(self, result: QualityGateResultV1) -> bool:
         return all(self._passed(item) for item in result.responses) and self._consensus_accepted(result.consensus)
+
+    @staticmethod
+    def _quality_failure_kind(result: QualityGateResultV1) -> str:
+        """Classify the owner of a failed gate before selecting a repair role."""
+
+        observed: set[str] = set()
+        for response in result.responses:
+            payload = response.payload
+            observed.add(str(payload.get("failure_kind") or "").casefold())
+            for test_result in payload.get("test_results", ()):
+                if not isinstance(test_result, Mapping):
+                    continue
+                observed.add(str(test_result.get("failure_kind") or "").casefold())
+                for interaction in test_result.get("interaction_results", ()):
+                    if isinstance(interaction, Mapping):
+                        observed.add(
+                            str(interaction.get("failure_kind") or "").casefold()
+                        )
+        observed.discard("")
+        if observed & {"contract", "test_definition", "tool_validation"}:
+            return "contract"
+        if observed & {"tool", "transport"}:
+            return "tool"
+        if observed & {"environment", "infrastructure"}:
+            return "environment"
+        return "application"
+
+    def _quality_failure_fingerprint(self, result: QualityGateResultV1) -> str:
+        normalized_findings = sorted(
+            {
+                re.sub(r"\s+", " ", item).strip().casefold()
+                for item in self._findings(*result.responses)
+                if str(item).strip()
+            }
+        )
+        raw = json.dumps(
+            {
+                "kind": self._quality_failure_kind(result),
+                "findings": normalized_findings,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _review_candidate(response: AgentResponse) -> Mapping[str, Any]:
@@ -6576,6 +6983,302 @@ class UltraOrchestrator:
         consensus = self._record_quality_consensus(node, responses)
         return QualityGateResultV1(responses=responses, consensus=consensus)
 
+    @staticmethod
+    def _browser_repair_weakening(
+        previous: Sequence[Mapping[str, Any]],
+        repaired: Sequence[Mapping[str, Any]],
+    ) -> tuple[str, ...]:
+        previous_steps = [
+            step
+            for scenario in previous
+            for step in scenario.get("steps", ())
+            if isinstance(step, Mapping)
+        ]
+        repaired_steps = [
+            step
+            for scenario in repaired
+            for step in scenario.get("steps", ())
+            if isinstance(step, Mapping)
+        ]
+        reasons: list[str] = []
+        if len(repaired) < len(previous):
+            reasons.append("repair removed an accepted browser scenario")
+        if len(repaired_steps) < len(previous_steps):
+            reasons.append("repair reduced the accepted user-action sequence")
+
+        strength = {
+            "visible": 1,
+            "id": 1,
+            "checked": 2,
+            "value": 2,
+            "text": 2,
+            "textcontent": 2,
+            "count": 2,
+            "visiblecount": 2,
+            "dataobjectcount": 3,
+            "datavisualstate": 3,
+        }
+        previous_assertions = [
+            assertion
+            for scenario in previous
+            for assertion in scenario.get("assertions", ())
+            if isinstance(assertion, Mapping)
+        ]
+        repaired_assertions = [
+            assertion
+            for scenario in repaired
+            for assertion in scenario.get("assertions", ())
+            if isinstance(assertion, Mapping)
+        ]
+        previous_strength = max(
+            (
+                strength.get(
+                    _canonical_browser_property(assertion.get("property")).casefold(),
+                    0,
+                )
+                for assertion in previous_assertions
+            ),
+            default=0,
+        )
+        repaired_strength = max(
+            (
+                strength.get(
+                    _canonical_browser_property(assertion.get("property")).casefold(),
+                    0,
+                )
+                for assertion in repaired_assertions
+            ),
+            default=0,
+        )
+        if repaired_strength < previous_strength:
+            reasons.append("repair weakened an observable outcome to a presence check")
+        previous_non_boolean = any(
+            str(assertion.get("equals") or assertion.get("contains") or "")
+            .strip()
+            .casefold()
+            not in {"", "true", "false"}
+            for assertion in previous_assertions
+        )
+        repaired_only_boolean = bool(repaired_assertions) and all(
+            str(assertion.get("equals") or assertion.get("contains") or "")
+            .strip()
+            .casefold()
+            in {"true", "false"}
+            for assertion in repaired_assertions
+        )
+        if previous_non_boolean and repaired_only_boolean:
+            reasons.append("repair replaced a value assertion with a boolean presence assertion")
+        return tuple(dict.fromkeys(reasons))
+
+    @staticmethod
+    def _browser_inventory_contract_repair(
+        scenarios: Sequence[Mapping[str, Any]],
+        test_results: Sequence[Mapping[str, Any]],
+    ) -> tuple[list[dict[str, Any]], tuple[str, ...]]:
+        """Repair only targets directly named by an authoritative DOM inventory.
+
+        Small local models often describe an assertion as ``role=textbox,
+        name=Calculation Display`` even when the receipt proves that the
+        application exposes ``id=display`` on a non-form element.  Rebinding is
+        safe only when exactly one simple inventory id appears as a whole token
+        in the supplied name.  No action, expected value, or product field is
+        invented here.
+        """
+
+        inventory: list[Mapping[str, Any]] = []
+        for result in test_results:
+            raw_targets = result.get("interaction_targets", ())
+            if isinstance(raw_targets, Sequence) and not isinstance(
+                raw_targets, (str, bytes)
+            ):
+                inventory.extend(
+                    target for target in raw_targets if isinstance(target, Mapping)
+                )
+        simple_ids = tuple(
+            dict.fromkeys(
+                str(target.get("id") or "").strip()
+                for target in inventory
+                if re.fullmatch(
+                    r"[A-Za-z_][A-Za-z0-9_.:-]*",
+                    str(target.get("id") or "").strip(),
+                )
+            )
+        )
+        repaired: list[dict[str, Any]] = []
+        receipts: list[str] = []
+        for raw_scenario in scenarios:
+            scenario, normalization = _normalize_browser_scenario_transport(
+                raw_scenario
+            )
+            receipts.extend(normalization)
+            assertions: list[Any] = []
+            for raw_assertion in scenario.get("assertions", ()):
+                if not isinstance(raw_assertion, Mapping):
+                    assertions.append(raw_assertion)
+                    continue
+                assertion = dict(raw_assertion)
+                if not str(assertion.get("selector") or "").strip():
+                    name_tokens = set(
+                        re.findall(
+                            r"[A-Za-z_][A-Za-z0-9_.:-]*",
+                            str(assertion.get("name") or ""),
+                        )
+                    )
+                    matches = [
+                        value
+                        for value in simple_ids
+                        if value.casefold()
+                        in {token.casefold() for token in name_tokens}
+                    ]
+                    if len(matches) == 1:
+                        assertion["selector"] = f"#{matches[0]}"
+                        assertion.pop("role", None)
+                        assertion.pop("name", None)
+                        receipts.append(
+                            "browser assertion target rebound to exact inventory id "
+                            f"#{matches[0]}"
+                        )
+                assertions.append(assertion)
+            scenario["assertions"] = assertions
+            repaired.append(scenario)
+        return repaired, tuple(dict.fromkeys(receipts))
+
+    def _repair_verification_contract(
+        self,
+        node: WorkNode,
+        quality_gate: QualityGateResultV1,
+        *,
+        attempt: int,
+    ) -> tuple[WorkNode, AgentResponse, bool]:
+        """Ask the tester to repair only its browser scenario, never product bytes."""
+
+        test_results = [
+            dict(item)
+            for gate_response in quality_gate.responses
+            for item in gate_response.payload.get("test_results", ())
+            if isinstance(item, Mapping)
+        ]
+        previous = list(node.contract.metadata.get("browser_scenarios", ()) or ())
+        deterministic_scenarios, deterministic_receipts = (
+            self._browser_inventory_contract_repair(previous, test_results)
+        )
+        deterministic_payload = {
+            "modules": [{
+                "module_id": node.id,
+                "browser_scenarios": deterministic_scenarios,
+            }]
+        }
+        deterministic_valid = False
+        if deterministic_receipts and deterministic_scenarios != previous:
+            try:
+                self._validate_typed_response(
+                    "browser_scenarios", deterministic_payload
+                )
+                deterministic_valid = not self._browser_repair_weakening(
+                    previous, deterministic_scenarios
+                )
+            except AgentProtocolError:
+                deterministic_valid = False
+        if deterministic_valid:
+            response = AgentResponse(
+                payload={
+                    **deterministic_payload,
+                    "normalization_receipt": list(deterministic_receipts),
+                },
+                summary="Browser targets repaired from the authoritative DOM inventory.",
+                reasoning_summary=(
+                    "The harness rebound only an explicitly named simple DOM id and "
+                    "preserved every action and expected outcome."
+                ),
+                provider="harness",
+                model="browser-inventory-repair-v1",
+            )
+        else:
+            response = self._invoke(
+                AgentRole.TESTER,
+                "browser_scenarios",
+                task={
+                "modules": [
+                    {
+                        "module_id": node.id,
+                        "title": node.contract.title,
+                        "objective": node.contract.objective,
+                        "acceptance_criteria": list(node.contract.acceptance_criteria),
+                        "existing_browser_scenarios": list(
+                            node.contract.metadata.get("browser_scenarios", ()) or ()
+                        ),
+                    }
+                ],
+                "verification_contract_repair": {
+                    "attempt": attempt,
+                    "failure_fingerprint": self._quality_failure_fingerprint(
+                        quality_gate
+                    ),
+                    "findings": list(self._findings(*quality_gate.responses)),
+                    "test_results": test_results,
+                    "instruction": (
+                        "Repair only the executable browser steps, targets, and assertions. "
+                        "Preserve or strengthen the accepted user-action count and observable "
+                        "outcome; never replace a value/count assertion with canvas presence. "
+                        "Do not propose or request any workspace mutation. Use interaction_targets "
+                        "from the failed receipt when present."
+                    ),
+                },
+                },
+                context=self._new_context(node, AgentRole.TESTER),
+                node_id=node.id,
+            )
+        repaired_scenarios: list[dict[str, Any]] = []
+        for item in response.payload.get("modules", ()):
+            if not isinstance(item, Mapping) or str(item.get("module_id")) != node.id:
+                continue
+            repaired_scenarios = [
+                dict(scenario)
+                for scenario in item.get("browser_scenarios", ())
+                if isinstance(scenario, Mapping)
+            ]
+            break
+        if not repaired_scenarios or repaired_scenarios == previous:
+            return node, response, False
+        weakening = self._browser_repair_weakening(previous, repaired_scenarios)
+        if weakening:
+            assert self.run_state
+            self.events.publish(
+                "ultra.verification_contract_repair_rejected",
+                f"[{node.id}] rejected a browser repair that weakened accepted semantics.",
+                run_id=self.run_state.id,
+                node_id=node.id,
+                attempt=attempt,
+                reasons=list(weakening),
+            )
+            return node, response, False
+        repaired_contract = replace(
+            node.contract,
+            metadata={
+                **dict(node.contract.metadata),
+                "browser_scenarios": repaired_scenarios,
+                "browser_scenarios_authorship": "tester_contract_repair",
+                "verification_contract_repair_attempt": attempt,
+            },
+        )
+        repaired_node = replace(
+            node,
+            contract=repaired_contract,
+            phase=InnerPhase.TEST,
+        )
+        self.nodes[node.id] = repaired_node
+        assert self.run_state
+        self.state.save_work_node(self.run_state.id, repaired_node)
+        self.events.publish(
+            "ultra.verification_contract_repaired",
+            f"[{node.id}] tester replaced the invalid browser contract without mutating artifacts.",
+            run_id=self.run_state.id,
+            node_id=node.id,
+            attempt=attempt,
+            failure_fingerprint=self._quality_failure_fingerprint(quality_gate),
+        )
+        return repaired_node, response, True
+
     def _execute_node(self, scheduled_node: WorkNode) -> ResultPackageV1:
         assert self.run_state
         node = self.nodes[scheduled_node.id]
@@ -6635,7 +7338,13 @@ class UltraOrchestrator:
             and not is_parent_assembler
             else ()
         )
-        verification_only = bool(node.contract.metadata.get("verification_only"))
+        verification_only = bool(
+            node.contract.metadata.get("verification_only")
+            or (
+                isinstance(prior_replan, Mapping)
+                and prior_replan.get("verification_only") is True
+            )
+        )
         implementation = (
             AgentResponse(
                 payload={
@@ -6749,25 +7458,67 @@ class UltraOrchestrator:
         )
         responses.extend(quality_gate.responses)
         fixes = 0
-        verification_contract_failure = any(
-            isinstance(item, Mapping)
-            and item.get("failure_kind") == "contract"
-            for response in quality_gate.responses
-            for result in response.payload.get("test_results", ())
-            if isinstance(result, Mapping)
-            for item in result.get("interaction_results", ())
-        )
-        if verification_contract_failure:
+        verification_repairs = 0
+        while (
+            not self._quality_gate_passed(quality_gate)
+            and self._quality_failure_kind(quality_gate) == "contract"
+            and verification_repairs < 2
+        ):
+            verification_repairs += 1
             self.events.publish(
                 "ultra.verification_contract_repair_required",
-                f"[{node.id}] interaction transport failed; artifact mutation is prohibited.",
+                f"[{node.id}] interaction transport failed; tester repair {verification_repairs}/2 started and artifact mutation is prohibited.",
                 run_id=self.run_state.id,
                 node_id=node.id,
+                attempt=verification_repairs,
+                failure_fingerprint=self._quality_failure_fingerprint(quality_gate),
             )
+            node, repair_response, changed = self._repair_verification_contract(
+                node,
+                quality_gate,
+                attempt=verification_repairs,
+            )
+            responses.append(repair_response)
+            if not changed:
+                break
+            quality_gate = self._quality(
+                node,
+                candidate_response,
+                authoritative_responses=authoritative_gate,
+            )
+            responses.extend(quality_gate.responses)
+        infrastructure_retries = 0
+        while (
+            not self._quality_gate_passed(quality_gate)
+            and self._quality_failure_kind(quality_gate) in {"tool", "environment"}
+            and infrastructure_retries < 2
+        ):
+            infrastructure_retries += 1
+            self.events.publish(
+                "ultra.verification_infrastructure_retry",
+                f"[{node.id}] verification infrastructure retry {infrastructure_retries}/2; artifact mutation is prohibited.",
+                run_id=self.run_state.id,
+                node_id=node.id,
+                attempt=infrastructure_retries,
+                failure_kind=self._quality_failure_kind(quality_gate),
+                failure_fingerprint=self._quality_failure_fingerprint(quality_gate),
+            )
+            quality_gate = self._quality(
+                node,
+                candidate_response,
+                authoritative_responses=authoritative_gate,
+            )
+            responses.extend(quality_gate.responses)
+        failure_kind = self._quality_failure_kind(quality_gate)
+        failure_counts: dict[str, int] = defaultdict(int)
+        initial_failure_fingerprint = self._quality_failure_fingerprint(quality_gate)
+        failure_counts[initial_failure_fingerprint] = 1
+        repeated_failure_breaker = False
         while (
             not self._quality_gate_passed(quality_gate)
             and fixes < self.config.max_fix_attempts
-            and not verification_contract_failure
+            and failure_kind == "application"
+            and not repeated_failure_breaker
         ):
             fixes += 1
             node = replace(node, phase=InnerPhase.FIX)
@@ -6865,20 +7616,77 @@ class UltraOrchestrator:
                 )
             )
             responses.extend(quality_gate.responses)
+            failure_kind = self._quality_failure_kind(quality_gate)
+            failure_fingerprint = self._quality_failure_fingerprint(quality_gate)
+            failure_counts[failure_fingerprint] += 1
+            if failure_counts[failure_fingerprint] >= 3:
+                repeated_failure_breaker = True
+                self.events.publish(
+                    "ultra.repeated_failure_breaker",
+                    (
+                        f"[{node.id}] the same quality failure survived two candidate "
+                        "mutations; further code mutation is prohibited pending diagnosis."
+                    ),
+                    run_id=self.run_state.id,
+                    node_id=node.id,
+                    failure_kind=failure_kind,
+                    failure_fingerprint=failure_fingerprint,
+                    occurrences=failure_counts[failure_fingerprint],
+                    fixes=fixes,
+                )
 
         if not self._quality_gate_passed(quality_gate):
-            replan = self._invoke(
-                AgentRole.PLANNER,
-                InnerPhase.REPLAN,
-                task={
-                    "contract": asdict(node.contract),
-                    "findings": self._findings(*quality_gate.responses),
-                    "consensus": dict(quality_gate.consensus),
-                    "attempts": fixes,
-                },
-                context=self._new_context(node, AgentRole.PLANNER),
-                node_id=node.id,
-            )
+            failure_kind = self._quality_failure_kind(quality_gate)
+            failure_fingerprint = self._quality_failure_fingerprint(quality_gate)
+            blocker_owner = {
+                "contract": "test_harness",
+                "tool": "tooling",
+                "environment": "environment",
+                "application": (
+                    "diagnostic" if repeated_failure_breaker else "candidate_code"
+                ),
+            }.get(failure_kind, "diagnostic")
+            if failure_kind in {"contract", "tool", "environment"}:
+                replan = AgentResponse(
+                    payload={
+                        "verification_only": True,
+                        "preserve_candidate": True,
+                        "failure_kind": failure_kind,
+                        "blocker_owner": blocker_owner,
+                        "failure_fingerprint": failure_fingerprint,
+                        "verification_repair_attempts": verification_repairs,
+                        "infrastructure_retries": infrastructure_retries,
+                    },
+                    summary=(
+                        "Verification infrastructure remains blocked; product mutation was prohibited."
+                    ),
+                    reasoning_summary=(
+                        "The failed evidence was owned by the test contract, tool, or environment, "
+                        "so the harness did not ask the coder to modify the candidate."
+                    ),
+                    provider="harness",
+                    model="failure-router-v1",
+                )
+            else:
+                replan = self._invoke(
+                    AgentRole.PLANNER,
+                    InnerPhase.REPLAN,
+                    task={
+                        "contract": asdict(node.contract),
+                        "findings": self._findings(*quality_gate.responses),
+                        "consensus": dict(quality_gate.consensus),
+                        "attempts": fixes,
+                        "failure_classification": {
+                            "failure_kind": failure_kind,
+                            "blocker_owner": blocker_owner,
+                            "failure_fingerprint": failure_fingerprint,
+                            "occurrences": failure_counts[failure_fingerprint],
+                            "mutation_prohibited": repeated_failure_breaker,
+                        },
+                    },
+                    context=self._new_context(node, AgentRole.PLANNER),
+                    node_id=node.id,
+                )
             responses.append(replan)
             result = ResultPackageV1(
                 node_id=node.id,
@@ -6889,6 +7697,10 @@ class UltraOrchestrator:
                     dict.fromkeys(
                         (
                             *self._findings(*quality_gate.responses),
+                            (
+                                f"[blocker_owner={blocker_owner} failure_kind={failure_kind} "
+                                f"failure_fingerprint={failure_fingerprint}]"
+                            ),
                             *(
                                 (f"quality consensus {quality_gate.consensus.get('status')} for {node.id}",)
                                 if quality_gate.consensus and not self._consensus_accepted(quality_gate.consensus)
@@ -6903,6 +7715,18 @@ class UltraOrchestrator:
                     "candidate": dict(self._review_candidate(candidate_response)),
                     "replan": dict(replan.payload),
                     "status": "best_candidate_below_target",
+                    "failure_diagnostic": {
+                        "failure_kind": failure_kind,
+                        "blocker_owner": blocker_owner,
+                        "failure_fingerprint": failure_fingerprint,
+                        "occurrences": failure_counts[failure_fingerprint],
+                        "verification_repair_attempts": verification_repairs,
+                        "infrastructure_retries": infrastructure_retries,
+                        "mutation_prohibited": bool(
+                            repeated_failure_breaker
+                            or failure_kind in {"contract", "tool", "environment"}
+                        ),
+                    },
                 },
             )
             self._results[node.id] = result
@@ -6985,8 +7809,22 @@ class UltraOrchestrator:
             node_id=node.id,
         )
         responses.append(memory)
+        # Earlier quality/fix rounds are superseded once a later candidate
+        # passes. Publishing the whole append-only attempt log as current
+        # evidence makes global review reopen defects that the final browser
+        # receipt has already disproved. Keep history durable in agent runs and
+        # events, but expose only the accepted candidate and final gate here.
+        accepted_responses = (
+            candidate_response,
+            *quality_gate.responses,
+            integration,
+            memory,
+            *publication_gate,
+        )
         artifacts = tuple(
-            item for response in responses for item in self._records(response, "artifacts")
+            item
+            for response in accepted_responses
+            for item in self._records(response, "artifacts")
         )
         final_authoritative_gate = publication_gate or authoritative_gate
         authoritative_evidence = tuple(
@@ -6997,12 +7835,14 @@ class UltraOrchestrator:
         evidence = tuple(
             (
                 item
-                for response in responses
+                for response in accepted_responses
                 for item in self._records(response, "evidence")
             )
         ) + authoritative_evidence
         test_results = tuple(
-            item for response in responses for item in self._records(response, "test_results")
+            item
+            for response in accepted_responses
+            for item in self._records(response, "test_results")
         )
         raw_component = integration.payload.get("component_package")
         implementation_payload = (
@@ -7077,8 +7917,12 @@ class UltraOrchestrator:
             artifacts=artifacts,
             evidence=evidence,
             test_results=test_results,
-            findings=self._findings(*responses),
-            insights=tuple(insight for response in responses for insight in response.insights),
+            findings=self._findings(*accepted_responses),
+            insights=tuple(
+                insight
+                for response in accepted_responses
+                for insight in response.insights
+            ),
             component_package=(
                 dict(materialized_component.get("package", {}))
                 if materialized_component.get("package")
@@ -7124,15 +7968,68 @@ class UltraOrchestrator:
         )
         return result
 
+    @staticmethod
+    def _global_node_summary(result: ResultPackageV1) -> Mapping[str, Any]:
+        """Project only current accepted evidence into cross-module review.
+
+        Attempt history remains durable on the node/agent records. A successful
+        node's global contract must not contain receipts explicitly superseded
+        by its later accepted quality gate.
+        """
+
+        def accepted(item: Any) -> bool:
+            if not isinstance(item, Mapping):
+                return False
+            if item.get("passed") is False or item.get("success") is False:
+                return False
+            status = str(
+                item.get("status") or item.get("verification") or ""
+            ).casefold()
+            if status in {"failed", "error", "rejected", "blocked"}:
+                return False
+            interactions = item.get("interaction_results", ())
+            if (
+                isinstance(interactions, Sequence)
+                and not isinstance(interactions, (str, bytes))
+                and any(
+                    isinstance(interaction, Mapping)
+                    and interaction.get("passed") is False
+                    for interaction in interactions
+                )
+            ):
+                return False
+            kind = str(item.get("kind") or item.get("type") or "").casefold()
+            if any(token in kind for token in ("failure", "error")):
+                return False
+            return bool(
+                item.get("passed") is True
+                or item.get("success") is True
+                or item.get("verified") is True
+                or status in {"passed", "ok", "success", "accepted"}
+                or str(item.get("sha256") or item.get("content_hash") or "").strip()
+                or kind in {"artifact_hash", "executable_verification"}
+            )
+
+        evidence = (
+            [item for item in result.evidence if accepted(item)]
+            if result.success
+            else list(result.evidence)
+        )
+        return {
+            "node_id": result.node_id,
+            "summary": (
+                f"{result.node_id} completed with an accepted node quality gate."
+                if result.success
+                else result.summary
+            ),
+            "artifacts": list(result.artifacts),
+            "evidence": evidence,
+        }
+
     def _global_gate(self) -> ResultPackageV1:
         assert self.run_state and self.goal_spec and self.architecture and self.master_plan
         node_summaries = [
-            {
-                "node_id": result.node_id,
-                "summary": result.summary,
-                "artifacts": list(result.artifacts),
-                "evidence": list(result.evidence),
-            }
+            self._global_node_summary(result)
             for result in self._results.values()
         ]
         self._set_phase(UltraPhase.INTEGRATION, "Integrating all modules")

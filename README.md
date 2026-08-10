@@ -68,12 +68,8 @@ failure modes that prompts alone cannot solve:
   visual acceptance requires an independent vision model, two clean verdicts,
   and a blind pairwise preference. The builder cannot judge its own output.
 
-Run the structural and behavioral audit, persist its metrics, and compare the next
-run against it:
-
-```powershell
-.venv\Scripts\python -m agent --workspace D:\path\to\project --command "/doctor --record"
-```
+Open `/settings`, choose **Diagnostics**, then run the structural and behavioral
+audit. Recorded results remain available to Advanced Tracing for comparison.
 
 ## Quick start
 
@@ -134,55 +130,56 @@ With an empty composer, `?` opens context-sensitive keyboard help; inside a
 message or plan document it remains ordinary text. The footer shows only the
 four or five controls actionable in the current view. Below 80x24 the workspace
 shows a resize gate while background work and telemetry continue safely.
-Read-only `/status`, `/agents`, `/tree`, `/agent`, `/thinking`, and `/details`
-remain available while work continues. `F3` opens model
+`/live` remains available for calm progress while `/advanced-tracing` opens the
+complete developer trace only when requested. `F3` opens model
 selection and `F4` opens permissions. `Ctrl+Q` exits only at a saved checkpoint;
 while work is active it requests a checkpoint and keeps the session open. Use
 `--plain` to skip the animated intro and use the line-oriented SSH/screen-reader
 UI, or `--reduced-motion` for lower-motion setup and progress surfaces.
 
-`F6` toggles **Safe Auto** at any time. `/sleep on` and `/sleep safe` provide the
-same policy: explicitly recommended reversible actions continue and every choice
-is logged, while risky decisions remain manual. `/sleep full` is a separate,
-explicit Full Auto opt-in that accepts every tool approval in the selected
-workspace, including shell commands and installs, and records each automatic
-approval in durable History. The Web Sleep control requires typing `FULL AUTO`
-before enabling it. `/sleep off` disables either policy. In eligible
-Ultra/Full-Docker sessions enabling Sleep also tries to arm the deeper Ultra
-Sleep profile; failure of that stricter gate does not disable the general mode.
+`F6` toggles **Safe Auto** at any time. The full Sleep policy is configured under
+Runtime in `/settings`; explicit Full Auto can accept tool approvals in the
+selected workspace and every automatic approval is audited. In eligible
+Ultra/Full-Docker sessions, enabling Sleep also attempts to arm the deeper Ultra
+Sleep profile; failure of that stricter gate does not disable Safe Auto.
 
-`F7` opens Change Review for the current immutable checkpoint and `F8` (or `/explorer`) opens the exact
+`F7` opens Change Review for the current immutable checkpoint and `F8` opens the exact
 selected project workspace in the operating-system file explorer. The fixed
 footer changes by execution class: local models prioritize CPU/GPU/RAM, while
 cloud models prioritize provider/model activity, input/output/cached tokens,
 known context remaining, and only provider limits actually reported by the
 provider. Unknown quotas and limits are shown as unavailable, never estimated.
 
-## Plan mode and durable conversation
+## Ultra Plan and durable conversation
 
-`/mode plan` is a real planning-only mode. It may inspect and prepare a durable
-plan, but it cannot execute tools or file changes. `/plan` opens the primary Web
-workspace. Save Draft persists a session-scoped draft without activating it;
-Save Revision validates and creates an exact immutable revision; Approve & Start
-is the single execution gate. Model changes, pause/resume, queued guidance,
-recursive execution, review, results, and history are available in the same
-workspace at valid saved checkpoints. The terminal remains a compact fallback.
+The two main interaction choices are **Ultra** and **Ultra Plan**. Both use the
+same recursive Ultra execution engine; Ultra Plan adds a planning boundary before
+mutation. Selecting it opens `/plan` automatically. The browser asks as many
+material questions as needed, presents one editable plan document, then uses two
+explicit confirmations: **Prepare agents** shows the exact first-layer team, and
+**Approve & start** hands that revision back to the terminal. Execution never
+depends on the browser remaining open.
 
-`/chat` opens the read-only durable workspace timeline. Restoring a workspace
-with conversation history opens that view first; Escape returns to the working
-surface, and typing a new request transfers it to the composer. Failed partial
-model streams and raw reasoning are never promoted into durable chat.
+The web surface has only two pages. Plan owns the pre-execution conversation and
+approval. Live is a read-only projection of current work, the agent tree, durable
+timeline, and recorded diffs. The terminal/runtime remains the control plane and
+source of truth; the browser exposes only small blocker actions such as retry,
+change model, allow/deny, and stop safely.
+
+The persistent terminal keeps the durable workspace conversation in its main
+surface. Failed partial model streams and raw reasoning are never promoted into
+durable chat.
 
 `/pause` records a cooperative pause request and stops new scheduling. The UI
 shows `Pause pending` while the current model/tool/agent drains, and changes the
-goal to PAUSED only after a saved checkpoint. `/resume` and `/continue` appear
+goal to PAUSED only after a saved checkpoint. `/resume` appears
 only after that durable state exists. An API call is not presented as a
 server-side job and does not claim to keep running after the computer shuts down.
 
 ## ULTRA mode
 
-`/mode ultra` turns a compact request into `GoalSpecV1`, architecture, and an
-approval-bound master plan. After the master plan is applied in Plan Studio, the background scheduler runs
+Ultra execution turns a compact request into `GoalSpecV1`, architecture, and an
+approval-bound master plan. After the master plan is applied in Ultra Plan, the background scheduler runs
 the same pipeline for local and cloud models:
 
 ```text
@@ -211,8 +208,8 @@ reproducibility, evaluation validity, and serving reliability for ML. Existing
 master modules receive those contracts directly; a new specialist swarm is
 created only when the approved plan has not already divided the responsibility.
 
-`/tree`, `/agents`, `/agent`, `/memory`,
-`/trace`, `/insights`, and `/metrics` keep the default scrollback uncluttered.
+`/live` and `/advanced-tracing` keep the default scrollback uncluttered while
+making concise progress or complete developer evidence available on demand.
 
 During a long ULTRA run, the main body keeps a two-line activity strip with the
 human-readable phase, active operation, completed/remaining nodes, elapsed time,
@@ -220,22 +217,21 @@ and an approximate ETA only after enough work has been observed. Blockers add on
 temporary third line. CPU, GPU, RAM, context, model activity, and Sleep state stay
 in the fixed footer rather than interrupting the transcript.
 
-`/agents` opens a live in-workspace Swarm Inspector without starting a nested
+`/live` opens the read-only Ultra Live workspace without starting a nested
 terminal application.
 Every materialized specialist receives a short path-derived name and a read-only
 workspace showing its status, role/phase, capabilities, owned concerns and
 interfaces, assignment, deliverable, and latest redacted prompt. Up/Down switches
 specialists without affecting execution; Tab or Left/Right switches between the
 agent workspace and a status-aware hierarchy map. The view refreshes from durable
-SQLite state while the local model continues running. `/tree` opens the same
-inspector directly on the hierarchy tab. `/thinking show|hide|status` (or
-`/reasoning`) controls redacted session summaries; raw chain-of-thought is never
-shown. `/details [ID]` expands a collapsed long message or the latest diagnostic.
+SQLite state while the local model continues running. Advanced Tracing exposes
+redacted reasoning summaries, prompt records, context decisions, and diagnostics;
+raw chain-of-thought is never stored or shown.
 Plain/redirected terminals retain
 the compact text fallback.
 
-`/permissions full` is fail-closed: it works only after `/setup` builds the
-versioned non-root Docker image. The workspace is the only writable bind mount;
+Full permissions are fail-closed and selectable only in Settings after Project
+setup builds the versioned non-root Docker image. The workspace is the only writable bind mount;
 the host home, Docker socket, and credentials are never mounted or injected.
 
 The original command remains supported:
@@ -259,12 +255,10 @@ python agent/main.py --workspace /path/to/project
 3. Deterministic validation checks every plan; a separate critic is used only
    for complex or high-risk work.
 4. Open `/plan`, edit or revise the plan, then use the explicit Approve & Start action.
-5. Use `/mode normal` for the cohesive durable workflow or `/mode ultra` for
-   recursive specialists, architecture debate, component isolation, and consensus.
-   `/mode plan` is planning-only. Normal may escalate to Ultra; an Ultra project may
-   visit Plan for editing and return to Ultra, but cannot be downgraded to Normal.
-   Mode changes requested during work are applied only after the nearest saved
-   checkpoint. Ctrl-C requests that checkpoint cooperatively.
+5. Routing and recursive depth are selected from task complexity and model
+   capability. Use `/plan` only when you explicitly want the editable planning
+   boundary before mutation. Changes requested during work are applied only after
+   the nearest saved checkpoint; Ctrl-C requests that checkpoint cooperatively.
 6. Add guidance or edit the checklist at any checkpoint. The durable objective is
    always re-injected, even after context compaction or restart.
 7. Completion requires all accepted tasks, direct evidence, no uncertain action,
@@ -290,56 +284,34 @@ one operation, repeated read-only inspections are coalesced, usage counters and
 recoverable schema details stay folded, and a plan is announced only after the
 independent critic accepts it. Provider thoughts drive a compact single-line
 square loader whose gray-to-white motion changes by activity state and whose
-label reflects the current thought or tool, then collapse at the end of each model step; `/thinking`
-opens the redacted, session-only blocks again. Use `/trace`, `/history`, or
-`/metrics` when durable technical detail is needed.
+label reflects the current thought or tool, then collapses at the end of each
+model step. Use `/advanced-tracing` when durable technical detail is needed.
 
 ## Commands
 
 | Command | Effect |
 |---|---|
-| `/` | Open the interactive slash-command palette |
-| `/mode plan`, `/mode normal`, `/mode ultra` | Select planning-only, durable Normal, or recursive specialist Ultra orchestration |
-| `/queue`, `/enqueue MODE TEXT`, `/guide TEXT` | Inspect durable FIFO work, add a mode-bound prompt, or guide only the active goal |
-| `/project-brain [QUERY]` | Inspect project-scoped memory |
-| `/sessions [SESSION_ID]` | Browse project sessions or restore one from its saved model/mode/permission/concurrency checkpoint |
-| `/settings [NAME [VALUE]]` | Inspect safe session settings or change color/runtime limits; secrets are never displayed |
-| `/api-key [openai\|gemini\|ollama]`, `/settings api-key PROVIDER` | Enter a provider credential in a masked composer and save it to the Git-ignored application `.env`; the value never enters chat history |
-| `/model [NAME]` | Reopen the picker or switch models at a safe checkpoint |
-| `/permissions normal\|full`, `/setup` | Select approvals or initialize the fail-closed Docker Full sandbox |
-| `/skills` | Show the real local tool registry, availability, risk, and approval policy |
-| `/processes`, `/stop-process ID` | Inspect or stop agent-owned processes and HTML previews |
-| `/sleep on\|safe\|full\|off\|status` | Choose Safe Auto or explicit Full Auto unattended approvals; every automatic approval is audited |
-| `/agents` | Open the recursive Execution tree, controls, agents, and recorded result |
-| `/memory [SECTION]`, `/trace [latest\|RUN_ID]` | Inspect Project Brain and redacted prompts/context/summaries |
-| `/thinking` | Expand redacted provider thoughts captured during this session |
-| `/insights [NODE]`, `/metrics` | Inspect durable findings and execution metrics |
-| `/questions`, `/answer ID VALUE` | Advanced fallback for decisions; reply normally, use `/answer 1` for the current question, or `/answer q1 1` for an explicit ID (`/ans` is an alias) |
-| plain text / `/goal TEXT` | Enter the same Intent Architect gate when idle; otherwise add durable user guidance |
-| `/plan` | Open the primary Web workspace and its detailed plan/revision surface |
-| `/review` | Open Change Review, the only file/hunk review surface |
-| `/status` | Refresh the compact terminal working surface |
-| `/chat` | Open the durable read-only workspace conversation; typing returns to the composer |
-| `/explorer`, `/open-folder` | Open the exact selected project workspace in the file explorer |
-| `/done ID NOTE` | Complete a task with user-supplied evidence |
-| `/todo ID`, `/block ID NOTE`, `/skip ID NOTE` | Reopen or change task state |
-| `/run [STEPS]` | Run one bounded work slice; the goal itself has no slice deadline |
-| `/auto` | Persist through no-progress attempts; pause after repeated provider failures or at real input/approval boundaries |
-| `/pause`, `/resume`, `/continue` | Request a cooperative checkpoint, then continue only after PAUSED is durable |
-| `/history` | Show durable events and generated worker roles/results |
-| `/versions` | List protected baseline/accepted checkpoints and their file-change summaries |
+| `/plan` | Open Ultra Plan and its editable document / first-layer approval flow |
+| `/live` | Open the simple read-only progress workspace |
+| `/show-diff` | Open the standalone read-only workflow diff with live and recorded changes |
+| `/advanced-tracing` | Open the standalone developer trace for the current or a prior run |
+| `/settings` | Open Runtime, Providers, Project, Terminal, and Diagnostics settings |
+| `/pause` | Request a cooperative saved checkpoint |
+| `/resume` | Continue from the durable checkpoint |
+| `/stop` | Stop now while keeping the saved stage resumable |
 | `/undo [STEPS]` | With explicit approval, safely revert accepted checkpoints while preserving the undo in Git history; blocked during active work or with dirty files |
-| `/resolve ENTITY_ID applied\|not-run NOTE` | Reconcile an uncertain crash-window action or worker after inspecting real workspace state |
-| `/cancel CANCEL` | Explicitly abandon an unfinished goal |
-| `/quit` / `exit` | Exit without losing the goal |
+| `/help` | Show the public command surface and the active key bindings |
+| `/quit` | Checkpoint and leave the session |
 
-All slash commands also accept the legacy `:` prefix.
+There are no legacy aliases or `:` command prefix. Approval, retry, questions,
+model recovery, Explorer, and managed-process actions appear as typed TUI
+controls or inside Settings.
 
 For scripting/non-interactive inspection:
 
 ```bash
-python -m agent --workspace ./project --command "/status"
-python -m agent --workspace ./project --provider ollama --model gemma4:e4b --mode normal --command "/approve 2"
+python -m agent --workspace ./project --command "/help"
+python -m agent --workspace ./project --provider ollama --model gemma4:e4b --command "Build and verify the requested artifact"
 ```
 
 To start a genuinely empty workflow thread while reusing the selected project
@@ -348,7 +320,7 @@ and its protection settings, add `--new-session`.  This is different from
 timeline of an existing thread:
 
 ```powershell
-python -m agent --workspace ./project --new-session --provider ollama --model gemma4:e4b --command "/sleep full" --command "Build the requested artifact and verify it" --auto
+python -m agent --workspace ./project --new-session --provider ollama --model gemma4:e4b --command "Build the requested artifact and verify it" --auto
 ```
 
 ## Lifecycle and completion authority
@@ -441,8 +413,8 @@ Set `LLM_PROVIDER=openai`, `gemini`, or `ollama` in `.env`, or pass `--provider`
 Use `--model` for a one-run override. Adapters normalize streaming, tool calls,
 usage, IDs, malformed arguments, and provider-native replay metadata. Gemini
 thought signatures/function IDs and Ollama thinking/tool names are retained.
-The TUI can add or replace a key through `/api-key`; use `/model` afterward to
-select or reconnect that provider at a safe checkpoint.
+The TUI can add or replace a masked key under Providers in `/settings`; choose
+Runtime / Model there to select or reconnect at a safe checkpoint.
 
 ## Runtime tuning
 

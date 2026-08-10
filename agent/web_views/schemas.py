@@ -12,6 +12,14 @@ class RetryPolicyPayload(BaseModel):
     backoff_seconds: float = Field(default=0, ge=0, le=3600)
 
 
+class TraceRevealPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    trace_id: str = Field(min_length=1, max_length=200)
+    goal_id: str | None = Field(default=None, max_length=200)
+    run_id: str | None = Field(default=None, max_length=200)
+
+
 class TaskPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -80,6 +88,17 @@ class PlanApprovalPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     revision: int = Field(ge=1)
+    plan_fingerprint: str = Field(default="", max_length=128)
+    team_fingerprint: str = Field(default="", max_length=128)
+
+
+class PlanDocumentPayload(BaseModel):
+    """The calm editor's single-document plan handoff."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    base_revision: int = Field(ge=1)
+    document: str = Field(min_length=1, max_length=40_000)
 
 
 class ToolApprovalPayload(BaseModel):

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GA3BAD · Advanced Tracing</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%23d99a22'/%3E%3Ctext x='16' y='21' text-anchor='middle' font-family='Arial' font-size='12' font-weight='700'%3EG3%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/advanced-tracing.css">
+</head>
+<body>
+  <header class="trace-header">
+    <a class="trace-brand" href="#overview" aria-label="Advanced Tracing overview">
+      <span class="brand-mark">G3</span>
+      <span><strong>Advanced Tracing</strong><small>Developer evidence</small></span>
+    </a>
+    <div class="run-identity">
+      <span id="stateBadge" class="state-badge" data-state="loading">LOADING</span>
+      <span id="runLabel" class="run-label">Reading the durable journal…</span>
+    </div>
+    <div class="header-actions">
+      <label class="run-picker-label" for="runPicker">Run</label>
+      <select id="runPicker" aria-label="Select traced run"></select>
+      <button id="exportButton" class="quiet-button" type="button">Export JSON</button>
+    </div>
+  </header>
+
+  <div class="trace-shell" id="traceShell">
+    <aside class="trace-index" aria-label="Trace sections">
+      <div class="index-search">
+        <label for="traceSearch">Find in trace</label>
+        <input id="traceSearch" type="search" placeholder="file, agent, event…" autocomplete="off">
+      </div>
+      <nav id="sectionNav">
+        <button type="button" data-section="overview" aria-current="page"><span>Overview</span><b id="countOverview">—</b></button>
+        <button type="button" data-section="timeline"><span>Timeline</span><b id="countTimeline">—</b></button>
+        <button type="button" data-section="files"><span>Files</span><b id="countFiles">—</b></button>
+        <button type="button" data-section="problems"><span>Problems</span><b id="countProblems">—</b></button>
+        <button type="button" data-section="agents"><span>Agents & models</span><b id="countAgents">—</b></button>
+        <button type="button" data-section="prompts"><span>Plans & prompts</span><b id="countPrompts">—</b></button>
+        <button type="button" data-section="context"><span>Context</span><b id="countContext">—</b></button>
+        <button type="button" data-section="changes"><span>Changes</span><b id="countChanges">—</b></button>
+      </nav>
+      <div class="privacy-note">
+        <span class="privacy-mark">R</span>
+        <p><strong>Redacted by default.</strong> Secrets and chain-of-thought are never available.</p>
+      </div>
+    </aside>
+
+    <main class="trace-workspace" tabindex="-1">
+      <div class="workspace-heading">
+        <div>
+          <p class="eyebrow" id="sectionEyebrow">RUN EVIDENCE</p>
+          <h1 id="sectionTitle">Overview</h1>
+          <p id="sectionDescription">What happened, what needs inspection, and where the evidence lives.</p>
+        </div>
+        <div id="sectionTools" class="section-tools"></div>
+      </div>
+      <div id="loadingState" class="loading-state" role="status">
+        <span class="trace-spinner" aria-hidden="true"></span>
+        <span>Projecting the durable trace…</span>
+      </div>
+      <div id="errorState" class="error-state" hidden></div>
+      <section id="traceContent" aria-live="polite"></section>
+    </main>
+
+    <aside class="trace-inspector" id="traceInspector" aria-label="Selected trace detail">
+      <div class="inspector-empty" id="inspectorEmpty">
+        <span class="inspector-glyph">↳</span>
+        <h2>Select one record</h2>
+        <p>Its exact IDs, evidence, paths, prompt receipt, or diff will appear here.</p>
+      </div>
+      <div id="inspectorContent" hidden></div>
+    </aside>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/advanced-tracing.js" defer></script>
+</body>
+</html>

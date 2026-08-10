@@ -21,7 +21,7 @@ from agent.evaluation import (
     run_single_file_3d_html_benchmark,
 )
 from agent.local_provider import (ModelCapabilityProfile, OllamaRequestCompiler, ProviderFailureKind,
-    ProviderRequestError, extract_first_json_object, normalize_action_proposal,
+    ProviderRequestError, extract_action_proposal, extract_first_json_object, normalize_action_proposal,
     repair_structured_json_object)
 from agent.providers.ollama_provider import OllamaProvider
 from agent.reasoning import evaluate_reasoning_artifact, reasoning_debate_protocol_for
@@ -684,6 +684,44 @@ function lerp(a,b,t){return a+(b-a)*t} function animate(){requestAnimationFrame(
             normalize_action_proposal(candidate),
             ("update_task", {"task_id": "T001", "status": "done"}),
         )
+
+    def test_text_action_unwraps_single_item_array(self):
+        proposal, receipt = extract_action_proposal(
+            '[{"name":"submit_goal_intake","args":{"objective":"Build it"}}]'
+        )
+        self.assertEqual(
+            proposal,
+            ("submit_goal_intake", {"objective": "Build it"}),
+        )
+        self.assertIn("single-item", " ".join(receipt.actions))
+
+    def test_text_action_repairs_observed_mismatched_array_delimiter(self):
+        proposal, receipt = extract_action_proposal(
+            '[{"name":"submit_goal_intake","args":{"objective":"Build it",'
+            '"questions":[{"id":"visual"}]}]]'
+        )
+        self.assertEqual(proposal[0], "submit_goal_intake")
+        self.assertEqual(proposal[1]["objective"], "Build it")
+        self.assertIn("expected '}'", receipt.delimiter_mismatch)
+        self.assertEqual(len(receipt.actions), 3)
+
+    def test_text_action_closes_missing_outer_array_delimiter(self):
+        proposal, receipt = extract_action_proposal(
+            '[{"name":"submit_goal_intake","args":'
+            '{"objective":"Build it","questions":[]}}'
+        )
+        self.assertEqual(proposal[0], "submit_goal_intake")
+        self.assertEqual(proposal[1]["questions"], [])
+        self.assertIn("ended before outer delimiter", receipt.delimiter_mismatch)
+        self.assertIn("incomplete single-item", " ".join(receipt.actions))
+
+    def test_text_action_rejects_multiple_action_array(self):
+        proposal, receipt = extract_action_proposal(
+            '[{"name":"read_file","args":{"path":"a"}},'
+            '{"name":"read_file","args":{"path":"b"}}]'
+        )
+        self.assertIsNone(proposal)
+        self.assertIn("exactly one", receipt.json_error)
 
     def test_local_json_repair_removes_invalid_single_quote_escape(self):
         candidate, actions = repair_structured_json_object(

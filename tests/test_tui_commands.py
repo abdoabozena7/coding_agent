@@ -25,28 +25,32 @@ class CommandAvailabilityTests(unittest.TestCase):
         idle = SimpleNamespace(status="idle", running=False, undo_available=False)
         matches = matching_commands("/", snapshot=idle)
         self.assertEqual(
-            [item.name for item in matches[:4]],
-            ["/plan", "/model", "/settings", "/help"],
+            [item.name for item in matches[:5]],
+            ["/plan", "/live", "/show-diff", "/advanced-tracing", "/settings"],
         )
-        self.assertGreater(len(matches), 9)
+        self.assertEqual(
+            {item.name for item in COMMAND_SPECS},
+            {
+                "/plan", "/live", "/show-diff", "/advanced-tracing", "/settings", "/pause",
+                "/resume", "/stop", "/undo", "/help", "/quit",
+            },
+        )
 
-    def test_legacy_mode_command_is_hidden_from_interactive_palette(self):
+    def test_removed_commands_do_not_exist_in_interactive_metadata(self):
         running = SimpleNamespace(status="running", running=True, undo_available=False)
-        mode = next(item for item in COMMAND_SPECS if item.name == "/mode")
-        availability = command_availability(mode, running)
-        self.assertFalse(availability.visible)
-        self.assertFalse(availability.enabled)
-        self.assertIn("automatically", availability.reason.casefold())
+        names = {item.name for item in matching_commands("", snapshot=running)}
+        self.assertFalse({"/mode", "/model", "/sleep", "/trace", "/agents"} & names)
 
-    def test_running_palette_exposes_explicit_sleep_actions(self):
+    def test_running_palette_keeps_only_direct_recovery_controls(self):
         running = SimpleNamespace(status="running", running=True, undo_available=False)
-        names = {item.name for item in matching_commands("/sleep", snapshot=running)}
-        self.assertTrue({"/sleep on", "/sleep safe", "/sleep full", "/sleep off", "/sleep status"} <= names)
+        names = {item.name for item in matching_commands("", snapshot=running)}
+        self.assertTrue({"/pause", "/stop", "/live", "/show-diff", "/advanced-tracing", "/settings"} <= names)
+        self.assertNotIn("/resume", names)
 
-    def test_recovery_palette_keeps_sleep_and_stop_discoverable(self):
+    def test_recovery_palette_keeps_resume_and_stop_discoverable(self):
         recovering = SimpleNamespace(status="recovering", running=True, undo_available=False)
         names = {item.name for item in matching_commands("", snapshot=recovering)}
-        self.assertTrue({"/sleep on", "/sleep full", "/sleep off", "/sleep status", "/stop"} <= names)
+        self.assertTrue({"/pause", "/stop", "/live", "/show-diff", "/advanced-tracing"} <= names)
 
 
 if __name__ == "__main__":

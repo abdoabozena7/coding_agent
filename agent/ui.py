@@ -17,7 +17,7 @@ from typing import Any, Iterable, Mapping, TextIO
 
 try:
     from .action_policy import ApprovalRequirement, classify_action
-    from .config import InteractionMode, runtime_setting_names
+    from .config import InteractionMode
     from .events import UIEvent
     from .safety import redact_data, redact_text
     from .tui import ChoiceItem, select_horizontal_action, terminal_supports_unicode
@@ -37,7 +37,7 @@ try:
     )
 except ImportError:  # direct ``python agent/main.py`` compatibility
     from action_policy import ApprovalRequirement, classify_action  # type: ignore
-    from config import InteractionMode, runtime_setting_names  # type: ignore
+    from config import InteractionMode  # type: ignore
     from events import UIEvent  # type: ignore
     from safety import redact_data, redact_text  # type: ignore
     from tui import ChoiceItem, select_horizontal_action, terminal_supports_unicode  # type: ignore
@@ -172,54 +172,9 @@ if Completer is not None:
                             display_meta=description,
                         )
                 return
-            tokens = lowered.split()
-            if not tokens:
-                return
-            trailing_space = bool(lowered and lowered[-1].isspace())
-            current = "" if trailing_space else tokens[-1]
-            if tokens[0] == "/mode" and len(tokens) <= 2:
-                yield from self._values(
-                    current,
-                    (
-                        ("plan", "inspect and edit a durable plan without executing"),
-                        ("normal", "shared intake, durable goal, planning, review, and automatic execution"),
-                        ("ultra", "recursive specialists with component and quality gates"),
-                    ),
-                )
-            elif tokens[0] in {"/api-key", "/apikey", "/add-api-key"} and len(tokens) <= 2:
-                yield from self._values(current, ("openai", "gemini", "ollama"))
-            elif tokens[0] in {"/permissions", "/permission", "/access"} and len(tokens) <= 2:
-                yield from self._values(
-                    current,
-                    (
-                        ("normal", "ask before risky actions"),
-                        ("full", "Docker-isolated access without workspace prompts"),
-                    ),
-                )
-            elif tokens[0] == "/settings" and len(tokens) >= 2 and tokens[1] == "mode" and len(tokens) <= 3:
-                yield from self._values(current, ("plan", "normal", "ultra"))
-            elif tokens[0] == "/settings" and len(tokens) >= 2 and tokens[1] in {"api-key", "api_key"} and len(tokens) <= 3:
-                yield from self._values(current, ("openai", "gemini", "ollama"))
-            elif tokens[0] == "/settings" and len(tokens) >= 2 and tokens[1] == "color" and len(tokens) <= 3:
-                yield from self._values(current, ("auto", "on", "off"))
-            elif tokens[0] == "/settings" and (
-                len(tokens) == 1 or (len(tokens) == 2 and not trailing_space)
-            ):
-                choices = (
-                    "mode",
-                    "color",
-                    "provider",
-                    "model",
-                    "workspace",
-                    "api-key",
-                    "concurrency",
-                    "ultra_depth",
-                    "ultra_nodes",
-                    "fix_attempts",
-                    "reset",
-                    *runtime_setting_names(),
-                )
-                yield from self._values(current, choices)
+            # Settings and recovery actions are selected inside focused TUI
+            # surfaces.  No hidden second-token command language exists.
+            return
 else:
     SlashCommandCompleter = None  # type: ignore
 
@@ -347,26 +302,13 @@ def render_brand() -> str:
 
 
 def render_slash_menu() -> str:
-    """Render the plain-terminal fallback of the Codex-like slash palette."""
+    """Render the same small command surface in a plain terminal."""
 
-    width = max(len(command) for command, _description in CODEX_SLASH_COMMANDS)
+    width = max(len(command) for command, _description in ALL_SLASH_COMMANDS)
     lines = ["Commands"]
     lines.extend(
         f"{command:<{width}}  {description}"
-        for command, description in CODEX_SLASH_COMMANDS
-    )
-    lines.extend(
-        (
-            "",
-            "More GA3BAD commands remain available directly, including:",
-            "  /mode plan   create and edit a durable plan without executing it",
-            "  /mode normal shared intake, durable goal, planning, review, and automatic execution",
-            "  /mode ultra  recursive specialists, component packages, and deeper quality gates",
-            "  /settings    inspect or change session settings",
-            "  /trace       inspect redacted prompts and run trace",
-            "",
-            "Legacy :commands remain supported.",
-        )
+        for command, description in ALL_SLASH_COMMANDS
     )
     return "\n".join(lines)
 
@@ -689,7 +631,7 @@ def render_agents(
         (
             "",
             "View only: /agent NUMBER|NODE_ID|AGENT_ID",
-            "All specialists: /agents --all",
+            "All specialists: /advanced-tracing",
         )
     )
     return "\n".join(lines)
@@ -899,7 +841,7 @@ def render_dashboard(view: DashboardView, width: int | None = None) -> str:
     for item in (view.activity[-4:] or ["Ready."]):
         lines.append("|" + _fit(f" {item}", inner) + "|")
     lines.append(rule)
-    commands = " /  /mode  /run [steps]  /plan  /review  /agents  /settings  /status  /help  /quit"
+    commands = " /plan  /live  /show-diff  /advanced-tracing  /settings  /pause  /resume  /stop  /undo  /help  /quit"
     lines.append("|" + _fit(commands, inner) + "|")
     lines.append("+" + "-" * inner + "+")
     return "\n".join(lines)
@@ -1075,77 +1017,36 @@ def render_plan(view: DashboardView, width: int | None = None) -> str:
     lines.append(
         "Use /plan to review, revise, and apply the exact plan in Plan Studio"
         if not execution_started
-        else "Use /status for compact state or /review for the current checkpoint"
+        else "Use /live for simple progress or /advanced-tracing for the complete trace"
     )
     return "\n".join(lines).rstrip()
 
 
 HELP_TEXT = """\
-Slash palette and modes
-  /                           open the slash-command palette
-  /mode                      show the current interaction mode
-  /mode plan                 planning and review only; no tools or file changes
-  /mode normal               intent intake + durable goal + planning/review/automatic execution
-  /mode ultra                recursive specialists + Project Brain + full quality gates
-  /settings                  show safe session settings (never secrets)
-  /settings NAME VALUE       change mode, color, or a runtime limit this session
-  /settings reconfigure      reopen and update the saved project profile
-  /model                     reopen the tool-capable model picker at a safe checkpoint
-  /permissions normal|full   choose approvals or Docker-isolated Full access
-  /setup                     build/validate the one-time Full-access sandbox
-  /setup project             reopen the saved project model/protection/profile choices
-  /skills                    show actual local tools and live capability status
-  /processes                 list managed processes and HTML previews
-  /stop-process ID           stop a managed process or preview
-  /sleep safe|full|off|status  unattended policy; Full Auto accepts reviewed plans and tools
-  /open-web                  open the primary Workspace control surface
+Slash commands
+  /plan               open the explicit Ultra Plan workspace
+  /live               open the simple read-only workflow view
+  /show-diff          open the simple live workflow diff
+  /advanced-tracing   open the standalone developer trace
+  /settings           open runtime, provider, project, terminal, and diagnostics settings
+  /pause              pause active work at a saved boundary
+  /resume             resume the saved checkpoint
+  /stop               stop now and keep the stage resumable
+  /undo [STEPS]       revert accepted checkpoints after confirmation
+  /help               show this help
+  /quit               checkpoint and leave the session
 
 Persistent workspace keys
-  F2                         Simple / Advanced details
+  F2                         Simple / Advanced display
   F3 / F4 / F6              model / permissions / Sleep Mode
-  F7 / F8                    current diff / exact project folder
-  arrows / Enter / Escape    navigate / safe default / back or safe cancel
+  F7 / F8 / F9              diff / project folder / agents
+  arrows / Enter / Escape    navigate / confirm / back
   Page Up / Page Down / End  inspect transcript / resume following
   Ctrl+C / Ctrl+Q            cooperative pause / checkpoint-safe exit
 
-Goal and plan
-  /goal TEXT                 start a durable goal (plain text also works when idle)
-  /plan                      open Plan Studio for the latest exact revision
-  /review                    open Change Review for the current checkpoint
-  /execution / /agents       open the live Execution tree (read-only)
-  /chat                      open the durable read-only workspace conversation
-  /questions                 show non-discoverable intake/planning decisions
-  /answer ID 1|2|3|TEXT      select a suggestion or save a free-form answer
-
-Task outcomes
-  /done TASK_ID NOTE         mark done with user evidence
-  /todo|/block|/skip ID NOTE change task status
-
-Execution
-  /run [STEPS]               run a bounded work slice; goal remains durable
-  /auto                      retry/self-prompt without limit until completion or real user input
-  /pause / /resume           drain to a saved checkpoint, then continue
-  /history / /status         inspect durable milestones in the Workspace
-  /versions                  list protected accepted checkpoints and change summaries
-  /diff [NUMBER|COMMIT]      show current changes or one redacted checkpoint patch
-  /explorer                  open the exact selected project folder
-  /undo [STEPS]              safely revert accepted checkpoints after explicit approval
-  /tree [NODE]               inspect the specialist module/submodule/task hierarchy
-  /agents [--all|AGENT]      read-only live swarm list/topology
-  /agent NUMBER|ID           inspect one specialist and its redacted prompt
-  /memory [SECTION]          inspect/search Project Brain entries
-  /trace [latest|RUN_ID]     show redacted prompts, context, and reasoning summaries
-  /thinking                  expand redacted thoughts captured this session
-  /insights [NODE]           show findings, decisions, and lessons
-  /metrics                   show token, agent, node, fix, and concurrency metrics
-  /doctor [--live] [--record]
-                              audit weak-model architecture; --live probes Ollama, --record saves benchmark history
-  /resolve ENTITY_ID applied|not-run NOTE
-                              reconcile a crash-window action/worker after inspection
-  /cancel CANCEL             explicitly abandon an unfinished goal
-  /quit                      exit safely; unfinished state resumes next launch
-
-All legacy :commands remain supported.
+Planning questions, approvals, retries, model recovery, agents, and
+process controls appear as focused TUI actions or inside Settings. They are not
+additional slash commands.
 """
 
 
@@ -1442,7 +1343,7 @@ class _LiveActivity:
         interrupt_key = "esc" if self._supports_esc_interrupt() else "Ctrl+C"
         interrupt = f"({elapsed}s {separator} {interrupt_key} to interrupt)"
         if label_value:
-            # The detailed activity still drives /thinking and completed event
+            # Detailed activity still drives Advanced Tracing and completed-event
             # lines; the live row itself mirrors Codex's compact chrome.
             interrupt = _fit(interrupt, max(8, columns - len(label) - 5)).rstrip()
         with self.owner._lock:
@@ -1523,7 +1424,7 @@ class _LiveActivity:
             f"  {progress_label}",
             f"  now   {_fit(current or 'Preparing the next step', max(8, content_width - 6)).rstrip()}",
             f"  done  {_fit((last_completed or 'No specialist completed yet') + ' · next ' + (next_work or 'scheduler deciding'), max(8, content_width - 6)).rstrip()}",
-            f"  {interrupt_key} checkpoints safely · /agents details · /status snapshot",
+            f"  {interrupt_key} checkpoints safely · /live progress · /advanced-tracing details",
         ]
         rows = [_fit(row, columns).rstrip() for row in rows]
         with self.owner._lock:
@@ -1938,7 +1839,7 @@ class ConsoleUI:
             return
         self._live_line(
             self._icon("◇", "[~]"),
-            f"{summary} · {duration}s · details in /thinking",
+            f"{summary} · {duration}s · details in /advanced-tracing",
             self.thought_done,
         )
 
@@ -1953,7 +1854,7 @@ class ConsoleUI:
                 # exclusively in Advanced details.
                 technical = (
                     lower.startswith(("coordinator trace:", "goal.event:", "plan.event:"))
-                    or "details in /thinking" in lower
+                    or "details in /advanced-tracing" in lower
                     or "fingerprint" in lower
                 )
                 self._workspace_store.append_transcript(
@@ -2262,7 +2163,7 @@ class ConsoleUI:
             return
         failed = provider_state in {"failed", "network_unavailable", "stopped"}
         self._live_line(
-            self._icon("أ—", "[X]") if failed else self._icon("â—‡", "[>]"),
+            self._icon("\u00d7", "[X]") if failed else self._icon("\u25c7", "[>]"),
             message,
             self.red if failed else self.cyan,
             dedupe_key=f"plain-provider:{request_key}:{provider_state}",
@@ -2945,15 +2846,15 @@ class ConsoleUI:
 
                 @bindings.add("f2")
                 def _open_mode(event) -> None:
-                    event.app.exit(result="/mode")
+                    event.app.exit(result="/settings")
 
                 @bindings.add("f3")
                 def _open_model(event) -> None:
-                    event.app.exit(result="/model")
+                    event.app.exit(result="/settings")
 
                 @bindings.add("f4")
                 def _open_permissions(event) -> None:
-                    event.app.exit(result="/permissions")
+                    event.app.exit(result="/settings")
 
                 @bindings.add("c-k")
                 def _open_commands(event) -> None:

@@ -25,19 +25,24 @@ from ..events import LiveWorkflowEventV1
 from .schemas import (
     ExplanationRequestPayload,
     PlanApprovalPayload,
+    PlanDocumentPayload,
     PlanPayload,
     PlanRequestPayload,
     QueuePromptPayload,
     QueueReorderPayload,
     ReviewSubmissionPayload,
     ToolApprovalPayload,
+    TraceRevealPayload,
     WorkspaceActionRequest,
 )
 from .security import SessionSecurity
 from .service import CoreWebAdapter
 
 
-VIEWS = frozenset({"thread", "plan", "review", "agents", "execution", "history", "tree", "diff"})
+VIEWS = frozenset({
+    "plan", "live", "thread", "review", "agents", "execution", "history",
+    "tree", "diff", "show-diff", "advanced-tracing",
+})
 
 
 def _set_web_control_connected(runtime: Any, connected: bool) -> None:
@@ -181,13 +186,25 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
     async def shell(request: Request, session_id: str, view_name: str):
         if session_id != adapter.session_id or view_name not in VIEWS:
             raise HTTPException(status_code=404, detail="view not found")
-        adapter.request_view(view_name)
+        standalone_trace = view_name == "advanced-tracing"
+        standalone_diff = view_name == "show-diff"
+        public_view = (
+            "advanced-tracing"
+            if standalone_trace
+            else (
+                "show-diff"
+                if standalone_diff
+                else ("plan" if view_name == "plan" else "live")
+            )
+        )
+        if not standalone_trace and not standalone_diff:
+            adapter.request_view(public_view)
         token = request.query_params.get("token", "")
         if token:
             if not security.validate_handshake(token):
                 raise HTTPException(status_code=401, detail="invalid or expired session token")
             response = RedirectResponse(
-                f"/sessions/{session_id}/{view_name}",
+                f"/sessions/{session_id}/{public_view}",
                 status_code=303,
             )
             response.set_cookie(
@@ -211,7 +228,19 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
             return response
         if not security.validate_cookie(request.cookies.get("ga3bad_session")):
             raise HTTPException(status_code=401, detail="open this view from GA3BAD")
-        return FileResponse(static_dir / "index.html", media_type="text/html")
+        if view_name != public_view:
+            return RedirectResponse(
+                f"/sessions/{session_id}/{public_view}",
+                status_code=303,
+            )
+        return FileResponse(
+            static_dir / (
+                "advanced-tracing.html"
+                if standalone_trace
+                else ("show-diff.html" if standalone_diff else "index.html")
+            ),
+            media_type="text/html",
+        )
 
     def check_session(session_id: str) -> None:
         if session_id != adapter.session_id:
@@ -262,6 +291,11 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
         """Stream safe workflow activity; durable snapshots repair reconnects."""
 
         check_session(session_id)
+        observer_only = str(request.query_params.get("observer") or "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
         raw_after = request.headers.get("last-event-id") or request.query_params.get("after") or "0"
         try:
             after_sequence = max(0, int(raw_after))
@@ -271,8 +305,9 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
         async def stream():
             queue = adapter.events.open_queue()
             cursor = after_sequence
-            app.state.web_connections = int(app.state.web_connections) + 1
-            _set_web_control_connected(adapter.runtime, True)
+            if not observer_only:
+                app.state.web_connections = int(app.state.web_connections) + 1
+                _set_web_control_connected(adapter.runtime, True)
             try:
                 snapshot = adapter.workspace_context()
                 latest = adapter.events.latest_sequence
@@ -347,8 +382,11 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
                     )
             finally:
                 adapter.events.close_queue(queue)
-                app.state.web_connections = max(0, int(app.state.web_connections) - 1)
-                _set_web_control_connected(adapter.runtime, bool(app.state.web_connections))
+                if not observer_only:
+                    app.state.web_connections = max(0, int(app.state.web_connections) - 1)
+                    _set_web_control_connected(
+                        adapter.runtime, bool(app.state.web_connections)
+                    )
 
         return StreamingResponse(
             stream(),
@@ -380,10 +418,19 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
         check_session(session_id)
         return adapter.save_plan_revision(payload)
 
+    @app.post("/api/sessions/{session_id}/plan/team-preview")
+    async def prepare_team_preview(session_id: str, payload: PlanDocumentPayload):
+        check_session(session_id)
+        return adapter.prepare_team_preview(payload)
+
     @app.post("/api/sessions/{session_id}/plan/approve")
     async def approve_plan(session_id: str, payload: PlanApprovalPayload):
         check_session(session_id)
-        return adapter.approve_plan(payload.revision)
+        return adapter.approve_plan(
+            payload.revision,
+            plan_fingerprint=payload.plan_fingerprint,
+            team_fingerprint=payload.team_fingerprint,
+        )
 
     @app.post("/api/sessions/{session_id}/tool-approval")
     async def resolve_tool_approval(session_id: str, payload: ToolApprovalPayload):
@@ -445,6 +492,16 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
         check_session(session_id)
         return adapter.review_snapshot(checkpoint)
 
+    @app.get("/api/sessions/{session_id}/show-diff")
+    async def get_workflow_diff(session_id: str):
+        check_session(session_id)
+        return await asyncio.to_thread(adapter.diff_workflow_snapshot)
+
+    @app.get("/api/sessions/{session_id}/show-diff/{change_id}")
+    async def get_workflow_diff_detail(session_id: str, change_id: str):
+        check_session(session_id)
+        return await asyncio.to_thread(adapter.diff_workflow_detail, change_id)
+
     @app.get("/api/sessions/{session_id}/history")
     async def get_history(
         session_id: str,
@@ -500,6 +557,96 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
             "server_time": time.time(),
         }
 
+    @app.get("/api/sessions/{session_id}/advanced-tracing/overview")
+    async def advanced_trace_overview(
+        session_id: str,
+        goal_id: str | None = None,
+        run_id: str | None = None,
+    ):
+        check_session(session_id)
+        return adapter.advanced_trace_overview(goal_id=goal_id, run_id=run_id)
+
+    @app.get("/api/sessions/{session_id}/advanced-tracing/timeline")
+    async def advanced_trace_timeline(
+        session_id: str,
+        goal_id: str | None = None,
+        run_id: str | None = None,
+        after: int = 0,
+        limit: int = 250,
+        category: str = "",
+        query: str = "",
+    ):
+        check_session(session_id)
+        return adapter.advanced_trace_timeline(
+            goal_id=goal_id,
+            run_id=run_id,
+            after=after,
+            limit=limit,
+            category=category,
+            query=query,
+        )
+
+    @app.get("/api/sessions/{session_id}/advanced-tracing/sections/{section}")
+    async def advanced_trace_section(
+        session_id: str,
+        section: str,
+        goal_id: str | None = None,
+        run_id: str | None = None,
+    ):
+        check_session(session_id)
+        return adapter.advanced_trace_section(
+            section,
+            goal_id=goal_id,
+            run_id=run_id,
+        )
+
+    @app.get("/api/sessions/{session_id}/advanced-tracing/inspector/{entity_type}/{entity_id}")
+    async def advanced_trace_inspector(
+        session_id: str,
+        entity_type: str,
+        entity_id: str,
+        goal_id: str | None = None,
+        run_id: str | None = None,
+    ):
+        check_session(session_id)
+        return adapter.advanced_trace_inspector(
+            entity_type,
+            entity_id,
+            goal_id=goal_id,
+            run_id=run_id,
+        )
+
+    @app.post("/api/sessions/{session_id}/advanced-tracing/reveal")
+    async def advanced_trace_reveal(
+        session_id: str,
+        payload: TraceRevealPayload,
+    ):
+        check_session(session_id)
+        return adapter.advanced_trace_reveal_prompt(
+            payload.trace_id,
+            goal_id=payload.goal_id,
+            run_id=payload.run_id,
+        )
+
+    @app.get("/api/sessions/{session_id}/advanced-tracing/export")
+    async def advanced_trace_export(
+        session_id: str,
+        goal_id: str | None = None,
+        run_id: str | None = None,
+        include_stored_text: bool = False,
+    ):
+        check_session(session_id)
+        payload = adapter.advanced_trace_export(
+            goal_id=goal_id,
+            run_id=run_id,
+            include_stored_text=include_stored_text,
+        )
+        response = JSONResponse(payload)
+        response.headers["Content-Disposition"] = (
+            f'attachment; filename="ga3bad-trace-{session_id[:8]}.json"'
+        )
+        return response
+
     return app
 
 
@@ -537,22 +684,9 @@ class LocalWebServer:
         return True
 
     def _on_runtime_event(self, event: Any) -> None:
-        """Auto-open only mandatory artifact gates; monitoring stays opt-in."""
+        """Keep monitoring opt-in; Ultra Plan is the only automatic web launch."""
 
-        view_name = ""
-        artifact_key = ""
-        if event.kind in {"checkpoint.review_ready", "review.required"}:
-            view_name = "review"
-            artifact_key = f"review:{event.data.get('checkpoint_id') or event.message}"
-        if not view_name or artifact_key in self._opened_artifacts or not self.running:
-            return
-        self._opened_artifacts.add(artifact_key)
-        threading.Thread(
-            target=self.open_view,
-            args=(view_name,),
-            name=f"ga3bad-open-{view_name}",
-            daemon=True,
-        ).start()
+        del event
 
     @property
     def running(self) -> bool:
@@ -608,7 +742,8 @@ class LocalWebServer:
         return base + ("?" + urlencode({"token": self.security.token}) if include_token else "")
 
     def open_view(self, view_name: str) -> dict[str, Any]:
-        self.adapter.request_view(view_name)
+        if view_name not in {"advanced-tracing", "show-diff"}:
+            self.adapter.request_view(view_name)
         url = self.url_for(view_name)
         opened = bool(webbrowser.open(url, new=2))
         self.adapter.events.publish(

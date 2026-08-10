@@ -154,6 +154,18 @@ verification appropriate to risk, and dependencies. Cover relevant correctness,
     but do not add irrelevant ceremony. Keep tasks independently schedulable where
     possible so focused workers can be delegated later.
 
+    REQUIREMENT FIDELITY IS NON-NEGOTIABLE. Treat the complete user objective as
+    the execution contract, never as a loose entry point. Preserve and map every
+    material deliverable, constraint, exclusion, named technology, interaction,
+    quality attribute, acceptance signal, and supplied implementation detail. A
+    long or already-detailed request must become an at-least-equally-specific plan;
+    never summarize away information merely to make the plan shorter. A short
+    request still needs a complete bounded plan with explicit outcomes, acceptance,
+    dependencies, and authoritative verification, but detail must improve proof and
+    clarity rather than inventing scope. Plan document detail and task-tree size are
+    independent: one cohesive task may have a rich contract, while genuinely
+    independent subsystems may become separate tasks.
+
     A plan must make the accepted semantics visible, not merely repeat the request.
     Map every required outcome and acceptance criterion to concrete task descriptions,
     observable criteria, and verification. When the user requests visual, interaction,

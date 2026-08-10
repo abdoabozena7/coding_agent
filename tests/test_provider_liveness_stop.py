@@ -24,8 +24,9 @@ from agent.testing import ScriptedProvider
 
 def test_stop_commands_are_explicit_and_unambiguous() -> None:
     assert parse_command("/stop").kind is CommandKind.STOP
-    assert parse_command("/stop").args["shutdown_ollama"] is False
-    assert parse_command("/stop ollama").args["shutdown_ollama"] is True
+    assert parse_command("/stop").args == {}
+    with pytest.raises(ValueError):
+        parse_command("/stop ollama")
     with pytest.raises(ValueError):
         parse_command("/stop everything")
 

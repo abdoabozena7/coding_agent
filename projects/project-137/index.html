@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Calculator 3D Viewer</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #f0f0f0; }
+        /* Set the container to take up most of the viewport height, allowing space for potential UI elements */
+        #container { width: 100%; height: 85vh; display: flex; justify-content: center; align-items: center; } 
+    </style>
+</head>
+<body id="root">
+    <!-- The container where Three.js will render -->
+    <div id="container"></div>
+    <script type="module" src="src/renderer/scene-setup.js"></script>
+</body>
+</html>

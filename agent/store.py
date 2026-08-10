@@ -105,7 +105,7 @@ from .durable_memory import (
 )
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 DEFAULT_SESSION_ID = "workspace-session"
 MAX_PENDING_PROMPTS = 10
 
@@ -446,6 +446,9 @@ class StateStore:
                     existing = 14
                 if existing < 15:
                     self._migrate_v15()
+                    existing = 15
+                if existing < 16:
+                    self._migrate_v16()
                 journal_columns = {
                     str(row[1])
                     for row in self._connection.execute(
@@ -1687,6 +1690,32 @@ class StateStore:
                     )
             connection.execute("PRAGMA user_version=15")
 
+    def _migrate_v16(self) -> None:
+        """Add immutable, revisioned post-run Advanced Tracing snapshots."""
+
+        schema = """
+        BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS advanced_trace_snapshots (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES workflow_sessions(id) ON DELETE CASCADE,
+            goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            ultra_run_id TEXT REFERENCES ultra_runs(id) ON DELETE SET NULL,
+            revision INTEGER NOT NULL,
+            terminal_status TEXT NOT NULL,
+            cutoff_sequence INTEGER NOT NULL,
+            payload_blob BLOB NOT NULL,
+            compression TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(goal_id, revision)
+        );
+        CREATE INDEX IF NOT EXISTS idx_advanced_trace_goal
+            ON advanced_trace_snapshots(goal_id,revision,created_at);
+        PRAGMA user_version=16;
+        COMMIT;
+        """
+        self._connection.executescript(schema)
+
     def _remove_legacy_recovery_baselines(self) -> None:
         """Remove only recorded full-copy baselines under agent-owned state."""
 
@@ -2739,7 +2768,7 @@ class StateStore:
                 or not str(row["execution_strategy"]).strip()
             ):
                 raise StalePlanError(
-                    "plan lacks fingerprinted applicability evidence; use /replan before approval"
+                    "plan lacks fingerprinted applicability evidence; choose Replan before approval"
                 )
             current_status = PlanStatus(row["status"])
             ensure_plan_transition(current_status, PlanStatus.ACCEPTED)
@@ -7209,6 +7238,128 @@ class StateStore:
                 "queued_count": self.count_queued_prompts(str(row["id"])),
             }
             for row in rows
+        )
+
+    def save_advanced_trace_snapshot(
+        self,
+        *,
+        session_id: str,
+        goal_id: str,
+        ultra_run_id: str | None,
+        terminal_status: str,
+        cutoff_sequence: int,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Freeze one versioned, integrity-addressed developer trace."""
+
+        raw = json.dumps(
+            dict(payload),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        compressed = zlib.compress(raw, level=9)
+        now = utc_now()
+        with self.transaction() as connection:
+            latest = connection.execute(
+                "SELECT * FROM advanced_trace_snapshots WHERE goal_id=? "
+                "ORDER BY revision DESC LIMIT 1",
+                (goal_id,),
+            ).fetchone()
+            if latest is not None and str(latest["payload_hash"]) == digest:
+                return self._advanced_trace_snapshot_from_row(latest, include_payload=True)
+            revision = int(latest["revision"] if latest is not None else 0) + 1
+            snapshot_id = new_id("trace-snapshot")
+            connection.execute(
+                "INSERT INTO advanced_trace_snapshots("
+                "id,session_id,goal_id,ultra_run_id,revision,terminal_status,"
+                "cutoff_sequence,payload_blob,compression,payload_hash,created_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    snapshot_id,
+                    session_id,
+                    goal_id,
+                    ultra_run_id,
+                    revision,
+                    str(terminal_status),
+                    max(0, int(cutoff_sequence)),
+                    compressed,
+                    "zlib-json",
+                    digest,
+                    _iso(now),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM advanced_trace_snapshots WHERE id=?",
+                (snapshot_id,),
+            ).fetchone()
+        assert row is not None
+        return self._advanced_trace_snapshot_from_row(row, include_payload=True)
+
+    @staticmethod
+    def _advanced_trace_snapshot_from_row(
+        row: sqlite3.Row,
+        *,
+        include_payload: bool,
+    ) -> dict[str, Any]:
+        value = {
+            key: row[key]
+            for key in (
+                "id", "session_id", "goal_id", "ultra_run_id", "revision",
+                "terminal_status", "cutoff_sequence", "compression",
+                "payload_hash", "created_at",
+            )
+        }
+        if include_payload:
+            try:
+                value["payload"] = json.loads(
+                    zlib.decompress(bytes(row["payload_blob"])).decode("utf-8")
+                )
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise StateCorruptionError(
+                    f"advanced trace snapshot {row['id']} is unreadable: {exc}"
+                ) from exc
+        return value
+
+    def list_advanced_trace_snapshots(
+        self,
+        goal_id: str,
+        *,
+        include_payload: bool = False,
+    ) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM advanced_trace_snapshots WHERE goal_id=? "
+                "ORDER BY revision,created_at,id",
+                (goal_id,),
+            ).fetchall()
+        return tuple(
+            self._advanced_trace_snapshot_from_row(
+                row,
+                include_payload=include_payload,
+            )
+            for row in rows
+        )
+
+    def latest_advanced_trace_snapshot(
+        self,
+        goal_id: str,
+        *,
+        include_payload: bool = True,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM advanced_trace_snapshots WHERE goal_id=? "
+                "ORDER BY revision DESC LIMIT 1",
+                (goal_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._advanced_trace_snapshot_from_row(
+            row,
+            include_payload=include_payload,
         )
 
     def latest_event_sequence(self, goal_id: str | None = None) -> int:

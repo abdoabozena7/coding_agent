@@ -955,12 +955,13 @@ class MaterializedPackageV9Tests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
                 self.tool_names: list[set[str]] = []
+                self.system_prompts: list[str] = []
                 self.user_payloads: list[dict] = []
                 self.conversations: list[list[dict]] = []
 
             def call(self, conversation, tools, system):
-                del system
                 self.calls += 1
+                self.system_prompts.append(system)
                 try:
                     payload = json.loads(conversation[0]["content"])
                 except json.JSONDecodeError:
@@ -1067,7 +1068,13 @@ class MaterializedPackageV9Tests(unittest.TestCase):
         self.assertLess(len(json.dumps(provider.user_payloads[0])), 5_000)
         self.assertNotIn("publish_component", provider.tool_names[0])
         self.assertNotIn("publish_component", provider.tool_names[1])
-        self.assertTrue(all("stage_component_file" in names for names in provider.tool_names))
+        self.assertTrue(all(not names for names in provider.tool_names))
+        self.assertTrue(
+            all(
+                '"name": "stage_component_file"' in prompt
+                for prompt in provider.system_prompts
+            )
+        )
         self.assertTrue(
             all(
                 names.isdisjoint({"write_file", "edit_file", "run_command", "run_bash"})
@@ -1714,7 +1721,7 @@ class PersistenceAndPickerV9Tests(unittest.TestCase):
             store.close()
             connection = sqlite3.connect(Path(directory) / ".coding-agent" / "state.db")
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 15)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 16)
                 tables = {
                     row[0]
                     for row in connection.execute(

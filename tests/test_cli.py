@@ -11,6 +11,7 @@ from unittest import mock
 
 from agent.cli import (
     _interactive_setup,
+    _latest_recoverable_session_id,
     build_parser,
     choose_access_level,
     choose_interaction_mode,
@@ -20,7 +21,14 @@ from agent.cli import (
     interactive_loop,
     main,
 )
-from agent.commands import CommandKind, CommandParseError, parse_command
+from agent.commands import (
+    CommandKind,
+    CommandParseError,
+    InternalActionKind,
+    UnknownCommandParseError,
+    internal_action,
+    parse_command,
+)
 from agent.config import InteractionMode, RuntimeConfig, SessionPreferences
 from agent.models import GoalStatus
 from agent.store import StateStore
@@ -39,6 +47,78 @@ class _TTY(io.StringIO):
 
 
 class CLITests(unittest.TestCase):
+    def test_explicit_resume_prefers_goal_owning_session_over_newer_empty_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            with StateStore(workspace) as store:
+                store.save_workflow_session(
+                    "workspace-active",
+                    goal_id=None,
+                    session_mode="normal",
+                    plan_state="none",
+                    run_state="idle",
+                    state={},
+                )
+                store.create_goal_and_bind_workflow_session(
+                    "resume this durable goal",
+                    session_id="workspace-active",
+                )
+                # Reproduce project-136: a later command created/refreshed the
+                # empty default row after the real goal-owning session.
+                store.save_workflow_session(
+                    "workspace-session",
+                    goal_id=None,
+                    session_mode="normal",
+                    plan_state="none",
+                    run_state="idle",
+                    state={},
+                )
+
+            self.assertEqual(
+                _latest_recoverable_session_id(workspace),
+                "workspace-active",
+            )
+
+    def test_explicit_resume_recovers_legacy_session_with_missing_goal_projection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            with StateStore(workspace) as store:
+                store.save_workflow_session(
+                    "workspace-legacy",
+                    goal_id=None,
+                    session_mode="normal",
+                    plan_state="none",
+                    run_state="idle",
+                    state={},
+                )
+                store.create_goal_and_bind_workflow_session(
+                    "resume the legacy durable goal",
+                    session_id="workspace-legacy",
+                )
+                # Reproduce project-135: the authoritative Goal retains its
+                # session_id while the denormalized session projection is null.
+                store.save_workflow_session(
+                    "workspace-legacy",
+                    goal_id=None,
+                    session_mode="normal",
+                    plan_state="none",
+                    run_state="planning",
+                    state={},
+                )
+                store.save_workflow_session(
+                    "workspace-session",
+                    goal_id=None,
+                    session_mode="normal",
+                    plan_state="none",
+                    run_state="idle",
+                    state={},
+                )
+
+            self.assertEqual(
+                _latest_recoverable_session_id(workspace),
+                "workspace-legacy",
+            )
+
     def test_new_session_flag_creates_an_empty_thread_instead_of_resuming_default(self):
         with tempfile.TemporaryDirectory() as directory:
             with StateStore(directory) as store:
@@ -70,7 +150,7 @@ class CLITests(unittest.TestCase):
                         "--new-session",
                         "--provider", "ollama",
                         "--model", "gemma4:e4b",
-                        "--command", "/status",
+                        "--command", "/help",
                         "--plain",
                         "--no-color",
                     ]
@@ -137,6 +217,53 @@ class CLITests(unittest.TestCase):
             self.assertEqual(setup[4].concurrency, 1)
             self.assertIn("Loaded this project's saved setup", output.getvalue())
 
+    def test_new_interactive_session_does_not_inherit_saved_plan_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            with StateStore(workspace) as store:
+                store.save_workflow_session(
+                    "workspace-session",
+                    goal_id=None,
+                    session_mode="plan",
+                    plan_state="none",
+                    run_state="idle",
+                    state={
+                        "model_snapshot": {
+                            "provider": "ollama",
+                            "model": "gemma4:e4b",
+                            "execution_class": "local",
+                            "capabilities": ["tools"],
+                        },
+                        "access_level": "normal",
+                        "concurrency": 1,
+                        "interaction_mode": "plan",
+                    },
+                )
+            GitProtectionManager(workspace).configure(
+                auto_checkpoint=False,
+                auto_push=False,
+                provider="snapshot",
+            )
+            args = build_parser().parse_args(
+                [
+                    "--workspace", str(workspace), "--new-session",
+                    "--provider", "ollama", "--plain", "--no-color",
+                ]
+            )
+            console = ConsoleUI(
+                stream=io.StringIO(),
+                color=False,
+                input_func=lambda prompt: (_ for _ in ()).throw(
+                    AssertionError(f"setup unexpectedly prompted: {prompt}")
+                ),
+            )
+
+            setup = _interactive_setup(args, console, "ollama")
+
+            self.assertIsNotNone(setup)
+            assert setup is not None
+            self.assertIs(setup[4].mode, InteractionMode.NORMAL)
+
     def test_strongest_local_failover_skips_failed_model_aliases(self):
         from agent.cli import _strongest_local_model
         from agent.model_catalog import ExecutionClass
@@ -173,7 +300,7 @@ class CLITests(unittest.TestCase):
             )
         )
 
-    def test_first_local_project_prompt_opens_execution_workspace_immediately(self):
+    def test_working_tui_prompt_stays_terminal_only(self):
         import time
 
         from agent.cli import _persistent_interactive_loop
@@ -197,7 +324,7 @@ class CLITests(unittest.TestCase):
                 )
                 deadline = time.monotonic() + 3
                 while time.monotonic() < deadline:
-                    if opened.is_set() and executed.is_set():
+                    if executed.is_set():
                         break
                     time.sleep(0.01)
                 self.on_exit()
@@ -262,19 +389,224 @@ class CLITests(unittest.TestCase):
             telemetry.return_value.stop.return_value = None
             _persistent_interactive_loop(runtime, console, SessionPreferences())
 
-        self.assertTrue(
-            opened.is_set(),
-            {
-                "transcript": [
-                    item.text for item in captured["store"].snapshot().transcript
-                ],
-                "log": list(captured["store"].snapshot().advanced_log),
+        self.assertTrue(executed.is_set())
+        self.assertFalse(opened.is_set())
+        self.assertNotIn("opened_after_execute", captured)
+        open_view.assert_not_called()
+        execute.assert_called_once()
+
+    def test_working_plan_approval_offers_terminal_actions_and_web_review(self):
+        import time
+
+        from agent.cli import _persistent_interactive_loop
+
+        web_opened = Event()
+        captured = {}
+
+        class FakeApp:
+            def __init__(self, _store, *, on_exit, **_kwargs):
+                captured["store"] = _store
+                self.on_exit = on_exit
+                self.overlay_kind = ""
+
+            def run(self):
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    request = captured["store"].active_attention()
+                    if request is not None:
+                        captured["options"] = [option.value for option in request.options]
+                        captured["default"] = request.default_key
+                        captured["cancel"] = request.cancel_key
+                        captured["store"].resolve_attention("web")
+                        break
+                    time.sleep(0.01)
+                web_opened.wait(3)
+                self.on_exit()
+
+            def stop(self):
+                return None
+
+            def close_overlay(self):
+                return None
+
+            def restore_composer(self, *_args, **_kwargs):
+                return None
+
+            def open_details(self, *_args, **_kwargs):
+                return None
+
+            def open_swarm(self, *_args, **_kwargs):
+                return None
+
+            def update_swarm(self, *_args, **_kwargs):
+                return None
+
+        goal = SimpleNamespace(
+            id="goal-1",
+            objective="Create hello.txt",
+            status=GoalStatus.AWAITING_PLAN_APPROVAL,
+            metadata={},
+        )
+        view = SimpleNamespace(
+            status="awaiting_plan_approval",
+            tasks=(SimpleNamespace(title="Create hello.txt"),),
+            objective="Create hello.txt",
+            goal_id="goal-1",
+            plan_revision=2,
+            plan_summary="Create and verify exactly one file.",
+        )
+        runtime = mock.Mock()
+        runtime.workspace = Path("workspace")
+        runtime.session_id = "approval-session"
+        runtime.model_name = "gemma4:e4b"
+        runtime.execution_class = "local"
+        runtime.interaction_mode = SimpleNamespace(value="working")
+        runtime.active_goal.return_value = goal
+        runtime.dashboard.return_value = view
+        runtime.sleep_mode_enabled.return_value = False
+        runtime.sleep_mode_policy.return_value = "off"
+        runtime.store.list_timeline_entries.return_value = []
+        runtime.store.count_queued_prompts.return_value = 0
+        runtime.store.list_queued_prompts.return_value = []
+        runtime.store.claim_next_prompt.return_value = None
+        runtime.store.get_workflow_session.return_value = {"state": {}}
+        runtime.store.get_accepted_plan.return_value = None
+        runtime.local_web_server.take_execution_request.return_value = False
+        runtime.version_control.diff.return_value = ""
+        console = mock.Mock()
+        console.stream = io.StringIO()
+        console.color = False
+
+        with mock.patch("agent.cli.PersistentWorkspaceApp", FakeApp), mock.patch(
+            "agent.cli.TelemetrySampler"
+        ) as telemetry, mock.patch(
+            "agent.cli.question_session", return_value=None
+        ), mock.patch(
+            "agent.cli._current_ultra_run", return_value=None
+        ), mock.patch(
+            "agent.cli._open_local_web_view", side_effect=lambda *_args: web_opened.set()
+        ) as open_view:
+            telemetry.return_value.start.return_value = None
+            telemetry.return_value.stop.return_value = None
+            _persistent_interactive_loop(runtime, console, SessionPreferences())
+
+        self.assertEqual(captured["options"], ["start", "open", "web", "cancel"])
+        self.assertEqual(captured["default"], "cancel")
+        self.assertEqual(captured["cancel"], "cancel")
+        self.assertTrue(web_opened.is_set())
+        open_view.assert_called_once_with(runtime, console, "plan")
+
+    def test_completed_goal_presents_handoff_and_opens_project_folder(self):
+        import time
+
+        from agent.cli import _persistent_interactive_loop
+
+        folder_opened = Event()
+        captured = {}
+
+        class FakeApp:
+            def __init__(self, _store, *, on_exit, **_kwargs):
+                captured["store"] = _store
+                self.on_exit = on_exit
+                self.overlay_kind = ""
+
+            def run(self):
+                first_request = ""
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    request = captured["store"].active_attention()
+                    if request is None:
+                        time.sleep(0.01)
+                        continue
+                    if not first_request:
+                        first_request = request.id
+                        captured["options"] = [option.value for option in request.options]
+                        captured["default"] = request.default_key
+                        captured["store"].resolve_attention("explorer")
+                    elif request.id != first_request:
+                        captured["store"].resolve_attention("dismiss")
+                        break
+                    time.sleep(0.01)
+                folder_opened.wait(3)
+                self.on_exit()
+
+            def stop(self):
+                return None
+
+            def close_overlay(self):
+                return None
+
+            def restore_composer(self, *_args, **_kwargs):
+                return None
+
+            def open_details(self, *_args, **_kwargs):
+                return None
+
+            def open_swarm(self, *_args, **_kwargs):
+                return None
+
+            def update_swarm(self, *_args, **_kwargs):
+                return None
+
+        goal = SimpleNamespace(
+            id="goal-complete",
+            objective="Create hello.txt",
+            status=GoalStatus.COMPLETED,
+            metadata={
+                "goal_change_sets": (
+                    {"changed_files": ("hello.txt",)},
+                ),
             },
         )
-        self.assertTrue(executed.is_set())
-        self.assertTrue(captured["opened_after_execute"])
-        open_view.assert_called_once_with(runtime, console, "execution")
-        execute.assert_called_once()
+        view = SimpleNamespace(
+            status="completed",
+            tasks=(SimpleNamespace(status="done"),),
+            objective="Create hello.txt",
+            goal_id="goal-complete",
+            plan_revision=1,
+        )
+        runtime = mock.Mock()
+        runtime.workspace = Path.cwd()
+        runtime.session_id = "completed-session"
+        runtime.model_name = "gemma4:e4b"
+        runtime.execution_class = "local"
+        runtime.interaction_mode = SimpleNamespace(value="working")
+        runtime.active_goal.return_value = goal
+        runtime.dashboard.return_value = view
+        runtime.sleep_mode_enabled.return_value = False
+        runtime.sleep_mode_policy.return_value = "off"
+        runtime.store.list_timeline_entries.return_value = []
+        runtime.store.count_queued_prompts.return_value = 0
+        runtime.store.list_queued_prompts.return_value = []
+        runtime.store.claim_next_prompt.return_value = None
+        runtime.store.get_workflow_session.return_value = {"state": {}}
+        runtime.store.get_accepted_plan.return_value = None
+        runtime.store.list_evidence.return_value = []
+        runtime.local_web_server.take_execution_request.return_value = False
+        runtime.version_control.diff.return_value = ""
+        console = mock.Mock()
+        console.stream = io.StringIO()
+        console.color = False
+
+        with mock.patch("agent.cli.PersistentWorkspaceApp", FakeApp), mock.patch(
+            "agent.cli.TelemetrySampler"
+        ) as telemetry, mock.patch(
+            "agent.cli.question_session", return_value=None
+        ), mock.patch(
+            "agent.cli._current_ultra_run", return_value=None
+        ), mock.patch(
+            "agent.cli.tools.web_preview.list_previews", return_value=()
+        ), mock.patch(
+            "agent.cli.os.startfile", create=True, side_effect=lambda *_args: folder_opened.set()
+        ) as startfile:
+            telemetry.return_value.start.return_value = None
+            telemetry.return_value.stop.return_value = None
+            _persistent_interactive_loop(runtime, console, SessionPreferences())
+
+        self.assertEqual(captured["options"], ["explorer", "changes", "dismiss"])
+        self.assertEqual(captured["default"], "dismiss")
+        self.assertTrue(folder_opened.is_set())
+        startfile.assert_called_once()
 
     def test_session_recovery_backfills_model_snapshot_from_capability_envelope(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -313,7 +645,7 @@ class CLITests(unittest.TestCase):
                         "--workspace", directory,
                         "--session", "recover-me",
                         "--provider", "ollama",
-                        "--command", "/status",
+                        "--command", "/help",
                         "--plain",
                         "--no-color",
                     ]
@@ -383,6 +715,54 @@ class CLITests(unittest.TestCase):
         self.assertNotIn("normal", ultra_values)
         self.assertNotIn("ultra", ultra_values)
 
+    def test_working_plan_review_offers_terminal_approval_edit_and_web(self):
+        from agent.cli import _plan_attention
+
+        view = SimpleNamespace(
+            goal_id="goal-1",
+            plan_revision=3,
+            plan_summary="A saved recursive plan",
+            tasks=(SimpleNamespace(title="Create the requested file"),),
+        )
+
+        request = _plan_attention(view, (), plan_only=False)
+
+        self.assertEqual(
+            [item.value for item in request.options],
+            ["start", "open", "web", "cancel"],
+        )
+        self.assertEqual(request.options[2].label, "Open in website")
+        self.assertEqual(request.default_key, "cancel")
+        self.assertEqual(request.cancel_key, "cancel")
+
+    def test_completed_work_offers_project_preview_and_diff_handoff(self):
+        from agent.cli import _completion_attention
+
+        view = SimpleNamespace(
+            goal_id="goal-1",
+            tasks=(
+                SimpleNamespace(status="done"),
+                SimpleNamespace(status="skipped"),
+            ),
+        )
+
+        request = _completion_attention(view, preview_available=True)
+
+        self.assertEqual(
+            [item.value for item in request.options],
+            ["explorer", "preview", "changes", "dismiss"],
+        )
+        self.assertTrue(request.options[0].recommended)
+        self.assertEqual(request.default_key, "dismiss")
+        self.assertEqual(request.cancel_key, "dismiss")
+        self.assertIn("2/2 planned steps complete", request.message)
+
+        without_preview = _completion_attention(view, preview_available=False)
+        self.assertEqual(
+            [item.value for item in without_preview.options],
+            ["explorer", "changes", "dismiss"],
+        )
+
     def test_mode_command_changes_depth_without_starting_a_second_foundation(self):
         output = io.StringIO()
         console = ConsoleUI(stream=output, color=False)
@@ -398,7 +778,7 @@ class CLITests(unittest.TestCase):
             execute_command(
                 runtime,
                 console,
-                parse_command("/mode ultra"),
+                internal_action(InternalActionKind.MODE, mode="ultra"),
                 preferences,
             )
         )
@@ -991,13 +1371,23 @@ class CLITests(unittest.TestCase):
         preferences = SessionPreferences(mode=InteractionMode.NORMAL)
 
         self.assertTrue(
-            execute_command(runtime, console, parse_command("/sleep on"), preferences)
+            execute_command(
+                runtime,
+                console,
+                internal_action(InternalActionKind.SLEEP, action="on"),
+                preferences,
+            )
         )
         self.assertTrue(console.sleep_enabled)
         runtime.set_sleep_mode.assert_called_once_with(True, policy="safe")
         runtime.sleep_profile.assert_not_called()
         self.assertTrue(
-            execute_command(runtime, console, parse_command("/sleep status"), preferences)
+            execute_command(
+                runtime,
+                console,
+                internal_action(InternalActionKind.SLEEP, action="status"),
+                preferences,
+            )
         )
         self.assertIn("safe recommended choices only", output.getvalue())
 
@@ -1008,7 +1398,12 @@ class CLITests(unittest.TestCase):
         preferences = SessionPreferences(mode=InteractionMode.NORMAL)
 
         self.assertTrue(
-            execute_command(runtime, console, parse_command("/sleep full"), preferences)
+            execute_command(
+                runtime,
+                console,
+                internal_action(InternalActionKind.SLEEP, action="full"),
+                preferences,
+            )
         )
 
         runtime.set_sleep_mode.assert_called_once_with(True, policy="full")
@@ -1022,7 +1417,12 @@ class CLITests(unittest.TestCase):
         preferences = SessionPreferences(mode=InteractionMode.ULTRA)
 
         self.assertTrue(
-            execute_command(runtime, console, parse_command("/sleep on"), preferences)
+            execute_command(
+                runtime,
+                console,
+                internal_action(InternalActionKind.SLEEP, action="on"),
+                preferences,
+            )
         )
         self.assertTrue(console.sleep_enabled)
         self.assertIn("deeper Ultra Sleep was not armed", output.getvalue())
@@ -1061,7 +1461,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(selected.value, "normal")
         self.assertIn("Full access is unavailable", output.getvalue())
 
-    def test_mode_picker_exposes_only_working_and_plan(self):
+    def test_mode_picker_exposes_only_ultra_and_ultra_plan(self):
         answers = iter(("2",))
         output = io.StringIO()
 
@@ -1074,10 +1474,11 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(selected, InteractionMode.PLAN)
         rendered = output.getvalue().casefold()
-        self.assertIn("working", rendered)
-        self.assertNotIn("ultra", rendered)
+        self.assertIn("ultra", rendered)
+        self.assertIn("ultra-plan", rendered)
+        self.assertNotIn("working", rendered)
 
-    def test_status_command_is_offline_import_safe_and_creates_durable_state(self):
+    def test_help_command_is_offline_import_safe_and_creates_durable_state(self):
         with tempfile.TemporaryDirectory() as directory:
             output = io.StringIO()
             with redirect_stdout(output):
@@ -1088,81 +1489,49 @@ class CLITests(unittest.TestCase):
                         "--provider",
                         "ollama",
                         "--command",
-                        ":status",
+                        "/help",
                         "--no-color",
                     ]
                 )
             self.assertEqual(code, 0)
             rendered = output.getvalue()
-            self.assertIn("GA3BAD CODING AGENT", rendered)
-            self.assertIn("STATUS IDLE", rendered)
+            self.assertIn("Slash commands", rendered)
             self.assertNotIn("\x1b", rendered)
             self.assertTrue((Path(directory) / ".coding-agent" / "state.db").is_file())
 
-    def test_slash_menu_mode_and_settings_commands_are_parsed(self):
+    def test_public_slash_surface_is_exact_and_old_commands_are_rejected(self):
         self.assertEqual(parse_command("/").kind, CommandKind.MENU)
         self.assertEqual(parse_command("/   ").kind, CommandKind.MENU)
-        self.assertEqual(parse_command("/thinking").kind, CommandKind.THINKING)
-        self.assertEqual(parse_command("/reasoning hide").args["action"], "hide")
-        self.assertEqual(parse_command("/details 42").kind, CommandKind.DETAILS)
-        self.assertEqual(parse_command("/details 42").args["target"], "42")
-        self.assertEqual(parse_command("/doctor").kind, CommandKind.DOCTOR)
-        self.assertEqual(parse_command("/readiness").kind, CommandKind.DOCTOR)
-        self.assertEqual(parse_command("/doctor --live").args, {"live": True})
-        self.assertEqual(parse_command("/doctor --record").args, {"record": True})
-        self.assertEqual(parse_command("/doctor --record --live").args, {"record": True, "live": True})
-        self.assertEqual(parse_command("/skills").kind, CommandKind.SKILLS)
-        self.assertEqual(parse_command("/processes").kind, CommandKind.PROCESSES)
-        self.assertEqual(parse_command("/versions").kind, CommandKind.VERSIONS)
-        self.assertEqual(parse_command("/diff").args, {"target": None})
-        self.assertEqual(parse_command("/diff 2").args, {"target": "2"})
+        expected = {
+            "/plan": CommandKind.PLAN,
+            "/live": CommandKind.LIVE,
+            "/show-diff": CommandKind.SHOW_DIFF,
+            "/advanced-tracing": CommandKind.ADVANCED_TRACING,
+            "/settings": CommandKind.SETTINGS,
+            "/pause": CommandKind.PAUSE,
+            "/resume": CommandKind.RESUME,
+            "/stop": CommandKind.STOP,
+            "/undo": CommandKind.UNDO,
+            "/help": CommandKind.HELP,
+            "/quit": CommandKind.QUIT,
+        }
+        self.assertEqual(
+            {text: parse_command(text).kind for text in expected}, expected
+        )
         self.assertEqual(parse_command("/undo").args, {"steps": 1})
         self.assertEqual(parse_command("/undo 3").args, {"steps": 3})
-        stopped = parse_command("/stop-process preview-123")
-        self.assertEqual(stopped.kind, CommandKind.STOP_PROCESS)
-        self.assertEqual(stopped.args["resource_id"], "preview-123")
-        self.assertEqual(parse_command("/model gemma4:e4b high").args, {"model": "gemma4:e4b", "effort": "high"})
-        self.assertEqual(parse_command("/model xhigh").args, {"model": None, "effort": "xhigh"})
-        self.assertEqual(parse_command("/keymap").kind, CommandKind.KEYMAP)
-        for unsupported in (
-            "/ide", "/vim on", "/sandbox-add-read-dir C:\\Users", "/experimental"
+        for removed in (
+            "/thinking", "/doctor", "/skills", "/processes", "/diff",
+            "/model gemma4:e4b", "/mode ultra", "/approve 1", "/continue",
         ):
+            with self.subTest(command=removed):
+                with self.assertRaisesRegex(UnknownCommandParseError, "/help"):
+                    parse_command(removed)
+        for malformed_public in ("/settings color off", "/plan edit"):
             with self.assertRaises(CommandParseError):
-                parse_command(unsupported)
-        self.assertEqual(parse_command("/chat").kind, CommandKind.CHAT)
-        self.assertEqual(parse_command("/explorer").kind, CommandKind.EXPLORER)
-        self.assertEqual(parse_command("/continue").kind, CommandKind.RESUME)
-        self.assertEqual(parse_command("/plan edit").args["action"], "edit")
+                parse_command(malformed_public)
 
-        mode_query = parse_command("/mode")
-        self.assertEqual(mode_query.kind, CommandKind.MODE)
-        self.assertIsNone(mode_query.args["mode"])
-        self.assertEqual(parse_command("/mode GOAL").args["mode"], "normal")
-        self.assertEqual(parse_command("/mode\tgoal").args["mode"], "normal")
-        self.assertEqual(parse_command(":mode plan").args["mode"], "plan")
-
-        settings_query = parse_command("/settings")
-        self.assertEqual(settings_query.kind, CommandKind.SETTINGS)
-        self.assertEqual(settings_query.args, {"key": None, "value": None})
-        setting = parse_command("/settings work-quantum 7")
-        self.assertEqual(
-            setting.args,
-            {"key": "work_quantum", "value": "7"},
-        )
-        self.assertEqual(
-            parse_command("/settings\tcolor\toff").args,
-            {"key": "color", "value": "off"},
-        )
-        self.assertEqual(
-            parse_command("/api-key openai").args,
-            {"key": "api_key", "value": "openai"},
-        )
-        self.assertEqual(
-            parse_command("/settings api-key gemini").args,
-            {"key": "api_key", "value": "gemini"},
-        )
-
-    def test_legacy_goal_alias_keeps_user_facing_settings_automatic(self):
+    def test_settings_is_the_single_public_configuration_surface(self):
         with tempfile.TemporaryDirectory() as directory:
             output = io.StringIO()
             with redirect_stdout(output):
@@ -1172,8 +1541,6 @@ class CLITests(unittest.TestCase):
                         directory,
                         "--provider",
                         "ollama",
-                        "--command",
-                        "/mode goal",
                         "--command",
                         "/settings",
                         "--no-color",
@@ -1182,7 +1549,6 @@ class CLITests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             rendered = output.getvalue()
-            self.assertIn("GOAL workflow selected", rendered)
             self.assertIn("Session settings", rendered)
             self.assertIn("mode       = automatic", rendered)
             self.assertNotIn("API_KEY", rendered)
@@ -1200,7 +1566,7 @@ class CLITests(unittest.TestCase):
                         "--mode",
                         "ultra",
                         "--command",
-                        "/status",
+                        "/help",
                         "--no-color",
                     ]
                 )
@@ -1242,7 +1608,7 @@ class CLITests(unittest.TestCase):
                         "--mode",
                         "plan",
                         "--command",
-                        "/status",
+                        "/help",
                         "--no-color",
                         "--plain",
                     ]
@@ -1278,7 +1644,7 @@ class CLITests(unittest.TestCase):
                         "--provider", "ollama",
                         "--model", "gemma4:e4b",
                         "--mode", "plan",
-                        "--command", "/status",
+                        "--command", "/help",
                         "--plain",
                         "--no-color",
                     ]
@@ -1316,20 +1682,19 @@ class CLITests(unittest.TestCase):
                         "--workspace", directory,
                         "--provider", "ollama",
                         "--model", "gemma4:e4b",
-                        "--command", "/status",
+                        "--command", "/help",
                         "--plain", "--no-color",
                     ]
                 )
 
         self.assertEqual(code, 0, output.getvalue())
-        open_browser.assert_called_once()
-        opened_url = open_browser.call_args.args[0]
-        self.assertIn("127.0.0.1:54321", opened_url)
-        self.assertIn("owner-token", opened_url)
+        open_browser.assert_not_called()
         self.assertIn("already running", output.getvalue())
+        self.assertIn("open http://127.0.0.1:54321", output.getvalue())
+        self.assertIn("owner-token", output.getvalue())
         self.assertNotIn("fatal: Mode is locked", output.getvalue())
 
-    def test_interactive_recovery_opens_the_live_web_workspace(self):
+    def test_working_recovery_does_not_open_a_web_workspace(self):
         from agent.model_catalog import ModelDescriptor
         from agent.sandbox import AccessLevel, DockerSandbox
 
@@ -1368,50 +1733,25 @@ class CLITests(unittest.TestCase):
                 code = main(["--provider", "ollama", "--plain", "--no-color"])
 
         self.assertEqual(code, 0, output.getvalue())
-        open_view.assert_called_once()
-        self.assertEqual(open_view.call_args.args[2], "execution")
+        open_view.assert_not_called()
 
-    def test_doctor_record_command_persists_benchmark_history(self):
+    def test_doctor_is_a_typed_diagnostics_action_not_a_slash_command(self):
         with tempfile.TemporaryDirectory() as directory:
             output = io.StringIO()
-            with mock.patch.dict("os.environ", {"AGENT_REQUIRE_LOCAL_GPU": "0"}, clear=False):
-                with redirect_stdout(output):
-                    code = main(
-                        [
-                            "--workspace",
-                            directory,
-                            "--provider",
-                            "ollama",
-                            "--model",
-                            "gemma4:e4b",
-                            "--command",
-                            "/doctor --record",
-                            "--no-color",
-                            "--plain",
-                        ]
+            runtime = mock.Mock()
+            runtime.workspace = Path(directory)
+            with mock.patch("agent.cli._show_doctor") as show_doctor:
+                self.assertTrue(
+                    execute_command(
+                        runtime,
+                        ConsoleUI(stream=output, color=False),
+                        internal_action(InternalActionKind.DOCTOR, live=False, record=True),
+                        SessionPreferences(),
                     )
-            with StateStore(directory) as store:
-                rows = store.list_benchmark_results(suite_name="agent-readiness", limit=10)
-                trend_rows = store.list_benchmark_results(suite_name="benchmark-trend", limit=10)
-
-        self.assertEqual(code, 0)
-        rendered = output.getvalue()
-        self.assertIn("Agent readiness", rendered)
-        self.assertIn("Recorded benchmark runs", rendered)
-        self.assertIn("Benchmark trends", rendered)
-        scenarios = {row["scenario_name"]: row for row in rows}
-        self.assertIn("structural", scenarios)
-        self.assertIn("behavioral", scenarios)
-        self.assertEqual(scenarios["structural"]["provider"], "ollama")
-        self.assertEqual(scenarios["behavioral"]["model"], "gemma4:e4b")
-        self.assertGreaterEqual(scenarios["behavioral"]["metrics"]["checks"], 4)
-        trend_scenarios = {row["scenario_name"]: row for row in trend_rows}
-        self.assertIn("agent-readiness/structural", trend_scenarios)
-        self.assertIn("agent-readiness/behavioral", trend_scenarios)
-        self.assertEqual(
-            trend_scenarios["agent-readiness/structural"]["inputs"]["trend"]["verdict"],
-            "insufficient_history",
-        )
+                )
+            show_doctor.assert_called_once()
+        with self.assertRaises(UnknownCommandParseError):
+            parse_command("/doctor --record")
 
     def test_settings_mutate_and_query_runtime_config_for_this_session(self):
         output = io.StringIO()
@@ -1432,7 +1772,11 @@ class CLITests(unittest.TestCase):
             execute_command(
                 runtime,
                 console,
-                parse_command("/settings work-quantum 7"),
+                internal_action(
+                    InternalActionKind.SETTINGS_UPDATE,
+                    key="work_quantum",
+                    value="7",
+                ),
                 preferences,
             )
         )
@@ -1443,7 +1787,11 @@ class CLITests(unittest.TestCase):
             execute_command(
                 runtime,
                 console,
-                parse_command("/settings work-quantum"),
+                internal_action(
+                    InternalActionKind.SETTINGS_UPDATE,
+                    key="work_quantum",
+                    value=None,
+                ),
                 preferences,
             )
         )
@@ -1468,7 +1816,11 @@ class CLITests(unittest.TestCase):
             execute_command(
                 runtime,
                 console,
-                parse_command("/model evil\x1b[31mred"),
+                internal_action(
+                    InternalActionKind.MODEL,
+                    model="evil\x1b[31mred",
+                    effort=None,
+                ),
                 SessionPreferences(),
             )
         self.assertNotIn("\x1b", output.getvalue())
@@ -1492,7 +1844,7 @@ class CLITests(unittest.TestCase):
                 execute_command(
                     runtime,
                     console,
-                    parse_command("/mode goal"),
+                    internal_action(InternalActionKind.MODE, mode="normal"),
                     preferences,
                 )
             )
@@ -1502,7 +1854,7 @@ class CLITests(unittest.TestCase):
                 execute_command(
                     runtime,
                     console,
-                    parse_command("/approve 1"),
+                    internal_action(InternalActionKind.APPROVE, revision=1),
                     preferences,
                 )
             )
@@ -1514,7 +1866,7 @@ class CLITests(unittest.TestCase):
                 execute_command(
                     runtime,
                     console,
-                    parse_command("/approve 1"),
+                    internal_action(InternalActionKind.APPROVE, revision=1),
                     preferences,
                 )
             )
@@ -1550,14 +1902,14 @@ class CLITests(unittest.TestCase):
             self.assertEqual(selected.name, "project-002")
             self.assertTrue(selected.is_dir())
 
-    def test_unprefixed_exit_keeps_legacy_repl_behavior(self):
-        self.assertEqual(parse_command("exit").kind, CommandKind.QUIT)
-        self.assertEqual(parse_command("quit").kind, CommandKind.QUIT)
+    def test_unprefixed_exit_is_ordinary_composer_text(self):
+        self.assertEqual(parse_command("exit").kind, CommandKind.TEXT)
+        self.assertEqual(parse_command("quit").kind, CommandKind.TEXT)
 
     def test_common_setup_errors_return_friendly_exit_code(self):
         output = io.StringIO()
         with redirect_stdout(output):
-            code = main(["--workspace", "definitely-missing-workspace", "--command", ":status"])
+            code = main(["--workspace", "definitely-missing-workspace", "--command", "/help"])
         self.assertEqual(code, 2)
         self.assertIn("fatal:", output.getvalue())
 
@@ -1565,10 +1917,21 @@ class CLITests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 code = main([
-                    "--workspace", directory, "--create-workspace", "--command", ":status"
+                    "--workspace", directory, "--create-workspace", "--command", "/help"
                 ])
-            self.assertEqual(code, 2)
-            self.assertIn("fatal:", output.getvalue())
+            self.assertEqual(code, 0, output.getvalue())
+            self.assertNotIn("fatal:", output.getvalue())
+
+        with tempfile.TemporaryDirectory() as directory:
+            created = Path(directory) / "fresh-project"
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = main([
+                    "--workspace", str(created), "--create-workspace", "--command", "/help"
+                ])
+            self.assertEqual(code, 0, output.getvalue())
+            self.assertTrue(created.is_dir())
+            self.assertNotIn("fatal:", output.getvalue())
 
     def test_invalid_provider_environment_is_reported_even_with_model_override(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1576,7 +1939,7 @@ class CLITests(unittest.TestCase):
             with mock.patch.dict("os.environ", {"LLM_PROVIDER": " invalid provider "}, clear=False):
                 with redirect_stdout(output):
                     code = main([
-                        "--workspace", directory, "--model", "anything", "--command", ":status"
+                        "--workspace", directory, "--model", "anything", "--command", "/help"
                     ])
             self.assertEqual(code, 2)
             self.assertIn("Unknown LLM_PROVIDER", output.getvalue())
@@ -1824,7 +2187,7 @@ class CLITests(unittest.TestCase):
                     "--provider",
                     "ollama",
                     "--command",
-                    "/status",
+                    "/help",
                     "--no-color",
                     "--plain",
                 ]

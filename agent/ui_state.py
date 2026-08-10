@@ -16,6 +16,11 @@ from enum import Enum
 from threading import Event, RLock
 from typing import Any, Callable, Mapping
 
+try:
+    from .safety import redact_text
+except ImportError:  # direct ``python agent/main.py`` compatibility
+    from safety import redact_text  # type: ignore
+
 
 _DEFAULT_UTTERANCES = {
     "continue with recommended",
@@ -151,6 +156,15 @@ class ResourceSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class SwarmAgentLine:
+    role: str = "Agent"
+    status: str = "queued"
+    phase: str = ""
+    task: str = ""
+    summary: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class SwarmSummarySnapshot:
     total: int = 0
     running: int = 0
@@ -158,6 +172,7 @@ class SwarmSummarySnapshot:
     completed: int = 0
     blocked: int = 0
     active_labels: tuple[str, ...] = ()
+    agent_lines: tuple[SwarmAgentLine, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +266,15 @@ class LiveActivityEntry:
     received_bytes: int = 0
     received_chunks: int = 0
     received_tokens: int = 0
+    kind: str = ""
+    tool: str = ""
+    node_id: str = ""
+    detail: str = ""
+    output: str = ""
+    output_preview: tuple[str, ...] = ()
+    hidden_lines: int = 0
+    started_at: float | None = None
+    duration_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -654,50 +678,99 @@ class WorkspaceUIStore:
     def update_swarm_summary(self, snapshot: Mapping[str, Any] | None) -> None:
         nodes = tuple((snapshot or {}).get("nodes") or ())
         agents = tuple((snapshot or {}).get("agents") or ())
-        latest: dict[str, str] = {}
-        roles: dict[str, str] = {}
-        for agent in agents:
+        node_titles: dict[str, str] = {}
+        node_statuses: list[str] = []
+        for node in nodes:
             node_id = str(
-                (agent.get("work_node_id") if isinstance(agent, Mapping) else getattr(agent, "work_node_id", ""))
+                (node.get("id") if isinstance(node, Mapping) else getattr(node, "id", ""))
                 or ""
             )
-            raw_status = agent.get("status", "") if isinstance(agent, Mapping) else getattr(agent, "status", "")
-            status = str(getattr(raw_status, "value", raw_status))
+            title = (
+                node.get("title") or node.get("objective")
+                if isinstance(node, Mapping)
+                else getattr(node, "title", "") or getattr(node, "objective", "")
+            )
             if node_id:
-                latest[node_id] = status.casefold()
-                raw_role = agent.get("role", "") if isinstance(agent, Mapping) else getattr(agent, "role", "")
-                roles[node_id] = " ".join(str(raw_role or "").replace("_", " ").split()).title()
+                node_titles[node_id] = " ".join(str(title or node_id).split())
+            raw_status = (
+                node.get("status", "")
+                if isinstance(node, Mapping)
+                else getattr(node, "status", "")
+            )
+            node_statuses.append(
+                str(getattr(raw_status, "value", raw_status)).casefold()
+            )
+
         statuses: list[str] = []
         active_labels: list[str] = []
-        for node in nodes:
-            node_id = str((node.get("id") if isinstance(node, Mapping) else getattr(node, "id", "")) or "")
-            raw_node_status = node.get("status", "") if isinstance(node, Mapping) else getattr(node, "status", "")
-            status = latest.get(
-                node_id,
-                str(getattr(raw_node_status, "value", raw_node_status)).casefold(),
-            )
-            statuses.append(status)
-            if status in {"running", "in_progress", "planning", "testing", "reviewing", "verifying"}:
-                title = (
-                    node.get("title") or node.get("objective")
-                    if isinstance(node, Mapping)
-                    else getattr(node, "title", "") or getattr(node, "objective", "")
+        agent_lines: list[SwarmAgentLine] = []
+        for agent in agents:
+            node_id = str(
+                (
+                    agent.get("work_node_id") or agent.get("task_id")
+                    if isinstance(agent, Mapping)
+                    else getattr(agent, "work_node_id", "")
                 )
-                clean_title = " ".join(str(title or node_id).split())
-                role = roles.get(node_id, "")
-                active_labels.append(f"{role} · {clean_title}" if role else clean_title)
+                or ""
+            )
+            raw_status = (
+                agent.get("status", "")
+                if isinstance(agent, Mapping)
+                else getattr(agent, "status", "")
+            )
+            status = str(getattr(raw_status, "value", raw_status)).casefold() or "queued"
+            statuses.append(status)
+            raw_role = (
+                agent.get("role", "")
+                if isinstance(agent, Mapping)
+                else getattr(agent, "role", "")
+            )
+            role = " ".join(str(raw_role or "agent").replace("_", " ").split()).title()
+            raw_phase = (
+                agent.get("phase", "")
+                if isinstance(agent, Mapping)
+                else getattr(agent, "phase", "")
+            )
+            phase = " ".join(str(raw_phase or "").replace("_", " ").split()).title()
+            task = node_titles.get(node_id, "")
+            raw_result = (
+                agent.get("latest_output") or agent.get("result")
+                if isinstance(agent, Mapping)
+                else getattr(agent, "result", None)
+            )
+            summary = (
+                str(raw_result.get("summary") or "")
+                if isinstance(raw_result, Mapping)
+                else str(getattr(raw_result, "summary", "") or "")
+            )
+            if not summary and status == "queued":
+                summary = "Waiting for a dependency or execution slot"
+            agent_lines.append(
+                SwarmAgentLine(
+                    role=role,
+                    status=status,
+                    phase=phase,
+                    task=task,
+                    summary=" ".join(summary.split())[:500],
+                )
+            )
+            if status in {"running", "in_progress", "planning", "testing", "reviewing", "verifying"}:
+                active_labels.append(f"{role} · {task or phase or 'Working'}")
+        if not statuses:
+            statuses = node_statuses
         running_values = {"running", "in_progress", "planning", "testing"}
         reviewing_values = {"reviewing", "verifying"}
         completed_values = {"completed", "done"}
         blocked_values = {"failed", "blocked", "revision_required", "uncertain"}
         with self._lock:
             self._swarm = SwarmSummarySnapshot(
-                total=len(nodes),
+                total=len(agents) if agents else len(nodes),
                 running=sum(item in running_values for item in statuses),
                 reviewing=sum(item in reviewing_values for item in statuses),
                 completed=sum(item in completed_values for item in statuses),
                 blocked=sum(item in blocked_values for item in statuses),
                 active_labels=tuple(active_labels[:3]),
+                agent_lines=tuple(agent_lines),
             )
         self._notify()
 
@@ -1129,9 +1202,116 @@ class WorkspaceUIStore:
             received_bytes=max(0, int(data.get("received_bytes") or 0)),
             received_chunks=max(0, int(data.get("received_chunks") or 0)),
             received_tokens=max(0, int(data.get("received_tokens") or 0)),
+            kind=str(data.get("event_kind") or data.get("kind") or ""),
+            tool=str(data.get("tool") or ""),
+            node_id=str(data.get("node_id") or data.get("current_node_id") or ""),
+            detail=redact_text(data.get("detail") or "", 1_200),
         )
         self._live_timeline.append(entry)
         self._activity_sequence = max(self._activity_sequence, sequence)
+
+    @staticmethod
+    def _tool_activity_detail(data: Mapping[str, Any], tool: str) -> str:
+        args = data.get("args")
+        values = args if isinstance(args, Mapping) else {}
+        if tool in {"run_bash", "run_command", "shell_command", "start_process"}:
+            command = values.get("command") or values.get("cmd")
+            if command:
+                return redact_text(" ".join(str(command).split()), 1_200)
+        for key in ("path", "file", "target", "url", "query", "pattern"):
+            value = values.get(key)
+            if value not in {None, ""}:
+                return redact_text(str(value), 1_200)
+        return ""
+
+    def _append_tool_call_locked(self, data: Mapping[str, Any]) -> None:
+        tool = str(data.get("tool") or data.get("message") or "operation")
+        detail = self._tool_activity_detail(data, tool)
+        enriched = dict(data)
+        enriched.update(
+            {
+                "message": tool,
+                "tool": tool,
+                "detail": detail,
+                "state": "active",
+                "source": "TOOL",
+            }
+        )
+        self._append_live_activity_locked(enriched)
+        if not self._live_timeline:
+            return
+        entry = self._live_timeline[-1]
+        if entry.tool == tool and entry.state == "active":
+            self._live_timeline[-1] = replace(entry, started_at=time.monotonic())
+
+    @staticmethod
+    def _tool_result_lines(value: Any) -> tuple[str, tuple[str, ...], int]:
+        output = redact_text(value or "", 12_000).replace("\r\n", "\n").replace("\r", "\n")
+        lines = tuple(line.rstrip() for line in output.splitlines())
+        if not lines:
+            lines = ("(no output)",)
+        preview_limit = 2
+        return output, lines[:preview_limit], max(0, len(lines) - preview_limit)
+
+    def _complete_tool_activity_locked(self, data: Mapping[str, Any]) -> None:
+        tool = str(data.get("tool") or "")
+        actor = str(data.get("actor") or data.get("active_actor") or "")
+        node_id = str(data.get("node_id") or data.get("current_node_id") or "")
+        result = data.get("message") or data.get("result") or ""
+        normalized_result = str(result).lstrip().casefold()
+        failed = (
+            str(data.get("state") or "").casefold() == "failed"
+            or str(data.get("event_kind") or "") == "tool.failed"
+            or normalized_result.startswith(("error:", "permission denied", "failed:"))
+        )
+        match_index: int | None = None
+        for index in range(len(self._live_timeline) - 1, -1, -1):
+            candidate = self._live_timeline[index]
+            if candidate.source != "TOOL" or candidate.state != "active":
+                continue
+            if tool and candidate.tool and candidate.tool != tool:
+                continue
+            if actor and candidate.actor and candidate.actor != actor:
+                continue
+            if node_id and candidate.node_id and candidate.node_id != node_id:
+                continue
+            match_index = index
+            break
+        output, preview, hidden = self._tool_result_lines(result)
+        if match_index is None:
+            enriched = dict(data)
+            enriched.update(
+                {
+                    "message": tool or "operation",
+                    "tool": tool or "operation",
+                    "source": "TOOL",
+                    "state": "failed" if failed else "completed",
+                }
+            )
+            self._append_live_activity_locked(enriched)
+            if self._live_timeline:
+                entry = self._live_timeline[-1]
+                self._live_timeline[-1] = replace(
+                    entry,
+                    output=output,
+                    output_preview=preview,
+                    hidden_lines=hidden,
+                )
+            return
+        entry = self._live_timeline[match_index]
+        duration = (
+            max(0.0, time.monotonic() - entry.started_at)
+            if entry.started_at is not None
+            else None
+        )
+        self._live_timeline[match_index] = replace(
+            entry,
+            state="failed" if failed else "completed",
+            output=output,
+            output_preview=preview,
+            hidden_lines=hidden,
+            duration_seconds=duration,
+        )
 
     def set_composer_mode(self, value: str) -> str:
         with self._lock:
@@ -1430,14 +1610,17 @@ class WorkspaceUIStore:
             "approval.requested", "approval.received", "plan.approved.local_web",
             "execution.started", "execution.boundary", "process.waiting",
             "tool_call", "tool_result", "tool.started", "tool.completed", "tool.failed",
+            "ultra.agent_started", "ultra.agent", "ultra.node", "ultra.phase",
             "recovery.presented", "execution.reconciled",
         }
         if normalized in timeline_kinds:
             timeline_data = dict(data)
             timeline_data.setdefault("message", message)
+            timeline_data.setdefault("event_kind", normalized)
             timeline_data.setdefault("source", (
                 "MODEL" if normalized in {"provider.activity", "heartbeat"}
                 else "TOOL" if normalized.startswith("tool")
+                else "AGENT" if normalized.startswith("ultra.agent")
                 else "PROCESS" if normalized.startswith("process")
                 else "USER" if normalized in {"approval.received", "plan.approved.local_web"}
                 else "HARNESS"
@@ -1448,11 +1631,17 @@ class WorkspaceUIStore:
                 if normalized in {"error", "tool.failed"}
                 or timeline_message.startswith(("error:", "permission denied", "failed:"))
                 else "completed" if normalized in {"tool_result", "tool.completed"}
+                or normalized == "ultra.agent"
                 else "waiting" if normalized in {"approval.requested", "process.waiting"}
                 else "active"
             ))
             with self._lock:
-                self._append_live_activity_locked(timeline_data)
+                if normalized in {"tool_call", "tool.started"}:
+                    self._append_tool_call_locked(timeline_data)
+                elif normalized in {"tool_result", "tool.completed", "tool.failed"}:
+                    self._complete_tool_activity_locked(timeline_data)
+                else:
+                    self._append_live_activity_locked(timeline_data)
                 # A tool call/result, process signal, or approval event is a
                 # real runtime heartbeat even when the provider is using an
                 # atomic structured response.  Keep the liveness clock tied to
@@ -1468,7 +1657,7 @@ class WorkspaceUIStore:
         if normalized == "model_text":
             self.append_log("model_text: streaming response")
         elif normalized == "model_thought":
-            self.append_log("model_thought: reasoning update; use /thinking for details")
+            self.append_log("model_thought: reasoning summary updated; use /advanced-tracing for details")
         else:
             self.append_log(f"{kind}: {message}" if message else kind)
         if normalized in {"tool.failed", "workflow.failed"} or (
@@ -1673,6 +1862,64 @@ class WorkspaceUIStore:
             elif normalized == "recovery.presented":
                 self.set_activity(ActivityStage.PAUSED, message or "Action required to continue", running=False)
             self._notify()
+            return
+        if normalized == "ultra.agent_started":
+            role = " ".join(str(data.get("role") or "specialist").replace("_", " ").split()).title()
+            node_title = " ".join(
+                str(
+                    data.get("current_node_title")
+                    or data.get("node_title")
+                    or data.get("node_id")
+                    or "assigned work"
+                ).split()
+            )
+            phase = " ".join(str(data.get("phase") or "working").replace("_", " ").split())
+            with self._lock:
+                self._active_actor = role
+                self._current_task = node_title
+                self._progress = replace(
+                    self._progress,
+                    current_task=node_title,
+                    active_operation=f"{role} · {phase} · {node_title}",
+                )
+            self.set_activity(
+                ActivityStage.CHECKING if phase.casefold() in {"reviewing", "testing", "verifying"} else ActivityStage.BUILDING,
+                f"{role} · {phase} · {node_title}",
+                running=True,
+            )
+            return
+        if normalized == "ultra.agent":
+            role = " ".join(str(data.get("role") or "specialist").replace("_", " ").split()).title()
+            summary = " ".join(str(message or f"{role} finished").split())
+            self.set_activity(
+                self._activity.stage,
+                self._activity.summary,
+                last_success=summary[:500],
+            )
+            return
+        if normalized == "ultra.node":
+            node_title = " ".join(
+                str(data.get("current_node_title") or data.get("node_title") or data.get("node_id") or "").split()
+            )
+            status = str(data.get("status") or "").casefold()
+            if node_title:
+                with self._lock:
+                    self._current_task = node_title
+                    self._progress = replace(self._progress, current_task=node_title)
+            if status == "running":
+                self.set_activity(ActivityStage.BUILDING, node_title or "Running specialist work", running=True)
+            elif status in {"completed", "done"}:
+                self.set_activity(
+                    self._activity.stage,
+                    self._activity.summary,
+                    last_success=f"Completed {node_title or 'specialist work'}",
+                )
+            else:
+                self._notify()
+            return
+        if normalized == "ultra.phase":
+            phase = str(data.get("ultra_phase") or data.get("phase") or message or "working")
+            self.set_activity(ActivityStage.BUILDING, phase.replace("_", " ").title(), running=True)
             return
         if normalized == "model_text":
             actor = str(data.get("actor") or "").strip().casefold()

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.commands import parse_command
+from agent.commands import InternalActionKind, internal_action, parse_command
 from agent.chat_runtime import (
     RequestedEffectV2,
     SemanticRouteDecisionV3,
@@ -226,6 +226,115 @@ def test_invalid_goal_intake_repairs_without_rerouting_the_goal() -> None:
             agent.close(); store.close()
 
 
+def test_observed_gemma_intake_transport_completes_end_to_end_without_fatal() -> None:
+    prompt = "Create a calculator and preview it"
+    intake = semantic_goal_intake(prompt)
+    action = json.dumps({"name": "submit_goal_intake", "args": intake})
+    malformed_action = "[" + action[:-1] + "]]"
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        agent, store = runtime(workspace, [
+            semantic_route(
+                "goal", original=prompt, outcome_kind="runnable_product",
+                effects=("write", "preview"),
+            ),
+            malformed_action,
+            inspect_call(), plan_call(), plan_pass(),
+        ])
+        try:
+            decision, plan = agent.route_input(prompt)
+            assert decision.kind.value == "goal"
+            assert plan.goal_id == agent.active_goal().id
+            assert agent.active_goal().metadata["execution_strategy"] == "recursive"
+            events = store.list_recent_events(limit=100)
+            assert any(
+                item.event_type == "provider.action_transport_normalized"
+                for item in events
+            )
+            assert not any(
+                "must be called exactly once" in str(item.payload.get("error") or "")
+                for item in events
+            )
+        finally:
+            agent.close(); store.close()
+
+
+def test_resume_promotes_legacy_pending_working_intake_to_recursive() -> None:
+    prompt = "Create a calculator"
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        agent, store = runtime(workspace, [
+            semantic_route(
+                "goal", original=prompt, outcome_kind="runnable_product",
+                effects=("write",),
+            ),
+            RuntimeError("intake provider offline"),
+        ])
+        try:
+            with pytest.raises(ProviderUnavailableError):
+                agent.route_input(prompt)
+            session = store.get_workflow_session(agent.session_id)
+            pending = dict(session["state"]["pending_semantic_turn"])
+            pending["minimum_strategy"] = "staged"
+            agent._save_pending_semantic_turn(pending)
+            agent.provider = ScriptedProvider([
+                semantic_goal_intake_turn(semantic_goal_intake(prompt))
+            ])
+
+            resumed, decision = agent._semantic_preflight(resume_pending=True)
+
+            assert decision.goal_intake is not None
+            assert resumed["minimum_strategy"] == "recursive"
+            assert resumed["strategy_decision"]["strategy"] == "recursive"
+        finally:
+            agent.close(); store.close()
+
+
+def test_identical_intake_transport_fingerprint_resets_cache_and_uses_minimal_packet() -> None:
+    class ResettableScriptedProvider(ScriptedProvider):
+        def __init__(self, turns):
+            super().__init__(turns)
+            self.cache_resets = 0
+
+        def reset_model_cache(self):
+            self.cache_resets += 1
+
+    prompt = "Create a calculator"
+    malformed = "not-json-intake-response"
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        store = StateStore(workspace)
+        provider = ResettableScriptedProvider([
+            semantic_route(
+                "goal", original=prompt, outcome_kind="runnable_product",
+                effects=("write",),
+            ),
+            malformed,
+            malformed,
+            semantic_goal_intake_turn(semantic_goal_intake(prompt)),
+            inspect_call(), plan_call(), plan_pass(),
+        ])
+        agent = AgentRuntime(provider, store, workspace, config=config())
+        try:
+            decision, plan = agent.route_input(prompt)
+
+            assert decision.kind.value == "goal"
+            assert plan.goal_id == agent.active_goal().id
+            assert provider.cache_resets == 1
+            minimal_retry = provider.calls[3].conversation
+            assert len(minimal_retry) == 1
+            assert "MINIMAL_SEMANTIC_GOAL_INTAKE_RETRY" in minimal_retry[0]["content"]
+            events = store.list_recent_events(limit=100)
+            adapted = [
+                item for item in events
+                if item.event_type == "semantic_turn.intake_transport_adapted"
+            ]
+            assert len(adapted) == 1
+            assert adapted[0].payload["model_cache_reset"] is True
+        finally:
+            agent.close(); store.close()
+
+
 def test_contradictory_chat_build_decision_repairs_in_the_same_semantic_turn() -> None:
     prompt = "Create a runnable calculator"
     contradictory = semantic_route(
@@ -366,33 +475,23 @@ def test_unadvertised_plan_question_is_rejected_without_spending_stage_budget() 
             agent.close(); store.close()
 
 
-def test_action_tool_contract_rejects_unrequested_category_before_execution() -> None:
+def test_recursive_working_promotes_action_before_any_workspace_execution() -> None:
     prompt = "Create note.txt"
     with tempfile.TemporaryDirectory() as directory:
         workspace = Path(directory)
 
-        def disallowed_call(request):
-            names = {item["function"]["name"] for item in request.tools}
-            assert "write_file" in names
-            assert "run_command" not in names
-            return {"tool_calls": [{
-                "id": "bad", "name": "run_command", "args": {"command": "echo unauthorized"},
-            }]}
-
         agent, store = runtime(workspace, [
             semantic_turn("action", original=prompt, effects=("write",)),
-            disallowed_call,
-            {"tool_calls": [{
-                "id": "write", "name": "write_file",
-                "args": {"path": "note.txt", "content": "safe\n"},
-            }]},
-            "Created note.txt.",
+            semantic_goal_intake_turn(semantic_goal_intake(prompt)),
+            inspect_call(), plan_call(), plan_pass(),
         ])
         try:
-            result = agent.chat(prompt)
-            assert "Created note.txt" in result.message
-            assert [item["tool_name"] for item in store.list_session_actions(agent.session_id)] == ["write_file"]
-            assert (workspace / "note.txt").read_text(encoding="utf-8") == "safe\n"
+            decision, plan = agent.route_input(prompt)
+            assert decision.kind.value == "goal"
+            assert plan.goal_id == agent.active_goal().id
+            assert agent.active_goal().metadata["execution_strategy"] == "recursive"
+            assert store.list_session_actions(agent.session_id) == ()
+            assert not (workspace / "note.txt").exists()
         finally:
             agent.close(); store.close()
 
@@ -636,11 +735,17 @@ def test_restart_marks_mid_action_mutation_uncertain_and_never_replays_it() -> N
     prompt = "Create note.txt"
     with tempfile.TemporaryDirectory() as directory:
         workspace = Path(directory)
-        first, first_store = runtime(workspace, [
-            semantic_turn("action", original=prompt, effects=("write",))
-        ])
-        semantic_turn_state, decision = first._semantic_preflight(prompt)
-        semantic_turn_state["status"] = "dispatching"
+        first, first_store = runtime(workspace, [])
+        semantic_turn_state = {
+            "turn_id": "turn-mid-mutation",
+            "original_input": prompt,
+            "requested_mode": "normal",
+            "interaction_mode": "working",
+            "minimum_strategy": "recursive",
+            "status": "dispatching",
+            "stage": "action",
+            "action_records": [],
+        }
         first._save_pending_semantic_turn(semantic_turn_state)
         action_id = first_store.begin_session_action(
             first.session_id,
@@ -698,7 +803,10 @@ def test_plan_mode_rejects_changing_action_and_model_repairs_to_goal() -> None:
             assert session["state"]["interaction_mode"] == "plan"
             assert not (workspace / "note.txt").exists()
             routed = [event for event in store.list_recent_events(limit=100) if event.event_type == "semantic_turn.routed"]
-            assert routed[-1].payload["semantic_attempts"] == 1
+            # Ultra Plan promotes a changing Action to the recursive Goal path
+            # immediately; it no longer burns a semantic repair just to reach
+            # the engine shared by both public modes.
+            assert routed[-1].payload["semantic_attempts"] == 0
         finally:
             agent.close(); store.close()
 
@@ -717,7 +825,9 @@ def test_goal_command_forces_goal_intake_without_general_route_guess() -> None:
 
         agent, store = runtime(workspace, [forced_goal, inspect_call(), plan_call(), plan_pass()])
         try:
-            plan = agent.apply_command(parse_command("/goal " + prompt))
+            plan = agent.apply_command(
+                internal_action(InternalActionKind.GOAL, objective=prompt)
+            )
             assert plan.goal_id == agent.active_goal().id
             events = store.list_recent_events(limit=100)
             routing = next(event for event in events if event.event_type == "semantic_turn.routing")

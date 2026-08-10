@@ -900,18 +900,27 @@ class SleepModeTests(RuntimeTestCase):
 
 
 class UltraQualityFeedbackTests(RuntimeTestCase):
-    def test_quality_replan_feedback_includes_node_findings(self):
+    def test_quality_replan_feedback_excludes_successful_node_history(self):
         runtime, _provider = self.runtime([])
         result = SimpleNamespace(
             run=SimpleNamespace(id=""),
             node_results=(
                 SimpleNamespace(
+                    node_id="M001",
+                    success=True,
                     findings=(
-                        "Calculator state does not update after button input.",
+                        "Superseded canvas-missing finding.",
                     )
+                ),
+                SimpleNamespace(
+                    node_id="M002",
+                    success=False,
+                    findings=("Calculator state does not update after button input.",),
                 ),
             ),
             global_result=SimpleNamespace(
+                node_id="__global__",
+                success=False,
                 findings=("Global browser behavior did not pass.",)
             ),
         )
@@ -920,6 +929,7 @@ class UltraQualityFeedbackTests(RuntimeTestCase):
 
         self.assertIn("Calculator state does not update", feedback)
         self.assertIn("Global browser behavior did not pass", feedback)
+        self.assertNotIn("Superseded canvas-missing", feedback)
 
 
 class PlanningAndCompletionTests(RuntimeTestCase):
@@ -1362,6 +1372,84 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             mock.ANY,
             allow_scope_expansion=False,
         )
+
+    def test_ultra_convergence_does_not_replan_a_test_harness_failure(self):
+        runtime, _provider = self.runtime([])
+        goal = self.store.create_goal(
+            "Verify the browser artifact.",
+            session_id=runtime.session_id,
+        )
+        self.store.update_goal_metadata(goal.id, ultra_run_id="ultra-contract")
+        self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.store.transition_goal(goal.id, GoalStatus.RUNNING)
+        self.store.transition_goal(goal.id, GoalStatus.REVISING)
+        revision_required = SimpleNamespace(
+            run=SimpleNamespace(phase="revision_required"),
+            node_results=(
+                SimpleNamespace(
+                    findings=("browser assertion schema failed",),
+                    component_package={
+                        "failure_diagnostic": {
+                            "failure_kind": "contract",
+                            "blocker_owner": "test_harness",
+                            "mutation_prohibited": True,
+                            "failure_fingerprint": "a" * 64,
+                        }
+                    },
+                ),
+            ),
+            global_result=None,
+        )
+
+        with mock.patch.object(runtime, "_ensure_ultra_session"), mock.patch.object(
+            runtime, "wait_for_ultra", return_value=revision_required
+        ), mock.patch.object(runtime, "replan_ultra") as replan:
+            result = runtime.converge_ultra()
+
+        self.assertIs(result, revision_required)
+        replan.assert_not_called()
+        current = self.store.get_goal(goal.id)
+        self.assertEqual(current.status, GoalStatus.PAUSED)
+        self.assertEqual(
+            current.metadata["verification_blocker"]["blocker_owner"],
+            "test_harness",
+        )
+
+    def test_ultra_convergence_honors_strategy_repetition_limit(self):
+        runtime, _provider = self.runtime([])
+        goal = self.store.create_goal(
+            "Repair the candidate without plan thrashing.",
+            session_id=runtime.session_id,
+        )
+        self.store.update_goal_metadata(
+            goal.id,
+            ultra_run_id="ultra-repetition",
+            in_scope_quality_revision_attempts=2,
+        )
+        self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.store.transition_goal(goal.id, GoalStatus.RUNNING)
+        self.store.transition_goal(goal.id, GoalStatus.REVISING)
+        revision_required = SimpleNamespace(
+            run=SimpleNamespace(phase="revision_required"),
+            node_results=(
+                SimpleNamespace(
+                    findings=("same candidate failure",),
+                    component_package={},
+                ),
+            ),
+            global_result=None,
+        )
+
+        with mock.patch.object(runtime, "_ensure_ultra_session"), mock.patch.object(
+            runtime, "wait_for_ultra", return_value=revision_required
+        ), mock.patch.object(runtime, "replan_ultra") as replan:
+            result = runtime.converge_ultra()
+
+        self.assertIs(result, revision_required)
+        replan.assert_not_called()
+        current = self.store.get_goal(goal.id)
+        self.assertEqual(current.status, GoalStatus.PAUSED)
+        self.assertIn("strategy", current.metadata["waiting_question"].casefold())
 
     def test_resume_contracts_ultra_repair_from_accepted_foundation(self):
         runtime, _provider = self.runtime([])
@@ -1820,6 +1908,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
 
         session = self.store.get_workflow_session(runtime.session_id)
         self.assertEqual(session["state"]["interaction_mode"], "working")
+        self.assertEqual(session["state"]["minimum_strategy"], "recursive")
 
     def test_normal_can_visit_plan_and_return_to_normal(self):
         runtime, _provider = self.runtime([])
@@ -2746,11 +2835,11 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         plan = runtime.start_goal(request)
 
         self.assertIsNotNone(plan)
-        second_request_names = {
-            item["function"]["name"] for item in provider.calls[1].tools
-        }
-        self.assertIn("propose_plan", second_request_names)
-        self.assertIn("list_files", second_request_names)
+        # Local Ollama tool schemas are transported as a streamable, bounded
+        # JSON action contract instead of an atomic native-tool request.
+        self.assertEqual(provider.calls[1].tools, [])
+        self.assertIn("propose_plan", provider.calls[1].system)
+        self.assertIn("list_files", provider.calls[1].system)
         self.assertTrue(
             any(
                 event.event_type == "tool_contract.alias_normalized"

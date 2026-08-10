@@ -1101,7 +1101,7 @@ class SemanticCoreV14Tests(unittest.TestCase):
                 try:
                     self.assertEqual(
                         connection.execute("PRAGMA user_version").fetchone()[0],
-                        15,
+                        16,
                     )
                 finally:
                     connection.close()

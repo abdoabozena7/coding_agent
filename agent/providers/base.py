@@ -34,6 +34,7 @@ class ProviderCallPolicyV1:
     stage: str = ""
     max_output_tokens: int | None = None
     reasoning_effort: str | None = None
+    temperature: float | None = None
     stage_deadline_seconds: float | None = None
 
 

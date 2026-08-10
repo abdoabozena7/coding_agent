@@ -511,7 +511,7 @@ class GitProtectionManager:
                 checkpoints = self.history(max(index, 1))
                 if index < 1 or index > len(checkpoints):
                     raise VersionControlError(
-                        f"Checkpoint {index} is not available; run /versions to list valid numbers."
+                        f"Checkpoint {index} is not available; inspect Changes in Advanced Tracing."
                     )
                 commit = checkpoints[index - 1].commit
             result = self._git(

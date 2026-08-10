@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GA3BAD · Workflow Diff</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%23d99a22'/%3E%3Ctext x='16' y='21' text-anchor='middle' font-family='Arial' font-size='12' font-weight='700'%3EG3%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/show-diff.css">
+</head>
+<body>
+  <header class="diff-header">
+    <a class="brand" href="#" aria-label="Workflow Diff home">
+      <span class="brand-mark">G3</span>
+      <span><strong>Workflow Diff</strong><small>Read-only review</small></span>
+    </a>
+    <div class="run-state">
+      <span id="stateBadge" class="state-badge" data-state="loading">LOADING</span>
+      <span id="updatedLabel">Reading project changes…</span>
+    </div>
+    <div class="header-actions">
+      <a id="advancedLink" class="quiet-link" href="#">Advanced details</a>
+      <button id="copyAllButton" type="button" disabled>Copy full diff</button>
+    </div>
+  </header>
+
+  <main class="diff-shell">
+    <aside class="diff-index" aria-label="Changed files">
+      <div class="change-picker">
+        <label for="changePicker">Workflow point</label>
+        <select id="changePicker" disabled></select>
+      </div>
+      <div class="index-summary" id="indexSummary">
+        <strong>0 files</strong><span>+0 −0</span>
+      </div>
+      <div class="file-search">
+        <label for="fileSearch">Find a file</label>
+        <input id="fileSearch" type="search" placeholder="path or filename…" autocomplete="off">
+      </div>
+      <nav id="fileList" aria-label="Files in selected diff"></nav>
+    </aside>
+
+    <section class="diff-workspace" aria-live="polite">
+      <div id="loadingState" class="loading-state" role="status">
+        <span class="spinner" aria-hidden="true"></span>
+        <span>Building the read-only diff…</span>
+      </div>
+      <div id="errorState" class="error-state" hidden></div>
+      <div id="emptyState" class="empty-state" hidden>
+        <span class="empty-mark">±</span>
+        <h1>No diff yet</h1>
+        <p>Changes will appear here live as soon as the workflow writes a file.</p>
+      </div>
+      <div id="diffContent" hidden>
+        <header class="file-heading">
+          <div>
+            <p class="eyebrow" id="changeLabel">WORKFLOW CHANGE</p>
+            <h1 id="fileTitle">Select a file</h1>
+            <p id="fileMeta"></p>
+          </div>
+          <div class="file-actions">
+            <button id="copyFileButton" type="button">Copy file diff</button>
+            <button id="downloadButton" type="button">Download patch</button>
+          </div>
+        </header>
+        <div class="diff-table" id="diffTable" role="table" aria-label="Unified file diff"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/show-diff.js" defer></script>
+</body>
+</html>

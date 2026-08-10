@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Calculator with 3D Visualization</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body { margin: 0; font-family: Arial, sans-serif; background-color: #f4f4f9; display: flex; justify-content: center; align-items: flex-start; padding-top: 20px; }
+        /* Container for the canvas ensures it has space */
+        #canvas-container { 
+            width: 100%;
+            max-width: 800px; /* Match initial canvas width context */
+            height: 400px; /* Match initial canvas height context */
+            margin-bottom: 30px;
+            border: 1px solid #ccc;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+
+        /* --- Calculator Styling --- */
+        .calculator { 
+            border: 1px solid #ccc;
+            border-radius: 10px;
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
+            background-color: #333;
+            padding: 20px;
+            width: fit-content; /* Constrain calculator width */
+        }
+        #display { 
+            background-color: #222;
+            color: white;
+            font-size: 2.5em;
+            padding: 15px;
+            text-align: right;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            min-height: 50px;
+            overflow-x: auto;
+            white-space: nowrap;
+        }
+        .buttons { 
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 10px;
+        }
+        button {
+            padding: 20px; 
+            font-size: 1.5em;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            background-color: #666;
+            color: white;
+            transition: background-color 0.2s, transform 0.1s;
+        }
+        button:hover {
+            background-color: #777;
+        }
+        button:active {
+            transform: scale(0.98);
+        }
+        /* Specific button styling for operators and clear */
+        #clear { 
+            background-color: #d4d4d2; /* AC Button Color */
+        }
+        .operator { 
+             /* Styling applied to general operator buttons */
+        }
+        #equals, .operator { 
+            background-color: #ff9500;
+        }
+    </style>
+</head>
+<body id="app-body">
+    <!-- 3D Canvas container required for SceneRenderer -->
+    <div id="canvas-container">
+        <canvas id="threeD-canvas" width="800" height="400"></canvas>
+    </div >
+    
+    <div class="calculator" id="calculator">
+        <div id="display">0</div>
+        <div class="buttons">
+            <!-- Row 1 -->
+            <button id="clear" class="operator">AC</button>
+            <button id="signChange" class="operator">+/-</button>
+            <button id="percent" class="operator">%</button>
+            <button id="divide" class="operator">/</button>
+
+            <!-- Row 2 -->
+            <button id="seven">7</button>
+            <button id="eight">8</button>
+            <button id="nine">9</button>
+            <button id="multiply" class="operator">*</button>
+
+            <!-- Row 3 -->
+            <button id="four">4</button>
+            <button id="five">5</button>
+            <button id="six">6</button>
+            <button id="subtract" class="operator">-</button>
+
+            <!-- Row 4 -->
+            <button id="one">1</button>
+            <button id="two">2</button>
+            <button id="three">3</button>
+            <button id="add" class="operator">+</button>
+
+            <!-- Row 5 -->
+            <button id="zero">0</button>
+            <button id="decimal">.</button>
+            <button id="equals" class="operator">=</button>
+        </div>
+    </div>
+
+    <script>
+        // --- THREE.JS SCENE SETUP (Unchanged per instruction) ---
+        let scene, camera, renderer;
+        let operandsGroup = new THREE.Group(); // Container for 3D geometry representing calculation parts
+        const CANVAS_ID = 'threeD-canvas';
+
+        function initThreeJs() {
+            const container = document.getElementById('canvas-container');
+            if (!container) { console.error("Canvas container not found."); return; }
+            
+            // Robustly get dimensions, prioritizing computed style size over initial attributes
+            let width = Math.min(parseFloat(getComputedStyle(container).getPropertyValue('width').trim()), 800);
+            let height = Math.min(parseFloat(getComputedStyle(container).getPropertyValue('height').trim()) || parseFloat(document.getElementById('threeD-canvas').getAttribute('height')), 400);
+
+            if (width === 0 || height === 0) { console.error("Canvas container has zero dimensions."); return; }
+
+            // Initialize scene, camera, renderer attached to the canvas context
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000);
+            camera.position.z = 3;
+
+            renderer = new THREE.WebGLRenderer({
+                canvas: document.getElementById(CANVAS_ID),
+                antialias: true
+            });
+            renderer.setSize(width, height);
+
+            // Explicitly set CSS dimensions to ensure canvas scales correctly within the container's bounds
+             const canvasElement = document.getElementById(CANVAS_ID); 
+             if (canvasElement) { 
+                 canvasElement.style.width = '100%'; 
+                 canvasElement.style.height = '100%';
+             }
+
+            // Setup lighting and initial geometry group
+            operandsGroup.name = "OperandsGroup"; // Name for easier identification
+            scene.add(operandsGroup);
+            const ambientLight = new THREE.AmbientLight(0xffffff, 1.5); // Slightly brighter
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+            directionalLight.position.set(1, 2, 1).normalize();
+            scene.add(directionalLight);
+        
+            // Add a ground plane for better context (optional)
+            const floorGeometry = new THREE.PlaneGeometry(10, 10);
+            const floorMaterial = new THREE.MeshPhongMaterial({ color: 0xaaaaaa, side: THREE.DoubleSide });
+            const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+            floor.rotation.x = -Math.PI / 2; // Rotate to be flat on the ground
+            scene.add(floor);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            // Smooth rotation for demonstration
+            operandsGroup.rotation.y += 0.001;
+            renderer.render(scene, camera);
+        }
+
+        /**
+         * Clears all existing objects from the visual representation.
+         */
+        function resetVisualization() {
+             while(operandsGroup.children.length > 0) {
+                const object = operandsGroup.children[0];
+                // Check if geometry or material exists before disposing to avoid errors
+                if (object.geometry) object.geometry.dispose();
+                if (Array.isArray(object.material)) {
+                    object.material.forEach(m => m.dispose());
+                } else if (object.material) {
+                    object.material.dispose();
+                }
+                operandsGroup.removeAt(0);
+            }
+        }
+
+        /**
+         * Renders operands A and B separated by an arc representing the operation.
+         */
+        function renderVisualization(numA, opSymbol, numB) {
+            resetVisualization();
+            const SCALE_FACTOR = 0.1; // Controls how big each number is visually relative to its magnitude
+            
+            // Helper to create a sphere representing a number value
+            const createOperandMesh = (value, offsetZ) => {
+                // Size based on absolute value of the operand
+                const radius = Math.max(0.1, Math.abs(value) * SCALE_FACTOR);
+                
+                const geometry = new THREE.SphereGeometry(radius, 32, 32);
+                // Color coding: Blue for positive, Red for negative (relative to initial rendering state)
+                let color;
+                if (Math.abs(value) < 1e-9) { 
+                     color = 0x333333; // Dark grey/black for actual zero value
+                } else if (Math.abs(value) <= 0.05 && Math.abs(value) >= 1e-8) { 
+                     color = 0xcccccc; // Grey for near zero
+                } else if (value > 0) { 
+                    color = 0x00aaff;
+                } else { 
+                    color = 0xff4444;
+                }
+                const material = new THREE.MeshPhongMaterial({ color: color });
+                const mesh = new THREE.Mesh(geometry, material);
+                // Positioning adjustment: Sphere A slightly left/back, Sphere B slightly right/front
+                mesh.position.set((value >= 0 ? 1 : -1) * radius * 0.5 , Math.sign(value) * (radius*0.5), offsetZ);
+                return mesh;
+            };
+
+            // 1. Render Operands (Spheres)
+            let meshA, meshB; 
+            if (typeof numA === 'number' && !isNaN(numA)) {
+                 meshA = createOperandMesh(numA, -2);
+                 operandsGroup.add(meshA);
+            }
+
+            if (typeof numB === 'number' && !isNaN(numB)) { 
+                meshB = createOperandMesh(numB, 2); 
+                operandsGroup.add(meshB);
+            }
+
+            // 2. Render Operator Arc (Visual link)
+            const arcGeometry = new THREE.BufferGeometry();
+            const points = [];
+            const segments = 64;
+            
+            let startZ, endZ;
+            if (numA !== undefined && numB !== undefined) { 
+                startZ = -1.5; // Near A
+                endZ = 1.5;  // Near B
+            } else if (numA !== undefined && opSymbol) {
+                 // Path connecting A to the general area of operation
+                startZ = -2;
+                endZ = 0.5; 
+            } else {
+                resetVisualization(); return;
+            }
+
+            for (let i = 0; i <= segments; i++) {
+                const t = i / segments;
+                // Path moves generally from left/back to right/front
+                const x = Math.sin((t * Math.PI) * 1.5) * 0.2 + (i > 30 && numB ? 0.4 : 0);
+                const y = Math.cos(t * Math.PI * 1.2) * 0.3 + (Math.sin(t * Math.PI) * 0.1);
+                const z = startZ + t * (endZ - startZ); // Linear Z progression for the connector
+                points.push(x, y, z);
+            }
+            arcGeometry.setFromPoints(points.map(p => new THREE.Vector3(p[0], p[1], p[2])));
+
+            const arcMaterial = new THREE.MeshPhongMaterial({ color: 0xff9500 });
+            const arc = new THREE.Line(arcGeometry, arcMaterial);
+            operandsGroup.add(arc);
+        }
+
+        // --- MathCore (No changes needed) ---
+        const MathCore = {
+            calculate: function(expression) {
+                if (!expression || expression === "") return null; 
+                try {
+                    let safeExpression = expression.replace(/([+\-*/])/g, ' $1 ');
+                    safeExpression = safeExpression.trim().replace(/(\s+)([+\-*/])(\s*)/g, ' $2 '); 
+                    
+                    // Using Function constructor is a common pattern for simple evaluation on controlled input
+                    const result = Function('return (' + safeExpression + ')')();
+                    
+                    if (isNaN(result) || !isFinite(result)) {
+                        throw new Error("Invalid calculation");
+                    }
+                    // Limit precision to prevent floating point garbage in display strings, but keep full number for state.
+                    return parseFloat(parseFloat(result.toFixed(10)).toString()); 
+                } catch (e) {
+                    console.error("MathCore Calculation Error:", e);
+                    return NaN;
+                }
+            },
+            processAction: function(currentInput, actionType, value) {
+                if (actionType === 'calculate' && currentInput) {
+                     const result = this.calculate(currentInput);
+                    return typeof result === 'number' ? String(result).substring(0, 15) : "Error"; 
+                }
+                return currentInput;
+            }
+        };
+        
+        // --- UILogicBinder & Visualization Integration (Refactored Logic) ---
+        class UILogicBinder {
+            constructor() {
+                this.displayElement = document.getElementById('display');
+                this.canvasContainer = document.getElementById('canvas-container');
+                
+                // State tracking: 
+                this.currentDisplayValue = "0"; 
+                
+                // Calculation state variables
+                this.firstOperand = null;   // The first number/result in the calculation chain (A)
+                this.operator = null;      // The operator (+, -, *, /) awaiting B
+                this.secondOperand = null; // The second number/input being built or used as B
+                
+                this.isResultDisplayed = false; // True if the last action was '=' or % (resets A for next operation start)
+
+                initThreeJs();
+                animate(); 
+                this.setupEventListeners();
+            }
+
+            updateDisplay(value) {
+                if (typeof value !== 'string') { 
+                    value = String(value);
+                }
+                this.currentDisplayValue = value;
+                this.displayElement.textContent = value;
+
+                let shouldUpdateState = true;
+
+                // State reset logic on specific displays:
+                if (['Error', 'Error: Div/0'].includes(value)) { 
+                    shouldUpdateState = false; // Do not let error messages modify currentInput for chaining
+                    this.resetCalculatedState(); // Reset all calculation state on error display
+                } else if (!isNaN(parseFloat(value))) {
+                     // If the displayed value is purely numeric, it represents our latest input or result accumulation.
+                     if (this.isResultDisplayed) { 
+                        // If we just saw a final result, this new number starts A
+                        this.firstOperand = parseFloat(value); 
+                        this.secondOperand = null;
+                        this.operator = null; // Reset operator since starting fresh input sequence
+                    } else if (!['+', '-', '*', '/', '.', 'SET_PERCENT'].includes(String(parseFloat(this.currentDisplayValue))) && !isNaN(parseFloat(value)) ) {
+                         // If we are typing numbers, just update the current second operand accumulator (secondOperand tracks the *input* for B)
+                     }
+                }
+
+                // Re-evaluate visualization after any change
+                this.updateVisualization(); 
+            }
+            
+            resetCalculatedState() {
+                 this.firstOperand = null;
+                 this.operator = null;
+                 this.secondOperand = null;
+                 this.isResultDisplayed = false;
+            }
+
+
+            // VISUALIZATION: Updates 3D scene based on the current internal state representation.
+            updateVisualization() {
+                if (this.firstOperand === null) {
+                    resetVisualization();
+                    return;
+                }
+
+                let numA_render, opSymbol, numB_render;
+                let shouldRenderArc = false;
+
+                // --- Case 1: A is set, Op is set, and B is being typed (or was the last entered digit) ---
+                if (this.operator && !['=', 'AC'].includes(document.querySelector('.buttons button[id="equals"]').id)) {
+                    
+                    let currentB = parseFloat(this.currentDisplayValue);
+
+                     if (numA_render === undefined) { 
+                        numA_render = this.firstOperand; 
+                     }
+
+                    // If we are actively typing into B, use the displayed value for visualization.
+                    if (!isNaN(currentB)) { 
+                         numB_render = currentB;
+                         opSymbol = this.operator === 'PERCENT' ? '%' : this.operator;
+                         shouldRenderArc = true;
+                     } else {
+                        // If we are waiting for B input, and B isn't fully formed yet (e.g., after setting A and Op):
+                        numB_render = null;
+                        opSymbol = this.operator === 'PERCENT' ? '%' : this.operator;
+                        shouldRenderArc = true; // We still show the operation context
+                     }
+
+                    if(shouldRenderArc && numA_render !== undefined) {
+                        // If B is also fully formed, pass it for better visualization (might be null if user hasn't typed yet)
+                         renderVisualization(numA_render, opSymbol, numB_render);
+                        return;
+                    }
+                }
+                // --- Case 2: Single result displayed (Waiting for new operation or reset) ---
+                else if (this.isResultDisplayed && !isNaN(parseFloat(this.firstOperand))) {
+                     resetVisualization(); 
+                     const geometry = new THREE.SphereGeometry(Math.max(0.1, Math.abs(this.firstOperand) * 0.08), 32, 32);
+                     const material = new THREE.MeshPhongMaterial({ color: 0x00cc00 });
+                     const mesh = new THREE.Mesh(geometry, material);
+                     mesh.position.set(0, 0, -5); // Display result far out on the Z axis
+                     operandsGroup.add(mesh);
+                }
+
+            }
+
+
+            // --- Event Handlers ---
+        handleClear() {
+                this.firstOperand = null;
+                this.operator = null;
+                this.secondOperand = null;
+                this.isResultDisplayed = false;
+                this.currentDisplayValue = "0";
+                this.updateDisplay("0");
+            }
+            
+            appendNumber(number) {
+                 // Number input logic: Append to the currently tracked B value or start fresh if A was just calculated
+                if (this.isResultDisplayed && !isNaN(parseFloat(this.firstOperand))) { 
+                    // Starting a new number after a result, reset state for next calculation.
+                     this.secondOperand = null;
+                     this.operator = null; 
+                     this.isResultDisplayed = false;
+                }
+
+                let newDisplayValue;
+                if (this.currentDisplayValue === "0" && number !== '.') {
+                    newDisplayValue = String(number);
+                } else if (['Error', 'Error: Div/0'].includes(this.currentDisplayValue)) { 
+                     // Ignore input if error displayed
+                     return;
+                }
+                 else {
+                    newDisplayValue = this.currentDisplayValue + number;
+                }
+
+               this.updateDisplay(newDisplayValue);
+            }
+
+             appendDecimal() {
+                if (['Error', 'Error: Div/0'].includes(this.currentDisplayValue)) return;
+                let currentNum = parseFloat(this.currentDisplayValue);
+                // Only append if the last character isn't a decimal point OR if we are starting from zero
+                const lastChar = this.currentDisplayValue.slice(-1);
+                if (!['.', 'Error', 'Error: Div/0'].includes(lastChar) || (this.firstOperand === null && !this.operator)) {
+                     this.updateDisplay(this.currentDisplayValue + '.');
+                }
+            }
+
+
+            appendOperator(opSymbol) {
+                 let currentNumB = parseFloat(this.currentDisplayValue);
+                
+                // 1. Calculate potential result immediately if A, Op, and B are all confirmed
+                if (this.firstOperand !== null && this.operator && !isNaN(currentNumB)) {
+                    
+                    let calculatedVal;
+                    try {
+                        if (this.operator === '/') {
+                            if (currentNumB === 0) throw new Error("Division by Zero");
+                            calculatedVal = this.firstOperand / currentNumB;
+                        } else if (this.operator === '*') {
+                             calculatedVal = this.firstOperand * currentNumB;
+                        } else if (this.operator === '+') {
+                            calculatedVal = this.firstOperand + currentNumB;
+                        } else if (this.operator === '-') {
+                            calculatedVal = this.firstOperand - currentNumB;
+                        }
+
+                    } catch (e) {
+                        console.error("Calculation error on operator press:", e);
+                        // On error, fall through to setting new op context.
+                    }
+
+                    if (!isNaN(calculatedVal) && isFinite(calculatedVal)) { 
+                        // Success: The result becomes the new A for chaining.
+                        this.firstOperand = calculatedVal;
+                        this.secondOperand = null; 
+                        this.isResultDisplayed = true;
+                        this.updateDisplay(String(Math.round(calculatedVal * 100) / 100)); // Show rounded result
+                        return; // Stop here, calculation complete for this step
+                    }
+                }
+                
+                // 2. Update State: Set A and Op (or update B if we are chaining operations)
+                 if (isNaN(currentNumB)) {
+                     // If B is not yet formed (e.g., operator pressed immediately after AC/=), keep existing A.
+                      this.operator = opSymbol;
+                      this.secondOperand = null; 
+                      this.isResultDisplayed = false;
+                 } else { 
+                    // Normal flow: We confirm the current display value as B, or overwrite A if no previous calculation happened (special case handled below).
+
+                     if (this.firstOperand === null) {
+                         // This is the first operation in a session. Set A to the current number.
+                         this.firstOperand = currentNumB;
+                         this.secondOperand = currentNumB; // B context set initially
+                     } else { 
+                        // Previous calculation happened (A was last result), keep A, update Op.
+                        this.operator = opSymbol;
+                        this.secondOperand = currentNumB; 
+                     }
+                     
+                     this.isResultDisplayed = false;
+                 }
+                
+                // Final display update: Reflect the new operation context (A op B).
+                const finalDisplayString = this.firstOperand === null ? "" : `${MathCore.calculate(this.firstOperand)} ${opSymbol}`;
+                this.updateDisplay(finalDisplayString);
+            }
+            
+            handleUtility(id) {
+                const currentVal = parseFloat(this.currentDisplayValue);
+                if (isNaN(currentVal)) return;
+
+                let nextOpSymbol = null;
+                if (id === 'signChange') { 
+                    // Toggles the sign of the number currently being input/displayed.
+                    nextOpSymbol = "SIG_CHANGE"; // Use a conceptual flag for state update
+                     this.secondOperand = -parseFloat(this.secondOperand || currentVal);
+                } else if (id === 'percent') {
+                   // % is treated as an operation that immediately calculates and updates B, then sets Op=".%"
+                    const result = parseFloat(currentVal) / 100;
+                    this.firstOperand = parseFloat(currentVal); 
+                    this.secondOperand = result; // The calculated percent value
+                    this.isResultDisplayed = true; 
+                    this.operator = 'PERCENT'; 
+                    this.updateDisplay(String(result));
+                }
+                
+                 if (nextOpSymbol === "SIG_CHANGE") {
+                     // Update display immediately, but don't change the operator state until the user hits '=' or another op.
+                     this.updateDisplay(String(-currentVal)); 
+                 } else if (id === 'percent') { 
+                    // State is already set in appendOperator logic upon return from % calculation.
+                 }
+            }
+            
+            handleEquals() {
+                if (!this.operator || this.firstOperand === null) {
+                     // Nothing to calculate, just repeat display value if safe
+                     return;
+                }
+                
+                let finalResult = null;
+
+                try {
+                    let expression;
+                    if (this.operator === 'PERCENT') { 
+                        // For %: Calculate A * B/100 or similar based on what the logic intended.
+                         expression = `${this.firstOperand} / 100`; // Assuming previous state locked it down
+                    } else {
+                        // Standard calculation using stored values (A and B=secondOperand)
+                        if (this.operator === '/') {
+                            if (parseFloat(this.secondOperand) === 0) throw new Error("Division by Zero");
+                            expression = `${this.firstOperand}/${this.secondOperand}`;
+                        } else if (this.operator === '*') {
+                             expression = `${this.firstOperand}*${this.secondOperand}`;
+                        } else if (this.operator === '+') {
+                            expression = `${this.firstOperand}+${this.secondOperand}`;
+                        } else if (this.operator === '-') {
+                            expression = `${this.firstOperand}-${this.secondOperand}`;
+                        }
+                    }
+                    
+                    finalResult = MathCore.calculate(expression);
+                } catch (e) {
+                    console.error("Equals Calculation Error:", e);
+                     this.updateDisplay("Error: Calc Failed");
+                     return;
+                }
+                
+                if (!isNaN(finalResult) && isFinite(finalResult)) {
+                    // Success
+                    this.firstOperand = finalResult; // Result becomes the new A for chaining
+                    this.secondOperand = null;
+                    this.operator = null; 
+                    this.isResultDisplayed = true; 
+                    this.updateDisplay(String(Math.round(finalResult * 100) / 100)); // Display result, rounded to 2 decimals
+                } else {
+                    this.updateDisplay("Error: Result Undefined");
+                }
+            }
+        }
+    </script>
+</body>
+</html>

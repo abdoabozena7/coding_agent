@@ -838,6 +838,10 @@ _COLOR_STYLE = {
     "workspace.command.title": "bold #BE9765",
     "workspace.command": "#d0d0d0",
     "workspace.command.selected": "bold #ffffff bg:#71533D",
+    "workspace.command.binary": "bold #8ab4f8",
+    "workspace.command.flag": "#f38ba8",
+    "workspace.command.pipe": "bold #2dd4bf",
+    "workspace.activity.meta": "#707070",
     "workspace.project": "bold #BE9765",
     "workspace.phase": "bold #937152",
     "workspace.resource": "#808080",
@@ -1189,7 +1193,7 @@ def _contextual_footer_text(snapshot: WorkspaceSnapshot, width: int) -> str:
     if snapshot.attention is not None:
         if snapshot.attention.kind.value == "approval":
             value = (
-                "Decision required in Workspace | /open-web | terminal fallback only"
+                "Decision required in Workspace | Open in Web | terminal fallback only"
                 if snapshot.control_surface == "web"
                 else "[Y] Allow once | [N] Deny | / Commands | Arrows Select | Enter Confirm"
             )
@@ -1198,16 +1202,16 @@ def _contextual_footer_text(snapshot: WorkspaceSnapshot, width: int) -> str:
     elif snapshot.runtime_phase == "waiting_for_approval":
         value = "Approve in the prompt | F5 Activity | F7 Diff | ? Help"
     elif snapshot.runtime_phase == "waiting_for_process":
-        value = "Waiting for process | /stop Stop now | F5 Activity | Ctrl+C Pause | ? Help"
+        value = "Waiting for process | Ctrl+T Tools | F9 Agents | /stop | Ctrl+C Pause | ? Help"
     elif snapshot.running:
-        value = "/stop Stop now | F5 Activity | / Queue | Ctrl+C Pause | F7 Diff | ? Help"
+        value = "Ctrl+T Tools | F9 Agents | /stop Stop | Ctrl+C Pause | F7 Diff | ? Help"
     elif str(snapshot.status).casefold() == "paused":
-        value = "/resume Continue | F5 Activity | F7 Diff | ? Help"
+        value = "/resume Continue | Ctrl+T Tools | F9 Agents | F7 Diff | ? Help"
     elif str(snapshot.status).casefold() not in {"idle", "completed", "cancelled"}:
-        value = "F5 Activity | /details Diagnose | /resume Retry | ? Help"
+        value = "F5 Activity | /advanced-tracing Diagnose | /resume Retry | ? Help"
     else:
         target = "Simple" if snapshot.mode is ExperienceMode.ADVANCED else "Advanced"
-        value = f"/ Commands | F2 {target} | F5 Activity | F6 {_sleep_text(snapshot)} | ? Help"
+        value = f"/ Commands | F2 {target} | Ctrl+T Tools | F9 Agents | ? Help"
     if snapshot.queued_count:
         value += f" | queued {snapshot.queued_count}"
     return _fit(value, width).rstrip()
@@ -1254,7 +1258,12 @@ def render_persistent_workspace(
         if snapshot.attention.message:
             lines.extend(textwrap.wrap(snapshot.attention.message, width=width)[:3])
         options = []
-        page_size = 3
+        page_size = (
+            4
+            if snapshot.attention.kind is AttentionKind.PLAN_REVIEW
+            or len(snapshot.attention.options) <= 4
+            else 3
+        )
         total_options = len(snapshot.attention.options)
         start = max(
             0,
@@ -1358,7 +1367,10 @@ class PersistentWorkspaceApp:
             content=FormattedTextControl(self._live_activity_fragments),
             wrap_lines=True,
             always_hide_cursor=True,
-            height=Dimension(min=6, max=8, preferred=7),
+            # In stacked layouts this is the user's live work transcript, not
+            # a one-line status widget.  Give it enough vertical room to keep
+            # several completed tool blocks visible under the active one.
+            height=Dimension(min=9, max=18, preferred=15),
         )
         wide_activity = Window(
             content=FormattedTextControl(self._live_activity_fragments),
@@ -1392,7 +1404,7 @@ class PersistentWorkspaceApp:
             content=FormattedTextControl(self._attention_fragments),
             wrap_lines=True,
             always_hide_cursor=True,
-            height=Dimension(min=1, max=12, preferred=6),
+            height=Dimension(min=1, max=14, preferred=8),
         )
         composer = Window(
             content=BufferControl(
@@ -1654,6 +1666,41 @@ class PersistentWorkspaceApp:
             lines.append("No runtime activity has been recorded yet.")
         return "\n".join(lines)
 
+    @staticmethod
+    def _tool_entries(snapshot: WorkspaceSnapshot) -> list[Any]:
+        return [
+            entry
+            for entry in snapshot.live_timeline
+            if entry.source == "TOOL" or entry.tool or entry.kind.startswith("tool")
+        ]
+
+    def _tool_transcript_text(self) -> str:
+        entries = self._tool_entries(self.store.snapshot())
+        if not entries:
+            return "No tool activity has been recorded in this session yet."
+        lines = [
+            "Tool activity transcript · redacted · newest state is live",
+            "",
+        ]
+        for entry in entries:
+            state = str(entry.state or "active").casefold()
+            mark = "[x]" if state == "completed" else "[!]" if state == "failed" else "[>]"
+            actor = " ".join(str(entry.actor or "agent").replace("_", " ").split()).title()
+            label = entry.detail or str(entry.tool or entry.message).replace("_", " ")
+            duration = (
+                f" · {entry.duration_seconds:.1f}s"
+                if entry.duration_seconds is not None
+                else ""
+            )
+            lines.append(f"{mark} {actor} · {state} · {label}{duration}")
+            output = str(entry.output or "")
+            if output:
+                lines.extend(f"    {line}" for line in output.splitlines())
+            elif state == "active":
+                lines.append("    (waiting for the tool result)")
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
     def open_details(self, title: str, value: str, *, kind: str = "details") -> None:
         self._overlay_kind = kind
         self._overlay_title = str(title)
@@ -1755,18 +1802,35 @@ class PersistentWorkspaceApp:
             )
             event.app.invalidate()
 
+        @self._bindings.add("c-t", eager=True)
+        def _open_tool_transcript(event: Any) -> None:
+            if self._overlay_kind == "plan_edit":
+                return
+            self.open_details(
+                "Tool activity transcript",
+                self._tool_transcript_text(),
+                kind="tool_transcript",
+            )
+            event.app.invalidate()
+
         @self._bindings.add("f6", eager=True)
         def _toggle_sleep(event: Any) -> None:
-            self.store.toggle_sleep_mode()
+            self.on_input(WorkspaceInput(kind="sleep_toggle"))
             event.app.invalidate()
 
         @self._bindings.add("f7", eager=True)
         def _open_diff(event: Any) -> None:
-            self.on_input(WorkspaceInput(text="/diff"))
+            self.on_input(WorkspaceInput(kind="diff"))
 
         @self._bindings.add("f8", eager=True)
         def _open_folder(event: Any) -> None:
-            self.on_input(WorkspaceInput(text="/explorer"))
+            self.on_input(WorkspaceInput(kind="explorer"))
+
+        @self._bindings.add("f9", eager=True)
+        def _open_agents(event: Any) -> None:
+            if not self._overlay_kind:
+                self.on_input(WorkspaceInput(kind="agents"))
+                event.app.invalidate()
 
         @self._bindings.add("c-k", eager=True)
         def _open_actions(event: Any) -> None:
@@ -1819,11 +1883,12 @@ class PersistentWorkspaceApp:
                         "  Ctrl+Q        exit only at a safe checkpoint",
                         "",
                         "Inspect",
-                        "  F5 activity | F7 diff | F8 project folder | /agents | /tree",
+                        "  Ctrl+T tool transcript | F5 activity | F7 diff | F8 project folder",
+                        "  F9 agents | /live | /advanced-tracing",
                         "",
                         "Session",
                         "  F2 Advanced/Simple | F3 model | F4 permissions | F6 Sleep",
-                        "  /sleep on | /sleep off | /sleep status",
+                        "  /settings opens the complete configuration hub",
                     )
                 ),
                 kind="help",
@@ -1992,7 +2057,9 @@ class PersistentWorkspaceApp:
                 return
             if attention is not None and value:
                 command_name = value.casefold().split(maxsplit=1)[0].replace(":", "/", 1)
-                if command_name in {"/open-web", "/stop", "/sleep", "/status", "/activity"}:
+                if command_name in {
+                    "/stop", "/pause", "/resume", "/live", "/advanced-tracing"
+                }:
                     # Control and recovery commands must remain usable even
                     # while an approval owns the normal composer. Otherwise
                     # the UI can instruct the user to open/stop and then
@@ -2010,7 +2077,7 @@ class PersistentWorkspaceApp:
                     self.store.resolve_attention("custom", text=value)
                 elif terminal_decision_blocked:
                     self.store.set_attention_feedback(
-                        "Decision required in Workspace. Use /open-web; terminal fallback is reserved for Web outages."
+                        "Decision required in Workspace. Use its Open in Web action; terminal fallback is reserved for Web outages."
                     )
                 elif not value:
                     self.store.resolve_selected_attention()
@@ -2166,7 +2233,7 @@ class PersistentWorkspaceApp:
                 if request.kind.value == "approval":
                     if self.store.snapshot().control_surface == "web":
                         self.store.set_attention_feedback(
-                            "Decision required in Workspace. Use /open-web; terminal fallback is reserved for Web outages."
+                            "Decision required in Workspace. Use Open in Web; terminal fallback is reserved for Web outages."
                         )
                         return
                     aliases = {
@@ -2251,8 +2318,28 @@ class PersistentWorkspaceApp:
                 width=max(60, width - 1),
                 height=height,
                 unicode=terminal_supports_unicode(self.output),
+                tick=int(time.monotonic() * 8),
+                animate=self._animate,
             )
-            return FormattedText([("class:details.body", body)])
+            fragments: list[tuple[str, str]] = []
+            for line in body.splitlines():
+                normalized = line.casefold()
+                style = (
+                    "class:details.title" if line.startswith("SWARM INSPECTOR")
+                    else "class:workspace.error" if any(
+                        token in normalized
+                        for token in (" failed", " blocked", " attention", " uncertain")
+                    )
+                    else "class:workspace.success" if " completed" in normalized or " done" in normalized
+                    else "class:workspace.agent" if any(
+                        token in normalized
+                        for token in (" running", " working", " reviewing", " testing")
+                    )
+                    else "class:workspace.muted" if line.startswith(("Path  ", "model ", "tokens ", "Last  "))
+                    else "class:details.body"
+                )
+                fragments.append((style, line + "\n"))
+            return FormattedText(fragments)
         if self._overlay_kind == "diff":
             fragments: list[tuple[str, str]] = [
                 ("class:details.title", (self._overlay_title or "Project changes") + "\n"),
@@ -2393,7 +2480,7 @@ class PersistentWorkspaceApp:
                 preview = "\n ".join(first_lines)[:500]
                 rendered = (
                     f"{preview}\n … {len(entry.text):,} chars collapsed "
-                    f"· /details {entry.id}"
+                    f"· inspect in /advanced-tracing ({entry.id})"
                 )
             if entry.role == "user":
                 fragments.extend(
@@ -2417,6 +2504,132 @@ class PersistentWorkspaceApp:
             )
         return FormattedText(fragments)
 
+    @staticmethod
+    def _activity_actor_style(actor: str) -> str:
+        normalized = str(actor).casefold()
+        if any(token in normalized for token in ("review", "critic")):
+            return "class:workspace.actor.reviewer"
+        if any(token in normalized for token in ("test", "verify", "quality")):
+            return "class:workspace.actor.test"
+        if any(token in normalized for token in ("architect", "plan")):
+            return "class:workspace.actor.architect"
+        return "class:workspace.actor.implementer"
+
+    @staticmethod
+    def _command_fragments(value: str) -> list[tuple[str, str]]:
+        fragments: list[tuple[str, str]] = []
+        command_seen = False
+        after_pipe = False
+        for token in re.split(r"(\s+)", str(value)):
+            if not token:
+                continue
+            stripped = token.strip()
+            if not stripped:
+                fragments.append(("class:workspace.assistant", token))
+                continue
+            if stripped in {"|", "&&", "||", ";"}:
+                style = "class:workspace.command.pipe"
+                after_pipe = True
+            elif stripped.startswith("-"):
+                style = "class:workspace.command.flag"
+            elif not command_seen or after_pipe:
+                style = "class:workspace.command.binary"
+                command_seen = True
+                after_pipe = False
+            else:
+                style = "class:workspace.assistant"
+            fragments.append((style, token))
+        return fragments
+
+    def _tool_activity_block_fragments(
+        self,
+        entry: Any,
+        *,
+        width: int,
+        compact: bool,
+    ) -> list[tuple[str, str]]:
+        state = str(entry.state or "active").casefold()
+        unicode = terminal_supports_unicode(self.output)
+        active_for = (
+            0.0
+            if entry.started_at is None
+            else max(0.0, time.monotonic() - entry.started_at)
+        )
+        animate = self._animate and state == "active" and active_for >= 0.2
+        pulse = ("·", "∙", "●", "∙") if unicode else (".", "o", "O", "o")
+        marker = (
+            pulse[int(time.monotonic() * 8) % len(pulse)]
+            if animate
+            else "●" if state == "completed" and unicode
+            else "+" if state == "completed"
+            else "■" if state == "failed" and unicode
+            else "!" if state == "failed"
+            else "○" if unicode
+            else "o"
+        )
+        marker_style = (
+            "class:workspace.success" if state == "completed"
+            else "class:workspace.error" if state == "failed"
+            else "class:workspace.actor.tool"
+        )
+        tool = str(entry.tool or entry.message or "operation")
+        is_command = tool in {"run_bash", "run_command", "shell_command", "start_process"}
+        verb = (
+            "Running" if state == "active" and is_command
+            else "Using" if state == "active"
+            else "Ran" if state == "completed" and is_command
+            else "Used" if state == "completed"
+            else "Failed"
+        )
+        actor = " ".join(str(entry.actor or "agent").replace("_", " ").split()).title()
+        detail = str(entry.detail or "")
+        label = detail if is_command and detail else tool.replace("_", " ")
+        if detail and not is_command:
+            label += f" · {detail}"
+        duration = (
+            f" · {entry.duration_seconds:.1f}s"
+            if entry.duration_seconds is not None and entry.duration_seconds >= 0.1
+            else ""
+        )
+        fragments: list[tuple[str, str]] = [
+            (marker_style, f" {marker} "),
+            (self._activity_actor_style(actor), f"{actor} "),
+            ("class:workspace.muted", f"· {verb} "),
+        ]
+        if is_command and detail:
+            fragments.extend(self._command_fragments(label))
+        else:
+            fragments.append(("class:workspace.assistant", label))
+        if duration:
+            fragments.append(("class:workspace.activity.meta", duration))
+        fragments.append(("", "\n"))
+
+        preview = tuple(entry.output_preview or ())
+        preview_limit = 1 if compact else 2
+        shown = preview[:preview_limit]
+        branch = "└" if unicode else "\\"
+        if shown:
+            for line in shown:
+                output_style = (
+                    "class:workspace.error" if state == "failed"
+                    else "class:workspace.muted"
+                )
+                fragments.append(("class:workspace.activity.meta", f"   {branch} "))
+                fragments.append((output_style, _fit(line or "(empty line)", max(12, width - 6)).rstrip() + "\n"))
+        elif state == "active":
+            fragments.append((
+                "class:workspace.activity.meta",
+                f"   {branch} waiting for result · agent remains active\n",
+            ))
+        hidden = max(0, int(entry.hidden_lines or 0) + max(0, len(preview) - len(shown)))
+        if hidden:
+            ellipsis = "…" if unicode else "..."
+            fragments.append((
+                "class:workspace.activity.meta",
+                f"     {ellipsis} +{hidden} lines · Ctrl+T transcript\n",
+            ))
+        return fragments
+
     def _live_activity_fragments(self) -> Any:
         """Render a truthful live rail without exposing model scratch work."""
 
@@ -2424,7 +2637,7 @@ class PersistentWorkspaceApp:
         # Use the same size source as the responsive container. This keeps
         # the rail contents and the actual wide/narrow layout in agreement,
         # including during resize events and deterministic PTY tests.
-        terminal_width = self._terminal_size()[0]
+        terminal_width, terminal_height = self._terminal_size()
         wide = terminal_width >= 120
         width = min(54, max(34, terminal_width - 2)) if wide else max(34, terminal_width - 2)
         fragments: list[tuple[str, str]] = [
@@ -2515,6 +2728,67 @@ class PersistentWorkspaceApp:
             f" {_fit(evidence, width).rstrip()}\n",
         ))
 
+        swarm = snapshot.swarm
+        if swarm.total:
+            fragments.append((
+                "class:workspace.agent",
+                (
+                    f"\n AGENTS · {swarm.total} total · {swarm.running + swarm.reviewing} active"
+                    f" · {swarm.completed} complete\n"
+                ),
+            ))
+            pulse = ("·", "∙", "●", "∙") if terminal_supports_unicode(self.output) else (".", "o", "O", "o")
+            active_mark = (
+                pulse[int(time.monotonic() * 8) % len(pulse)]
+                if self._animate
+                else ">"
+            )
+            if swarm.agent_lines:
+                visible_agents = 4 if wide else 3
+                for agent in swarm.agent_lines[-visible_agents:]:
+                    status = str(agent.status or "queued").casefold()
+                    active = status in {
+                        "running", "in_progress", "planning", "testing",
+                        "reviewing", "verifying", "fixing", "integrating",
+                    }
+                    mark = (
+                        active_mark if active
+                        else "✓" if status in {"completed", "done"}
+                        else "!" if status in {"failed", "blocked", "uncertain"}
+                        else "○"
+                    )
+                    style = (
+                        "class:workspace.error"
+                        if status in {"failed", "blocked", "uncertain"}
+                        else "class:workspace.success"
+                        if status in {"completed", "done"}
+                        else "class:workspace.agent"
+                    )
+                    detail = agent.task or agent.phase or status.replace("_", " ")
+                    fragments.append((
+                        style,
+                        f" {mark} {_fit(f'{agent.role} · {status.replace('_', ' ')} · {detail}', max(12, width - 3)).rstrip()}\n",
+                    ))
+                    if wide and agent.summary:
+                        fragments.append((
+                            "class:workspace.muted",
+                            f"   └ {_fit(agent.summary, max(12, width - 6)).rstrip()}\n",
+                        ))
+            else:
+                labels = swarm.active_labels or (
+                    f"{swarm.running} running · {swarm.reviewing} reviewing",
+                )
+                for label in labels[: (3 if wide else 1)]:
+                    fragments.append((
+                        "class:workspace.agent",
+                        f" {active_mark} {_fit(label, max(12, width - 3)).rstrip()}\n",
+                    ))
+            if swarm.blocked:
+                fragments.append((
+                    "class:workspace.error",
+                    f" ! {swarm.blocked} agent{'s' if swarm.blocked != 1 else ''} need attention\n",
+                ))
+
         if wide:
             if snapshot.objective:
                 fragments.extend((
@@ -2568,20 +2842,54 @@ class PersistentWorkspaceApp:
                 f" Transport · {_compact_bytes(snapshot.received_bytes)} · {snapshot.received_chunks} chunks · {snapshot.received_tokens} tokens\n",
             ))
 
-        fragments.append(("class:workspace.queue", "\n ACTIVITY\n"))
-        entries = list(snapshot.live_timeline)
+        fragments.append(("class:workspace.queue", "\n TOOL ACTIVITY\n"))
+        tool_entries = self._tool_entries(snapshot)
+        if tool_entries:
+            # Preserve the recent work ledger instead of replacing it with
+            # only the newest call.  The cap follows terminal height so an
+            # 80x24 terminal remains usable while ordinary Windows Terminal
+            # sizes show a Codex-style stack of past and current operations.
+            if wide:
+                visible_tools = (
+                    3
+                    if swarm.total
+                    else max(3, min(6, (terminal_height - 18) // 3))
+                )
+            else:
+                visible_tools = (
+                    2
+                    if swarm.total
+                    else max(2, min(3, (terminal_height - 12) // 3))
+                )
+            for entry in tool_entries[-visible_tools:]:
+                fragments.extend(
+                    self._tool_activity_block_fragments(
+                        entry,
+                        width=width,
+                        compact=not wide,
+                    )
+                )
+        else:
+            fragments.append(("class:workspace.muted", " Waiting for the first tool call\n"))
+
+        entries = [
+            entry
+            for entry in snapshot.live_timeline
+            if not (entry.source == "TOOL" or entry.tool or entry.kind.startswith("tool"))
+        ]
         if not wide:
             # Heartbeats prove liveness in the NOW block; reserve the compact
             # timeline for state transitions and evidence-bearing events.
             meaningful = [item for item in entries if "request is open" not in item.message.casefold()]
             entries = meaningful or entries
-        entries = entries[-(7 if wide else 3):]
-        if not entries:
-            fragments.append(("class:workspace.muted", " Waiting for the first runtime event\n"))
+        entries = entries[-2:] if wide else []
+        if entries:
+            fragments.append(("class:workspace.queue", "\n EVENTS\n"))
         source_styles = {
             "MODEL": "class:workspace.actor.architect",
             "TOOL": "class:workspace.actor.tool",
             "PROCESS": "class:workspace.actor.test",
+            "AGENT": "class:workspace.agent",
             "USER": "class:workspace.user",
             "HARNESS": "class:workspace.queue",
         }
@@ -2745,11 +3053,16 @@ class PersistentWorkspaceApp:
         if snapshot.control_surface == "web" and request.kind is AttentionKind.APPROVAL:
             fragments.append((
                 "class:workspace.queue",
-                "   Open Web · /open-web   (terminal approval is available only if Web is disconnected)\n",
+                "   Open in Web   (terminal approval is available only if Web is disconnected)\n",
             ))
             return FormattedText(fragments)
 
-        page_size = 3
+        page_size = (
+            4
+            if request.kind is AttentionKind.PLAN_REVIEW
+            or len(request.options) <= 4
+            else 3
+        )
         total_options = len(request.options)
         start = max(
             0,
@@ -3267,9 +3580,18 @@ class SwarmInspectorState:
             self.tab = value
 
 
-def _swarm_status_mark(status: str, unicode: bool) -> str:
+def _swarm_status_mark(
+    status: str,
+    unicode: bool,
+    *,
+    tick: int = 0,
+    animate: bool = False,
+) -> str:
     normalized = str(status).casefold()
     if normalized in {"running", "in_progress", "planning", "reviewing", "testing"}:
+        if animate:
+            frames = ("·", "∙", "●", "∙") if unicode else (".", "o", "O", "o")
+            return frames[int(tick) % len(frames)]
         return "◉" if unicode else ">"
     if normalized in {"completed", "done"}:
         return "●" if unicode else "x"
@@ -3313,6 +3635,9 @@ def _swarm_tree_lines(
     *,
     selected_id: str,
     unicode: bool,
+    latest: Mapping[str, Any] | None = None,
+    tick: int = 0,
+    animate: bool = False,
 ) -> list[str]:
     by_parent: dict[str | None, list[Any]] = {}
     for node in nodes:
@@ -3321,7 +3646,7 @@ def _swarm_tree_lines(
         by_parent.setdefault(parent_key, []).append(node)
     for children in by_parent.values():
         children.sort(key=lambda item: (int(_swarm_field(item, "position", 0) or 0), str(_swarm_field(item, "id"))))
-    latest: dict[str, Any] = {}
+    latest = dict(latest or {})
     lines: list[str] = []
 
     def visit(parent_id: str | None, prefix: str = "") -> None:
@@ -3336,7 +3661,8 @@ def _swarm_tree_lines(
             phase = str(_swarm_field(node, "checkpoint", _swarm_field(node, "phase", "")) or "")
             suffix = f" · {phase.replace('_', ' ')}" if phase else ""
             lines.append(
-                f"{selected} {prefix}{branch} {_swarm_status_mark(status, unicode)} "
+                f"{selected} {prefix}{branch} "
+                f"{_swarm_status_mark(status, unicode, tick=tick, animate=animate)} "
                 f"{swarm_agent_name(node, nodes)} · {status.replace('_', ' ')}{suffix}"
             )
             visit(node_id, prefix + continuation)
@@ -3352,6 +3678,8 @@ def render_swarm_inspector(
     width: int = 120,
     height: int = 34,
     unicode: bool = True,
+    tick: int = 0,
+    animate: bool = False,
 ) -> str:
     """Render one responsive frame of the live read-only swarm inspector."""
 
@@ -3398,7 +3726,14 @@ def render_swarm_inspector(
         return finish("\n".join((header[:width], rule[:width], "No specialists have been materialized yet.", "Esc close · R refresh")))
 
     if state.tab == "tree":
-        tree = _swarm_tree_lines(nodes, selected_id=selected_id, unicode=unicode)
+        tree = _swarm_tree_lines(
+            nodes,
+            selected_id=selected_id,
+            unicode=unicode,
+            latest=latest,
+            tick=tick,
+            animate=animate,
+        )
         body = tree[: max(4, height - 5)]
         hidden = len(tree) - len(body)
         if hidden > 0:
@@ -3420,7 +3755,9 @@ def render_swarm_inspector(
         cursor = "›" if unicode and offset == state.selected_index else ">" if offset == state.selected_index else " "
         left.append(
             _fit(
-                f"{cursor} {offset + 1:02d} {_swarm_status_mark(status, unicode)} {swarm_agent_name(node, nodes)}",
+                f"{cursor} {offset + 1:02d} "
+                f"{_swarm_status_mark(status, unicode, tick=tick, animate=animate)} "
+                f"{swarm_agent_name(node, nodes)}",
                 left_width,
             ).rstrip()
         )
@@ -3443,10 +3780,47 @@ def render_swarm_inspector(
     prompt = ""
     if trace is not None:
         prompt = str(_swarm_field(trace, "self_prompt", "") or _swarm_field(trace, "system_prompt", "")).strip()
+    provider = str(_swarm_field(agent, "provider", "") or "")
+    model = str(_swarm_field(agent, "model", "") or "")
+    attempt = int(_swarm_field(agent, "attempt", 0) or 0)
+    usage = _swarm_field(agent, "usage", {})
+    usage = usage if isinstance(usage, Mapping) else {}
+    input_tokens = int(usage.get("input_tokens", 0) or 0)
+    output_tokens = int(usage.get("output_tokens", 0) or 0)
+    started_at = _swarm_field(agent, "started_at", None)
+    finished_at = _swarm_field(agent, "finished_at", None)
+    elapsed = ""
+    try:
+        start_seconds = float(started_at.timestamp())
+        end_seconds = float(finished_at.timestamp()) if finished_at is not None else time.time()
+        elapsed = _compact_duration(max(0, int(end_seconds - start_seconds)))
+    except (AttributeError, TypeError, ValueError, OSError):
+        pass
+    result = _swarm_field(agent, "result", None)
+    result_summary = str(_swarm_field(result, "summary", "") or "").strip()
+    error = str(_swarm_field(agent, "error", "") or "").strip()
+    run_facts = [
+        value
+        for value in (
+            f"model {provider}/{model}" if provider or model else "",
+            f"attempt {attempt}" if attempt else "",
+            f"elapsed {elapsed}" if elapsed else "",
+        )
+        if value
+    ]
+    token_facts = (
+        f"tokens in {input_tokens:,} · out {output_tokens:,}"
+        if input_tokens or output_tokens
+        else ""
+    )
     right: list[str] = [
         swarm_agent_name(selected, nodes).upper(),
-        f"{_swarm_status_mark(status, unicode)} {status.replace('_', ' ')}  ·  {role}/{phase}",
+        f"{_swarm_status_mark(status, unicode, tick=tick, animate=animate)} "
+        f"{status.replace('_', ' ')}  ·  {role}/{phase}",
         f"Path  {_swarm_ancestry(selected, nodes)}",
+        *( [" · ".join(run_facts)] if run_facts else [] ),
+        *( [token_facts] if token_facts else [] ),
+        *(textwrap.wrap(f"Last  {error or result_summary}", width=right_width)[:2] if error or result_summary else []),
         "",
         "CAN DO",
         *textwrap.wrap(capabilities, width=right_width)[:3],
@@ -3563,6 +3937,8 @@ def run_swarm_inspector(
             width=max(60, width - 1),
             height=max(18, height - 1),
             unicode=unicode,
+            tick=int(time.monotonic() * 8),
+            animate=not reduced_motion,
         )
         return FormattedText([("class:details.body", rendered)])
 

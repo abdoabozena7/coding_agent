@@ -506,6 +506,8 @@ class OllamaProvider:
                 self.reasoning_effort = str(policy.reasoning_effort)
             if policy.max_output_tokens is not None:
                 self.max_output_tokens = min(65_536, max(128, int(policy.max_output_tokens)))
+            if policy.temperature is not None:
+                self.temperature = max(0.0, min(2.0, float(policy.temperature)))
         transport_timeout = (
             float(policy.stage_deadline_seconds)
             if policy is not None and policy.stage_deadline_seconds

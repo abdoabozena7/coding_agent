@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Calculator</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; background-color: #1a1a2e; color: white; }
+        #calculator-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding-top: 20px;
+        }
+        #display {
+            background-color: #2c3e50; 
+            color: white;
+            padding: 20px 40px;
+            font-size: 2.5em;
+            text-align: right;
+            margin-bottom: 20px;
+            border-radius: 10px;
+            min-width: 300px;
+        }
+        #calculator {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 10px;
+            background-color: #2c3e50;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.5);
+        }
+        button {
+            padding: 20px; 
+            font-size: 1.5em;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            background-color: #34495e;
+            color: white;
+            transition: background-color 0.1s, transform 0.1s;
+        }
+        button:hover {
+            background-color: #4a6178;
+        }
+        button:active { 
+            transform: scale(0.98);
+        }
+        #gameCanvas3d {
+            display: block;
+            width: 100%;
+            height: 40vh; /* Allocate space for the canvas above buttons */
+            min-height: 250px;
+            background-color: #000000;
+        }
+    </style>
+</head>
+<body id="calculator-app">
+    <h1 style="margin-bottom: 30px;">3D Calculator Interface</h1>
+    <div id="calculator-container">
+        <!-- Three.js Canvas Placeholder -->
+        <canvas id="gameCanvas3d" width="800" height="250"></canvas>
+        
+        <div id="display">0</div>
+        
+        <div id="calculator">
+            <button class="operator clear" data-value="C">C</button>
+            <button class="operator backspace" data-value="DEL">DEL</button>
+            <button class="operator" data-value="/">/</button>
+            <button class="operator" data-value="*">×</button>
+
+            <button data-value="7">7</button>
+            <button data-value="8">8</button>
+            <button data-value="9">9</button>
+            <button class="operator" data-value="-">-</button>
+
+            <button data-value="4">4</button>
+            <button data-value="5">5</button>
+            <button data-value="6">6</button>
+            <button class="operator" data-value="+">+</button>
+
+            <button data-value="1">1</button>
+            <button data-value="2">2</button>
+            <button data-value="3">3</button>
+            <button class="equals" data-value="=">=</button>
+
+            <button data-value="0" style="grid-column: span 2;">0</button>
+            <button data-value+"." style="grid-column: span 1;\">.</button>
+        </div>
+    </div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="sceneManager.js"></script>
+<script src="calculator.js"></script>
+</body >
+</html>

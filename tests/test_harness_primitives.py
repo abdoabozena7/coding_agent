@@ -4,7 +4,12 @@ import io
 import unittest
 from unittest import mock
 
-from agent.commands import CommandKind, CommandParseError, parse_command
+from agent.commands import (
+    CommandKind,
+    CommandParseError,
+    UnknownCommandParseError,
+    parse_command,
+)
 from agent.context import maybe_compact
 from agent.config import ReasoningEffort
 from agent.control import ControlValidationError, validate_control_call
@@ -36,59 +41,41 @@ class CommandTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "low, medium, high, or xhigh"):
             ReasoningEffort.parse("infinite")
 
-    def test_plain_text_and_plan_edit_commands(self):
+    def test_plain_text_and_public_commands(self):
         self.assertEqual(parse_command("build it").kind, CommandKind.TEXT)
-        add = parse_command(":add Harden paths :: traversal tests pass")
-        self.assertEqual(add.args["text"], "Harden paths")
-        self.assertEqual(add.args["acceptance_criteria"], "traversal tests pass")
-        edit = parse_command("/edit t002 Better title")
         self.assertEqual(
-            edit.args,
-            {"task_id": "T002", "field": "task", "value": "Better title"},
+            parse_command(":add Harden paths :: traversal tests pass").args["text"],
+            ":add Harden paths :: traversal tests pass",
         )
-        criteria = parse_command(":edit T002 accept First proof || Second proof")
-        self.assertEqual(criteria.args["field"], "accept")
+        expected = {
+            "/plan": CommandKind.PLAN,
+            "/live": CommandKind.LIVE,
+            "/show-diff": CommandKind.SHOW_DIFF,
+            "/advanced-tracing": CommandKind.ADVANCED_TRACING,
+            "/settings": CommandKind.SETTINGS,
+            "/pause": CommandKind.PAUSE,
+            "/resume": CommandKind.RESUME,
+            "/stop": CommandKind.STOP,
+            "/undo": CommandKind.UNDO,
+            "/help": CommandKind.HELP,
+            "/quit": CommandKind.QUIT,
+        }
+        self.assertEqual(
+            {command: parse_command(command).kind for command in expected}, expected
+        )
 
-    def test_answer_shortcuts_target_the_current_decision(self):
-        self.assertEqual(
-            parse_command("/answer 1").args,
-            {"question_id": "", "value": "1"},
-        )
-        self.assertEqual(
-            parse_command("/ans 2").args,
-            {"question_id": "", "value": "2"},
-        )
-        with self.assertRaisesRegex(CommandParseError, "Example: /answer q1 1"):
-            parse_command("/answer")
+    def test_removed_slash_commands_are_not_aliases(self):
+        for command in ("/approve", "/mode ultra", "/agents", "/trace", "/queue"):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(UnknownCommandParseError, r"/help"):
+                    parse_command(command)
 
-    def test_revision_and_slice_are_validated(self):
-        self.assertEqual(parse_command(":approve 7").args["revision"], 7)
-        self.assertEqual(parse_command(":run 3").args["steps"], 3)
+    def test_undo_steps_are_validated(self):
+        self.assertEqual(parse_command("/undo 7").args["steps"], 7)
         with self.assertRaises(CommandParseError):
-            parse_command(":run 0")
+            parse_command("/undo 0")
         with self.assertRaises(CommandParseError):
-            parse_command(":approve latest")
-        resolved = parse_command(":resolve action_123 not-run inspected the workspace")
-        self.assertEqual(resolved.args["resolution"], "not-run")
-
-    def test_slash_errors_keep_the_slash_prefix(self):
-        with self.assertRaisesRegex(CommandParseError, r"/reject FEEDBACK"):
-            parse_command("/reject")
-        with self.assertRaisesRegex(CommandParseError, r"/replan FEEDBACK"):
-            parse_command("/replan")
-
-    def test_v3_ultra_views_and_permission_commands_parse(self):
-        self.assertEqual(parse_command("/mode ultra").args["mode"], "ultra")
-        self.assertEqual(parse_command("/permissions full").args["level"], "full")
-        self.assertEqual(parse_command("/tree M001").args["target"], "M001")
-        self.assertEqual(parse_command("/agents --all").args["all"], True)
-        self.assertEqual(parse_command("/agent 12").kind, CommandKind.AGENT)
-        self.assertEqual(parse_command("/agents node-api").args["target"], "node-api")
-        self.assertEqual(parse_command("/trace latest").args["target"], "latest")
-        self.assertEqual(
-            parse_command("/answer platform Desktop").args,
-            {"question_id": "platform", "value": "Desktop"},
-        )
+            parse_command("/undo latest")
 
 
 class ControlSchemaTests(unittest.TestCase):
@@ -434,7 +421,7 @@ class TerminalUITests(unittest.TestCase):
 
         start.assert_called_with("plan", "Planner · step 1")
         self.assertNotIn("Inspect the empty workspace first.", output.getvalue())
-        self.assertIn("details in /thinking", output.getvalue())
+        self.assertIn("details in /advanced-tracing", output.getvalue())
         self.assertNotIn("Response", output.getvalue())
         self.assertIn("Inspect the empty workspace first.", console.thought_blocks()[0]["text"])
         self.assertIn("list_files", console.thought_blocks()[0]["text"])
@@ -450,7 +437,7 @@ class TerminalUITests(unittest.TestCase):
         self.assertNotIn("Inspect files", rendered)
         self.assertNotIn("Compare results", rendered)
         self.assertNotIn("print('hidden')", rendered)
-        self.assertIn("details in /thinking", rendered)
+        self.assertIn("details in /advanced-tracing", rendered)
         self.assertIn("Inspect files", console.thought_blocks()[0]["text"])
 
     def test_live_thinking_uses_codex_working_row(self):
@@ -807,6 +794,64 @@ class TerminalUITests(unittest.TestCase):
         self.assertEqual(rendered.count("validating it"), 1)
         self.assertEqual(rendered.count("Retrying planner request"), 1)
 
+    def test_plain_provider_marks_never_emit_mojibake(self):
+        class UTF8Stream(io.StringIO):
+            encoding = "utf-8"
+
+        class ASCIIStream(io.StringIO):
+            encoding = "ascii"
+
+        class CP1256Stream(io.StringIO):
+            encoding = "cp1256"
+
+        def render(stream):
+            console = ConsoleUI(
+                stream=stream,
+                color=False,
+                plain=True,
+                reduced_motion=True,
+            )
+            console.on_event(
+                UIEvent(
+                    "provider.activity",
+                    "Request created for planner",
+                    {
+                        "actor": "planner",
+                        "physical_request_id": "request-1",
+                        "provider_state": "request_created",
+                    },
+                )
+            )
+            console.on_event(
+                UIEvent(
+                    "provider.activity",
+                    "Provider request failed",
+                    {
+                        "actor": "planner",
+                        "physical_request_id": "request-2",
+                        "provider_state": "failed",
+                    },
+                )
+            )
+            return stream.getvalue()
+
+        unicode_rendered = render(UTF8Stream())
+        self.assertIn("\u25c7 Request created for planner", unicode_rendered)
+        self.assertIn("\u00d7 Provider request failed", unicode_rendered)
+        self.assertNotIn("\u00e2\u2014\u2021", unicode_rendered)
+        self.assertNotIn("\u0623\u2014", unicode_rendered)
+        self.assertNotIn("\ufffd", unicode_rendered)
+
+        ascii_rendered = render(ASCIIStream())
+        self.assertIn("[>] Request created for planner", ascii_rendered)
+        self.assertIn("[X] Provider request failed", ascii_rendered)
+        self.assertTrue(ascii_rendered.isascii())
+
+        cp1256_rendered = render(CP1256Stream())
+        self.assertIn("[>] Request created for planner", cp1256_rendered)
+        self.assertIn("\u00d7 Provider request failed", cp1256_rendered)
+        cp1256_rendered.encode("cp1256", errors="strict")
+
     def test_concurrent_tool_results_keep_their_node_specific_details(self):
         class TTY(io.StringIO):
             encoding = "utf-8"
@@ -905,7 +950,7 @@ class TerminalUITests(unittest.TestCase):
                 self.assertEqual(console._plan_format_retries, 0)
                 self.assertEqual(console._plan_recovered_retries, 0)
 
-    def test_live_slash_completer_covers_every_palette_command_and_settings(self):
+    def test_live_slash_completer_covers_only_the_public_palette(self):
         if SlashCommandCompleter is None:
             self.skipTest("prompt-toolkit is not installed")
         from prompt_toolkit.document import Document
@@ -917,20 +962,12 @@ class TerminalUITests(unittest.TestCase):
         self.assertEqual({item.text for item in top}, {command for command, _ in ALL_SLASH_COMMANDS})
         self.assertTrue(all(item.start_position == -1 for item in top))
 
-        modes = list(completer.get_completions(Document("/mode u"), None))
-        self.assertEqual([item.text for item in modes], ["ultra"])
-        tab_modes = list(completer.get_completions(Document("/mode\t\tu"), None))
-        self.assertEqual([item.text for item in tab_modes], ["ultra"])
-        settings = {
-            item.text
-            for item in completer.get_completions(Document("/settings "), None)
-        }
-        self.assertTrue({"mode", "color", "provider", "model", "workspace"} <= settings)
-        spaced_settings = {
-            item.text
-            for item in completer.get_completions(Document("/settings    "), None)
-        }
-        self.assertEqual(settings, spaced_settings)
+        self.assertEqual(
+            list(completer.get_completions(Document("/mode u"), None)), []
+        )
+        self.assertEqual(
+            list(completer.get_completions(Document("/settings "), None)), []
+        )
 
     def test_brand_is_strict_ascii_with_centered_small_subtitle(self):
         rendered = render_brand()
@@ -952,20 +989,18 @@ class TerminalUITests(unittest.TestCase):
         self.assertEqual(len(lines[-1]), max(len(line) for line in lines[:5]))
         self.assertEqual(lines[-1], "coding agent".center(len(lines[-1])))
 
-    def test_slash_menu_lists_supported_modes_and_controls(self):
+    def test_slash_menu_lists_exactly_eleven_public_commands(self):
         rendered = render_slash_menu()
         rendered.encode("ascii")
 
-        self.assertIn("/model", rendered)
-        self.assertIn("/keymap", rendered)
-        self.assertNotIn("/ide", rendered)
-        self.assertNotIn("/sandbox-add-read-dir", rendered)
-        self.assertIn("/mode normal", rendered)
-        self.assertNotIn("/mode goal", rendered)
-        self.assertIn("/mode ultra", rendered)
-        self.assertIn("/settings", rendered)
-        self.assertIn("/trace", rendered)
-        self.assertIn("Legacy :commands remain supported.", rendered)
+        commands = [line.split()[0] for line in rendered.splitlines()[1:]]
+        self.assertEqual(
+            commands,
+            [
+                "/plan", "/live", "/show-diff", "/advanced-tracing", "/settings", "/pause",
+                "/resume", "/stop", "/undo", "/help", "/quit",
+            ],
+        )
 
     def test_show_brand_without_color_matches_plain_renderer(self):
         output = io.StringIO()

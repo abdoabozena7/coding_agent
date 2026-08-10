@@ -27,7 +27,7 @@ from threading import Event, RLock, Thread
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import context, tools
-from .commands import CommandKind, UserCommand
+from .commands import CommandKind, InternalActionKind, UserCommand
 from .chat_runtime import (
     RequestedEffectV2,
     RouteDecisionV1,
@@ -141,12 +141,10 @@ from .repository_index import OllamaEmbeddingProvider, RepositoryIndex
 from .diagnostics import ErrorSignature, FailureDomain, normalize_error_message
 from .version_control import GitProtectionManager, VersionControlError
 from .local_provider import (
-    extract_first_json_object,
-    normalize_action_proposal,
+    extract_action_proposal,
     normalize_generated_tool_payload,
     ProviderFailureKind,
     ProviderRequestError,
-    repair_structured_json_object,
 )
 from .ultra_models import normalize_contract_path
 
@@ -549,7 +547,11 @@ class AgentRuntime:
                 session_mode=SessionMode.NORMAL.value,
                 plan_state=PlanState.NONE.value,
                 run_state=RunState.IDLE.value,
-                state=self._session_runtime_snapshot(),
+                state={
+                    **self._session_runtime_snapshot(),
+                    "interaction_mode": InteractionModeV2.WORKING.value,
+                    "minimum_strategy": ExecutionStrategyV1.RECURSIVE.value,
+                },
             )
         else:
             # A second process may open the same session for a read-only
@@ -735,7 +737,7 @@ class AgentRuntime:
                     goal.id,
                     resume_status=GoalStatus.REVISING.value,
                     waiting_question=(
-                        "The accepted legacy plan predates applicability evidence. Use /resume or /replan "
+                        "The accepted legacy plan predates applicability evidence. Use /resume or choose Replan "
                         "to inspect the workspace and create a newly approved executable plan."
                     ),
                     auto_retryable=False,
@@ -952,13 +954,24 @@ class AgentRuntime:
                     GoalStatus.VERIFYING: RunState.VERIFYING.value,
                     GoalStatus.REVIEWING: RunState.REVIEWING.value,
                 }.get(goal.status, RunState.PLANNING.value)
+            recreated_state = self._session_runtime_snapshot()
+            if goal is None or (
+                session_mode != SessionMode.PLAN.value
+                and goal.active_plan_revision is None
+                and not bool(goal.metadata.get("strategy_locked"))
+            ):
+                recreated_state = {
+                    **recreated_state,
+                    "interaction_mode": InteractionModeV2.WORKING.value,
+                    "minimum_strategy": ExecutionStrategyV1.RECURSIVE.value,
+                }
             self.store.save_workflow_session(
                 self.session_id,
                 goal_id=goal_id,
                 session_mode=session_mode,
                 plan_state=plan_state,
                 run_state=run_state,
-                state=self._session_runtime_snapshot(),
+                state=recreated_state,
             )
             self.store.append_event(
                 "workflow.session_recreated",
@@ -2170,7 +2183,7 @@ class AgentRuntime:
             provider = self.provider_name
             if provider not in {"openai", "gemini", "ollama"}:
                 raise RuntimeStateError(
-                    "ULTRA requires a selected tool-capable model descriptor; reopen /model"
+                    "ULTRA requires a selected tool-capable model descriptor; choose Runtime / Model in Settings"
                 )
             model = self.model_name
             cloud = provider in {"openai", "gemini"} or model.casefold().endswith(
@@ -2205,7 +2218,7 @@ class AgentRuntime:
             )
         if self.permission_adapter is None:
             raise RuntimeStateError(
-                "ULTRA permissions are not initialized; restart interactively or use /permissions"
+                "ULTRA permissions are not initialized; restart interactively or choose Runtime / Permissions in Settings"
             )
         return self.model_descriptor, self.permission_adapter
 
@@ -2488,6 +2501,10 @@ class AgentRuntime:
             )
         except (OSError, UnicodeError, ValueError, TypeError):
             return tuple(facts)
+        self._record_repository_context_slice(
+            context_slice,
+            stage="semantic_intake",
+        )
         for entry in context_slice.entries:
             facts.append(
                 "Discovered repository context: "
@@ -2500,6 +2517,49 @@ class AgentRuntime:
                 f"Repository retrieval omitted {context_slice.omitted_entries} lower-ranked entries."
             )
         return tuple(facts)
+
+    def _record_repository_context_slice(
+        self,
+        context_slice: Any,
+        *,
+        stage: str,
+        goal_id: str | None = None,
+        work_node_id: str | None = None,
+        agent_run_id: str | None = None,
+    ) -> None:
+        """Persist ranked context selection without coupling the index to SQLite."""
+
+        if not goal_id:
+            active = self.active_goal()
+            goal_id = active.id if active is not None else None
+        if not goal_id:
+            return
+        candidates = []
+        for item in tuple(getattr(context_slice, "candidates", ()) or ())[:200]:
+            try:
+                candidates.append(item.to_dict())
+            except (AttributeError, TypeError, ValueError):
+                continue
+        self.store.append_event(
+            "context.repository_retrieval",
+            goal_id=goal_id,
+            entity_type="work_node" if work_node_id else "goal",
+            entity_id=work_node_id or goal_id,
+            payload={
+                "stage": str(stage),
+                "query": redact_text(str(getattr(context_slice, "query", "")), 2_000),
+                "budget_chars": int(getattr(context_slice, "size_chars", 0) or 0),
+                "selected_count": sum(
+                    str(item.get("outcome")) == "selected" for item in candidates
+                ),
+                "excluded_count": sum(
+                    str(item.get("outcome")) != "selected" for item in candidates
+                ),
+                "work_node_id": work_node_id,
+                "agent_run_id": agent_run_id,
+                "candidates": candidates,
+            },
+        )
 
     def _record_global_learning(
         self,
@@ -2983,7 +3043,19 @@ class AgentRuntime:
         *,
         approved_by: str = "user",
     ) -> Plan:
-        accepted = self._ensure_ultra_session().approve(
+        ultra_session = self._ensure_ultra_session()
+        latest = self.latest_plan()
+        bound_plan = getattr(getattr(ultra_session, "adapter", None), "plan", None)
+        if (
+            latest is not None
+            and (
+                bound_plan is None
+                or int(getattr(bound_plan, "revision", 0) or 0) != latest.revision
+                or str(getattr(bound_plan, "fingerprint", "")) != latest.fingerprint
+            )
+        ):
+            ultra_session.adopt_plan_revision(latest)
+        accepted = ultra_session.approve(
             revision,
             approved_by=approved_by,
         )
@@ -3142,6 +3214,15 @@ class AgentRuntime:
                 else ()
             ),
         ):
+            if (
+                getattr(package, "success", None) is True
+                and str(getattr(package, "node_id", "")) != "__global__"
+            ):
+                # A completed node's historical repair findings are retained
+                # on its durable package, but they are not blockers for a new
+                # master-plan revision. Only failed nodes and the failed global
+                # gate contribute current quality feedback.
+                continue
             findings.extend(
                 str(item).strip()
                 for item in getattr(package, "findings", ())
@@ -3199,6 +3280,52 @@ class AgentRuntime:
                 return result
             if outcome and not bool(dict(outcome.get("contract") or {}).get("auto_converge", True)):
                 return result
+            failure_diagnostics = [
+                dict(diagnostic)
+                for package in tuple(
+                    getattr(result, "node_results", None)
+                    or getattr(result, "results", ())
+                    or ()
+                )
+                for component in (getattr(package, "component_package", None),)
+                if isinstance(component, Mapping)
+                for diagnostic in (component.get("failure_diagnostic"),)
+                if isinstance(diagnostic, Mapping)
+            ]
+            non_candidate_blockers = [
+                item
+                for item in failure_diagnostics
+                if bool(item.get("mutation_prohibited"))
+                and str(item.get("blocker_owner") or "")
+                in {"test_harness", "tooling", "environment"}
+            ]
+            if non_candidate_blockers:
+                blocker = non_candidate_blockers[0]
+                current = self.store.get_goal(goal.id)
+                if current.status is GoalStatus.REVISING:
+                    self.store.transition_goal(
+                        goal.id,
+                        GoalStatus.PAUSED,
+                        reason="verification owner is not candidate code",
+                    )
+                self.store.update_goal_metadata(
+                    goal.id,
+                    waiting_question=(
+                        "Automatic verification repair was exhausted without evidence of a "
+                        "candidate-code defect. Inspect or retry the saved verification boundary; "
+                        "the accepted artifact was preserved."
+                    ),
+                    waiting_on="verification",
+                    resume_action="retry_verification",
+                    auto_retryable=False,
+                    verification_blocker=dict(blocker),
+                )
+                self.events.publish(
+                    "ultra.non_candidate_failure_boundary",
+                    "Verification failure was not routed into a product replan.",
+                    diagnostic=dict(blocker),
+                )
+                return result
             feedback = self._ultra_quality_feedback(result)
             self.events.publish(
                 "ultra.strategy_revision",
@@ -3211,6 +3338,42 @@ class AgentRuntime:
                 max(0, int(getattr(accepted_plan, "revision", 1) or 1) - 1),
             )
             revision_attempt = prior_in_scope_revisions + 1
+            max_strategy_repetitions = max(
+                1,
+                int(
+                    dict(outcome.get("contract") or {}).get(
+                        "max_strategy_repetitions", 2
+                    )
+                    if outcome
+                    else 2
+                ),
+            )
+            if revision_attempt > max_strategy_repetitions:
+                current = self.store.get_goal(goal.id)
+                if current.status is GoalStatus.REVISING:
+                    self.store.transition_goal(
+                        goal.id,
+                        GoalStatus.PAUSED,
+                        reason="automatic strategy repetition limit reached",
+                    )
+                self.store.update_goal_metadata(
+                    goal.id,
+                    waiting_question=(
+                        "The same bounded quality strategy remained below target after "
+                        f"{max_strategy_repetitions} autonomous revision(s). The candidate and "
+                        "failure diagnostics were preserved; add guidance or retry the saved boundary."
+                    ),
+                    waiting_on="diagnosis",
+                    resume_action="ultra_replan",
+                    auto_retryable=False,
+                )
+                self.events.publish(
+                    "ultra.strategy_repetition_breaker",
+                    "Automatic plan thrashing was stopped at the outcome-contract limit.",
+                    attempts=prior_in_scope_revisions,
+                    limit=max_strategy_repetitions,
+                )
+                return result
             allow_scope_expansion = revision_attempt >= 3
             self.store.update_goal_metadata(
                 goal.id,
@@ -4243,27 +4406,26 @@ class AgentRuntime:
         return WorkflowModeLock(False)
 
     def transition_mode(self, mode: str) -> str:
-        """Persist Working/Plan input; legacy Ultra is a one-way depth request."""
+        """Persist Plan or recursive Working; normal/ultra are Working aliases."""
         target = SessionMode.parse(mode)
         session = self.store.get_workflow_session(self.session_id)
         previous = SessionMode.parse(str(session["session_mode"]))
         if target is previous:
             if target is SessionMode.NORMAL and self.active_goal() is None:
                 state = dict(session.get("state", {}))
-                pending = state.get("pending_semantic_turn")
-                if not (
-                    isinstance(pending, Mapping)
-                    and str(pending.get("status")) != "completed"
-                ) and state.pop("minimum_strategy", None) is not None:
+                if (
+                    state.get("minimum_strategy")
+                    != ExecutionStrategyV1.RECURSIVE.value
+                    or state.get("interaction_mode")
+                    != InteractionModeV2.WORKING.value
+                ):
                     self.store.mutate_workflow_session(
                         self.session_id,
                         lambda current_state: {
                             "state": {
-                                key: value
-                                for key, value in dict(
-                                    current_state.get("state") or {}
-                                ).items()
-                                if key != "minimum_strategy"
+                                **dict(current_state.get("state") or {}),
+                                "interaction_mode": InteractionModeV2.WORKING.value,
+                                "minimum_strategy": ExecutionStrategyV1.RECURSIVE.value,
                             }
                         },
                         expected_revision=int(session.get("revision") or 0),
@@ -4283,7 +4445,9 @@ class AgentRuntime:
             else InteractionModeV2.WORKING.value
         )
         if target is SessionMode.NORMAL:
-            state.pop("minimum_strategy", None)
+            state["minimum_strategy"] = ExecutionStrategyV1.RECURSIVE.value
+        elif target is SessionMode.PLAN:
+            state["minimum_strategy"] = ExecutionStrategyV1.RECURSIVE.value
         if goal is not None:
             policy = dict(goal.metadata.get("execution_policy") or {})
             policy.update(
@@ -4400,9 +4564,15 @@ class AgentRuntime:
         name = str(actor or "").casefold()
         local = self.execution_class == "local"
         if name == "semantic-router":
-            tokens, deadline = 1_536, 600.0 if local else 120.0
+            # This stage emits one compact classification tool call. Giving a
+            # partially CPU-offloaded local model a planner-sized atomic
+            # budget hides a wedged runner for ten minutes because no response
+            # bytes exist until the tool call is complete.
+            tokens, deadline = 768, 180.0 if local else 120.0
         elif name == "semantic-goal-intake":
-            tokens, deadline = 2_048, 600.0 if local else 180.0
+            # Intake is larger than routing but still bounded metadata, not a
+            # plan or implementation artifact.
+            tokens, deadline = 1_536, 180.0 if local else 180.0
         elif name in {"semantic-goal", "semantic-interpretation"}:
             tokens, deadline = 6_144, 600.0 if local else 240.0
         elif name in {"planner", "plan-reviewer"}:
@@ -4417,11 +4587,20 @@ class AgentRuntime:
             # mutation look alive indefinitely and diverged from the runtime
             # acceptance contract.
             tokens, deadline = None, 900.0
-        effort = str(getattr(self.provider, "reasoning_effort", "") or "") or None
+        effort = (
+            "off"
+            if local and name in {"semantic-router", "semantic-goal-intake"}
+            else str(getattr(self.provider, "reasoning_effort", "") or "") or None
+        )
         return ProviderCallPolicyV1(
             stage=name,
             max_output_tokens=tokens,
             reasoning_effort=effort,
+            temperature=(
+                0.0
+                if local and name in {"semantic-router", "semantic-goal-intake"}
+                else None
+            ),
             stage_deadline_seconds=deadline,
         )
 
@@ -4522,17 +4701,44 @@ class AgentRuntime:
             else "No durable goal exists yet; preserve the latest exact user turn."
         )
         provider_budget = self._provider_conversation_budget(system, schemas)
+        context_before_chars = context.estimate_chars(conversation)
+        suspended_messages: list[int] = []
+
+        def record_provider_suspension(count: int) -> None:
+            suspended_messages.append(int(count))
+            self.events.publish(
+                "checkpoint",
+                f"Provider-aware context rotation suspended {count} transient messages.",
+                continues=True,
+            )
+
         conversation = context.suspend_and_revive(
             conversation,
             checkpoint,
             context.structural_summary,
             max_chars=provider_budget,
-            on_suspend=lambda count: self.events.publish(
-                "checkpoint",
-                f"Provider-aware context rotation suspended {count} transient messages.",
-                continues=True,
-            ),
+            on_suspend=record_provider_suspension,
         )
+        if suspended_messages and current_goal is not None:
+            self.store.append_event(
+                "context.rotated",
+                goal_id=current_goal.id,
+                entity_type="goal",
+                entity_id=current_goal.id,
+                payload={
+                    "actor": actor,
+                    "provider": self.provider_name,
+                    "model": self.model_name,
+                    "before_chars": context_before_chars,
+                    "after_chars": context.estimate_chars(conversation),
+                    "budget_chars": provider_budget,
+                    "suspended_messages": suspended_messages[-1],
+                    "checkpoint_fingerprint": hashlib.sha256(
+                        checkpoint.encode("utf-8", errors="replace")
+                    ).hexdigest(),
+                    "reason": "provider conversation budget reached",
+                },
+            )
         ensure_capabilities = getattr(self.provider, "_ensure_capabilities", None)
         if callable(ensure_capabilities):
             ensure_capabilities()
@@ -4553,7 +4759,29 @@ class AgentRuntime:
                     "health": getattr(capability_profile, "health_status", "unknown"),
                 },
             )
-        if not native_tools and schemas:
+        # Ollama intentionally switches to a non-streaming, atomic response when
+        # native tool schemas are present (see OllamaProvider.call). That makes
+        # every governed tool stage a possible silent single point of failure:
+        # the watchdog cannot observe response bytes and a wedged native call is
+        # replayed unchanged. Use a streamable JSON action transport for local
+        # Ollama and let the existing allow-list/parser/schema validator rebuild
+        # the ToolCall before anything can execute.
+        stage_json_action_adapter = bool(
+            schemas
+            and self.execution_class == "local"
+            and str(
+                getattr(self.model_descriptor, "provider", self.provider_name)
+                or self.provider_name
+            ).casefold()
+            == "ollama"
+        )
+        use_json_action_adapter = bool(schemas) and (
+            not native_tools or stage_json_action_adapter
+        )
+        provider_schemas: Sequence[dict[str, Any]] = (
+            () if use_json_action_adapter else schemas
+        )
+        if use_json_action_adapter:
             names = [_tool_name(schema) for schema in schemas if _tool_name(schema)]
             compact_contracts = [
                 {
@@ -4565,7 +4793,8 @@ class AgentRuntime:
             ]
             system = (
                 system
-                + "\n\nNATIVE TOOLS ARE UNAVAILABLE. Make exactly one bounded action proposal as "
+                + "\n\nNATIVE TOOL TRANSPORT IS DISABLED FOR THIS STAGE. "
+                + "Make exactly one bounded action proposal as "
                 + '{"name":"AVAILABLE_NAME","args":{...}} with no lifecycle IDs. '
                 + f"Available names: {', '.join(names)}. The harness validates and executes it.\n"
                 + "Use this exact compact action contract:\n"
@@ -4601,7 +4830,7 @@ class AgentRuntime:
                     physical_request_attempt += 1
                     turn = self._provider_call_with_watchdog(
                         provider_conversation,
-                        schemas,
+                        provider_schemas,
                         system,
                         actor=actor,
                         step=step,
@@ -4614,6 +4843,7 @@ class AgentRuntime:
                         raise TypeError(
                             f"provider returned {type(turn).__name__}, expected AssistantTurn"
                         )
+                    action_transport_receipt = None
                     receipts: list[dict[str, Any]] = []
                     for call in turn.tool_calls:
                         if (
@@ -4670,33 +4900,30 @@ class AgentRuntime:
                         # the requested call as JSON assistant text. Normalize only
                         # an allow-listed proposal; every other name is rejected
                         # below before dispatch.
-                        candidate = extract_first_json_object(turn.text)
-                        proposal = (
-                            normalize_action_proposal(candidate)
-                            if candidate is not None
-                            else None
+                        proposal, action_transport_receipt = extract_action_proposal(
+                            turn.text
                         )
-                        if proposal is None:
-                            repaired_candidate, repair_actions = repair_structured_json_object(
-                                turn.text
+                        turn.native = {
+                            **dict(turn.native or {}),
+                            "action_transport": action_transport_receipt.to_dict(),
+                        }
+                        if action_transport_receipt.actions:
+                            self.store.append_event(
+                                "provider.action_transport_normalized",
+                                goal_id=(current_goal.id if current_goal is not None else None),
+                                entity_type=(
+                                    "goal" if current_goal is not None else "session"
+                                ),
+                                entity_id=(
+                                    current_goal.id
+                                    if current_goal is not None
+                                    else self.session_id
+                                ),
+                                payload={
+                                    "actor": actor,
+                                    **action_transport_receipt.to_dict(),
+                                },
                             )
-                            repaired_proposal = (
-                                normalize_action_proposal(repaired_candidate)
-                                if repaired_candidate is not None
-                                else None
-                            )
-                            if repaired_proposal is not None:
-                                candidate = repaired_candidate
-                                proposal = repaired_proposal
-                                if repair_actions and current_goal is not None:
-                                    self.store.append_event(
-                                        "provider.response_repaired",
-                                        goal_id=current_goal.id,
-                                        payload={
-                                            "actor": actor,
-                                            "actions": list(repair_actions),
-                                        },
-                                    )
                         if proposal is not None:
                             name, args = proposal
                             args, receipt = normalize_generated_tool_payload(
@@ -4798,38 +5025,50 @@ class AgentRuntime:
                             ),
                         }
                     )
-                if current_goal is not None:
-                    recorded_calls = redact_text(
-                        json.dumps(
-                            [
-                                {
-                                    "name": call.name,
-                                    "args": redact_data(call.args),
-                                }
-                                for call in turn.tool_calls
-                            ],
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            default=str,
+                recorded_calls = redact_text(
+                    json.dumps(
+                        [
+                            {
+                                "name": call.name,
+                                "args": redact_data(call.args),
+                            }
+                            for call in turn.tool_calls
+                        ],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    ),
+                    8_000,
+                )
+                # Semantic routing happens before a Goal exists. Recording only
+                # goal-owned turns made the exact malformed gateway response
+                # disappear, which prevented evidence-based recovery of intake
+                # contract failures. Session ownership keeps those pre-goal
+                # diagnostics durable without inventing a placeholder Goal.
+                self.store.append_event(
+                    "provider.turn_recorded",
+                    goal_id=(current_goal.id if current_goal is not None else None),
+                    entity_type=("goal" if current_goal is not None else "session"),
+                    entity_id=(current_goal.id if current_goal is not None else self.session_id),
+                    payload={
+                        "actor": actor,
+                        "step": step,
+                        "tool_names": [call.name for call in turn.tool_calls],
+                        "tool_calls_redacted": recorded_calls,
+                        "text_excerpt": redact_text(turn.text or "", 1_000),
+                        "text_length": len(turn.text or ""),
+                        "text_prefix": redact_text((turn.text or "")[:700], 700),
+                        "text_suffix": redact_text((turn.text or "")[-1_200:], 1_200),
+                        "action_transport": redact_data(
+                            dict(turn.native.get("action_transport") or {})
                         ),
-                        8_000,
-                    )
-                    self.store.append_event(
-                        "provider.turn_recorded",
-                        goal_id=current_goal.id,
-                        payload={
-                            "actor": actor,
-                            "step": step,
-                            "tool_names": [call.name for call in turn.tool_calls],
-                            "tool_calls_redacted": recorded_calls,
-                            "text_excerpt": redact_text(turn.text or "", 1_000),
-                            "logical_request_id": logical_request_id,
-                            "physical_request_count": physical_request_attempt,
-                            "tool_contract_error": redact_data(
-                                dict(turn.native.get("tool_contract_error") or {})
-                            ),
-                        },
-                    )
+                        "logical_request_id": logical_request_id,
+                        "physical_request_count": physical_request_attempt,
+                        "tool_contract_error": redact_data(
+                            dict(turn.native.get("tool_contract_error") or {})
+                        ),
+                    },
+                )
                 self._emit_usage(turn)
                 return turn
             except (KeyboardInterrupt, SystemExit):
@@ -5296,9 +5535,12 @@ class AgentRuntime:
                     diagnostic_in_flight = False
                     dstate = str(diagnosis.get("state") or "")
                     if self.execution_class == "local" and dstate == "generating":
+                        activity_message = "Ollama is actively generating on GPU"
+                        if structured_call:
+                            activity_message += " · structured response is atomic"
                         self.events.publish(
                             "provider.activity",
-                            "Ollama is actively generating on GPU · structured response is atomic",
+                            activity_message,
                             source_kind="MODEL", actor=actor, phase=provider_phase,
                             state="active", provider_state="server_processing",
                             operation=f"Local model generating for {actor}", waiting_on="model",
@@ -5431,17 +5673,15 @@ class AgentRuntime:
                 or InteractionModeV2.WORKING.value
             )
             initial_strategy = str(strategy_snapshot.get("strategy") or "").casefold()
-            if selected_mode is not RunMode.ULTRA and initial_strategy in {"recursive", "ultra", "deep"}:
-                # A stale/legacy pending envelope must not silently turn a
-                # normal request into Ultra.  Explicit Ultra remains the only
-                # user-authorized capability escalation path.
-                initial_strategy = ExecutionStrategyV1.STAGED.value
+            planning_workflow = bool(
+                planning_only or interaction_mode == InteractionModeV2.PLAN.value
+            )
             if not initial_strategy:
-                initial_strategy = (
-                    ExecutionStrategyV1.RECURSIVE.value
-                    if selected_mode is RunMode.ULTRA
-                    else ExecutionStrategyV1.STAGED.value
-                )
+                initial_strategy = ExecutionStrategyV1.RECURSIVE.value
+            else:
+                # Ultra and Ultra Plan share one execution engine. Plan changes
+                # only the pre-mutation interview and approval boundary.
+                initial_strategy = ExecutionStrategyV1.RECURSIVE.value
             if strategy_snapshot:
                 strategy_snapshot["strategy"] = initial_strategy
             try:
@@ -5500,6 +5740,7 @@ class AgentRuntime:
                         ),
                         "entry_surface": entry_surface,
                     },
+                    "execution_strategy": initial_strategy,
                     "interaction_mode": interaction_mode,
                     "route": str(route_snapshot.get("route") or "goal"),
                     "model_capability_envelope": capability_snapshot,
@@ -5536,6 +5777,7 @@ class AgentRuntime:
                 "strategy_decision": strategy_snapshot,
                 "interaction_mode": interaction_mode,
             }
+            bound_state["minimum_strategy"] = ExecutionStrategyV1.RECURSIVE.value
             goal, _bound_session = self.store.create_goal_and_bind_workflow_session(
                 safe_objective,
                 session_id=self.session_id,
@@ -5562,7 +5804,7 @@ class AgentRuntime:
                 goal_id=goal.id,
                 payload={
                     "route": "goal",
-                    "execution_strategy": str(strategy_snapshot.get("strategy") or ("recursive" if selected_mode is RunMode.ULTRA else "staged")),
+                    "execution_strategy": initial_strategy,
                     "phase": "planning",
                     "model": self.model_name,
                     "provider": self.provider_name,
@@ -5865,6 +6107,21 @@ class AgentRuntime:
             forced_route = RouteKind(forced_value) if forced_value else None
             requested_mode = str(pending.get("requested_mode") or session["session_mode"])
             answers = dict(pending.get("answers", {}))
+            resume_mode = RunMode.parse(requested_mode)
+            active = self.active_goal()
+            if (
+                resume_mode is not RunMode.PLAN
+                and (
+                    active is None
+                    or (
+                        active.active_plan_revision is None
+                        and not bool(active.metadata.get("strategy_locked"))
+                    )
+                )
+            ):
+                pending["interaction_mode"] = InteractionModeV2.WORKING.value
+                pending["minimum_strategy"] = ExecutionStrategyV1.RECURSIVE.value
+                self._save_pending_semantic_turn(pending)
         else:
             original = str(text or "")
             if not original.strip():
@@ -5884,15 +6141,7 @@ class AgentRuntime:
                     if bound_mode is RunMode.PLAN
                     else InteractionModeV2.WORKING.value
                 ),
-                "minimum_strategy": (
-                    ExecutionStrategyV1.RECURSIVE.value
-                    if (
-                        bound_mode is RunMode.ULTRA
-                        or str(state.get("minimum_strategy") or "").casefold()
-                        in {"recursive", "ultra"}
-                    )
-                    else ExecutionStrategyV1.STAGED.value
-                ),
+                "minimum_strategy": ExecutionStrategyV1.RECURSIVE.value,
                 "forced_route": forced_route.value if forced_route else "",
                 "answers": dict(answers or {}),
                 "status": "routing",
@@ -6335,14 +6584,39 @@ class AgentRuntime:
                     raise
                 conversation.append(turn.to_message())
                 structural_error = ""
+                transport_diagnostic = (
+                    dict(turn.native.get("action_transport") or {})
+                    if isinstance(turn.native, Mapping)
+                    else {}
+                )
                 if len(turn.tool_calls) != 1:
-                    structural_error = "submit_goal_intake must be called exactly once"
+                    transport_error = str(
+                        transport_diagnostic.get("json_error") or ""
+                    ).strip()
+                    delimiter_error = str(
+                        transport_diagnostic.get("delimiter_mismatch") or ""
+                    ).strip()
+                    structural_error = (
+                        "submit_goal_intake action envelope was malformed: "
+                        + transport_error
+                        + (f"; {delimiter_error}" if delimiter_error else "")
+                        if transport_error
+                        else "submit_goal_intake must be called exactly once"
+                    )
                 elif turn.tool_calls[0].name not in {"submit_goal_intake", "submit_semantic_turn"}:
                     structural_error = "the only allowed call is submit_goal_intake"
                 elif not isinstance(turn.tool_calls[0].args, Mapping):
                     structural_error = "submit_goal_intake arguments must be an object"
                 if structural_error:
                     schema_repairs += 1
+                    response_fingerprint = str(
+                        transport_diagnostic.get("input_fingerprint") or ""
+                    )
+                    repeated_fingerprint = bool(
+                        response_fingerprint
+                        and response_fingerprint
+                        == str(pending.get("last_intake_response_fingerprint") or "")
+                    )
                     pending.update({
                         "intake_schema_attempts": schema_repairs,
                         "status": "routing",
@@ -6352,14 +6626,90 @@ class AgentRuntime:
                             "stage": "goal_intake", "category": "schema",
                             "message": structural_error, "attempts": schema_repairs,
                         },
+                        "last_intake_response_fingerprint": response_fingerprint,
+                        "last_intake_response_length": len(turn.text or ""),
+                        "last_intake_transport": redact_data(transport_diagnostic),
                     })
                     self._save_pending_semantic_turn(pending)
+                    self.store.append_event(
+                        "semantic_turn.intake_transport_rejected",
+                        entity_type="semantic_turn",
+                        entity_id=str(pending["turn_id"]),
+                        payload={
+                            "attempt": schema_repairs,
+                            "error": structural_error,
+                            "response_length": len(turn.text or ""),
+                            "response_prefix": redact_text((turn.text or "")[:700], 700),
+                            "response_suffix": redact_text((turn.text or "")[-1_200:], 1_200),
+                            "response_fingerprint": response_fingerprint,
+                            "repeated_fingerprint": repeated_fingerprint,
+                            "transport": redact_data(transport_diagnostic),
+                        },
+                    )
+                    if (
+                        repeated_fingerprint
+                        and not bool(pending.get("intake_transport_adaptation_attempted"))
+                    ):
+                        reset_cache = getattr(self.provider, "reset_model_cache", None)
+                        cache_reset = False
+                        if callable(reset_cache):
+                            try:
+                                reset_cache()
+                                cache_reset = True
+                            except Exception:
+                                cache_reset = False
+                        pending["intake_transport_adaptation_attempted"] = True
+                        pending["intake_transport_cache_reset"] = cache_reset
+                        self._save_pending_semantic_turn(pending)
+                        conversation = [
+                            {
+                                "role": "user",
+                                "content": state_envelope(
+                                    {
+                                        "exact_latest_user_input": original,
+                                        "accepted_route": {
+                                            "route": decision.route.value,
+                                            "interpretation": decision.interpretation,
+                                            "uncertainty": decision.uncertainty,
+                                        },
+                                        "workflow_mode": requested_mode,
+                                        "repository_manifest": repository_manifest,
+                                        "answered_intake_decisions": dict(answers or {}),
+                                        "required_action": (
+                                            "Return exactly one JSON object shaped as "
+                                            "{\"name\":\"submit_goal_intake\",\"args\":{...}}. "
+                                            "Never wrap it in an array and do not return prose."
+                                        ),
+                                    },
+                                    "MINIMAL_SEMANTIC_GOAL_INTAKE_RETRY",
+                                    max_chars=max(12_000, len(original) * 2 + 6_000),
+                                ),
+                            }
+                        ]
+                        self.store.append_event(
+                            "semantic_turn.intake_transport_adapted",
+                            entity_type="semantic_turn",
+                            entity_id=str(pending["turn_id"]),
+                            payload={
+                                "response_fingerprint": response_fingerprint,
+                                "model_cache_reset": cache_reset,
+                                "schema_attempt": schema_repairs,
+                            },
+                        )
+                        step += 1
+                        continue
                     if schema_repairs > repair_limit:
                         break
                     conversation.append({
                         "role": "user",
-                        "content": "SCHEMA VALIDATION ERROR: " + structural_error
-                        + ". Repair only the function-call shape.",
+                        "content": (
+                            "ACTION TRANSPORT ERROR: "
+                            + structural_error
+                            + ". Return exactly one JSON object shaped as "
+                            '{"name":"submit_goal_intake","args":{...}}. '
+                            "Never wrap it in an array, never return more than one action, "
+                            "and repair only the transport shape."
+                        ),
                     })
                     step += 1
                     continue
@@ -7555,14 +7905,14 @@ class AgentRuntime:
                 "The planner did not produce a critic-approved structured plan in its "
                 "bounded pass. The saved semantic and inspection checkpoint supports one "
                 "automatic retry with a fresh authoritative packet when the continuous "
-                "controller is active; otherwise add guidance and use /resume or /replan."
+                "controller is active; otherwise add guidance and use /resume or the Replan action."
                 if structured_retry
                 else question
             )
             if not provider_failure or retryable
             else (
                 "Planning stopped after repeated provider failures. Check the selected "
-                "model, credentials, network, or local service, then use /model or /resume."
+                "model, credentials, network, or local service, then use Settings or /resume."
             )
         )
         adaptation_updates: dict[str, Any] = {}
@@ -7768,7 +8118,7 @@ class AgentRuntime:
             return updated, True
         waiting = (
             "Provider access failed repeatedly. Check the selected model, credentials, "
-            "network, or local service, then use /model or /resume."
+            "network, or local service, then use Settings or /resume."
         )
         updated = self.store.update_goal_metadata(
             updated.id,
@@ -9457,7 +9807,7 @@ class AgentRuntime:
                     "Plan could not be prepared within the independent repair budget. "
                     f"Failed stage: {exhausted_stage}. {boundary_detail} "
                     f"Detail: {last_plan_format_error}. No workspace changes were made. "
-                    "Retry the saved stage or use /replan."
+                    "Retry the saved stage or choose the Replan action."
                 ),
                 technical_detail=last_plan_format_error,
                 attempts=max(invalid_plan_calls, question_repairs),
@@ -9466,7 +9816,7 @@ class AgentRuntime:
         else:
             self.events.publish(
                 "warning",
-                "Planning stopped before a valid plan was produced. Inspect the planning checkpoint for the exact stage and use /replan with guidance.",
+                "Planning stopped before a valid plan was produced. Inspect the planning checkpoint and choose Replan with guidance.",
                 planning_terminal=True,
             )
         if exhausted_stage == "semantic_interpretation":
@@ -9474,18 +9824,18 @@ class AgentRuntime:
                 f"Planning paused at {exhausted_stage}: the model's semantic "
                 "tool output did not satisfy the required contract after the "
                 f"repair budget. Detail: {last_plan_format_error}. "
-                "No workspace changes were made. Retry the saved stage or use /replan; "
+                "No workspace changes were made. Retry the saved stage or choose Replan; "
                 "changing the model is optional."
             )
         elif exhausted_stage:
             pause_question = (
                 f"Planning paused at {exhausted_stage}: {last_plan_format_error}. "
-                "No workspace changes were made. Retry the saved stage or use /replan."
+                "No workspace changes were made. Retry the saved stage or choose Replan."
             )
         else:
             pause_question = (
                 "The planner did not produce a critic-approved structured plan in its "
-                "bounded pass. Add guidance, then use /resume or /replan."
+                "bounded pass. Add guidance, then use /resume or choose Replan."
             )
         self._pause_planning(
             goal,
@@ -10342,6 +10692,11 @@ class AgentRuntime:
                 max_entries=30,
                 budget_chars=30_000,
             )
+            self._record_repository_context_slice(
+                context_slice,
+                stage="user_refinement",
+                goal_id=latest.id,
+            )
             components = [
                 {"path": entry.path, "kind": entry.kind, "name": entry.name, "start": entry.start, "end": entry.end, "file_hash": entry.file_hash}
                 for entry in context_slice.entries
@@ -10394,7 +10749,7 @@ class AgentRuntime:
             else:
                 self.events.publish(
                     "warning",
-                    "Guidance was saved, but crash-window work is still uncertain; reconcile it with /resolve before resuming.",
+                    "Guidance was saved, but crash-window work is still uncertain; use the recovery reconciliation action before resuming.",
                 )
         return item
 
@@ -10898,9 +11253,96 @@ class AgentRuntime:
         self._complete_semantic_turn(str(semantic_turn["turn_id"]), result_status=str(getattr(result, "status", "routed")))
         return result
 
+    def _promote_preapproval_working_goal(self, goal: Goal) -> Goal:
+        """Upgrade legacy Working checkpoints before any plan is approved."""
+
+        if (
+            goal.active_plan_revision is not None
+            or bool(goal.metadata.get("strategy_locked"))
+            or str(
+                goal.metadata.get("interaction_mode")
+                or self.interaction_mode.value
+            ).casefold()
+            == InteractionModeV2.PLAN.value
+        ):
+            return goal
+        capability_raw = goal.metadata.get("model_capability_envelope")
+        capability = (
+            ModelCapabilityEnvelopeV1.from_mapping(capability_raw)
+            if isinstance(capability_raw, Mapping)
+            else self.model_capability_envelope()
+        )
+        demand_raw = goal.metadata.get("task_demand")
+        demand = (
+            TaskDemandV1.from_mapping(demand_raw)
+            if (
+                isinstance(demand_raw, Mapping)
+                and bool(demand_raw)
+                and bool(demand_raw.get("rationale"))
+            )
+            else TaskDemandV1.from_legacy(
+                component_count=max(
+                    1, len(self.latest_plan().tasks) if self.latest_plan() else 1
+                ),
+                parallelism_required=False,
+                reasons=("pre-approval Working resume",),
+            )
+        )
+        decision = select_execution_strategy(
+            capability,
+            demand,
+            minimum=ExecutionStrategyV1.RECURSIVE,
+            allow_capability_escalation=True,
+        )
+        policy = dict(goal.metadata.get("execution_policy") or {})
+        policy.update(
+            {
+                "mode": RunMode.NORMAL.value,
+                "strategy": ExecutionStrategyV1.RECURSIVE.value,
+                "decomposition": "deep_when_independent",
+                "concurrency": decision.max_concurrency,
+            }
+        )
+        self.store.update_goal_metadata(
+            goal.id,
+            interaction_mode=InteractionModeV2.WORKING.value,
+            execution_policy=policy,
+            execution_strategy=ExecutionStrategyV1.RECURSIVE.value,
+            strategy_decision=decision.to_dict(),
+            strategy_fingerprint=decision.fingerprint,
+            strategy_locked=False,
+        )
+        session = self.store.get_workflow_session(self.session_id)
+        self.store.mutate_workflow_session(
+            self.session_id,
+            lambda current_state: {
+                "state": {
+                    **dict(current_state.get("state") or {}),
+                    "interaction_mode": InteractionModeV2.WORKING.value,
+                    "minimum_strategy": ExecutionStrategyV1.RECURSIVE.value,
+                    "execution_strategy": ExecutionStrategyV1.RECURSIVE.value,
+                    "strategy_decision": decision.to_dict(),
+                },
+                "session_mode": SessionMode.NORMAL.value,
+            },
+            expected_revision=int(session.get("revision") or 0),
+        )
+        self.store.append_event(
+            "execution_strategy.legacy_working_promoted",
+            goal_id=goal.id,
+            payload={
+                "strategy": ExecutionStrategyV1.RECURSIVE.value,
+                "strategy_fingerprint": decision.fingerprint,
+                "reason": "pre-approval Working resume",
+            },
+        )
+        return self.store.get_goal(goal.id)
+
     def resume(self) -> Any:
         self._stop_event.clear()
         goal = self.active_goal()
+        if goal is not None:
+            goal = self._promote_preapproval_working_goal(goal)
         while goal is not None and goal.status is GoalStatus.AWAITING_PLAN_APPROVAL:
             pending_plan = self.latest_plan()
             accepted_plan = self.store.get_accepted_plan(goal.id)
@@ -11033,6 +11475,78 @@ class AgentRuntime:
             )
             return self.replan_ultra(feedback)
         ultra_run = self.active_ultra_run() if goal is not None else None
+        pending_ultra_questions = tuple(
+            item
+            for item in (
+                ultra_run.config.get("pending_questions", ())
+                if ultra_run is not None
+                else ()
+            )
+            if isinstance(item, Mapping)
+        )
+        ultra_question_boundary = bool(
+            ultra_run is not None
+            and ultra_run.goal_spec is not None
+            and ultra_run.architecture_spec is None
+            and pending_ultra_questions
+        )
+        incomplete_ultra_foundation = bool(
+            goal is not None
+            and goal.status is GoalStatus.PAUSED
+            and goal.active_plan_revision is None
+            and ultra_run is not None
+            and not ultra_question_boundary
+            and (
+                ultra_run.goal_spec is None
+                or ultra_run.architecture_spec is None
+                or (
+                    not ultra_run.master_approved
+                    and ultra_run.status.value != "awaiting_approval"
+                )
+            )
+        )
+        if incomplete_ultra_foundation:
+            # Foundation roles are read-only and have no product mutation to
+            # replay. A process stop before MasterPlanV1 therefore resumes by
+            # starting one fresh bounded foundation revision on the same Goal,
+            # instead of entering execution and failing on a nonexistent plan.
+            self.store.update_ultra_run(
+                ultra_run.id,
+                status="blocked",
+                error="superseded by read-only foundation resume revision",
+                config={
+                    "superseded_by_resume": True,
+                    "mutation_replayed": False,
+                },
+            )
+            self.store.transition_goal(
+                goal.id,
+                GoalStatus.DISCOVERING,
+                reason="restarting interrupted pre-plan ULTRA foundation",
+            )
+            self.store.update_goal_metadata(
+                goal.id,
+                waiting_question="",
+                waiting_on="",
+                resume_action="",
+                resume_status=GoalStatus.DISCOVERING.value,
+            )
+            self.ultra_session = self._make_ultra_session()
+            self.store.append_event(
+                "ultra.foundation_resume_restarted",
+                goal_id=goal.id,
+                payload={
+                    "source_run_id": ultra_run.id,
+                    "reason": "interrupted before approved master plan",
+                    "mutation_replayed": False,
+                },
+            )
+            self.events.publish(
+                "ultra.foundation_retry",
+                "Restarting the interrupted read-only ULTRA foundation on the same Goal.",
+                goal_id=goal.id,
+            )
+            return self.ultra_session.restart_foundation(goal.id, goal.objective)
         resumable_failed_ultra = bool(
             goal is not None
             and goal.status == GoalStatus.BLOCKED
@@ -11077,7 +11591,7 @@ class AgentRuntime:
             suffix = " ..." if len(unresolved) > 5 else ""
             raise RuntimeStateError(
                 "cannot resume while crash-window work is uncertain; inspect it and use "
-                f"/resolve first ({preview}{suffix})"
+                f"resolve it from the recovery card first ({preview}{suffix})"
             )
         desired = (
             GoalStatus.RUNNING
@@ -12560,6 +13074,11 @@ class AgentRuntime:
                     signature.normalized_message,
                     max_entries=20,
                     budget_chars=20_000,
+                )
+                self._record_repository_context_slice(
+                    context_slice,
+                    stage="failure_reinspection",
+                    goal_id=latest.id,
                 )
                 related = context_slice.entries
                 updated_contract = GoalContractV1(**{
@@ -14387,20 +14906,52 @@ class AgentRuntime:
                     self.store.get_goal(goal.id),
                     self.store.get_latest_plan(goal.id),
                 ))
+                execution_context_before = context.estimate_chars(
+                    self._work_conversation
+                )
+                execution_suspended: list[int] = []
+
+                def record_execution_suspension(count: int) -> None:
+                    execution_suspended.append(int(count))
+                    self.events.publish(
+                        "checkpoint",
+                        f"Suspended {count} transient messages and revived a fresh model context from durable goal memory.",
+                        continues=True,
+                    )
+
+                execution_context_budget = self._provider_conversation_budget(
+                    COORDINATOR_SYSTEM_PROMPT,
+                    request_schemas,
+                )
                 self._work_conversation = context.suspend_and_revive(
                     self._work_conversation,
                     durable_checkpoint,
                     context.structural_summary,
-                    max_chars=self._provider_conversation_budget(
-                        COORDINATOR_SYSTEM_PROMPT,
-                        request_schemas,
-                    ),
-                    on_suspend=lambda count: self.events.publish(
-                        "checkpoint",
-                        f"Suspended {count} transient messages and revived a fresh model context from durable goal memory.",
-                        continues=True,
-                    ),
+                    max_chars=execution_context_budget,
+                    on_suspend=record_execution_suspension,
                 )
+                if execution_suspended:
+                    self.store.append_event(
+                        "context.rotated",
+                        goal_id=goal.id,
+                        entity_type="goal",
+                        entity_id=goal.id,
+                        payload={
+                            "actor": "coordinator",
+                            "provider": self.provider_name,
+                            "model": self.model_name,
+                            "before_chars": execution_context_before,
+                            "after_chars": context.estimate_chars(
+                                self._work_conversation
+                            ),
+                            "budget_chars": execution_context_budget,
+                            "suspended_messages": execution_suspended[-1],
+                            "checkpoint_fingerprint": hashlib.sha256(
+                                durable_checkpoint.encode("utf-8", errors="replace")
+                            ).hexdigest(),
+                            "reason": "coordinator context budget reached",
+                        },
+                    )
                 if self.store.get_goal(goal.id).status != GoalStatus.RUNNING:
                     break
 
@@ -14788,7 +15339,7 @@ class AgentRuntime:
 
     def apply_command(self, command: UserCommand) -> Any:
         kind, args = command.kind, command.args
-        if kind == CommandKind.ANSWER:
+        if kind == InternalActionKind.ANSWER:
             question_id = str(args.get("question_id") or "").strip()
             if self.store.get_pending_intake(self.session_id) is not None:
                 pending = self.intake_questions()
@@ -14819,36 +15370,36 @@ class AgentRuntime:
                     raise RuntimeStateError("there is no active planning question")
                 question_id = str(pending[0].get("id", ""))
             return self.answer_plan_question(question_id, args["value"])
-        if kind == CommandKind.GOAL:
+        if kind == InternalActionKind.GOAL:
             mode = self.store.get_workflow_session(self.session_id)["session_mode"]
             return self.submit_intent(args["objective"], requested_mode=mode)
-        if kind == CommandKind.APPROVE:
+        if kind == InternalActionKind.APPROVE:
             return self.approve_plan(args["revision"])
-        if kind in {CommandKind.REJECT, CommandKind.REPLAN}:
+        if kind in {InternalActionKind.REJECT, InternalActionKind.REPLAN}:
             goal = self.active_goal()
             if goal and goal.metadata.get("ultra_run_id"):
                 return self.replan_ultra(args["feedback"])
             return self.reject_plan(args["feedback"])
-        if kind == CommandKind.ADD:
+        if kind == InternalActionKind.ADD:
             return self.add_user_task(args["text"], args["acceptance_criteria"])
-        if kind == CommandKind.EDIT:
+        if kind == InternalActionKind.EDIT:
             return self.revise_plan(
                 reason=f"user edited checklist field {args['field']}",
                 edit=(args["task_id"], args["field"], args["value"]),
             )
-        if kind == CommandKind.REMOVE:
+        if kind == InternalActionKind.REMOVE:
             return self.revise_plan(reason="user removed a checklist item", remove=args["task_id"])
-        if kind == CommandKind.TASK_STATUS:
+        if kind == InternalActionKind.TASK_STATUS:
             return self.update_task_from_user(args["task_id"], args["status"], args["note"])
-        if kind == CommandKind.RUN:
+        if kind == InternalActionKind.RUN:
             return self.run_slice(args["steps"])
         if kind == CommandKind.PAUSE:
             return self.pause()
         if kind == CommandKind.RESUME:
             return self.resume()
-        if kind == CommandKind.CANCEL:
+        if kind == InternalActionKind.CANCEL:
             return self.cancel(args["confirmation"])
-        if kind == CommandKind.RESOLVE:
+        if kind == InternalActionKind.RESOLVE:
             return self.resolve_action(args["action_id"], args["resolution"], args["note"])
         if kind == CommandKind.TEXT:
             text = args["text"]

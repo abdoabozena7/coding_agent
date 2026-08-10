@@ -158,6 +158,7 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
 
         received = []
         store = WorkspaceUIStore()
+        submitted = []
         with create_pipe_input() as pipe:
             def receive(item):
                 received.append(item)
@@ -396,6 +397,146 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         self.assertIn("1.0 KB", receiving)
         self.assertIn("2 chunks", receiving)
 
+    def test_live_rail_renders_codex_style_tool_block_and_full_transcript(self):
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        store.handle_event(
+            "tool_call",
+            "run_command",
+            {
+                "sequence": 1,
+                "actor": "tester",
+                "node_id": "test-node",
+                "args": {"command": "pytest tests/test_widget.py -q"},
+            },
+        )
+        store.handle_event(
+            "tool_result",
+            "first line\nsecond line\nthird line\nfourth line",
+            {
+                "sequence": 2,
+                "actor": "tester",
+                "node_id": "test-node",
+                "tool": "run_command",
+            },
+        )
+        app = PersistentWorkspaceApp(
+            store,
+            on_input=lambda _item: None,
+            on_interrupt=lambda: None,
+            on_exit=lambda: True,
+            output=io.StringIO(),
+            app_output=DummyOutput(),
+            no_color=True,
+        )
+        app._terminal_size = lambda: (140, 40)
+
+        rendered = "".join(fragment[1] for fragment in app._live_activity_fragments())
+        self.assertIn("TOOL ACTIVITY", rendered)
+        self.assertIn("Tester", rendered)
+        self.assertIn("Ran", rendered)
+        self.assertIn("pytest tests/test_widget.py -q", rendered)
+        self.assertIn("first line", rendered)
+        self.assertIn("+2 lines", rendered)
+        self.assertIn("Ctrl+T transcript", rendered)
+        self.assertIn("fourth line", app._tool_transcript_text())
+
+    def test_stacked_live_rail_keeps_recent_completed_tool_blocks_visible(self):
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        for index in range(1, 5):
+            store.handle_event(
+                "tool_call",
+                "run_command",
+                {
+                    "sequence": index * 2,
+                    "actor": f"agent_{index}",
+                    "node_id": f"node-{index}",
+                    "args": {"command": f"check-step-{index}"},
+                },
+            )
+            store.handle_event(
+                "tool_result",
+                f"step {index} passed",
+                {
+                    "sequence": index * 2 + 1,
+                    "actor": f"agent_{index}",
+                    "node_id": f"node-{index}",
+                    "tool": "run_command",
+                },
+            )
+        app = PersistentWorkspaceApp(
+            store,
+            on_input=lambda _item: None,
+            on_interrupt=lambda: None,
+            on_exit=lambda: True,
+            output=io.StringIO(),
+            app_output=DummyOutput(),
+            no_color=True,
+        )
+        app._terminal_size = lambda: (100, 40)
+
+        rendered = "".join(fragment[1] for fragment in app._live_activity_fragments())
+
+        self.assertNotIn("check-step-1", rendered)
+        self.assertIn("check-step-2", rendered)
+        self.assertIn("check-step-3", rendered)
+        self.assertIn("check-step-4", rendered)
+        self.assertLess(rendered.index("check-step-2"), rendered.index("check-step-4"))
+
+    def test_live_rail_stacks_completed_running_and_waiting_agents(self):
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        store.update_swarm_summary(
+            {
+                "nodes": [{"id": "one-node", "title": "Ship the result"}],
+                "agents": [
+                    {
+                        "id": "coder",
+                        "work_node_id": "one-node",
+                        "role": "coder",
+                        "phase": "implementation",
+                        "status": "completed",
+                        "result": {"summary": "Implementation saved."},
+                    },
+                    {
+                        "id": "reviewer",
+                        "work_node_id": "one-node",
+                        "role": "reviewer",
+                        "phase": "reviewing",
+                        "status": "running",
+                    },
+                    {
+                        "id": "tester",
+                        "work_node_id": "one-node",
+                        "role": "tester",
+                        "phase": "testing",
+                        "status": "queued",
+                    },
+                ],
+            }
+        )
+        app = PersistentWorkspaceApp(
+            store,
+            on_input=lambda _item: None,
+            on_interrupt=lambda: None,
+            on_exit=lambda: True,
+            output=io.StringIO(),
+            app_output=DummyOutput(),
+            no_color=True,
+        )
+        app._terminal_size = lambda: (100, 40)
+
+        rendered = "".join(fragment[1] for fragment in app._live_activity_fragments())
+
+        self.assertIn("AGENTS · 3 total · 1 active · 1 complete", rendered)
+        self.assertIn("Coder · completed · Ship the result", rendered)
+        self.assertIn("Reviewer · running · Ship the result", rendered)
+        self.assertIn("Tester · queued · Ship the result", rendered)
+
     def test_simple_snapshot_fits_common_terminal_sizes(self):
         store = WorkspaceUIStore()
         store.update_identity(workspace="project-090", model="gemma4:e4b", status="running")
@@ -423,7 +564,7 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         # live app; the mode switch itself remains observable in snapshots.
         self.assertIn("ADVANCED", advanced)
 
-    def test_running_slash_palette_is_immediate_and_contains_sleep_actions(self):
+    def test_running_slash_palette_is_immediate_and_contains_public_actions(self):
         from prompt_toolkit.output import DummyOutput
 
         store = WorkspaceUIStore()
@@ -441,7 +582,8 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         app._buffer.text = "/"
         self.assertTrue(app._palette_open)
         rendered = "".join(fragment[1] for fragment in app._palette_fragments())
-        self.assertIn("/sleep on", rendered)
+        self.assertIn("/advanced-tracing", rendered)
+        self.assertNotIn("/sleep", rendered)
         self.assertIn("Commands", rendered)
 
     def test_advanced_activity_has_checklist_and_safe_stream(self):
@@ -565,7 +707,7 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         store = WorkspaceUIStore()
         submitted = []
         with create_pipe_input() as pipe:
-            pipe.send_text("/agents\r\x11")
+            pipe.send_text("/advanced-tracing\r\x11")
             app = PersistentWorkspaceApp(
                 store,
                 on_input=submitted.append,
@@ -578,7 +720,7 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
             )
             app.run()
 
-        self.assertEqual([item.text for item in submitted], ["/agents"])
+        self.assertEqual([item.text for item in submitted], ["/advanced-tracing"])
 
     def test_ctrl_k_opens_same_palette_and_tab_completes(self):
         from prompt_toolkit.input.defaults import create_pipe_input
@@ -587,7 +729,7 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         store = WorkspaceUIStore()
         submitted = []
         with create_pipe_input() as pipe:
-            pipe.send_text("\x0bsta\t\r\x11")
+            pipe.send_text("\x0bliv\t\r\x11")
             app = PersistentWorkspaceApp(
                 store,
                 on_input=submitted.append,
@@ -600,7 +742,7 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
             )
             app.run()
 
-        self.assertEqual([item.text for item in submitted], ["/status"])
+        self.assertEqual([item.text for item in submitted], ["/live"])
 
     def test_long_prompt_is_collapsed_visually_but_retained_in_store(self):
         from prompt_toolkit.output import DummyOutput
@@ -788,6 +930,78 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         waiter.join(1)
         self.assertEqual(answers[0].value, "pause")
 
+    def test_plan_review_keeps_all_actions_visible_with_safe_default_selected(self):
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        store.present_attention(
+            AttentionRequest(
+                id="complete-plan-card",
+                kind=AttentionKind.PLAN_REVIEW,
+                title="Review this plan",
+                options=(
+                    AttentionOption("start", "Approve and start", "start"),
+                    AttentionOption("open", "Review or edit", "open"),
+                    AttentionOption("web", "Open in website", "web"),
+                    AttentionOption("cancel", "Keep paused", "cancel"),
+                ),
+                default_key="cancel",
+                cancel_key="cancel",
+            )
+        )
+        app = PersistentWorkspaceApp(
+            store,
+            on_input=lambda _item: None,
+            on_interrupt=lambda: None,
+            on_exit=lambda: True,
+            output=io.StringIO(),
+            app_output=DummyOutput(),
+            no_color=True,
+        )
+
+        rendered = "".join(part[1] for part in app._attention_fragments())
+
+        self.assertIn("Approve and start", rendered)
+        self.assertIn("Review or edit", rendered)
+        self.assertIn("Open in website", rendered)
+        self.assertIn("Keep paused", rendered)
+
+    def test_completion_handoff_keeps_all_four_actions_visible(self):
+        from prompt_toolkit.output import DummyOutput
+
+        store = WorkspaceUIStore()
+        store.present_attention(
+            AttentionRequest(
+                id="completion-card",
+                kind=AttentionKind.QUESTION,
+                title="Work complete",
+                options=(
+                    AttentionOption("explorer", "Open project folder", "explorer"),
+                    AttentionOption("preview", "Open running preview", "preview"),
+                    AttentionOption("changes", "Review changes", "changes"),
+                    AttentionOption("dismiss", "Done", "dismiss"),
+                ),
+                default_key="dismiss",
+                cancel_key="dismiss",
+            )
+        )
+        app = PersistentWorkspaceApp(
+            store,
+            on_input=lambda _item: None,
+            on_interrupt=lambda: None,
+            on_exit=lambda: True,
+            output=io.StringIO(),
+            app_output=DummyOutput(),
+            no_color=True,
+        )
+
+        rendered = "".join(part[1] for part in app._attention_fragments())
+
+        self.assertIn("Open project folder", rendered)
+        self.assertIn("Open running preview", rendered)
+        self.assertIn("Review changes", rendered)
+        self.assertIn("Done", rendered)
+
     def test_escape_cancels_to_declared_safe_option(self):
         from threading import Thread
         from prompt_toolkit.input.defaults import create_pipe_input
@@ -838,11 +1052,12 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
                 cancel_key="deny",
             )
         )
+        submitted = []
         with create_pipe_input() as pipe:
             pipe.send_text("\x1b[17~\x11")
             app = PersistentWorkspaceApp(
                 store,
-                on_input=lambda _item: None,
+                on_input=submitted.append,
                 on_interrupt=lambda: None,
                 on_exit=store.mark_exit,
                 output=io.StringIO(),
@@ -851,7 +1066,8 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
                 no_color=True,
             )
             app.run()
-        self.assertTrue(store.snapshot().sleep_enabled)
+        self.assertFalse(store.snapshot().sleep_enabled)
+        self.assertEqual([item.kind for item in submitted], ["sleep_toggle"])
 
     def test_f5_does_not_ask_user_to_preclassify_the_next_prompt(self):
         from prompt_toolkit.input.defaults import create_pipe_input
@@ -988,11 +1204,12 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
         worker = Thread(target=lambda: release.wait(1.0))
         worker.start()
         pauses = []
+        submitted = []
         with create_pipe_input() as pipe:
             pipe.send_text("\x1b[17~\x03\x11")
             app = PersistentWorkspaceApp(
                 store,
-                on_input=lambda _item: None,
+                on_input=submitted.append,
                 on_interrupt=lambda: pauses.append(True),
                 on_exit=lambda: True,
                 output=io.StringIO(),
@@ -1003,7 +1220,8 @@ class PersistentWorkspaceSnapshotTests(unittest.TestCase):
             app.run()
         release.set()
         worker.join(1)
-        self.assertTrue(store.snapshot().sleep_enabled)
+        self.assertFalse(store.snapshot().sleep_enabled)
+        self.assertEqual([item.kind for item in submitted], ["sleep_toggle"])
         self.assertEqual(pauses, [True])
 
     def test_default_selection_prefers_enabled_but_disabled_rows_explain_themselves(self):
@@ -1161,6 +1379,32 @@ class SwarmInspectorTests(unittest.TestCase):
         self.assertIn("CURRENT PROMPT · REDACTED", rendered)
         self.assertIn("bounded movement contract", rendered)
         self.assertIn("↑↓ switch agent", rendered)
+
+    def test_agent_view_animates_live_status_and_shows_run_facts(self):
+        snapshot = self.snapshot()
+        snapshot["agents"][0].update(
+            {
+                "provider": "ollama",
+                "model": "gemma4:e4b",
+                "attempt": 2,
+                "usage": {"input_tokens": 1_200, "output_tokens": 340},
+                "result": {"summary": "Movement checks are passing."},
+            }
+        )
+        state = SwarmInspectorState(selected_index=1)
+
+        first = render_swarm_inspector(
+            snapshot, state, width=120, height=34, tick=0, animate=True
+        )
+        later = render_swarm_inspector(
+            snapshot, state, width=120, height=34, tick=2, animate=True
+        )
+
+        self.assertNotEqual(first, later)
+        self.assertIn("model ollama/gemma4:e4b", later)
+        self.assertIn("attempt 2", later)
+        self.assertIn("tokens in 1,200 · out 340", later)
+        self.assertIn("Movement checks are passing", later)
 
     def test_tree_view_is_hierarchical_status_aware_and_switchable(self):
         snapshot = self.snapshot()

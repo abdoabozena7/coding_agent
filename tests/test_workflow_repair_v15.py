@@ -12,7 +12,12 @@ from agent.chat_runtime import RouteKind
 from agent.models import GoalStatus, PlanStatus
 from agent.runtime import AgentRuntime
 from agent.store import StateStore
-from agent.testing import ScriptedProvider, semantic_goal_intake, semantic_turn
+from agent.testing import (
+    ScriptedProvider,
+    semantic_goal_intake,
+    semantic_goal_intake_turn,
+    semantic_turn,
+)
 from tests.test_runtime import inspect_call, plan_call, plan_pass, review_pass
 from tests.test_store import plan_basis, task
 
@@ -59,7 +64,7 @@ def _finish_turn() -> dict:
     }
 
 
-def test_hybrid_router_keeps_explanation_in_chat_and_small_file_action_bounded() -> None:
+def test_hybrid_router_keeps_explanation_in_chat_and_promotes_work_to_recursive_goal() -> None:
     with tempfile.TemporaryDirectory() as directory:
         workspace = Path(directory)
         store = StateStore(workspace)
@@ -73,19 +78,12 @@ def test_hybrid_router_keeps_explanation_in_chat_and_small_file_action_bounded()
                             response="The workflow persists state so interrupted work can resume.",
                         ),
                         semantic_turn("action", original="create note.txt", effects=("write",)),
-                        {
-                            "tool_calls": [
-                                {
-                                    "id": "write-note",
-                                    "name": "write_file",
-                                    "args": {
-                                        "path": "note.txt",
-                                        "content": "bounded action\n",
-                                    },
-                                }
-                            ]
-                        },
-                        "Bounded action completed.",
+                        semantic_goal_intake_turn(
+                            semantic_goal_intake("create note.txt")
+                        ),
+                        inspect_call(),
+                        plan_call(),
+                        plan_pass(),
                     ]
                 ),
                 store,
@@ -100,12 +98,10 @@ def test_hybrid_router_keeps_explanation_in_chat_and_small_file_action_bounded()
             assert runtime.active_goal() is None
 
             action, action_result = runtime.route_input("create note.txt")
-            assert action.kind is RouteKind.ACTION
-            assert action_result.status == "chat"
-            assert (workspace / "note.txt").read_text(encoding="utf-8") == (
-                "bounded action\n"
-            )
-            assert runtime.active_goal() is None
+            assert action.kind is RouteKind.GOAL
+            assert action_result.goal_id == runtime.active_goal().id
+            assert runtime.active_goal().metadata["execution_strategy"] == "recursive"
+            assert not (workspace / "note.txt").exists()
         finally:
             store.close()
 

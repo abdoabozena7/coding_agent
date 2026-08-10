@@ -213,6 +213,74 @@ class ExecutionToolTests(unittest.TestCase):
             )
             tools.run_tool("stop_preview", {"preview_id": payload["preview_id"]})
 
+    def test_preview_supports_bounded_dom_identity_visibility_and_count_assertions(self):
+        capability = tools.web_preview.browser_capability()
+        if not capability["available"] or not capability["playwright"]:
+            self.skipTest("Playwright plus Chrome/Edge/Chromium is unavailable")
+        with tempfile.TemporaryDirectory() as directory, tools.workspace_context(directory):
+            Path(directory, "index.html").write_text(
+                """<!doctype html><div id='threeD-canvas' data-object-count='3'
+                data-visual-state='5+3=8'>ready</div>
+                <div class='object'>one</div><div class='object'>two</div>
+                <input id='enabled' type='checkbox' checked>""",
+                encoding="utf-8",
+            )
+            payload = json.loads(tools.run_tool("preview_html", {
+                "path": "index.html",
+                "open_browser": False,
+                "verify": True,
+                "settle_ms": 0,
+                "interactions": [{
+                    "name": "bounded DOM observables",
+                    "steps": [],
+                    "assertions": [
+                        {
+                            "selector": "#threeD-canvas",
+                            "property": "id",
+                            "equals": "threeD-canvas",
+                        },
+                        {
+                            "selector": "#threeD-canvas",
+                            "property": "visible",
+                            "equals": "true",
+                        },
+                        {
+                            "selector": ".object",
+                            "property": "count",
+                            "equals": "2",
+                        },
+                        {
+                            "selector": ".object",
+                            "property": "visibleCount",
+                            "equals": "2",
+                        },
+                        {
+                            "selector": "#enabled",
+                            "property": "checked",
+                            "equals": "true",
+                        },
+                        {
+                            "selector": "#threeD-canvas",
+                            "property": "dataObjectCount",
+                            "equals": "3",
+                        },
+                        {
+                            "selector": "#threeD-canvas",
+                            "property": "dataVisualState",
+                            "equals": "5+3=8",
+                        },
+                    ],
+                }],
+            }))
+            self.addCleanup(tools.web_preview.shutdown_workspace, directory)
+            self.assertEqual(payload["verification"], "passed")
+            observations = payload["interaction_results"][0]["assertions"]
+            self.assertEqual(
+                [item["observed"] for item in observations],
+                ["threeD-canvas", True, 2, 2, True, "3", "5+3=8"],
+            )
+            tools.run_tool("stop_preview", {"preview_id": payload["preview_id"]})
+
     def test_preview_normalizes_small_model_dom_id_and_textcontent_transport(self):
         capability = tools.web_preview.browser_capability()
         if not capability["available"] or not capability["playwright"]:
@@ -282,6 +350,70 @@ class ExecutionToolTests(unittest.TestCase):
             self.assertIn("matched no elements", payload["interaction_results"][0]["error"])
             self.assertTrue(
                 any(item["data_value"] == "5" for item in payload["interaction_targets"])
+            )
+            tools.run_tool("stop_preview", {"preview_id": payload["preview_id"]})
+
+    def test_preview_reports_missing_exact_id_assertion_as_application_failure(self):
+        capability = tools.web_preview.browser_capability()
+        if not capability["available"] or not capability["playwright"]:
+            self.skipTest("Playwright plus Chrome/Edge/Chromium is unavailable")
+        with tempfile.TemporaryDirectory() as directory, tools.workspace_context(directory):
+            Path(directory, "index.html").write_text(
+                "<!doctype html><button id='ac'>AC</button>",
+                encoding="utf-8",
+            )
+            payload = json.loads(tools.run_tool("preview_html", {
+                "path": "index.html",
+                "open_browser": False,
+                "verify": True,
+                "settle_ms": 0,
+                "interactions": [{
+                    "name": "required canvas",
+                    "steps": [{"action": "click", "selector": "#ac"}],
+                    "assertions": [{
+                        "selector": "#threeD-canvas",
+                        "property": "id",
+                        "equals": "threeD-canvas",
+                    }],
+                }],
+            }))
+            self.addCleanup(tools.web_preview.shutdown_workspace, directory)
+            self.assertEqual(payload["verification"], "failed")
+            self.assertEqual(payload["failure_kind"], "application")
+            self.assertIn("matched no elements", payload["interaction_results"][0]["error"])
+            tools.run_tool("stop_preview", {"preview_id": payload["preview_id"]})
+
+    def test_preview_reports_zero_named_count_target_as_contract_failure(self):
+        capability = tools.web_preview.browser_capability()
+        if not capability["available"] or not capability["playwright"]:
+            self.skipTest("Playwright plus Chrome/Edge/Chromium is unavailable")
+        with tempfile.TemporaryDirectory() as directory, tools.workspace_context(directory):
+            Path(directory, "index.html").write_text(
+                "<!doctype html><button>2</button><canvas id='threeD-canvas'></canvas>",
+                encoding="utf-8",
+            )
+            payload = json.loads(tools.run_tool("preview_html", {
+                "path": "index.html",
+                "open_browser": False,
+                "verify": True,
+                "settle_ms": 0,
+                "interactions": [{
+                    "name": "invented 3D object label",
+                    "steps": [{"action": "click", "role": "button", "name": "2"}],
+                    "assertions": [{
+                        "role": "textbox",
+                        "name": "3D Object State Check",
+                        "property": "visibleCount",
+                        "equals": "3",
+                    }],
+                }],
+            }))
+            self.addCleanup(tools.web_preview.shutdown_workspace, directory)
+            self.assertEqual(payload["verification"], "failed")
+            self.assertEqual(payload["failure_kind"], "contract")
+            self.assertIn(
+                "count target matched no elements",
+                payload["interaction_results"][0]["error"],
             )
             tools.run_tool("stop_preview", {"preview_id": payload["preview_id"]})
 

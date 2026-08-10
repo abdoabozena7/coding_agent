@@ -42,8 +42,7 @@ from .evaluation import (
 )
 from .model_catalog import ExecutionClass, ModelDescriptor
 from .local_provider import (
-    extract_first_json_object,
-    normalize_action_proposal,
+    extract_action_proposal,
     normalize_generated_tool_args,
 )
 from .learning import GlobalLessonStore, LearnedLessonV1
@@ -100,6 +99,7 @@ from .ultra import (
     UltraRunV1,
     WorkNode as EngineWorkNode,
     _extract_json,
+    _normalize_browser_scenario_transport,
 )
 from .ultra_models import (
     AgentRun,
@@ -148,8 +148,13 @@ from .reasoning import (
 from .version_control import GitProtectionManager
 
 
+class _MutationTransportExhausted(AgentProtocolError):
+    """A local mutation turn ignored its bounded write-only handoff."""
+
+
 _READ_TOOLS = tools.names(categories={"read"})
 _WRITE_TOOLS = tools.names(categories={"write", "command", "install"})
+_FILE_WRITE_TOOLS = tools.names(categories={"write"})
 _TOOL_RISK = tools.risk_map()
 _TESTER_VERIFICATION_COMMAND_RE = re.compile(
     r"^\s*(?:"
@@ -553,8 +558,9 @@ _SUBMIT_MASTER_PLAN_TOOL = {
                                 "type": "object",
                                 "description": (
                                     "For interactive preview modules include browser_scenarios: "
-                                    "an array of {name, steps:[{action, role, name, text or value}], "
-                                    "assertions:[{role, name, property, equals or contains}]} objects."
+                                    "an array of {name, steps:[{action, role, name, value only for fill}], "
+                                    "assertions:[{role, name, property, equals or contains}]} objects. "
+                                    "Do not add text to click steps."
                                 ),
                             },
                         },
@@ -632,9 +638,12 @@ _SUBMIT_BROWSER_SCENARIOS_TOOL = {
                                                 "type": "object",
                                                 "description": (
                                                     "Observable assertion with role/name or selector, property "
-                                                    "value or text, and exactly one expected value in equals or "
+                                                    "value, text, textContent, id, visible, checked, count, or "
+                                                    "visibleCount; interactive graphics may expose bounded "
+                                                    "dataObjectCount or dataVisualState values. Use exactly one "
+                                                    "expected value in equals or "
                                                     "contains. Use property value only for form controls such as "
-                                                    "textbox, combobox, spinbutton, or slider; use property text "
+                                                    "textbox, combobox, spinbutton, or slider; use property text/textContent "
                                                     "for status, heading, button, and other elements. role is an "
                                                     "ARIA role, not an HTML tag."
                                                 ),
@@ -644,7 +653,19 @@ _SUBMIT_BROWSER_SCENARIOS_TOOL = {
                                                     "selector": {"type": "string"},
                                                     "property": {
                                                         "type": "string",
-                                                        "enum": ["value", "text"],
+                                                        "enum": [
+                                                            "value",
+                                                            "text",
+                                                            "textContent",
+                                                            "innerText",
+                                                            "id",
+                                                            "visible",
+                                                            "checked",
+                                                            "count",
+                                                            "visibleCount",
+                                                            "dataObjectCount",
+                                                            "dataVisualState",
+                                                        ],
                                                     },
                                                     "equals": {"type": "string"},
                                                     "contains": {"type": "string"},
@@ -1417,7 +1438,7 @@ _PHASE_CONTRACTS: dict[str, Mapping[str, Any]] = {
                                 {
                                     "role": "accessible role",
                                     "name": "accessible name",
-                                    "property": "value or text",
+                                    "property": "value, text, or textContent",
                                     "equals": "expected result",
                                 }
                             ],
@@ -1533,11 +1554,23 @@ class WorkspaceUltraAgent:
             return None
         contract = dict(request.task.get("contract", {}))
         metadata = dict(contract.get("metadata") or {})
-        interactions = [
-            dict(item)
-            for item in metadata.get("browser_scenarios", ())
-            if isinstance(item, Mapping)
-        ]
+        interactions: list[dict[str, Any]] = []
+        for raw_scenario in metadata.get("browser_scenarios", ()):
+            if not isinstance(raw_scenario, Mapping):
+                continue
+            scenario, normalization_actions = (
+                _normalize_browser_scenario_transport(raw_scenario)
+            )
+            event_bus = getattr(self, "events", None)
+            if normalization_actions and callable(getattr(event_bus, "publish", None)):
+                event_bus.publish(
+                    "ultra.browser_contract_normalized",
+                    "; ".join(normalization_actions),
+                    run_id=request.run_id,
+                    node_id=request.node_id,
+                    actions=list(normalization_actions),
+                )
+            interactions.append(scenario)
         result = str(
             self.executor(
                 ToolCall(
@@ -1555,9 +1588,35 @@ class WorkspaceUltraAgent:
             )
         )
         if result.startswith("Error:"):
+            lowered = result.casefold()
+            failure_kind = (
+                "contract"
+                if any(
+                    marker in lowered
+                    for marker in (
+                        "invalid arguments",
+                        "must be one of",
+                        "unknown key",
+                        "required property",
+                        "schema validation",
+                    )
+                )
+                else "environment"
+                if any(
+                    marker in lowered
+                    for marker in (
+                        "playwright is not installed",
+                        "browser executable",
+                        "browser could not",
+                        "permission denied",
+                    )
+                )
+                else "application"
+            )
             return {
                 "status": "failed",
                 "error": result,
+                "failure_kind": failure_kind,
                 "console_errors": [result],
                 "page_errors": [],
                 "network_errors": [],
@@ -1568,12 +1627,17 @@ class WorkspaceUltraAgent:
             return {
                 "status": "failed",
                 "error": f"preview_html returned malformed JSON: {redact_text(result, 500)}",
+                "failure_kind": "tool",
                 "console_errors": [],
                 "page_errors": [],
                 "network_errors": [],
             }
         if not isinstance(payload, Mapping):
-            return {"status": "failed", "error": "preview_html returned non-object payload"}
+            return {
+                "status": "failed",
+                "error": "preview_html returned non-object payload",
+                "failure_kind": "tool",
+            }
         evidence = dict(payload)
         html_result = str(
             self.executor(
@@ -2069,6 +2133,37 @@ class WorkspaceUltraAgent:
             if isinstance(request.task, Mapping)
             else {}
         )
+        typed_return_repair = (
+            dict(request.task.get("typed_return_repair", {}))
+            if isinstance(request.task, Mapping)
+            and isinstance(request.task.get("typed_return_repair"), Mapping)
+            else {}
+        )
+        if (
+            self.provider_name.casefold() == "ollama"
+            and bool(typed_return_repair.get("repeated_response"))
+        ):
+            reset_cache = getattr(self.provider, "reset_model_cache", None)
+            cache_reset = False
+            if callable(reset_cache):
+                try:
+                    reset_cache()
+                    cache_reset = True
+                except Exception:
+                    cache_reset = False
+            self.events.publish(
+                "ultra.typed_return_cache_reset",
+                "Repeated invalid typed response detected; local model cache "
+                f"reset={cache_reset} before the adapted repair request.",
+                run_id=request.run_id,
+                node_id=request.node_id,
+                role=self.role.value,
+                phase=request.phase,
+                response_fingerprint=str(
+                    typed_return_repair.get("response_fingerprint") or ""
+                ),
+                cache_reset=cache_reset,
+            )
         request_component_only = bool(
             dict(request_contract.get("metadata", {})).get("component_package_only")
         )
@@ -2108,6 +2203,17 @@ class WorkspaceUltraAgent:
                 InnerPhase.GLOBAL_REVIEW.value,
             }
         )
+        local_governed_mutation_phase = bool(
+            self.provider_name.casefold() == "ollama"
+            and self.role in {AgentRole.CODER, AgentRole.INTEGRATOR}
+            and request.phase
+            in {
+                InnerPhase.IMPLEMENT.value,
+                InnerPhase.FIX.value,
+                InnerPhase.INTEGRATE.value,
+            }
+            and tuple(request_contract.get("write_paths", ()) or ())
+        )
         configured_effort = str(getattr(self.provider, "reasoning_effort", "medium"))
         deterministic_roles = {
             AgentRole.GOAL_UNDERSTANDING,
@@ -2131,6 +2237,7 @@ class WorkspaceUltraAgent:
             or request.phase in compact_foundation_phases
             or component_leaf_quality_phase
             or component_quality_triage_phase
+            or local_governed_mutation_phase
         ):
             effective_effort = "off"
             setattr(self.provider, "reasoning_effort", effective_effort)
@@ -2159,7 +2266,7 @@ class WorkspaceUltraAgent:
             # Gemma's current Ollama grammar can terminate on an internal
             # <unused50> token and return an empty response. Typed extraction,
             # validation, and one targeted repair are safer than format=json;
-            # tool-using roles also need unconstrained native calls.
+            # governed action roles use validated streamed JSON transport.
             setattr(self.provider, "force_json", False)
         self.events.publish(
             "ultra.reasoning_routed",
@@ -2242,6 +2349,13 @@ class WorkspaceUltraAgent:
             ).casefold()
             not in {"passed", "ok", "success"}
         ):
+            failure_kind = str(harness_preview.get("failure_kind") or "application")
+            blocker_owner = {
+                "contract": "test_harness",
+                "tool": "tooling",
+                "environment": "environment",
+                "application": "candidate_code",
+            }.get(failure_kind, "diagnostic")
             browser_details = [
                 *[str(item) for item in harness_preview.get("benchmark_findings", ())],
                 *[str(item) for item in harness_preview.get("console_errors", ())],
@@ -2255,7 +2369,13 @@ class WorkspaceUltraAgent:
             )
             self.events.publish(
                 "ultra.deterministic_test_gate",
-                "Harness browser/readback benchmark failed; routing evidence to the fix loop",
+                (
+                    "Harness browser contract failed; routing evidence to test-definition repair"
+                    if failure_kind == "contract"
+                    else "Harness environment failed; candidate mutation is prohibited"
+                    if failure_kind in {"tool", "environment"}
+                    else "Harness browser/readback benchmark found a candidate defect"
+                ),
                 run_id=request.run_id,
                 node_id=request.node_id,
                 findings=findings,
@@ -2265,14 +2385,27 @@ class WorkspaceUltraAgent:
                 {
                     "payload": {
                         "passed": False,
+                        "failure_kind": failure_kind,
+                        "blocker_owner": blocker_owner,
+                        "candidate_status": (
+                            "unverified"
+                            if failure_kind in {"contract", "tool", "environment"}
+                            else "failed"
+                        ),
+                        "verification_status": "blocked",
                         "issues": findings,
                         "findings": findings,
                         "test_results": [
                             {
                                 "name": "harness_html_browser_and_quality_gate",
                                 "passed": False,
+                                "failure_kind": failure_kind,
+                                "blocker_owner": blocker_owner,
                                 "scores": dict(harness_preview.get("benchmark_scores", {})),
                                 "screenshot_path": harness_preview.get("screenshot_path"),
+                                "interaction_targets": list(
+                                    harness_preview.get("interaction_targets", ()) or ()
+                                ),
                                 "interaction_results": list(
                                     harness_preview.get("interaction_results", ()) or ()
                                 ),
@@ -2404,6 +2537,24 @@ class WorkspaceUltraAgent:
                         + current_html[:40_000]
                     )
         write_target_state: list[dict[str, Any]] = []
+        mutation_requirements = [
+            str(item)[:1_200]
+            for item in (
+                request.task.get("findings", ())
+                if isinstance(request.task, Mapping)
+                else ()
+            )
+            if str(item).strip()
+        ][:12]
+        mutation_acceptance_criteria = [
+            str(item)[:1_200]
+            for item in (
+                request_contract.get("acceptance_criteria", ())
+                or request_contract.get("success_criteria", ())
+                or ()
+            )
+            if str(item).strip()
+        ][:12]
         if self.role is AgentRole.CODER and request.phase in {
             InnerPhase.IMPLEMENT.value,
             InnerPhase.FIX.value,
@@ -2902,6 +3053,67 @@ class WorkspaceUltraAgent:
             and not request.task.get("component_assembler")
         )
         allowed_tools = self._allowed_tools()
+        if local_governed_mutation_phase and request.phase == InnerPhase.FIX.value:
+            contract_metadata = (
+                dict(request_contract.get("metadata", {}))
+                if isinstance(request_contract.get("metadata"), Mapping)
+                else {}
+            )
+            dependency_evidence_parts: list[str] = []
+            for key in ("findings", "prior_findings", "issues"):
+                value = request.task.get(key)
+                if isinstance(value, Mapping):
+                    dependency_evidence_parts.append(_json(value))
+                elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                    dependency_evidence_parts.extend(str(item) for item in value)
+                elif value is not None:
+                    dependency_evidence_parts.append(str(value))
+            dependency_contract_text = " ".join(
+                (
+                    str(request_contract.get("objective") or ""),
+                    " ".join(
+                        str(item)
+                        for item in tuple(
+                            request_contract.get("acceptance_criteria", ()) or ()
+                        )
+                    ),
+                    _json(contract_metadata),
+                )
+            ).casefold()
+            dependency_finding_text = " ".join(
+                dependency_evidence_parts
+            ).casefold()
+            dependency_markers = (
+                "missing dependency",
+                "missing module",
+                "module not found",
+                "cannot find module",
+                "package not installed",
+                "install depend",
+                "npm install",
+                "pnpm install",
+                "yarn install",
+                "requirements.txt",
+                "package.json",
+            )
+            dependency_install_justified = bool(
+                contract_metadata.get("allow_dependency_install")
+                or any(
+                    marker in dependency_finding_text
+                    or marker in dependency_contract_text
+                    for marker in dependency_markers
+                )
+            )
+            if not dependency_install_justified:
+                allowed_tools = allowed_tools - {"install_dependencies"}
+                self.events.publish(
+                    "ultra.dependency_install_restricted",
+                    "Dependency installation was withheld from Fix because no finding or contract requires it.",
+                    run_id=request.run_id,
+                    node_id=request.node_id,
+                    role=self.role.value,
+                    phase=request.phase,
+                )
         if component_publication_phase:
             if self.provider_name == "ollama":
                 # Leaf quality comes from isolated previews, independent
@@ -3022,6 +3234,8 @@ class WorkspaceUltraAgent:
         invalid_json_attempts = 0
         component_unused_retries = 0
         quality_read_count = 0
+        mutation_read_count = 0
+        mutation_claim_count = 0
         successful_mutation_paths: set[str] = set()
         max_invalid_json_attempts = 4 if self.provider_name.casefold() == "ollama" else 2
         for step in range(1, self.max_steps + 1):
@@ -3133,11 +3347,15 @@ class WorkspaceUltraAgent:
                         "other tool. Preserve every exact module_id. Each scenario requires "
                         "non-empty executable steps and observable assertions. Supported steps "
                         "are click(role/name or selector), fill(role/name or selector plus value), "
-                        "and press(key); never emit action type. Assertions require a target, "
-                        "property value or text, and equals or contains. role values must be ARIA "
+                        "and press(key); never put text on a click step. Assertions require a target, "
+                        "a supported property (value, text, textContent, id, visible, checked, "
+                        "count, visibleCount, dataObjectCount, or dataVisualState), and equals or "
+                        "contains. Interactive canvas/WebGL work must expose and assert a bounded "
+                        "data-object-count or data-visual-state value after the relevant user actions; "
+                        "canvas presence alone does not prove rendering behavior. role values must be ARIA "
                         "roles such as textbox, button, heading, or status, never HTML tags like "
                         "input, h2, or div. Use property value only with form-control roles; use "
-                        "property text for status, heading, button, and other elements."
+                        "property text or textContent for status, heading, button, and other elements."
                         " module_id belongs on each parent modules[] object, never inside an "
                         "individual browser_scenarios[] object."
                     )
@@ -3187,7 +3405,36 @@ class WorkspaceUltraAgent:
                         "separate; do not recreate a child's implementation from its summary. The harness "
                         "will reject assembly when approved child bytes are neither copied nor inlined."
                     )
-                turn = self.provider.call(conversation, schemas, system_prompt)
+                provider_schemas = schemas
+                if self.provider_name.casefold() == "ollama" and schemas:
+                    # Ollama's native tool transport is deliberately atomic.
+                    # A local runner can therefore generate indefinitely with
+                    # zero observable response bytes, including during coder
+                    # mutation turns. Transport one action as streamed JSON and
+                    # rebuild it below through the same role/phase allow-list;
+                    # tool execution and approval semantics remain unchanged.
+                    compact_contracts = [
+                        {
+                            "name": _schema_name(schema),
+                            "parameters": dict(
+                                schema.get("function", {}).get("parameters", {})
+                            ),
+                        }
+                        for schema in schemas
+                        if _schema_name(schema)
+                    ]
+                    system_prompt += (
+                        "\n\nNATIVE TOOL TRANSPORT IS DISABLED FOR THIS LOCAL STAGE. "
+                        "Propose exactly one available action as "
+                        '{"name":"AVAILABLE_NAME","args":{...}} with no prose. '
+                        "The harness validates and executes it. Use this exact compact "
+                        "action contract:\n"
+                        + _json(compact_contracts)
+                    )
+                    provider_schemas = []
+                turn = self.provider.call(
+                    conversation, provider_schemas, system_prompt
+                )
             except Exception as exc:
                 status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
                 if status == 429 or "rate limit" in str(exc).casefold():
@@ -3199,24 +3446,9 @@ class WorkspaceUltraAgent:
                 for key in totals:
                     totals[key] += int(getattr(turn.usage, key, 0) or 0)
             if not turn.tool_calls and schemas and turn.text:
-                candidate = extract_first_json_object(turn.text)
-                proposal = normalize_action_proposal(candidate) if candidate is not None else None
-                if proposal is None and isinstance(candidate, Mapping):
-                    nested_calls = candidate.get("tool_calls")
-                    if isinstance(nested_calls, (list, tuple)) and nested_calls:
-                        nested = nested_calls[0]
-                        if isinstance(nested, Mapping):
-                            proposal = normalize_action_proposal(
-                                {
-                                    "name": nested.get("tool_name")
-                                    or nested.get("name")
-                                    or nested.get("tool"),
-                                    "args": nested.get("parameters")
-                                    or nested.get("arguments")
-                                    or nested.get("args")
-                                    or {},
-                                }
-                            )
+                proposal, action_transport_receipt = extract_action_proposal(
+                    turn.text
+                )
                 if proposal is not None:
                     name, args = proposal
                     allowed = {_schema_name(schema) for schema in schemas}
@@ -3236,6 +3468,7 @@ class WorkspaceUltraAgent:
                             role=self.role.value,
                             phase=request.phase,
                             tool=name,
+                            normalization=action_transport_receipt.to_dict(),
                         )
             conversation.append(turn.to_message())
             if turn.tool_calls:
@@ -3329,6 +3562,16 @@ class WorkspaceUltraAgent:
                         if _schema_name(schema)
                     }
                     if call.name not in exposed_tools:
+                        if (
+                            local_governed_mutation_phase
+                            and inspection_observed
+                            and call.name in _READ_TOOLS
+                        ):
+                            raise _MutationTransportExhausted(
+                                f"{self.role.value} repeated a read after the one-read "
+                                "mutation budget; the required next action is an "
+                                "approval-bound write_file call"
+                            )
                         result = (
                             f"Error: tool {call.name!r} is not allowed for "
                             f"{self.role.value} during {request.phase}"
@@ -3839,6 +4082,8 @@ class WorkspaceUltraAgent:
                             )
                     if effective_call.name in _READ_TOOLS and not str(result).startswith("Error:"):
                         inspection_observed = True
+                        if local_governed_mutation_phase:
+                            mutation_read_count += 1
                     if effective_call.name in _WRITE_TOOLS and not str(result).startswith("Error:"):
                         mutation_observed = True
                         if mutation_path:
@@ -3851,6 +4096,108 @@ class WorkspaceUltraAgent:
                             "content": result,
                         }
                     )
+                    if (
+                        local_governed_mutation_phase
+                        and effective_call.name in _READ_TOOLS
+                        and not str(result).startswith("Error:")
+                    ):
+                        # One focused read is enough for a local mutation
+                        # turn. Replace the growing conversation with the
+                        # exact approved target packet and expose only file
+                        # mutation tools. This prevents a weak model from
+                        # spending all 16 steps repeatedly inspecting or
+                        # returning a read-only success envelope.
+                        target_state = next(
+                            (
+                                dict(item)
+                                for item in write_target_state
+                                if str(item.get("path") or "").strip()
+                            ),
+                            {},
+                        )
+                        target_path = str(target_state.get("path") or "").strip()
+                        conversation = [
+                            {
+                                "role": "user",
+                                "content": _json(
+                                    {
+                                        "node_id": request.node_id,
+                                        "phase": request.phase,
+                                        "objective": str(
+                                            request_contract.get("objective") or ""
+                                        )[:800],
+                                        "required_corrections": mutation_requirements,
+                                        "acceptance_criteria": mutation_acceptance_criteria,
+                                        "approved_write_paths": [
+                                            str(path)
+                                            for path in tuple(
+                                                request_contract.get("write_paths", ())
+                                                or ()
+                                            )
+                                        ],
+                                        "next_target": {
+                                            "path": target_path,
+                                            "exists": bool(target_state.get("exists")),
+                                            "current_content": str(result)[:40_000],
+                                        },
+                                        "required_action": (
+                                            "Return exactly one edit_file action for the existing "
+                                            "next_target.path (or write_file only when it does not exist) with "
+                                            "the complete implementation required by the approved "
+                                            "module contract. Return "
+                                            "no prose, do not use another read tool, and do not "
+                                            "claim completion without the governed write receipt."
+                                        ),
+                                    }
+                                ),
+                            }
+                        ]
+                        schemas[:] = [
+                            schema
+                            for schema in schemas
+                            if _schema_name(schema) in _FILE_WRITE_TOOLS
+                        ]
+                        self.events.publish(
+                            "ultra.mutation_read_budget_closed",
+                            "Closed local read tools after one focused inspection and "
+                            "requested the approval-bound write.",
+                            run_id=request.run_id,
+                            node_id=request.node_id,
+                            role=self.role.value,
+                            phase=request.phase,
+                            path=target_path,
+                            read_count=mutation_read_count,
+                        )
+                    if (
+                        local_governed_mutation_phase
+                        and effective_call.name in _FILE_WRITE_TOOLS
+                        and not str(result).startswith("Error:")
+                        and schemas
+                    ):
+                        # One governed mutation is the end of this isolated
+                        # local-model turn. Subsequent tester/reviewer/browser
+                        # roles remain separate mandatory gates.
+                        schemas.clear()
+                        conversation.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "The governed mutation succeeded and tools are now closed for "
+                                    "this turn. Return exactly one response_contract JSON object "
+                                    "using the mutation receipt. Do not claim product acceptance, "
+                                    "review, browser, or test success."
+                                ),
+                            }
+                        )
+                        self.events.publish(
+                            "ultra.mutation_handoff_requested",
+                            "Closed local mutation tools after the first successful write and requested one typed handoff.",
+                            run_id=request.run_id,
+                            node_id=request.node_id,
+                            role=self.role.value,
+                            phase=request.phase,
+                            path=mutation_path,
+                        )
                     if repeated_mutation_path and schemas:
                         # The durable executor/replay guard has already
                         # accepted this exact path. A weak model repeating the
@@ -4213,6 +4560,7 @@ class WorkspaceUltraAgent:
                             )
                             if not write_result.startswith("Error:"):
                                 mutation_observed = True
+                                successful_mutation_paths.add(proposed_path)
                                 if repaired_python_escaping:
                                     self.events.publish(
                                         "ultra.proposed_write_normalized",
@@ -4231,19 +4579,83 @@ class WorkspaceUltraAgent:
                                     characters=len(proposed_content),
                                 )
                 if requires_mutation and not mutation_observed:
-                    conversation.append(
+                    mutation_claim_count += 1
+                    if mutation_claim_count >= 2:
+                        raise _MutationTransportExhausted(
+                            f"{self.role.value} returned {mutation_claim_count} "
+                            "structured responses without the required governed "
+                            f"mutation for write_paths={list(contract_payload.get('write_paths', ()))!r}"
+                        )
+                    reset_cache = getattr(self.provider, "reset_model_cache", None)
+                    cache_reset = False
+                    if callable(reset_cache):
+                        try:
+                            reset_cache()
+                            cache_reset = True
+                        except Exception:
+                            cache_reset = False
+                    target_state = next(
+                        (
+                            dict(item)
+                            for item in write_target_state
+                            if str(item.get("path") or "").strip()
+                        ),
+                        {},
+                    )
+                    target_path = str(target_state.get("path") or "").strip()
+                    conversation = [
                         {
                             "role": "user",
-                            "content": (
-                                "No successful workspace mutation was observed. This phase owns "
-                                f"write_paths={list(contract_payload.get('write_paths', ()))!r}. "
-                                "Use an allowed write/edit tool now, then inspect the changed artifact "
-                                "Use write_file for a complete artifact replacement; use edit_file only "
-                                "with an exact old_str from harness_write_target_state. "
-                                "and only afterward return the required JSON result. A prose or JSON-only "
-                                "claim cannot complete an implementation/fix phase."
+                            "content": _json(
+                                {
+                                    "node_id": request.node_id,
+                                    "phase": request.phase,
+                                    "objective": str(
+                                        contract_payload.get("objective") or ""
+                                    )[:800],
+                                    "required_corrections": mutation_requirements,
+                                    "acceptance_criteria": mutation_acceptance_criteria,
+                                    "approved_write_paths": list(
+                                        contract_payload.get("write_paths", ()) or ()
+                                    ),
+                                    "next_target": {
+                                        "path": target_path,
+                                        "exists": bool(target_state.get("exists")),
+                                        "current_content": str(
+                                            target_state.get("content") or ""
+                                        )[:40_000],
+                                    },
+                                    "rejected_claim_fingerprint": hashlib.sha256(
+                                        _json(response.payload).encode("utf-8")
+                                    ).hexdigest(),
+                                    "required_action": (
+                                        "Return exactly one edit_file action for an existing "
+                                        "next_target.path (or write_file only when it does not exist) "
+                                        "with the complete approved "
+                                        "implementation. Return no prose, do not read "
+                                        "again, and do not return a success JSON before "
+                                        "the governed write receipt."
+                                    ),
+                                }
                             ),
                         }
+                    ]
+                    schemas[:] = [
+                        schema
+                        for schema in schemas
+                        if _schema_name(schema) in _FILE_WRITE_TOOLS
+                    ]
+                    self.events.publish(
+                        "ultra.mutation_claim_rejected",
+                        "Rejected a read-only implementation claim, reset the local "
+                        "model cache, and requested one approval-bound write.",
+                        run_id=request.run_id,
+                        node_id=request.node_id,
+                        role=self.role.value,
+                        phase=request.phase,
+                        path=target_path,
+                        claim_count=mutation_claim_count,
+                        cache_reset=cache_reset,
                     )
                     continue
                 if component_publication_phase and not component_publication_passed:
@@ -4262,13 +4674,132 @@ class WorkspaceUltraAgent:
                     continue
                 return response
             except Exception as exc:
+                if isinstance(exc, _MutationTransportExhausted):
+                    raise
                 content_preview = redact_text(str(turn.text or ""), 800)
                 compact_preview = re.sub(r"\s+", "", content_preview)
                 internal_token_only = bool(
                     re.fullmatch(r"(?:<unused\d+>)+", compact_preview)
                 )
                 empty_transport_turn = not compact_preview and not turn.tool_calls
+                if (
+                    local_governed_mutation_phase
+                    and mutation_observed
+                    and bool(successful_mutation_paths)
+                ):
+                    recovered = AgentResponse.from_mapping(
+                        {
+                            "payload": {
+                                "success": True,
+                                "passed": True,
+                                "phase_receipt_only": True,
+                                "handoff_transport_failed": True,
+                                "recovered_from_empty_provider_turn": bool(
+                                    internal_token_only or empty_transport_turn
+                                ),
+                                "artifacts": [
+                                    {
+                                        "kind": "governed_mutation_receipt",
+                                        "path": path,
+                                    }
+                                    for path in sorted(successful_mutation_paths)
+                                ],
+                                "evidence": [
+                                    {
+                                        "kind": "governed_mutation_receipt",
+                                        "path": path,
+                                        "status": "executed",
+                                    }
+                                    for path in sorted(successful_mutation_paths)
+                                ],
+                                "findings": [],
+                            },
+                            "summary": (
+                                f"{self.role.value} governed mutation completed; "
+                                "the typed handoff transport was recovered from its receipt."
+                            ),
+                            "reasoning_summary": (
+                                "This receipt closes only the mutation phase. Independent "
+                                "tester, reviewer, browser, and final-evidence gates remain required."
+                            ),
+                        },
+                        node_id=request.node_id,
+                        provider="harness",
+                        model="same-turn-mutation-receipt-v2",
+                        usage=totals,
+                    )
+                    self.events.publish(
+                        "ultra.mutation_handoff_recovered",
+                        recovered.summary,
+                        run_id=request.run_id,
+                        node_id=request.node_id,
+                        role=self.role.value,
+                        phase=request.phase,
+                        paths=sorted(successful_mutation_paths),
+                        error_type=type(exc).__name__,
+                        response_fingerprint=hashlib.sha256(
+                            str(turn.text or "").encode("utf-8")
+                        ).hexdigest(),
+                    )
+                    return recovered
                 if internal_token_only or empty_transport_turn:
+                    if (
+                        mutation_observed
+                        and bool(successful_mutation_paths)
+                        and request.phase
+                        in {
+                            InnerPhase.IMPLEMENT.value,
+                            InnerPhase.FIX.value,
+                            InnerPhase.INTEGRATE.value,
+                        }
+                        and self.role in {AgentRole.CODER, AgentRole.INTEGRATOR}
+                    ):
+                        recovered = AgentResponse.from_mapping(
+                            {
+                                "payload": {
+                                    "success": True,
+                                    "passed": True,
+                                    "recovered_from_empty_provider_turn": True,
+                                    "artifacts": [
+                                        {
+                                            "kind": "governed_mutation_receipt",
+                                            "path": path,
+                                        }
+                                        for path in sorted(successful_mutation_paths)
+                                    ],
+                                    "evidence": [
+                                        {
+                                            "kind": "governed_mutation_receipt",
+                                            "path": path,
+                                            "status": "executed",
+                                        }
+                                        for path in sorted(successful_mutation_paths)
+                                    ],
+                                    "findings": [],
+                                },
+                                "summary": (
+                                    f"{self.role.value} mutation receipt recovered after an "
+                                    "empty local-model handoff."
+                                ),
+                                "reasoning_summary": (
+                                    "The executor confirmed a governed write in this exact agent "
+                                    "turn. Independent artifact, review, and runtime gates remain required."
+                                ),
+                            },
+                            node_id=request.node_id,
+                            provider="harness",
+                            model="same-turn-mutation-receipt-v1",
+                        )
+                        self.events.publish(
+                            "ultra.same_turn_mutation_receipt_recovered",
+                            recovered.summary,
+                            run_id=request.run_id,
+                            node_id=request.node_id,
+                            role=self.role.value,
+                            phase=request.phase,
+                            paths=sorted(successful_mutation_paths),
+                        )
+                        return recovered
                     local_foundation_transport = bool(
                         request.phase in {"master_plan", "browser_scenarios"}
                         and self.provider_name == "ollama"
@@ -4279,6 +4810,7 @@ class WorkspaceUltraAgent:
                             or component_leaf_quality_phase
                             or component_quality_triage_phase
                             or local_foundation_transport
+                            or local_governed_mutation_phase
                         )
                         and component_unused_retries < 2
                     ):
@@ -4319,8 +4851,51 @@ class WorkspaceUltraAgent:
                                         "Call submit_browser_scenarios exactly once. Preserve each "
                                         "module_id and return at least one scenario with non-empty "
                                         "executable steps and observable assertions. Use only click, "
-                                        "fill with value, or press with key. Assertions require a target, "
-                                        "property value or text, and equals or contains."
+                                        "fill with value, or press with key; do not add text to click. "
+                                        "Assertions require a target, a supported property (value, text, "
+                                        "textContent, id, visible, checked, count, visibleCount, "
+                                        "dataObjectCount, or dataVisualState), and "
+                                        "equals or contains."
+                                    ),
+                                }
+                            )
+                        elif local_governed_mutation_phase:
+                            target_state = next(
+                                (
+                                    dict(item)
+                                    for item in write_target_state
+                                    if not bool(item.get("exists"))
+                                ),
+                                dict(write_target_state[0])
+                                if write_target_state
+                                else {},
+                            )
+                            target_path = str(target_state.get("path") or "").strip()
+                            recovery_content = _json(
+                                {
+                                    "node_id": request.node_id,
+                                    "phase": request.phase,
+                                    "objective": str(
+                                        request_contract.get("objective") or ""
+                                    )[:800],
+                                    "approved_write_paths": [
+                                        str(path)
+                                        for path in tuple(
+                                            request_contract.get("write_paths", ()) or ()
+                                        )
+                                    ],
+                                    "next_target": {
+                                        "path": target_path,
+                                        "exists": bool(target_state.get("exists")),
+                                        "current_content": str(
+                                            target_state.get("content") or ""
+                                        )[:8_000],
+                                    },
+                                    "required_action": (
+                                        "Return exactly one write_file action for next_target.path "
+                                        "with the complete implementation required by the approved "
+                                        "module contract. Do not claim other files were written. "
+                                        "Return no prose and do not use read tools."
                                     ),
                                 }
                             )
@@ -4380,6 +4955,8 @@ class WorkspaceUltraAgent:
                                 if request.phase == "master_plan" and local_foundation_transport
                                 else "ultra.browser_scenarios_transport_recovered"
                                 if request.phase == "browser_scenarios" and local_foundation_transport
+                                else "ultra.mutation_transport_recovered"
+                                if local_governed_mutation_phase
                                 else "ultra.component_transport_recovered"
                             ),
                             (
@@ -11017,7 +11594,7 @@ class UltraSession:
             return self.orchestrator.master_plan
         if run.goal_spec is None or run.architecture_spec is None:
             raise RuntimeError(
-                "the interrupted ULTRA foundation has no recoverable question checkpoint; use /replan"
+                "the interrupted ULTRA foundation has no recoverable question checkpoint; choose Replan"
             )
 
         self.goal_id = run.goal_id
@@ -11491,6 +12068,92 @@ class UltraSession:
             plan,
         )
         return plan
+
+    def adopt_plan_revision(self, plan: Plan) -> MasterPlanV1:
+        """Rebind an edited pre-approval Plan to the exact Ultra master graph.
+
+        The browser edits the durable Plan record, never a parallel execution
+        graph. Before approval we rebuild only the unstarted first layer and
+        bind both representations to the same fingerprint.
+        """
+
+        if not self.orchestrator or not self.adapter or not self.run_id:
+            raise RuntimeError("there is no live ULTRA foundation to update")
+        run = self.store.get_ultra_run(self.run_id)
+        if run.master_approved or self.adapter.approved:
+            raise RuntimeError("an approved ULTRA graph cannot adopt a new plan revision")
+        if self.adapter._persisted_nodes:
+            raise RuntimeError("first-layer work already exists; create a guided replan instead")
+
+        from .ultra import TaskContractV1 as EngineTaskContract
+
+        paths_by_task: dict[str, list[str]] = {}
+        for change in plan.expected_changes:
+            if not isinstance(change, Mapping):
+                continue
+            path = str(change.get("path") or "").strip()
+            if not path or path.startswith("<"):
+                continue
+            for task_id in change.get("supports_tasks", ()):
+                paths_by_task.setdefault(str(task_id), []).append(path)
+        task_to_node = {
+            task.id: str(task.metadata.get("ultra_node_id") or task.id)
+            for task in plan.tasks
+        }
+        modules = []
+        nodes: dict[str, EngineWorkNode] = {}
+        for position, task in enumerate(plan.tasks, 1):
+            node_id = task_to_node[task.id]
+            contract = EngineTaskContract(
+                id=node_id,
+                title=task.title,
+                objective=task.description or task.title,
+                acceptance_criteria=task.acceptance_criteria,
+                verification=task.verification,
+                depends_on=tuple(
+                    task_to_node.get(dependency, dependency)
+                    for dependency in task.depends_on
+                ),
+                write_paths=tuple(dict.fromkeys(paths_by_task.get(task.id, ()))),
+                forbidden_changes=tuple(task.metadata.get("constraints") or ()),
+                owned_interfaces=tuple(task.metadata.get("owned_interfaces") or ()),
+                metadata={**dict(task.metadata), "adopted_plan_revision": plan.revision},
+            )
+            modules.append(contract)
+            nodes[node_id] = EngineWorkNode(contract=contract, order=position)
+        master = MasterPlanV1(
+            summary=plan.summary,
+            modules=tuple(modules),
+            execution_strategy=plan.execution_strategy,
+            revision=plan.revision,
+            fingerprint=plan.fingerprint,
+        )
+        self.adapter.plan = plan
+        self.adapter.task_ids = {task_to_node[task.id]: task.id for task in plan.tasks}
+        self.adapter._pending_nodes.clear()
+        self.orchestrator.master_plan = master
+        self.orchestrator.nodes = nodes
+        self.orchestrator._order = max((node.order for node in nodes.values()), default=0)
+        for node in nodes.values():
+            self.adapter.save_work_node(self.run_id, node)
+        self.store.update_ultra_run(
+            self.run_id,
+            phase=UltraPhase.AWAITING_APPROVAL,
+            status=UltraRunStatus.AWAITING_APPROVAL,
+            config={
+                "master_plan_fingerprint": plan.fingerprint,
+                "module_count": len(modules),
+                "adopted_plan_revision": plan.revision,
+            },
+        )
+        self.events.publish(
+            "ultra.plan_revision_adopted",
+            f"Ultra first-layer preview now matches Plan r{plan.revision}.",
+            run_id=self.run_id,
+            plan_revision=plan.revision,
+            plan_fingerprint=plan.fingerprint,
+        )
+        return master
 
     def approve(
         self,

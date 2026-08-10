@@ -214,13 +214,14 @@ def _interaction_target_inventory(page: Any) -> list[dict[str, str]]:
     """Return bounded, authoritative targets for a subsequent repair request."""
 
     values = page.locator(
-        "button,input,select,textarea,a,[role],[data-value]"
+        "button,input,select,textarea,a,canvas,[role],[data-value],[id]"
     ).evaluate_all(
         """elements => elements.slice(0, 100).map(element => ({
             tag: (element.tagName || '').toLowerCase(),
             id: element.id || '',
             role: element.getAttribute('role') || '',
             name: element.getAttribute('aria-label') || element.innerText || element.value || '',
+            text: element.innerText || element.textContent || '',
             data_value: element.getAttribute('data-value') || '',
             type: element.getAttribute('type') || ''
         }))"""
@@ -231,11 +232,60 @@ def _interaction_target_inventory(page: Any) -> list[dict[str, str]]:
             continue
         item = {
             key: str(raw.get(key) or "").strip()[:240]
-            for key in ("tag", "id", "role", "name", "data_value", "type")
+            for key in ("tag", "id", "role", "name", "text", "data_value", "type")
         }
         if any(item.values()):
             inventory.append(item)
     return inventory
+
+
+def _observable_value(locator: Any, prop: str) -> Any:
+    """Read one allow-listed observable without executing page-authored code."""
+
+    if prop == "value":
+        return locator.input_value()
+    if prop == "text":
+        return locator.inner_text()
+    if prop == "textContent":
+        return locator.text_content() or ""
+    if prop == "id":
+        return locator.get_attribute("id") or ""
+    if prop == "visible":
+        return bool(locator.is_visible())
+    if prop == "checked":
+        return bool(locator.is_checked())
+    if prop == "count":
+        return int(locator.count())
+    if prop == "visibleCount":
+        return int(
+            locator.evaluate_all(
+                "elements => elements.filter(element => !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length)).length"
+            )
+        )
+    if prop == "dataObjectCount":
+        return locator.get_attribute("data-object-count") or ""
+    if prop == "dataVisualState":
+        return locator.get_attribute("data-visual-state") or ""
+    raise ValueError(f"unsupported observable property {prop!r}")
+
+
+def _comparison_text(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+class _MissingRequiredElement(ValueError):
+    """An exact assertion target is absent from the candidate application."""
+
+
+def _is_exact_id_assertion(item: Mapping[str, Any]) -> bool:
+    expected = str(item.get("equals") or "").strip()
+    return bool(
+        item.get("property") == "id"
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]*", expected)
+        and str(item.get("selector") or "").strip() == f"#{expected}"
+    )
 
 
 def _run_interaction_scenarios(
@@ -270,15 +320,38 @@ def _run_interaction_scenarios(
             assertions: list[dict[str, Any]] = []
             for raw_assertion in list(scenario.get("assertions") or ())[:20]:
                 assertion = dict(raw_assertion)
-                locator = _require_unique_interaction_locator(page, assertion)
                 prop = str(assertion.get("property") or "")
-                observed = locator.input_value() if prop == "value" else locator.inner_text()
+                try:
+                    locator = (
+                        _interaction_locator(page, assertion)
+                        if prop in {"count", "visibleCount"}
+                        else _require_unique_interaction_locator(page, assertion)
+                    )
+                    if (
+                        prop in {"count", "visibleCount"}
+                        and not str(assertion.get("selector") or "").strip()
+                        and locator.count() == 0
+                    ):
+                        raise ValueError(
+                            "interaction count target matched no elements: "
+                            f"role={str(assertion.get('role') or '').strip()!r} "
+                            f"name={str(assertion.get('name') or '').strip()!r}"
+                        )
+                except ValueError as exc:
+                    if (
+                        _is_exact_id_assertion(assertion)
+                        and "matched no elements" in str(exc).casefold()
+                    ):
+                        raise _MissingRequiredElement(str(exc)) from exc
+                    raise
+                observed = _observable_value(locator, prop)
                 expected = assertion.get("equals")
                 contains = assertion.get("contains")
+                observed_text = _comparison_text(observed)
                 passed = (
-                    observed == str(expected)
+                    observed_text == _comparison_text(expected)
                     if expected is not None
-                    else str(contains) in observed
+                    else _comparison_text(contains) in observed_text
                     if contains is not None
                     else False
                 )
@@ -298,9 +371,10 @@ def _run_interaction_scenarios(
         except Exception as exc:
             receipt["error"] = f"{type(exc).__name__}: {exc}"
             receipt["failure_kind"] = (
-                "contract"
-                if "unknown key" in str(exc).casefold()
-                or isinstance(exc, ValueError)
+                "application"
+                if isinstance(exc, _MissingRequiredElement)
+                else "contract"
+                if "unknown key" in str(exc).casefold() or isinstance(exc, ValueError)
                 else "application"
             )
         results.append(receipt)

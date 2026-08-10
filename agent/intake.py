@@ -29,6 +29,7 @@ class RunMode(str, Enum):
             "chat": "normal", "goal": "normal", "manual": "normal",
             "default": "normal", "auto": "normal", "agent": "normal",
             "working": "normal", "work": "normal",
+            "ultra-plan": "plan", "ultra_plan": "plan", "ultraplan": "plan",
             "deep": "ultra", "max": "ultra",
         }.get(normalized, normalized)
         try:

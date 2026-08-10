@@ -254,6 +254,54 @@ class PlanHarnessV4Tests(unittest.TestCase):
         )
         self.assertTrue(actions)
 
+    def test_plan_normalization_repairs_empty_and_singleton_object_dependencies(self):
+        normalized, actions = normalize_plan_draft(
+            {
+                "summary": "Create and verify one tiny artifact.",
+                "tasks": [
+                    {
+                        "id": "T1_Create_File",
+                        "title": "Create file",
+                        "description": "Create hello.txt with exact bytes.",
+                        "acceptance_criteria": ["hello.txt contains hello and one newline."],
+                        "verification": ["Read hello.txt and compare its exact bytes."],
+                        "depends_on": [""],
+                    },
+                    {
+                        "id": "T2_Verify_File",
+                        "title": "Verify file",
+                        "description": "Verify the requested final bytes.",
+                        "acceptance_criteria": ["The exact-byte check passes."],
+                        "verification": ["Read hello.txt and compare its exact bytes."],
+                        "depends_on": [{"T1_Create_File": {}}],
+                    },
+                ],
+                "expected_changes": [
+                    {
+                        "path": "hello.txt",
+                        "intent": "Create the requested file.",
+                        "basis": "explicit_user_requirement",
+                        "evidence_refs": ["user:request"],
+                        "supports_tasks": ["T1_Create_File"],
+                    }
+                ],
+                "execution_strategy": "Create the file, then verify its exact bytes.",
+                "applicability_evidence": [
+                    {
+                        "source": "inspection:I001",
+                        "fact": "The workspace was inspected.",
+                        "supports_tasks": ["T1_Create_File", "T2_Verify_File"],
+                    }
+                ],
+            }
+        )
+
+        validate_normalized_plan(normalized)
+        self.assertEqual(normalized["tasks"][0]["depends_on"], [])
+        self.assertEqual(normalized["tasks"][1]["depends_on"], ["T001"])
+        self.assertTrue(any("dropped an empty dependency" in item for item in actions))
+        self.assertTrue(any("singleton dependency object's key" in item for item in actions))
+
     def test_plan_normalization_derives_only_description_from_complete_task_contract(self):
         normalized, actions = normalize_plan_draft(
             {
@@ -628,7 +676,7 @@ class PersistenceV4Tests(unittest.TestCase):
             self.assertEqual(migrated.get_goal(goal_id).objective, "Quality test")
             check = sqlite3.connect(database)
             try:
-                self.assertEqual(check.execute("PRAGMA user_version").fetchone()[0], 15)
+                self.assertEqual(check.execute("PRAGMA user_version").fetchone()[0], 16)
             finally:
                 check.close()
             migrated._migrate_v4()

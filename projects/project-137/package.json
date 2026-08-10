@@ -1,0 +1,13 @@
+{
+  "name": "calculator-logic",
+  "version": "1.0.0",
+  "description": "Core logic for the 3D calculator state.",
+  "main": "src/index.js", 
+  "scripts": {
+    "test": "echo \"Placeholder: Run unit tests here\" && exit 0"
+  },
+  "keywords": ["calculator", "three.js"],
+  "dependencies": {
+    "three": "^r128"  // Assuming three.js is a dependency based on context/name
+  }
+}

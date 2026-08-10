@@ -206,8 +206,9 @@ def test_execution_state_exposes_accepted_anchors_and_task_refs() -> None:
 
 
 def test_plan_workspace_exposes_anchor_meaning_before_approval() -> None:
-    script = (Path(__file__).parents[1] / "agent" / "web_views" / "static" / "app.js").read_text(
+    script = (Path(__file__).parents[1] / "agent" / "web_views" / "static" / "plan.js").read_text(
         encoding="utf-8"
     )
-    assert "What your words mean in the finished result" in script
+    assert "request detail" in script
+    assert "carried into this plan" in script
     assert "requirement_anchors" in script

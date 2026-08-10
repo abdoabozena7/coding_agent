@@ -1,8 +1,8 @@
-"""Parsing for the interactive agent command language.
+"""The deliberately small public slash-command language.
 
-Commands deliberately remain plain text so the same controls work in a basic
-terminal, over SSH, and in richer frontends. Both ``:`` and ``/`` prefixes are
-accepted; unprefixed text is treated as a goal or guidance by the runtime.
+Only user-facing navigation and checkpoint controls belong here.  Attention
+cards, settings rows, and recovery controls dispatch typed actions directly;
+they are not compatibility slash commands.
 """
 
 from __future__ import annotations
@@ -15,8 +15,28 @@ from typing import Any
 class CommandKind(str, Enum):
     TEXT = "text"
     MENU = "menu"
-    MODE = "mode"
+    PLAN = "plan"
+    LIVE = "live"
+    SHOW_DIFF = "show_diff"
+    ADVANCED_TRACING = "advanced_tracing"
     SETTINGS = "settings"
+    PAUSE = "pause"
+    RESUME = "resume"
+    STOP = "stop"
+    UNDO = "undo"
+    HELP = "help"
+    QUIT = "quit"
+
+
+class InternalActionKind(str, Enum):
+    """Typed TUI actions which must never be parsed from user slash text.
+
+    This is the migration boundary for existing attention cards and settings
+    controls.  Keeping it separate makes the public command surface auditable.
+    """
+
+    MODE = "mode"
+    SETTINGS_UPDATE = "settings_update"
     MODEL = "model"
     PERMISSIONS = "permissions"
     KEYMAP = "keymap"
@@ -24,7 +44,6 @@ class CommandKind(str, Enum):
     SKILLS = "skills"
     PROCESSES = "processes"
     STOP_PROCESS = "stop_process"
-    STOP = "stop"
     TREE = "tree"
     AGENTS = "agents"
     AGENT = "agent"
@@ -50,7 +69,6 @@ class CommandKind(str, Enum):
     APPROVE = "approve"
     REJECT = "reject"
     REPLAN = "replan"
-    PLAN = "plan"
     REVIEW = "review"
     CHAT = "chat"
     EXPLORER = "explorer"
@@ -61,22 +79,17 @@ class CommandKind(str, Enum):
     TASK_STATUS = "task_status"
     RUN = "run"
     AUTO = "auto"
-    PAUSE = "pause"
-    RESUME = "resume"
     STATUS = "status"
     HISTORY = "history"
     DIFF = "diff"
     VERSIONS = "versions"
-    UNDO = "undo"
     RESOLVE = "resolve"
     CANCEL = "cancel"
-    HELP = "help"
-    QUIT = "quit"
 
 
 @dataclass(frozen=True)
 class UserCommand:
-    kind: CommandKind
+    kind: CommandKind | InternalActionKind
     args: dict[str, Any] = field(default_factory=dict)
     raw: str = ""
 
@@ -86,380 +99,65 @@ class CommandParseError(ValueError):
 
 
 class UnknownCommandParseError(CommandParseError):
-    """An unrecognised slash prefix that may still be ordinary chat text."""
+    """A slash prefix which is not part of the small public surface."""
 
 
-def _required(text: str, usage: str) -> str:
-    value = text.strip()
-    if not value:
-        raise CommandParseError(f"Missing value. Usage: {usage}")
-    return value
+def internal_action(
+    kind: InternalActionKind,
+    /,
+    **args: Any,
+) -> UserCommand:
+    """Build a typed internal action without routing through slash parsing."""
 
-
-def _task_and_text(rest: str, usage: str) -> tuple[str, str]:
-    parts = rest.strip().split(maxsplit=1)
-    if len(parts) != 2:
-        raise CommandParseError(f"Usage: {usage}")
-    return parts[0].upper(), parts[1].strip()
-
-
-def _text_and_criteria(rest: str) -> tuple[str, str]:
-    # A lightweight delimiter avoids fragile shell-style quoting for long prose.
-    text, separator, criteria = rest.partition("::")
-    return _required(text, ":add TEXT [:: ACCEPTANCE CRITERIA]"), criteria.strip()
+    return UserCommand(kind=kind, args=dict(args), raw="")
 
 
 def parse_command(line: str) -> UserCommand:
+    """Parse exactly the supported public command language."""
+
     raw = line.rstrip("\r\n")
     stripped = raw.strip()
     if not stripped:
         return UserCommand(CommandKind.TEXT, {"text": ""}, raw)
-    if stripped[0] not in {":", "/"}:
-        if stripped.lower() in {"exit", "quit"}:
-            return UserCommand(CommandKind.QUIT, raw=raw)
+    if not stripped.startswith("/"):
         return UserCommand(CommandKind.TEXT, {"text": stripped}, raw)
 
-    prefix = stripped[0]
     body = stripped[1:].strip()
     if not body:
-        # Keep the parser compatibility value for callers that use ``/`` to
-        # open a palette.  The persistent controller converts a literal slash
-        # submitted as message text to Chat; Ctrl+K remains the discoverable
-        # palette entry point.
         return UserCommand(CommandKind.MENU, raw=raw)
-    command_parts = body.split(maxsplit=1)
-    name = command_parts[0].lower()
-    rest = command_parts[1].strip() if len(command_parts) == 2 else ""
+    parts = body.split(maxsplit=1)
+    name = parts[0].casefold()
+    rest = parts[1].strip() if len(parts) == 2 else ""
 
-    aliases = {
-        "ans": "answer",
-        "exit": "quit",
-        "q": "quit",
-        "ls": "plan",
-        "list": "plan",
-        "continue": "resume",
-        "go": "run",
-        "yes": "approve",
-        "reasoning": "thinking",
+    no_argument_commands = {
+        "plan": CommandKind.PLAN,
+        "live": CommandKind.LIVE,
+        "show-diff": CommandKind.SHOW_DIFF,
+        "advanced-tracing": CommandKind.ADVANCED_TRACING,
+        "settings": CommandKind.SETTINGS,
+        "pause": CommandKind.PAUSE,
+        "resume": CommandKind.RESUME,
+        "stop": CommandKind.STOP,
+        "help": CommandKind.HELP,
+        "quit": CommandKind.QUIT,
     }
-    name = aliases.get(name, name)
+    if name in no_argument_commands:
+        if rest:
+            raise CommandParseError(f"/{name} does not take arguments.")
+        args = {"key": None, "value": None} if name == "settings" else {}
+        return UserCommand(no_argument_commands[name], args, raw)
 
-    def usage(command: str, suffix: str = "") -> str:
-        return f"{prefix}{command}{(' ' + suffix) if suffix else ''}"
-
-    if name == "mode":
-        if not rest:
-            return UserCommand(CommandKind.MODE, {"mode": None}, raw)
-        mode = rest.lower()
-        mode_aliases = {
-            "working": "normal",
-            "work": "normal",
-            "manual": "normal",
-            "default": "normal",
-            "auto": "normal",
-            "agent": "normal",
-            "chat": "normal",
-            "goal": "normal",
-            "deep": "ultra",
-            "max": "ultra",
-        }
-        mode = mode_aliases.get(mode, mode)
-        if mode not in {"plan", "normal", "ultra"}:
-            raise CommandParseError(f"Usage: {usage('mode', 'goal|plan|ultra')}")
-        return UserCommand(CommandKind.MODE, {"mode": mode}, raw)
-    if name in {"api-key", "apikey", "add-api-key"}:
-        provider = rest.casefold() or None
-        return UserCommand(
-            CommandKind.SETTINGS,
-            {"key": "api_key", "value": provider},
-            raw,
-        )
-    if name == "settings":
-        if not rest:
-            return UserCommand(CommandKind.SETTINGS, {"key": None, "value": None}, raw)
-        setting_parts = rest.split(maxsplit=1)
-        key = setting_parts[0]
-        value = setting_parts[1] if len(setting_parts) == 2 else ""
-        key = key.lower().replace("-", "_")
-        if key in {"project", "reconfigure", "setup"} and not value.strip():
-            return UserCommand(CommandKind.SETUP, {"project": True}, raw)
-        return UserCommand(
-            CommandKind.SETTINGS,
-            {"key": key, "value": value.strip() or None},
-            raw,
-        )
-    if name == "model":
-        parts = rest.split()
-        efforts = {"low", "medium", "high", "xhigh"}
-        effort = parts[-1].lower() if parts and parts[-1].lower() in efforts else None
-        if effort:
-            parts.pop()
-        return UserCommand(CommandKind.MODEL, {"model": " ".join(parts) or None, "effort": effort}, raw)
-    if name in {"permissions", "permission", "access"}:
-        level = rest.lower() or None
-        if level not in {None, "normal", "full"}:
-            raise CommandParseError(f"Usage: {usage('permissions', 'normal|full')}")
-        return UserCommand(CommandKind.PERMISSIONS, {"level": level}, raw)
-    if name == "keymap":
-        if rest:
-            raise CommandParseError(f"{prefix}keymap does not take arguments.")
-        return UserCommand(CommandKind.KEYMAP, raw=raw)
-    if name in {"doctor", "readiness"}:
-        args: dict[str, Any] = {}
-        for token in rest.lower().split():
-            if token in {"--live", "live"}:
-                args["live"] = True
-            elif token in {"--record", "record"}:
-                args["record"] = True
-            else:
-                raise CommandParseError(f"Usage: {usage(name, '[--live] [--record]')}")
-        return UserCommand(CommandKind.DOCTOR, args, raw=raw)
-    if name == "skills":
-        if rest:
-            raise CommandParseError(f"{prefix}skills does not take arguments.")
-        return UserCommand(CommandKind.SKILLS, raw=raw)
-    if name == "processes":
-        if rest:
-            raise CommandParseError(f"{prefix}processes does not take arguments.")
-        return UserCommand(CommandKind.PROCESSES, raw=raw)
-    if name == "stop-process":
-        return UserCommand(
-            CommandKind.STOP_PROCESS,
-            {"resource_id": _required(rest, usage("stop-process", "ID"))},
-            raw=raw,
-        )
-    if name in {"tree", "execution", "memory", "trace", "insights"}:
-        kind = {
-            "tree": CommandKind.TREE,
-            "execution": CommandKind.TREE,
-            "memory": CommandKind.MEMORY,
-            "trace": CommandKind.TRACE,
-            "insights": CommandKind.INSIGHTS,
-        }[name]
-        return UserCommand(kind, {"target": rest or None}, raw)
-    if name == "open-web":
-        if rest:
-            raise CommandParseError(f"{prefix}open-web does not take arguments.")
-        return UserCommand(CommandKind.OPEN_WEB, raw=raw)
-    if name == "thinking":
-        action = rest.lower() or "show"
-        if action not in {"show", "hide", "status"}:
-            raise CommandParseError(f"Usage: {usage('thinking', '[show|hide|status]')}")
-        return UserCommand(CommandKind.THINKING, {"action": action}, raw=raw)
-    if name == "details":
-        return UserCommand(CommandKind.DETAILS, {"target": rest or None}, raw=raw)
-    if name == "activity":
-        if rest:
-            raise CommandParseError(f"{prefix}activity does not take arguments.")
-        return UserCommand(CommandKind.ACTIVITY, raw=raw)
-    if name == "queue":
-        if rest:
-            raise CommandParseError(f"{prefix}queue does not take arguments.")
-        return UserCommand(CommandKind.QUEUE, raw=raw)
-    if name == "enqueue":
-        parts = rest.split(maxsplit=1)
-        if len(parts) != 2 or parts[0].casefold() not in {"plan", "normal", "ultra"}:
-            raise CommandParseError(
-                f"Usage: {usage('enqueue', 'plan|normal|ultra TEXT')}"
-            )
-        return UserCommand(
-            CommandKind.ENQUEUE,
-            {"mode": parts[0].casefold(), "text": _required(parts[1], usage("enqueue", "MODE TEXT"))},
-            raw=raw,
-        )
-    if name == "stop":
-        action = rest.casefold().strip()
-        if action not in {"", "ollama"}:
-            raise CommandParseError(f"Usage: {usage('stop', '[ollama]')}")
-        return UserCommand(CommandKind.STOP, {"shutdown_ollama": action == "ollama"}, raw=raw)
-    if name == "guide":
-        return UserCommand(
-            CommandKind.GUIDE,
-            {"text": _required(rest, usage("guide", "TEXT"))},
-            raw=raw,
-        )
-    if name in {"project-brain", "projectbrain"}:
-        return UserCommand(
-            CommandKind.PROJECT_BRAIN,
-            {"target": rest or None},
-            raw=raw,
-        )
-    if name == "effective-plan":
-        if rest:
-            raise CommandParseError(f"{prefix}effective-plan does not take arguments.")
-        return UserCommand(CommandKind.EFFECTIVE_PLAN, raw=raw)
-    if name == "ultra-details":
-        if rest:
-            raise CommandParseError(f"{prefix}ultra-details does not take arguments.")
-        return UserCommand(CommandKind.ULTRA_DETAILS, raw=raw)
-    if name == "sessions":
-        return UserCommand(
-            CommandKind.SESSIONS,
-            {"target": rest or None},
-            raw=raw,
-        )
-    if name == "agents":
-        if rest in {"", "--all", "all"}:
-            return UserCommand(
-                CommandKind.AGENTS,
-                {"all": bool(rest), "target": None},
-                raw,
-            )
-        if rest.startswith("--"):
-            raise CommandParseError(f"Usage: {usage('agents', '[--all|AGENT]')}")
-        return UserCommand(CommandKind.AGENT, {"target": rest}, raw)
-    if name == "agent":
-        return UserCommand(CommandKind.AGENT, {"target": rest or None}, raw)
-    if name in {"questions", "metrics"}:
-        if rest:
-            raise CommandParseError(f"{prefix}{name} does not take arguments.")
-        return UserCommand(CommandKind(name), raw=raw)
-    if name == "setup":
-        if rest.casefold() in {"project", "settings", "reconfigure"}:
-            return UserCommand(CommandKind.SETUP, {"project": True}, raw=raw)
-        if rest:
-            raise CommandParseError(f"Usage: {prefix}setup [project]")
-        return UserCommand(CommandKind.SETUP, raw=raw)
-    if name == "sleep":
-        action = rest.lower() or "status"
-        if action not in {"on", "safe", "full", "off", "status"}:
-            raise CommandParseError(f"Usage: {usage('sleep', 'on|safe|full|off|status')}")
-        return UserCommand(CommandKind.SLEEP, {"action": action}, raw)
-    if name == "answer":
-        parts = rest.split(maxsplit=1)
-        if len(parts) == 1 and parts[0] in {"1", "2", "3"}:
-            return UserCommand(
-                CommandKind.ANSWER,
-                {"question_id": "", "value": parts[0]},
-                raw,
-            )
-        if len(parts) != 2:
-            raise CommandParseError(
-                f"Usage: {usage('answer', 'QUESTION_ID VALUE')}. "
-                f"Example: {usage('answer', 'q1 1')}; or answer the current decision with "
-                f"{usage('answer', '1')}."
-            )
-        return UserCommand(CommandKind.ANSWER, {"question_id": parts[0], "value": parts[1].strip()}, raw)
-
-    if name == "goal":
-        return UserCommand(CommandKind.GOAL, {"objective": _required(rest, usage("goal", "OBJECTIVE"))}, raw)
-    if name == "approve":
-        revision = None
-        if rest:
-            try:
-                revision = int(rest)
-            except ValueError as exc:
-                raise CommandParseError("Plan revision must be an integer.") from exc
-        return UserCommand(CommandKind.APPROVE, {"revision": revision}, raw)
-    if name in {"reject", "replan"}:
-        feedback = _required(rest, usage(name, "FEEDBACK"))
-        kind = CommandKind.REJECT if name == "reject" else CommandKind.REPLAN
-        return UserCommand(kind, {"feedback": feedback}, raw)
-    if name == "help":
-        return UserCommand(CommandKind.HELP, {"topic": rest.lower() or None}, raw)
-    if name == "plan":
-        # Legacy ``/plan edit`` is accepted only as a compatibility alias for
-        # the same web launcher. It no longer opens a terminal editor.
-        action = rest.lower() or "show"
-        if action not in {"show", "edit"}:
-            raise CommandParseError(f"{prefix}plan is a web-view launcher.")
-        return UserCommand(CommandKind.PLAN, {"action": action}, raw=raw)
-    if name == "review":
-        if rest:
-            raise CommandParseError(f"{prefix}review is a web-view launcher and does not take arguments.")
-        return UserCommand(CommandKind.REVIEW, raw=raw)
-    if name == "chat":
-        if rest:
-            raise CommandParseError(f"{prefix}chat does not take arguments.")
-        return UserCommand(CommandKind.CHAT, raw=raw)
-    if name in {"explorer", "open-folder"}:
-        if rest:
-            raise CommandParseError(f"{prefix}{name} does not take arguments.")
-        return UserCommand(CommandKind.EXPLORER, raw=raw)
-    if name in {"status", "history", "versions", "auto", "pause", "resume", "quit"}:
-        if rest:
-            raise CommandParseError(f"{prefix}{name} does not take arguments.")
-        return UserCommand(CommandKind(name), raw=raw)
     if name == "undo":
         steps = 1
         if rest:
             try:
                 steps = int(rest)
             except ValueError as exc:
-                raise CommandParseError(f"Usage: {usage('undo', '[STEPS]')}") from exc
+                raise CommandParseError("Usage: /undo [STEPS]") from exc
             if steps < 1:
                 raise CommandParseError("Undo steps must be a positive integer.")
-        return UserCommand(CommandKind.UNDO, {"steps": steps}, raw=raw)
-    if name == "diff":
-        if len(rest.split()) > 1:
-            raise CommandParseError(f"Usage: {usage('diff', '[CHECKPOINT_OR_COMMIT]')}")
-        return UserCommand(CommandKind.DIFF, {"target": rest or None}, raw=raw)
-    if name == "cancel":
-        return UserCommand(CommandKind.CANCEL, {"confirmation": rest}, raw)
-    if name == "resolve":
-        parts = rest.split(maxsplit=2)
-        if len(parts) < 3:
-            raise CommandParseError(
-                f"Usage: {usage('resolve', 'ACTION_OR_DELEGATION_ID applied|not-run INSPECTION NOTE')}"
-            )
-        resolution = parts[1].lower().replace("_", "-")
-        if resolution not in {"applied", "not-run"}:
-            raise CommandParseError("Resolution must be 'applied' or 'not-run'.")
-        return UserCommand(
-            CommandKind.RESOLVE,
-            {"action_id": parts[0], "resolution": resolution, "note": parts[2].strip()},
-            raw,
-        )
-    if name == "run":
-        steps = None
-        if rest:
-            try:
-                steps = int(rest)
-            except ValueError as exc:
-                raise CommandParseError("Run steps must be a positive integer.") from exc
-            if steps < 1:
-                raise CommandParseError("Run steps must be a positive integer.")
-        return UserCommand(CommandKind.RUN, {"steps": steps}, raw)
-    if name == "add":
-        try:
-            text, criteria = _text_and_criteria(rest)
-        except CommandParseError as exc:
-            if prefix == "/":
-                raise CommandParseError(str(exc).replace(":add", "/add")) from exc
-            raise
-        return UserCommand(CommandKind.ADD, {"text": text, "acceptance_criteria": criteria}, raw)
-    if name == "edit":
-        parts = rest.split(maxsplit=2)
-        fields = {"title", "description", "accept", "verify", "depends", "risk"}
-        if len(parts) >= 3 and parts[1].lower() in fields:
-            task_id, field_name, value = parts[0].upper(), parts[1].lower(), parts[2].strip()
-        else:
-            task_id, value = _task_and_text(rest, usage("edit", "TASK_ID [FIELD] VALUE"))
-            field_name = "task"
-        return UserCommand(
-            CommandKind.EDIT,
-            {"task_id": task_id, "field": field_name, "value": value},
-            raw,
-        )
-    if name in {"remove", "rm"}:
-        return UserCommand(
-            CommandKind.REMOVE,
-            {"task_id": _required(rest, usage("remove", "TASK_ID")).upper()},
-            raw,
-        )
-    if name in {"done", "todo", "block", "skip"}:
-        parts = rest.split(maxsplit=1)
-        if not parts:
-            raise CommandParseError(f"Usage: {usage(name, 'TASK_ID [NOTE]')}")
-        status = {"done": "done", "todo": "pending", "block": "blocked", "skip": "skipped"}[name]
-        return UserCommand(
-            CommandKind.TASK_STATUS,
-            {"task_id": parts[0].upper(), "status": status, "note": parts[1] if len(parts) > 1 else ""},
-            raw,
-        )
-    if name == "todo":  # defensive; handled above, retained for readability
-        raise CommandParseError(f"Usage: {usage('todo', 'TASK_ID [NOTE]')}")
+        return UserCommand(CommandKind.UNDO, {"steps": steps}, raw)
 
     raise UnknownCommandParseError(
-        f"Unknown command '{prefix}{name}'. Type /help for commands."
+        "Unknown slash command. Use /help to see the supported commands."
     )

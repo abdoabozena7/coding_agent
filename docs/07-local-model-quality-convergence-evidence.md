@@ -81,7 +81,7 @@
 ## End-to-end validation (2026-07-13)
 
 - Full suite: **347 passed, 2 skipped, 46 subtests passed** in 47.21 seconds.
-- `/doctor --record`: structural and behavioral readiness passed, including code
+- Settings → Diagnostics → Record: structural and behavioral readiness passed, including code
   retrieval MRR `1.00`, shallow reasoning rejection (`0.2`), strong reasoning-graph
   acceptance (`1.0`), two-voter swarm consensus, and evaluation-driven remediation.
   A second process on the same workspace recorded both structural and behavioral
@@ -113,7 +113,7 @@
   Cold indexing took `190.540s`; updating 50 changed files took `4.104s`;
   query p95 was `0.128s`; measured peak allocation was `164,125,072` bytes.
   All acceptance thresholds passed: update `<5s`, query p95 `<2s`, memory `<4GB`.
-- Live `/doctor --live --record` against local `gemma4:e4b` passed structural,
+- Live Diagnostics recording against local `gemma4:e4b` passed structural,
   behavioral, and live orchestration-delta gates. The raw bounded request failed
   to produce JSON after using its output budget for thinking; the controlled
   harness request returned valid structured JSON. Retrieval MRR was `1.00`,

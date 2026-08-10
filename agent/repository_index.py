@@ -58,6 +58,35 @@ class SearchHit:
 
 
 @dataclass(frozen=True, slots=True)
+class RepositoryContextCandidateV1:
+    """One ranked repository item and the harness decision made about it."""
+
+    entry: IndexEntry
+    rank: int
+    score: float
+    channels: tuple[str, ...]
+    outcome: str
+    reason: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "path": self.entry.path,
+            "kind": self.entry.kind,
+            "name": self.entry.name,
+            "start": self.entry.start,
+            "end": self.entry.end,
+            "file_hash": self.entry.file_hash,
+            "rank": self.rank,
+            "score": self.score,
+            "channels": list(self.channels),
+            "confidence": self.entry.confidence,
+            "provenance": list(self.entry.provenance),
+            "outcome": self.outcome,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class FileSnapshot:
     path: str
     size: int
@@ -73,6 +102,7 @@ class RepositoryContextSlice:
     callers: Mapping[str, tuple[str, ...]]
     callees: Mapping[str, tuple[str, ...]]
     dependencies: Mapping[str, tuple[str, ...]]
+    candidates: tuple[RepositoryContextCandidateV1, ...] = ()
     omitted_entries: int = 0
     size_chars: int = 0
 
@@ -109,6 +139,7 @@ class RepositoryContextSlice:
             "callers": {key: list(value) for key, value in self.callers.items()},
             "callees": {key: list(value) for key, value in self.callees.items()},
             "dependencies": {key: list(value) for key, value in self.dependencies.items()},
+            "candidates": [item.to_dict() for item in self.candidates],
             "omitted_entries": self.omitted_entries,
             "size_chars": self.size_chars,
         }
@@ -1520,34 +1551,58 @@ class RepositoryIndex:
         budget_chars: int = 20_000,
         include_graph_neighborhood: bool = True,
     ) -> RepositoryContextSlice:
+        candidate_limit = max(1, min(200, max(1, int(max_entries)) * 4))
         hits = self.search_with_scores(
             query,
             kinds=kinds,
             relation_kinds=relation_kinds,
-            limit=max(1, max_entries),
+            limit=candidate_limit,
         )
         selected: list[IndexEntry] = []
         selected_keys: set[tuple[str, str, str, int]] = set()
+        candidates: list[RepositoryContextCandidateV1] = []
         used = 0
         budget = max(500, int(budget_chars))
 
-        def add_entry(entry: IndexEntry) -> bool:
+        def add_entry(entry: IndexEntry) -> tuple[bool, str]:
             nonlocal used
             key = self._entry_key(entry)
             if key in selected_keys:
-                return True
+                return True, "already selected"
             cost = self._entry_size(entry)
-            if selected and (used + cost > budget or len(selected) >= max(1, int(max_entries))):
-                return False
+            if selected and used + cost > budget:
+                return False, "context character budget reached"
+            if len(selected) >= max(1, int(max_entries)):
+                return False, "context entry limit reached"
             selected_keys.add(key)
             selected.append(entry)
             used += cost
-            return True
+            return True, "selected by ranked repository retrieval"
 
-        for hit in hits:
+        for rank, hit in enumerate(hits, 1):
             if set(hit.channels) == {"embedding"} and hit.score < 5.0:
+                candidates.append(
+                    RepositoryContextCandidateV1(
+                        entry=hit.entry,
+                        rank=rank,
+                        score=hit.score,
+                        channels=hit.channels,
+                        outcome="excluded",
+                        reason="embedding-only score below the retrieval threshold",
+                    )
+                )
                 continue
-            add_entry(hit.entry)
+            accepted, reason = add_entry(hit.entry)
+            candidates.append(
+                RepositoryContextCandidateV1(
+                    entry=hit.entry,
+                    rank=rank,
+                    score=hit.score,
+                    channels=hit.channels,
+                    outcome="selected" if accepted else "excluded",
+                    reason=reason,
+                )
+            )
         callers: dict[str, tuple[str, ...]] = {}
         callees: dict[str, tuple[str, ...]] = {}
         graph_neighborhood_enabled = (
@@ -1566,7 +1621,24 @@ class RepositoryIndex:
                 for symbol in (*caller_values, *callee_values):
                     target_entry = self._entry_for_qualified_symbol(symbol)
                     if target_entry is not None:
-                        add_entry(target_entry)
+                        key = self._entry_key(target_entry)
+                        was_selected = key in selected_keys
+                        accepted, reason = add_entry(target_entry)
+                        if not was_selected:
+                            candidates.append(
+                                RepositoryContextCandidateV1(
+                                    entry=target_entry,
+                                    rank=len(candidates) + 1,
+                                    score=0.0,
+                                    channels=("graph",),
+                                    outcome="selected" if accepted else "excluded",
+                                    reason=(
+                                        "selected from caller/callee graph neighborhood"
+                                        if accepted
+                                        else reason
+                                    ),
+                                )
+                            )
         selected_paths = {entry.path for entry in selected}
         dependency_graph = (
             self.resolved_dependency_graph()
@@ -1592,7 +1664,8 @@ class RepositoryIndex:
             callers=callers,
             callees=callees,
             dependencies=dependencies,
-            omitted_entries=max(0, len(hits) - len(selected)),
+            candidates=tuple(candidates),
+            omitted_entries=sum(item.outcome != "selected" for item in candidates),
             size_chars=used,
         )
 

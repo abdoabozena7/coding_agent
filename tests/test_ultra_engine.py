@@ -25,6 +25,8 @@ from agent.ultra import (
     InMemoryUltraState,
     InnerPhase,
     MasterPlanV1,
+    NodeStatus,
+    ResultPackageV1,
     TaskContractV1,
     UltraConfig,
     UltraOrchestrator,
@@ -330,6 +332,210 @@ def test_browser_scenario_transport_normalizes_executor_aliases() -> None:
     UltraOrchestrator._validate_typed_response("browser_scenarios", payload)
 
 
+def test_project_136_browser_transport_removes_click_noise_and_preserves_dom_assertions() -> None:
+    payload, actions = UltraOrchestrator._normalize_typed_payload(
+        "browser_scenarios",
+        {
+            "modules": [
+                {
+                    "module_id": "r0bec63abc011.M001",
+                    "browser_scenarios": [
+                        {
+                            "name": "Verify basic HTML load",
+                            "steps": [
+                                {
+                                    "action": "click",
+                                    "role": "button",
+                                    "name": "Initial Button Check",
+                                    "text": "",
+                                }
+                            ],
+                            "assertions": [
+                                {
+                                    "role": "textbox",
+                                    "name": "Canvas Existence",
+                                    "property": "id",
+                                    "equals": "threeD-canvas",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+        {"modules": [{"module_id": "r0bec63abc011.M001"}]},
+    )
+
+    scenario = payload["modules"][0]["browser_scenarios"][0]
+    assert "text" not in scenario["steps"][0]
+    assert scenario["assertions"][0]["property"] == "id"
+    assert any("empty text transport key removed" in item for item in actions)
+    UltraOrchestrator._validate_typed_response("browser_scenarios", payload)
+
+
+def test_visible_element_count_alias_is_bounded_observable_property() -> None:
+    payload, _actions = UltraOrchestrator._normalize_typed_payload(
+        "browser_scenarios",
+        {
+            "modules": [
+                {
+                    "module_id": "M003",
+                    "browser_scenarios": [
+                        {
+                            "name": "3D state count",
+                            "steps": [{"action": "click", "selector": "#equals"}],
+                            "assertions": [
+                                {
+                                    "selector": "#scene [data-object]",
+                                    "property": "visible_element_count",
+                                    "equals": "3",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+        {"modules": [{"module_id": "M003"}]},
+    )
+
+    assert (
+        payload["modules"][0]["browser_scenarios"][0]["assertions"][0][
+            "property"
+        ]
+        == "visibleCount"
+    )
+    UltraOrchestrator._validate_typed_response("browser_scenarios", payload)
+
+
+def test_graphics_data_observable_aliases_are_bounded_properties() -> None:
+    for supplied, expected in (
+        ("object_count", "dataObjectCount"),
+        ("visual_state", "dataVisualState"),
+    ):
+        payload, _actions = UltraOrchestrator._normalize_typed_payload(
+            "browser_scenarios",
+            {
+                "modules": [{
+                    "module_id": "M003",
+                    "browser_scenarios": [{
+                        "name": "3D state",
+                        "steps": [{"action": "click", "selector": "#equals"}],
+                        "assertions": [{
+                            "selector": "#threeD-canvas",
+                            "property": supplied,
+                            "equals": "3" if expected == "dataObjectCount" else "5+3=8",
+                        }],
+                    }],
+                }],
+            },
+            {"modules": [{"module_id": "M003"}]},
+        )
+        assertion = payload["modules"][0]["browser_scenarios"][0]["assertions"][0]
+        assert assertion["property"] == expected
+        UltraOrchestrator._validate_typed_response("browser_scenarios", payload)
+
+
+def test_browser_assertion_expected_alias_and_duplicate_comparator_are_normalized() -> None:
+    payload, actions = UltraOrchestrator._normalize_typed_payload(
+        "browser_scenarios",
+        {
+            "modules": [{
+                "module_id": "M003",
+                "browser_scenarios": [{
+                    "name": "result",
+                    "steps": [{"action": "click", "selector": "#equals"}],
+                    "assertions": [{
+                        "selector": "#display",
+                        "property": "textContent",
+                        "expected": 8,
+                        "contains": "8",
+                    }],
+                }],
+            }],
+        },
+        {"modules": [{"module_id": "M003"}]},
+    )
+    assertion = payload["modules"][0]["browser_scenarios"][0]["assertions"][0]
+    assert assertion == {
+        "selector": "#display",
+        "property": "textContent",
+        "equals": "8",
+    }
+    assert any("expected value alias" in item for item in actions)
+    assert any("duplicate contains" in item for item in actions)
+    UltraOrchestrator._validate_typed_response("browser_scenarios", payload)
+
+
+def test_browser_assertion_rejects_conflicting_comparators() -> None:
+    payload = {
+        "modules": [{
+            "module_id": "M003",
+            "browser_scenarios": [{
+                "name": "conflict",
+                "steps": [{"action": "click", "selector": "#equals"}],
+                "assertions": [{
+                    "selector": "#display",
+                    "property": "textContent",
+                    "equals": "8",
+                    "contains": "result",
+                }],
+            }],
+        }],
+    }
+    with unittest.TestCase().assertRaisesRegex(AgentProtocolError, "exactly one"):
+        UltraOrchestrator._validate_typed_response("browser_scenarios", payload)
+
+
+def test_browser_inventory_repair_rebinds_only_an_exact_named_id() -> None:
+    scenarios = [{
+        "name": "addition",
+        "steps": [{"action": "click", "role": "button", "name": "5"}],
+        "assertions": [{
+            "role": "textbox",
+            "name": "Calculation display value",
+            "property": "textContent",
+            "expected": 8,
+            "contains": "8",
+        }],
+    }]
+    repaired, receipts = UltraOrchestrator._browser_inventory_contract_repair(
+        scenarios,
+        [{
+            "interaction_targets": [
+                {"id": "display", "tag": "div", "name": "0"},
+                {"id": "five", "tag": "button", "name": "5"},
+            ]
+        }],
+    )
+    assert repaired[0]["steps"] == scenarios[0]["steps"]
+    assert repaired[0]["assertions"] == [{
+        "selector": "#display",
+        "property": "textContent",
+        "equals": "8",
+    }]
+    assert any("#display" in item for item in receipts)
+
+
+def test_browser_inventory_repair_does_not_guess_an_unnamed_target() -> None:
+    scenarios = [{
+        "name": "result",
+        "steps": [{"action": "click", "selector": "#equals"}],
+        "assertions": [{
+            "role": "status",
+            "name": "Final answer",
+            "property": "textContent",
+            "equals": "8",
+        }],
+    }]
+    repaired, receipts = UltraOrchestrator._browser_inventory_contract_repair(
+        scenarios,
+        [{"interaction_targets": [{"id": "display", "tag": "div"}]}],
+    )
+    assert repaired == scenarios
+    assert not any("target rebound" in item for item in receipts)
+
+
 def test_browser_scenario_validation_rejects_fill_without_value() -> None:
     payload = {
         "modules": [
@@ -359,6 +565,78 @@ def test_browser_scenario_validation_rejects_fill_without_value() -> None:
         assert "fill step requires value" in str(exc)
     else:
         raise AssertionError("fill without value must not reach browser execution")
+
+
+def test_browser_scenario_validation_rejects_canvas_as_aria_role() -> None:
+    payload = {
+        "modules": [
+            {
+                "module_id": "M003",
+                "browser_scenarios": [
+                    {
+                        "name": "canvas state",
+                        "steps": [
+                            {"action": "click", "role": "button", "name": "2"}
+                        ],
+                        "assertions": [
+                            {
+                                "role": "canvas",
+                                "name": "Canvas element visible for 3D rendering",
+                                "property": "visible",
+                                "equals": "true",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+    try:
+        UltraOrchestrator._validate_typed_response("browser_scenarios", payload)
+    except AgentProtocolError as exc:
+        assert "ARIA role, not an HTML tag" in str(exc)
+    else:
+        raise AssertionError("canvas HTML tag must not be accepted as an ARIA role")
+
+
+def test_browser_scenario_transport_normalizes_canvas_tag_to_selector() -> None:
+    payload, actions = UltraOrchestrator._normalize_typed_payload(
+        "browser_scenarios",
+        {
+            "modules": [
+                {
+                    "module_id": "M003",
+                    "browser_scenarios": [
+                        {
+                            "name": "canvas state",
+                            "steps": [
+                                {"action": "click", "role": "button", "name": "2"}
+                            ],
+                            "assertions": [
+                                {
+                                    "role": "canvas",
+                                    "name": "Canvas element visible for 3D rendering",
+                                    "property": "visible",
+                                    "equals": "true",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+        {"modules": [{"module_id": "M003"}]},
+    )
+
+    assertion = payload["modules"][0]["browser_scenarios"][0]["assertions"][0]
+    assert assertion == {
+        "selector": "canvas",
+        "property": "visible",
+        "equals": "true",
+    }
+    assert any("canvas HTML tag normalized" in item for item in actions)
+    UltraOrchestrator._validate_typed_response("browser_scenarios", payload)
 
 
 def test_browser_scenario_root_array_binds_to_exact_single_requested_module() -> None:
@@ -783,6 +1061,16 @@ class SchedulerTests(unittest.TestCase):
             request for request in factory.requests if request.phase == "architecture"
         ]
         self.assertEqual(len(architecture_calls), 4)
+        self.assertFalse(
+            architecture_calls[1].task["typed_return_repair"]["repeated_response"]
+        )
+        self.assertTrue(
+            architecture_calls[2].task["typed_return_repair"]["repeated_response"]
+        )
+        self.assertIn(
+            "do not replay it",
+            architecture_calls[2].task["typed_return_repair"]["instruction"],
+        )
         self.assertIsNone(engine.architecture)
 
     def test_cross_run_lessons_are_injected_into_foundation_planning(self):
@@ -883,6 +1171,114 @@ class SchedulerTests(unittest.TestCase):
 
 
 class UltraEngineTests(unittest.TestCase):
+    def test_browser_repair_cannot_replace_calculation_with_canvas_presence(self):
+        previous = [
+            {
+                "name": "3D calculation",
+                "steps": [
+                    {"action": "click", "role": "button", "name": "2"},
+                    {"action": "click", "role": "button", "name": "*"},
+                    {"action": "click", "role": "button", "name": "4"},
+                ],
+                "assertions": [
+                    {
+                        "role": "textbox",
+                        "name": "3D Object State Check",
+                        "property": "visibleCount",
+                        "equals": "3",
+                    }
+                ],
+            }
+        ]
+        weakened = [
+            {
+                "name": "canvas presence",
+                "steps": [{"action": "click", "role": "button", "name": "."}],
+                "assertions": [
+                    {"selector": "canvas", "property": "visible", "equals": "true"}
+                ],
+            }
+        ]
+
+        reasons = UltraOrchestrator._browser_repair_weakening(previous, weakened)
+
+        self.assertIn("repair reduced the accepted user-action sequence", reasons)
+        self.assertIn("repair weakened an observable outcome to a presence check", reasons)
+        self.assertIn(
+            "repair replaced a value assertion with a boolean presence assertion",
+            reasons,
+        )
+
+    def test_global_summary_excludes_superseded_failed_attempt_evidence(self):
+        result = ResultPackageV1(
+            node_id="M001",
+            success=True,
+            status="completed",
+            summary="Old model summary still says the canvas is missing.",
+            evidence=(
+                {
+                    "kind": "browser_preview",
+                    "verification": "failed",
+                    "interaction_results": [{"passed": False}],
+                },
+                {
+                    "kind": "harness_browser_preview",
+                    "status": "passed",
+                    "interaction_results": [{"passed": True}],
+                },
+                {"kind": "artifact_hash", "path": "index.html", "sha256": "abc"},
+            ),
+        )
+
+        summary = UltraOrchestrator._global_node_summary(result)
+
+        self.assertEqual(
+            summary["summary"],
+            "M001 completed with an accepted node quality gate.",
+        )
+        self.assertEqual(len(summary["evidence"]), 2)
+        self.assertTrue(all(item.get("verification") != "failed" for item in summary["evidence"]))
+
+    def test_replan_checkpoint_resumes_verification_without_replaying_coder(self):
+        engine, factory, _ = prepared_engine()
+        node_id = next(iter(engine.nodes))
+        node = replace(
+            engine.nodes[node_id],
+            status=NodeStatus.REVISION_REQUIRED,
+            phase=InnerPhase.REPLAN,
+        )
+        engine.nodes[node_id] = node
+        engine._prepared.clear()
+        engine._results[node_id] = ResultPackageV1(
+            node_id=node_id,
+            success=False,
+            status="revision_required",
+            summary="Browser contract requires repair.",
+            component_package={
+                "candidate": {"payload": {"mutation_receipt": True}},
+                "replan": {
+                    "verification_only": True,
+                    "preserve_candidate": True,
+                    "failure_kind": "contract",
+                },
+            },
+        )
+
+        request_count = len(factory.requests)
+        engine._ensure_expanded(node_id)
+        self.assertEqual(engine.nodes[node_id].status, NodeStatus.READY)
+        result = engine._execute_node(engine.nodes[node_id])
+
+        resumed_requests = factory.requests[request_count:]
+        self.assertTrue(result.success)
+        self.assertFalse(
+            any(
+                request.role is AgentRole.CODER
+                and request.phase == InnerPhase.IMPLEMENT.value
+                for request in resumed_requests
+            )
+        )
+
     def test_authoritative_hashes_skip_model_authored_final_evidence_formatter(self):
         modules = [module("M1", "src/app.py")]
 
@@ -1169,6 +1565,20 @@ class UltraEngineTests(unittest.TestCase):
         ]
         self.assertEqual(len(assembler_requests), 1)
         self.assertFalse(assembler_requests[0].task.get("final_assembler", False))
+
+    def test_decomposer_contract_scales_only_real_work_boundaries(self):
+        engine, factory, _plan = prepared_engine()
+
+        result = engine.run()
+
+        self.assertTrue(result.successful)
+        request = next(
+            item for item in factory.requests
+            if item.phase == InnerPhase.DECOMPOSE.value
+        )
+        self.assertIn("size the work tree from the approved contract", request.system_prompt)
+        self.assertIn("Return children: []", request.system_prompt)
+        self.assertIn("quality roles", request.system_prompt)
         component_assemblers = [
             request
             for request in factory.requests
@@ -1271,7 +1681,7 @@ class UltraEngineTests(unittest.TestCase):
         self.assertFalse(escaped_result.successful)
         self.assertEqual(escaped_engine.phase, UltraPhase.REVISION_REQUIRED)
 
-    def test_quality_loop_is_bounded_then_requests_replan(self):
+    def test_identical_quality_failure_breaker_stops_the_third_code_mutation(self):
         modules = [module("M1", "src/one")]
         phases = Counter()
 
@@ -1292,9 +1702,9 @@ class UltraEngineTests(unittest.TestCase):
 
         self.assertFalse(result.successful)
         self.assertEqual(engine.phase, UltraPhase.REVISION_REQUIRED)
-        self.assertEqual(phases[InnerPhase.FIX.value], 3)
+        self.assertEqual(phases[InnerPhase.FIX.value], 2)
         self.assertEqual(phases[InnerPhase.REPLAN.value], 1)
-        self.assertEqual(result.node_results[0].fix_attempts, 3)
+        self.assertEqual(result.node_results[0].fix_attempts, 2)
         self.assertEqual(
             result.node_results[0].component_package["status"],
             "best_candidate_below_target",
@@ -1303,6 +1713,150 @@ class UltraEngineTests(unittest.TestCase):
             result.node_results[0].component_package["replan"]["revision"],
             "change approach",
         )
+        diagnostic = result.node_results[0].component_package["failure_diagnostic"]
+        self.assertTrue(diagnostic["mutation_prohibited"])
+        self.assertEqual(diagnostic["blocker_owner"], "diagnostic")
+        self.assertEqual(diagnostic["occurrences"], 3)
+
+    def test_browser_contract_failure_routes_to_tester_repair_without_coder_fix(self):
+        browser_module = module("M1", "index.html")
+        browser_module["metadata"] = {
+            "browser_scenarios": [
+                {
+                    "name": "calculator flow",
+                    "steps": [{"action": "click", "selector": "#missing"}],
+                    "assertions": [
+                        {
+                            "selector": "#display",
+                            "property": "text",
+                            "equals": "1",
+                        }
+                    ],
+                }
+            ]
+        }
+        phases = Counter()
+
+        def contract_repair(request: AgentRequest) -> AgentResponse:
+            phases[(request.role.value, request.phase)] += 1
+            if request.phase == "browser_scenarios":
+                return AgentResponse(
+                    payload={
+                        "modules": [
+                            {
+                                "module_id": request.node_id,
+                                "browser_scenarios": [
+                                    {
+                                        "name": "calculator flow",
+                                        "steps": [
+                                            {"action": "click", "selector": "#increment"}
+                                        ],
+                                        "assertions": [
+                                            {
+                                                "selector": "#display",
+                                                "property": "textContent",
+                                                "equals": "1",
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                    summary="tester repaired only the browser contract",
+                )
+            if request.phase == InnerPhase.TEST.value and request.role is AgentRole.TESTER:
+                scenarios = request.task["contract"]["metadata"]["browser_scenarios"]
+                repaired = scenarios[0]["steps"][0].get("selector") == "#increment"
+                if not repaired:
+                    return AgentResponse(
+                        payload={
+                            "passed": False,
+                            "failure_kind": "contract",
+                            "blocker_owner": "test_harness",
+                            "issues": ["interaction target matched no elements: #missing"],
+                            "test_results": [
+                                {
+                                    "name": "browser",
+                                    "passed": False,
+                                    "failure_kind": "contract",
+                                    "interaction_targets": [
+                                        {"selector": "#increment", "role": "button"}
+                                    ],
+                                }
+                            ],
+                        },
+                        summary="browser contract failed",
+                    )
+            return standard_handler(request, modules=[browser_module])
+
+        engine, factory, _ = prepared_engine(
+            handler=contract_repair,
+            modules=[browser_module],
+        )
+        result = engine.run()
+
+        self.assertTrue(result.successful)
+        self.assertFalse(
+            any(
+                "matched no elements" in finding
+                for node_result in result.node_results
+                for finding in node_result.findings
+            )
+        )
+        self.assertFalse(
+            any(
+                test_result.get("passed") is False
+                for node_result in result.node_results
+                for test_result in node_result.test_results
+            )
+        )
+        self.assertEqual(phases[(AgentRole.TESTER.value, "browser_scenarios")], 1)
+        self.assertEqual(phases[(AgentRole.CODER.value, InnerPhase.FIX.value)], 0)
+        repaired_request = next(
+            request
+            for request in factory.requests
+            if request.phase == InnerPhase.TEST.value
+            and request.role is AgentRole.TESTER
+            and request.task["contract"]["metadata"]["browser_scenarios"][0]["steps"][0].get("selector")
+            == "#increment"
+        )
+        self.assertEqual(
+            repaired_request.task["contract"]["metadata"]["browser_scenarios_authorship"],
+            "tester_contract_repair",
+        )
+
+    def test_browser_environment_failure_retries_verification_without_coder_fix(self):
+        browser_module = module("M1", "index.html")
+        test_attempts = 0
+        phases = Counter()
+
+        def transient_environment_failure(request: AgentRequest) -> AgentResponse:
+            nonlocal test_attempts
+            phases[(request.role.value, request.phase)] += 1
+            if request.phase == InnerPhase.TEST.value and request.role is AgentRole.TESTER:
+                test_attempts += 1
+                if test_attempts <= 2:
+                    return AgentResponse(
+                        payload={
+                            "passed": False,
+                            "failure_kind": "environment",
+                            "blocker_owner": "environment",
+                            "issues": ["browser executable is temporarily unavailable"],
+                        },
+                        summary="browser environment unavailable",
+                    )
+            return standard_handler(request, modules=[browser_module])
+
+        engine, _, _ = prepared_engine(
+            handler=transient_environment_failure,
+            modules=[browser_module],
+        )
+        result = engine.run()
+
+        self.assertTrue(result.successful)
+        self.assertEqual(test_attempts, 3)
+        self.assertEqual(phases[(AgentRole.CODER.value, InnerPhase.FIX.value)], 0)
 
     def test_leaf_review_does_not_fail_for_downstream_plan_artifacts(self):
         modules = [

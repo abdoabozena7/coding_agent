@@ -168,6 +168,43 @@ class WorkspaceStoreTests(unittest.TestCase):
         store.handle_event("tool_result", "updated", {"tool": "write_file"})
         self.assertIn("write file", store.snapshot().activity.last_success)
 
+    def test_tool_activity_pairs_call_and_result_into_one_live_block(self):
+        store = WorkspaceUIStore()
+        store.handle_event(
+            "tool_call",
+            "run_command",
+            {
+                "sequence": 10,
+                "actor": "test_agent",
+                "node_id": "node-1",
+                "args": {"command": "pytest tests/test_widget.py -q"},
+            },
+        )
+
+        active = store.snapshot().live_timeline[-1]
+        self.assertEqual((active.tool, active.state), ("run_command", "active"))
+        self.assertEqual(active.detail, "pytest tests/test_widget.py -q")
+        self.assertIsNotNone(active.started_at)
+
+        store.handle_event(
+            "tool_result",
+            "one\ntwo\nthree\nfour",
+            {
+                "sequence": 11,
+                "actor": "test_agent",
+                "node_id": "node-1",
+                "tool": "run_command",
+            },
+        )
+
+        completed = store.snapshot().live_timeline[-1]
+        self.assertEqual(len(store.snapshot().live_timeline), 1)
+        self.assertEqual(completed.state, "completed")
+        self.assertEqual(completed.output_preview, ("one", "two"))
+        self.assertEqual(completed.hidden_lines, 2)
+        self.assertIn("four", completed.output)
+        self.assertIsNotNone(completed.duration_seconds)
+
     def test_retry_wait_and_recoverable_errors_do_not_claim_the_goal_is_paused(self):
         store = WorkspaceUIStore()
         store.set_activity(ActivityStage.BUILDING, "Working", running=True)
@@ -708,6 +745,44 @@ class WorkspaceStoreTests(unittest.TestCase):
             snapshot.swarm.active_labels,
             ("Three Js Ui Specialist · Build the 3D calculator controls",),
         )
+
+    def test_swarm_summary_keeps_every_agent_run_even_on_one_node(self):
+        store = WorkspaceUIStore()
+        store.update_swarm_summary(
+            {
+                "nodes": [
+                    {
+                        "id": "node-ui",
+                        "title": "Build the interface",
+                        "status": "in_progress",
+                    }
+                ],
+                "agents": [
+                    {
+                        "id": "agent-coder",
+                        "work_node_id": "node-ui",
+                        "role": "coder",
+                        "phase": "implementation",
+                        "status": "completed",
+                        "result": {"summary": "Created the requested file."},
+                    },
+                    {
+                        "id": "agent-tester",
+                        "work_node_id": "node-ui",
+                        "role": "tester",
+                        "phase": "testing",
+                        "status": "queued",
+                    },
+                ],
+            }
+        )
+
+        snapshot = store.snapshot().swarm
+        self.assertEqual(snapshot.total, 2)
+        self.assertEqual(len(snapshot.agent_lines), 2)
+        self.assertEqual(snapshot.agent_lines[0].summary, "Created the requested file.")
+        self.assertEqual(snapshot.agent_lines[1].status, "queued")
+        self.assertIn("Waiting for a dependency", snapshot.agent_lines[1].summary)
 
 
 if __name__ == "__main__":

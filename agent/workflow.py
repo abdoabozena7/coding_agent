@@ -38,6 +38,7 @@ class SessionMode(str, Enum):
             "chat": "normal", "goal": "normal",
             "manual": "normal", "default": "normal", "auto": "normal",
             "agent": "normal", "working": "normal", "work": "normal",
+            "ultra-plan": "plan", "ultra_plan": "plan", "ultraplan": "plan",
             "deep": "ultra", "max": "ultra",
         }.get(normalized, normalized)
         try:
@@ -309,6 +310,11 @@ _STABLE_TASK = re.compile(r"^T(\d{1,3})$", re.IGNORECASE)
 def _dependency_number(value: Any, legacy_ids: Mapping[str, int]) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool):
         return value
+    if isinstance(value, Mapping):
+        keys = [str(key).strip() for key in value if str(key).strip()]
+        if len(keys) != 1:
+            return None
+        value = keys[0]
     text = _text(value)
     if not text:
         return None
@@ -399,11 +405,27 @@ def normalize_plan_draft(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[
         dependencies: list[str] = []
         unresolved: list[str] = []
         for raw_dependency in dependencies_raw:
+            if raw_dependency is None or not _text(raw_dependency):
+                actions.append(
+                    f"/tasks/{index - 1}/depends_on dropped an empty dependency"
+                )
+                continue
+            if isinstance(raw_dependency, Mapping) and not raw_dependency:
+                actions.append(
+                    f"/tasks/{index - 1}/depends_on dropped an empty dependency object"
+                )
+                continue
             number = _dependency_number(raw_dependency, legacy_ids)
             if number is None:
                 unresolved.append(_text(raw_dependency))
                 continue
+            if isinstance(raw_dependency, Mapping):
+                actions.append(
+                    f"/tasks/{index - 1}/depends_on used the singleton dependency object's key"
+                )
             dependency_key = _text(raw_dependency).casefold()
+            if isinstance(raw_dependency, Mapping):
+                dependency_key = next(iter(raw_dependency)).strip().casefold()
             if (
                 dependency_key in title_positions
                 and len(title_positions[dependency_key]) == 1

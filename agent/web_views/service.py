@@ -23,9 +23,11 @@ from ..model_catalog import ExecutionClass, ModelCatalog
 from ..quality import ChangeSetStatus
 from ..sandbox import AccessLevel, DockerSandbox, PermissionAdapter
 from ..store import NotFoundError, StalePlanError
-from ..ultra_models import WorkNodeStatus
+from ..ultra_models import AgentRunStatus, WorkNodeStatus
 from ..version_control import GitProtectionManager, VersionControlError
+from ..advanced_tracing import AdvancedTraceProjection
 from .schemas import (
+    PlanDocumentPayload,
     PlanPayload,
     ReviewSubmissionPayload,
     WorkspaceActionRequest,
@@ -275,6 +277,14 @@ class CoreWebAdapter:
             raise NotFoundError("this session does not have a plan yet")
         return goal
 
+    def _advanced_trace(
+        self,
+        *,
+        goal_id: str | None = None,
+        run_id: str | None = None,
+    ) -> AdvancedTraceProjection:
+        return AdvancedTraceProjection(self, goal_id=goal_id, run_id=run_id)
+
     def _workspace_goal(self) -> Any | None:
         """Return completed history unless Plan explicitly starts a new request."""
 
@@ -352,6 +362,8 @@ class CoreWebAdapter:
         return None
 
     def request_view(self, view_name: str) -> None:
+        if view_name == "live":
+            view_name = "agents"
         if view_name in {"execution", "tree"}:
             view_name = "agents"
         elif view_name == "diff":
@@ -1181,17 +1193,6 @@ class CoreWebAdapter:
     def apply_workspace_action(self, request: WorkspaceActionRequest) -> dict[str, Any]:
         """Route every browser action through one idempotent controller."""
         action = request.action
-        if request.source == "terminal_fallback":
-            # The runtime may expose a live web connection state.  Do not let
-            # an accidental terminal action become a second approval surface.
-            server = getattr(self.runtime, "local_web_server", None)
-            web_connected = bool(
-                getattr(self.runtime, "web_control_connected", None)
-                if hasattr(self.runtime, "web_control_connected")
-                else getattr(server, "running", False)
-            )
-            if web_connected:
-                raise ValueError("Terminal fallback is available only while the Web workspace is disconnected.")
         goal = self._workspace_goal()
         before = self.store.latest_event_sequence()
         duplicate = False
@@ -2244,6 +2245,8 @@ class CoreWebAdapter:
                 "connection": "connected",
                 "runtime": runtime_payload,
                 "workflow_identity": workflow_identity,
+                "document": "",
+                "team_preview": None,
             }
         if goal is None:
             envelope = self.runtime.model_capability_envelope()
@@ -2280,6 +2283,8 @@ class CoreWebAdapter:
                 "connection": "connected",
                 "runtime": runtime_payload,
                 "workflow_identity": workflow_identity,
+                "document": "",
+                "team_preview": None,
             }
         plan = self.store.get_latest_plan(goal.id)
         if plan is None:
@@ -2335,6 +2340,8 @@ class CoreWebAdapter:
                 "connection": "connected",
                 "runtime": runtime_payload,
                 "workflow_identity": workflow_identity,
+                "document": "",
+                "team_preview": None,
             }
         session_mode = str(session["session_mode"])
         strategy = str(
@@ -2366,7 +2373,7 @@ class CoreWebAdapter:
             and plan.status is PlanStatus.PENDING_APPROVAL
         )
         draft = dict(self.runtime.session_snapshot().get("web_plan_draft") or {})
-        return {
+        snapshot = {
             "session_id": self.session_id,
             "session_short": self.session_id[:8],
             "goal_id": goal.id,
@@ -2429,8 +2436,199 @@ class CoreWebAdapter:
             "queue": self.queue_snapshot(),
             "updated_at": plan.updated_at.isoformat(),
             "connection": "connected",
-                "runtime": runtime_payload,
+            "runtime": runtime_payload,
         }
+        snapshot["document"] = self._plan_document(snapshot)
+        preview = dict(session_state.get("web_team_preview") or {})
+        snapshot["team_preview"] = (
+            preview
+            if int(preview.get("plan_revision") or 0) == int(plan.revision)
+            and str(preview.get("plan_fingerprint") or "") == str(plan.fingerprint)
+            else None
+        )
+        return snapshot
+
+    @staticmethod
+    def _plan_document(snapshot: Mapping[str, Any]) -> str:
+        """Render every execution contract field in one editable document."""
+
+        blocks = [str(snapshot.get("summary") or snapshot.get("objective") or "").strip()]
+        for index, task in enumerate(snapshot.get("tasks") or (), 1):
+            if not isinstance(task, Mapping):
+                continue
+            title = str(task.get("title") or f"Step {index}").strip()
+            description = str(task.get("description") or "").strip()
+            block = f"{index}. {title}"
+            if description:
+                block += "\n" + description
+            acceptance = [str(item).strip() for item in task.get("acceptance_criteria") or () if str(item).strip()]
+            verification = [str(item).strip() for item in task.get("tests") or () if str(item).strip()]
+            dependencies = [str(item).strip() for item in task.get("dependencies") or () if str(item).strip()]
+            block += "\n\nAcceptance:\n" + "\n".join(
+                f"- {item}" for item in (acceptance or [f"{title} satisfies the requested outcome."])
+            )
+            block += "\n\nVerification:\n" + "\n".join(
+                f"- {item}" for item in (verification or [f"Verify {title.casefold()} with authoritative evidence."])
+            )
+            block += f"\n\nDepends on: {', '.join(dependencies) if dependencies else 'None'}"
+            blocks.append(block)
+        return "\n\n".join(block for block in blocks if block).strip()
+
+    @staticmethod
+    def _parse_plan_document(document: str) -> tuple[str, list[dict[str, Any]]]:
+        value = str(document or "").replace("\r\n", "\n").strip()
+        matches = list(re.finditer(r"(?m)^\s*\d+\.\s+(.+?)\s*$", value))
+        if not matches:
+            raise ValueError("Keep at least one numbered plan step, for example: 1. Inspect the workspace")
+        summary = value[: matches[0].start()].strip()
+        if not summary:
+            raise ValueError("Write a short plan summary before the numbered steps.")
+        steps: list[dict[str, Any]] = []
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(value)
+            title = match.group(1).strip()
+            body = value[match.end():end].strip()
+            if not title:
+                raise ValueError("Every numbered step needs a title.")
+            sections = list(re.finditer(
+                r"(?mi)^\s*(Acceptance|Verification|Depends on):\s*(.*)$",
+                body,
+            ))
+            description_end = sections[0].start() if sections else len(body)
+            description = body[:description_end].strip()
+            parsed: dict[str, Any] = {
+                "title": title[:180],
+                "description": description[:4_000],
+                "acceptance_criteria": [],
+                "tests": [],
+                "dependencies": [],
+                "dependencies_specified": False,
+            }
+            for section_index, section in enumerate(sections):
+                section_end = sections[section_index + 1].start() if section_index + 1 < len(sections) else len(body)
+                name = section.group(1).casefold()
+                inline = section.group(2).strip()
+                tail = body[section.end():section_end].strip()
+                if name == "depends on":
+                    parsed["dependencies_specified"] = True
+                    dependency_text = " ".join(part for part in (inline, tail) if part).strip()
+                    if dependency_text.casefold() not in {"", "none", "-"}:
+                        parsed["dependencies"] = [item.strip() for item in dependency_text.split(",") if item.strip()]
+                    continue
+                items = []
+                if inline:
+                    items.append(inline.removeprefix("- ").strip())
+                items.extend(
+                    line.strip().removeprefix("- ").strip()
+                    for line in tail.splitlines()
+                    if line.strip()
+                )
+                parsed["acceptance_criteria" if name == "acceptance" else "tests"] = items
+            steps.append(parsed)
+        return summary[:20_000], steps
+
+    @staticmethod
+    def _team_name(title: str, index: int) -> str:
+        words = [word for word in re.split(r"\s+", str(title).strip()) if word]
+        while words and words[0].casefold() in {
+            "build", "create", "implement", "add", "update", "verify", "test", "design",
+        }:
+            words.pop(0)
+        stem = " ".join(words[:3]).strip(" .:-") or f"Module {index}"
+        return stem.title()
+
+    def prepare_team_preview(self, payload: PlanDocumentPayload) -> dict[str, Any]:
+        """Create one exact plan revision and bind a first-layer team preview to it."""
+
+        current = self.plan_snapshot()
+        if current.get("revision") != payload.base_revision:
+            raise StalePlanError(
+                f"Plan r{payload.base_revision} is stale. The current plan is Plan r{current.get('revision')}."
+            )
+        summary, steps = self._parse_plan_document(payload.document)
+        existing = list(current.get("tasks") or ())
+        task_values: list[dict[str, Any]] = []
+        for index, step in enumerate(steps, 1):
+            title = str(step.get("title") or "").strip()
+            description = str(step.get("description") or "").strip()
+            old = dict(existing[index - 1]) if index <= len(existing) else {}
+            task_id = str(old.get("id") or f"T{index:03d}")
+            acceptance = list(step.get("acceptance_criteria") or old.get("acceptance_criteria") or ())
+            tests = list(step.get("tests") or old.get("tests") or ())
+            if not acceptance:
+                acceptance = [f"{title} is complete and satisfies the approved outcome."]
+            if not tests:
+                tests = [f"Verify {title.casefold()} with authoritative evidence."]
+            task_values.append({
+                "id": task_id,
+                "title": title,
+                "description": description or str(old.get("description") or title),
+                "parent_id": old.get("parent_id"),
+                "dependencies": list(
+                    step.get("dependencies")
+                    if step.get("dependencies_specified")
+                    else old.get("dependencies") or ()
+                ),
+                "agent_role": str(old.get("agent_role") or "specialist"),
+                "inputs": list(old.get("inputs") or ()),
+                "outputs": list(old.get("outputs") or ()),
+                "expected_files": list(old.get("expected_files") or ()),
+                "acceptance_criteria": acceptance,
+                "requirement_refs": list(old.get("requirement_refs") or ()),
+                "tests": tests,
+                "risk_level": str(old.get("risk_level") or "medium"),
+                "required_tools": list(old.get("required_tools") or ()),
+                "memory_dependencies": list(old.get("memory_dependencies") or ()),
+                "retry_policy": dict(old.get("retry_policy") or {}),
+                "approval_gate": bool(old.get("approval_gate", False)),
+                "constraints": list(old.get("constraints") or ()),
+                "parallel": bool(old.get("parallel", False)),
+                "comments": list(old.get("comments") or ()),
+            })
+        normalized_document = self._plan_document({"summary": summary, "tasks": task_values})
+        if normalized_document != self._plan_document(current):
+            result = self.save_plan_revision(PlanPayload.model_validate({
+                "base_revision": payload.base_revision,
+                "summary": summary,
+                "tasks": task_values,
+                "global_constraints": list(current.get("global_constraints") or ()),
+                "protected_paths": list(current.get("protected_paths") or ()),
+                "change_note": "Prepared from the Ultra Plan document",
+            }))
+            current = self.plan_snapshot()
+        plan_fingerprint = str(current.get("fingerprint") or "")
+        agents = [
+            {
+                "node_id": str(task.get("id") or f"T{index:03d}"),
+                "name": self._team_name(str(task.get("title") or ""), index),
+                "role": str(task.get("agent_role") or "specialist"),
+                "mission": str(task.get("description") or task.get("title") or ""),
+                "depends_on": list(task.get("dependencies") or ()),
+            }
+            for index, task in enumerate(current.get("tasks") or (), 1)
+        ]
+        team_fingerprint = hashlib.sha256(
+            repr((current.get("revision"), plan_fingerprint, agents)).encode("utf-8")
+        ).hexdigest()
+        preview = {
+            "plan_revision": int(current.get("revision") or 0),
+            "plan_fingerprint": plan_fingerprint,
+            "team_fingerprint": team_fingerprint,
+            "agents": agents,
+        }
+        session = self.store.get_workflow_session(self.session_id)
+        self.store.mutate_workflow_session(
+            self.session_id,
+            lambda value: {
+                "state": {
+                    **dict(value.get("state") or {}),
+                    "web_team_preview": preview,
+                    "web_team_preview_required": True,
+                }
+            },
+            expected_revision=int(session.get("revision") or 0),
+        )
+        return preview
 
     @staticmethod
     def _model_fit_snapshot(strategy_decision: Mapping[str, Any]) -> dict[str, Any]:
@@ -2778,7 +2976,9 @@ class CoreWebAdapter:
                         **{
                             key: value
                             for key, value in dict(current_state.get("state") or {}).items()
-                            if key != "web_plan_draft"
+                            if key not in {
+                                "web_plan_draft", "web_team_preview", "web_team_preview_required"
+                            }
                         },
                         "web_plan_change_summary": change_summary,
                     },
@@ -2835,7 +3035,13 @@ class CoreWebAdapter:
 
         return self.save_plan_revision(payload)
 
-    def approve_plan(self, revision: int) -> dict[str, Any]:
+    def approve_plan(
+        self,
+        revision: int,
+        *,
+        plan_fingerprint: str = "",
+        team_fingerprint: str = "",
+    ) -> dict[str, Any]:
         with self._lock:
             goal = self._goal()
             plan = self.store.get_latest_plan(goal.id)
@@ -2849,6 +3055,21 @@ class CoreWebAdapter:
                 raise ValueError("This plan is not waiting for approval.")
             if plan.status is not PlanStatus.PENDING_APPROVAL:
                 raise ValueError(f"Plan r{revision} is already {plan.status.value}.")
+            session = self.store.get_workflow_session(self.session_id)
+            state = dict(session.get("state") or {})
+            if bool(state.get("web_team_preview_required")):
+                preview = dict(state.get("web_team_preview") or {})
+                if not preview:
+                    raise ValueError("Prepare the first-layer agents before starting work.")
+                if (
+                    int(preview.get("plan_revision") or 0) != revision
+                    or str(preview.get("plan_fingerprint") or "") != plan.fingerprint
+                    or str(plan_fingerprint or "") != plan.fingerprint
+                    or str(team_fingerprint or "") != str(preview.get("team_fingerprint") or "")
+                ):
+                    raise StalePlanError(
+                        "The plan or first-layer team changed. Prepare agents again before starting."
+                    )
             approved = self.runtime.approve_plan(
                 revision,
                 approved_by="user@local-web",
@@ -2876,6 +3097,18 @@ class CoreWebAdapter:
                 revision=approved.revision,
                 execution_requested=execution_requested,
                 source="local_web",
+            )
+            latest_session = self.store.get_workflow_session(self.session_id)
+            self.store.mutate_workflow_session(
+                self.session_id,
+                lambda current_state: {
+                    "state": {
+                        key: value
+                        for key, value in dict(current_state.get("state") or {}).items()
+                        if key not in {"web_team_preview", "web_team_preview_required"}
+                    }
+                },
+                expected_revision=int(latest_session.get("revision") or 0),
             )
             return {
                 "approved": True,
@@ -2951,6 +3184,142 @@ class CoreWebAdapter:
             "immutable": True,
             "connection": "connected",
         }
+
+    @staticmethod
+    def _diff_counts(files: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+        rows = list(files)
+        return {
+            "file_count": len(rows),
+            "additions": sum(int(item.get("additions") or 0) for item in rows),
+            "deletions": sum(int(item.get("deletions") or 0) for item in rows),
+        }
+
+    def _workflow_change_sets(self) -> tuple[Any | None, tuple[Any, ...]]:
+        """Return every recorded change set for the latest goal in this session."""
+
+        goal = self.runtime.active_goal() or self.store.get_latest_goal(self.session_id)
+        if goal is None:
+            return None, ()
+        changes: list[Any] = []
+        for run in self.store.list_ultra_runs(goal.id):
+            changes.extend(self.store.list_change_sets(run.id))
+        changes.sort(key=lambda item: (item.created_at, item.id), reverse=True)
+        return goal, tuple(changes)
+
+    def _working_diff_detail(self) -> dict[str, Any]:
+        try:
+            raw_diff = self.runtime.version_control.diff(None, limit=500_000)
+            error = ""
+        except (OSError, RuntimeError, VersionControlError) as exc:
+            raw_diff = ""
+            error = str(exc)
+        files = _diff_files(raw_diff, ())
+        for item in files:
+            item["patch_available"] = bool(item.get("diff") or item.get("hunks"))
+        counts = self._diff_counts(files)
+        return {
+            "id": "working",
+            "label": "Current workspace",
+            "kind": "working",
+            "status": "live" if files else "clean",
+            "agent": "workspace",
+            "task": "Uncheckpointed project changes",
+            "created_at": _iso_now(),
+            "updated_at": _iso_now(),
+            "changed_files": [item["path"] for item in files],
+            "files": files,
+            "diff": raw_diff if files else "",
+            "diff_hash": hashlib.sha256(raw_diff.encode("utf-8")).hexdigest() if files else "",
+            "has_diff": bool(files),
+            "error": error,
+            **counts,
+        }
+
+    def _recorded_diff_detail(self, checkpoint: Any) -> dict[str, Any]:
+        files = _diff_files(checkpoint.diff, checkpoint.changed_files)
+        reasons = dict(checkpoint.metadata.get("file_reasons") or {})
+        tasks = dict(checkpoint.metadata.get("file_tasks") or {})
+        for item in files:
+            item["patch_available"] = bool(item.get("diff") or item.get("hunks"))
+            item["agent"] = checkpoint.responsible_agent_id
+            item["task"] = tasks.get(item["path"], checkpoint.parent_id)
+            item["reason"] = reasons.get(
+                item["path"],
+                checkpoint.metadata.get("reason", "Changed during this workflow step."),
+            )
+        counts = self._diff_counts(files)
+        return {
+            "id": checkpoint.id,
+            "label": f"Recorded change · {checkpoint.id[-8:]}",
+            "kind": "change_set",
+            "status": checkpoint.status.value,
+            "agent": checkpoint.responsible_agent_id,
+            "task": checkpoint.parent_id,
+            "created_at": checkpoint.created_at.isoformat(),
+            "updated_at": checkpoint.updated_at.isoformat(),
+            "changed_files": list(checkpoint.changed_files),
+            "files": files,
+            "diff": checkpoint.diff,
+            "diff_hash": hashlib.sha256(checkpoint.diff.encode("utf-8")).hexdigest() if checkpoint.diff else "",
+            "has_diff": any(bool(item.get("patch_available")) for item in files),
+            "verification_evidence_ids": list(checkpoint.verification_evidence_ids),
+            "review_status": dict(checkpoint.review_status),
+            "integration_status": checkpoint.integration_status,
+            **counts,
+        }
+
+    def diff_workflow_snapshot(self) -> dict[str, Any]:
+        """Small read-only index for the standalone live workflow diff page."""
+
+        goal, changes = self._workflow_change_sets()
+        working = self._working_diff_detail()
+        recorded = [self._recorded_diff_detail(item) for item in changes]
+        entries = ([working] if working["has_diff"] else []) + recorded
+        selected = entries[0] if entries else None
+        terminal = bool(
+            goal is not None
+            and goal.status in {GoalStatus.COMPLETED, GoalStatus.CANCELLED, GoalStatus.BLOCKED}
+        )
+        return {
+            "session_id": self.session_id,
+            "workspace": str(self.runtime.workspace),
+            "goal_id": getattr(goal, "id", None),
+            "goal_status": getattr(getattr(goal, "status", None), "value", "idle"),
+            "state": "FROZEN" if terminal else ("LIVE" if goal is not None else "IDLE"),
+            "updated_at": _iso_now(),
+            "has_diff": bool(entries),
+            "selected_id": selected["id"] if selected else None,
+            "selected": selected,
+            "changes": [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"files", "diff"}
+                }
+                for item in entries
+            ],
+            "message": (
+                "No diff yet. Changes will appear here live as soon as the workflow writes a file."
+                if not entries
+                else ""
+            ),
+            "working_error": working.get("error") or "",
+        }
+
+    def diff_workflow_detail(self, change_id: str) -> dict[str, Any]:
+        """Return one current or historical diff without mutating workflow state."""
+
+        selected = str(change_id or "").strip()
+        if selected == "working":
+            detail = self._working_diff_detail()
+            if not detail["has_diff"]:
+                raise NotFoundError("the working tree does not have a diff yet")
+            return detail
+        _goal, changes = self._workflow_change_sets()
+        checkpoint = next((item for item in changes if item.id == selected), None)
+        if checkpoint is None:
+            raise NotFoundError("workflow diff was not found in this session")
+        return self._recorded_diff_detail(checkpoint)
 
     def submit_review(self, payload: ReviewSubmissionPayload) -> dict[str, Any]:
         with self._lock:
@@ -3282,6 +3651,19 @@ class CoreWebAdapter:
                 ),
             )
             result = agent.result.to_dict() if agent.result else {}
+            last_action = str(agent.phase or "").replace("_", " ") or "Waiting"
+            for log in reversed(logs):
+                summary = str(log.get("summary") or "").strip()
+                if summary and summary != str(log.get("type") or "").strip():
+                    last_action = summary
+                    break
+            if agent.status is AgentRunStatus.QUEUED:
+                last_action = "Waiting for a dependency or execution slot"
+            elif (
+                agent.status is AgentRunStatus.COMPLETED
+                and str(result.get("summary") or "").strip()
+            ):
+                last_action = str(result["summary"]).strip()[:500]
             progress_value = agent.usage.get("progress")
             progress = (
                 int(progress_value)
@@ -3298,9 +3680,12 @@ class CoreWebAdapter:
                     "task_id": agent.work_node_id,
                     "task": node.title if node else agent.phase,
                     "goal": node.objective if node else goal.objective,
+                    "provider": agent.provider,
+                    "model": agent.model,
+                    "attempt": agent.attempt,
                     "progress": progress,
                     "phase": agent.phase,
-                    "last_action": logs[-1]["summary"] if logs else agent.phase,
+                    "last_action": last_action,
                     "current_file": (
                         node.contract.write_paths[0]
                         if node and node.contract.write_paths
@@ -3309,6 +3694,12 @@ class CoreWebAdapter:
                     "files_inspected": list(node.contract.read_paths) if node else [],
                     "files_modifying": list(node.contract.write_paths) if node else [],
                     "start_time": agent.started_at.isoformat(),
+                    "updated_at": agent.updated_at.isoformat(),
+                    "finished_at": (
+                        agent.finished_at.isoformat()
+                        if agent.finished_at is not None
+                        else None
+                    ),
                     "elapsed_seconds": elapsed,
                     "retries": max(0, agent.attempt - 1),
                     "parent_agent": None,
@@ -3422,3 +3813,120 @@ class CoreWebAdapter:
             **payload,
         )
         return {"requested": True, "agent_id": agent_id, "message_id": message["id"]}
+
+    # Advanced Tracing is a separate, strictly read-only projection.  It does
+    # not change ``_requested_view`` and therefore cannot take control away
+    # from the deliberately simple Plan/Live workspace.
+    def advanced_trace_overview(
+        self,
+        *,
+        goal_id: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        projection = self._advanced_trace(goal_id=goal_id, run_id=run_id)
+        frozen = projection.ensure_frozen_snapshot()
+        value = projection.overview()
+        if frozen is not None:
+            value["frozen_snapshot"] = {
+                key: frozen[key]
+                for key in (
+                    "id", "revision", "terminal_status", "cutoff_sequence",
+                    "payload_hash", "created_at",
+                )
+            }
+        return value
+
+    def advanced_trace_timeline(
+        self,
+        *,
+        goal_id: str | None = None,
+        run_id: str | None = None,
+        after: int = 0,
+        limit: int = 250,
+        category: str = "",
+        query: str = "",
+    ) -> dict[str, Any]:
+        return self._advanced_trace(goal_id=goal_id, run_id=run_id).timeline(
+            after=after,
+            limit=limit,
+            category=category,
+            query=query,
+        )
+
+    def advanced_trace_section(
+        self,
+        section: str,
+        *,
+        goal_id: str | None = None,
+        run_id: str | None = None,
+        include_stored_text: bool = False,
+    ) -> dict[str, Any]:
+        projection = self._advanced_trace(goal_id=goal_id, run_id=run_id)
+        readers = {
+            "files": projection.files,
+            "problems": projection.problems,
+            "agents": projection.agents,
+            "context": projection.context,
+            "changes": projection.changes,
+        }
+        if section == "prompts":
+            return projection.prompts(include_stored_text=include_stored_text)
+        reader = readers.get(str(section))
+        if reader is None:
+            raise NotFoundError(f"unknown advanced trace section: {section}")
+        return reader()
+
+    def advanced_trace_reveal_prompt(
+        self,
+        trace_id: str,
+        *,
+        goal_id: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._advanced_trace(goal_id=goal_id, run_id=run_id).reveal_prompt(trace_id)
+
+    def advanced_trace_inspector(
+        self,
+        entity_type: str,
+        entity_id: str,
+        *,
+        goal_id: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        projection = self._advanced_trace(goal_id=goal_id, run_id=run_id)
+        sources = {
+            "file": projection.files().get("items", ()),
+            "problem": projection.problems().get("items", ()),
+            "agent": projection.agents().get("agents", ()),
+            "node": projection.agents().get("nodes", ()),
+            "change": projection.changes().get("items", ()),
+            "prompt": projection.prompts().get("traces", ()),
+        }
+        rows = sources.get(str(entity_type))
+        if rows is None:
+            raise NotFoundError("unknown advanced trace entity type")
+        candidate_keys = ("id", "path")
+        selected = next(
+            (
+                item for item in rows
+                if any(str(item.get(key) or "") == str(entity_id) for key in candidate_keys)
+            ),
+            None,
+        )
+        if selected is None:
+            raise NotFoundError("advanced trace entity was not found")
+        return {"entity_type": entity_type, "entity": selected}
+
+    def advanced_trace_export(
+        self,
+        *,
+        goal_id: str | None = None,
+        run_id: str | None = None,
+        include_stored_text: bool = False,
+    ) -> dict[str, Any]:
+        projection = self._advanced_trace(goal_id=goal_id, run_id=run_id)
+        if not include_stored_text:
+            frozen = projection.ensure_frozen_snapshot()
+            if frozen is not None:
+                return dict(frozen["payload"])
+        return projection.export_payload(include_stored_text=include_stored_text)

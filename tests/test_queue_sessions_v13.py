@@ -74,17 +74,16 @@ class QueueAndSessionV13Tests(unittest.TestCase):
         self.assertEqual(restored[0].id, item.id)
         self.assertEqual(restored[0].status, QueuedPromptStatus.PENDING)
 
-    def test_new_read_commands_and_explicit_enqueue_parse(self) -> None:
-        self.assertEqual(parse_command("/queue").kind, CommandKind.QUEUE)
-        self.assertEqual(parse_command("/effective-plan").kind, CommandKind.EFFECTIVE_PLAN)
-        self.assertEqual(parse_command("/ultra-details").kind, CommandKind.ULTRA_DETAILS)
-        self.assertEqual(parse_command("/project-brain architecture").kind, CommandKind.PROJECT_BRAIN)
-        self.assertEqual(
-            parse_command("/sessions session-b").args["target"],
-            "session-b",
-        )
-        queued = parse_command("/enqueue ultra finish the game")
-        self.assertEqual(queued.args, {"mode": "ultra", "text": "finish the game"})
+    def test_removed_queue_views_are_not_public_slash_commands(self) -> None:
+        from agent.commands import UnknownCommandParseError
+
+        for command in (
+            "/queue", "/effective-plan", "/ultra-details",
+            "/project-brain architecture", "/sessions session-b", "/enqueue task",
+        ):
+            with self.subTest(command=command):
+                with self.assertRaises(UnknownCommandParseError):
+                    parse_command(command)
 
 
 class ConcurrencyProbeTests(unittest.TestCase):

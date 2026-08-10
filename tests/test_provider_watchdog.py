@@ -188,6 +188,181 @@ class ProviderWatchdogTests(unittest.TestCase):
         self.assertEqual(local.stage_deadline_seconds, 600.0)
         self.assertGreater(local.stage_deadline_seconds, cloud.stage_deadline_seconds)
 
+    def test_local_semantic_gateway_is_compact_and_disables_reasoning(self) -> None:
+        runtime, _store = self._runtime(_SilentProvider())
+        runtime.model_descriptor = ModelDescriptor(
+            "ollama", "gemma4:e4b", ExecutionClass.LOCAL
+        )
+
+        router = runtime._provider_call_policy("semantic-router")
+        intake = runtime._provider_call_policy("semantic-goal-intake")
+
+        self.assertEqual(router.max_output_tokens, 768)
+        self.assertEqual(router.stage_deadline_seconds, 180.0)
+        self.assertEqual(router.reasoning_effort, "off")
+        self.assertEqual(router.temperature, 0.0)
+        self.assertEqual(intake.max_output_tokens, 1_536)
+        self.assertEqual(intake.stage_deadline_seconds, 180.0)
+        self.assertEqual(intake.reasoning_effort, "off")
+        self.assertEqual(intake.temperature, 0.0)
+
+    def test_local_goal_intake_uses_streamable_json_action_adapter(self) -> None:
+        provider = ScriptedProvider(
+            [
+                AssistantTurn(
+                    text=(
+                        '{"name":"submit_goal_intake","args":'
+                        '{"objective":"Build the accepted artifact"}}'
+                    )
+                )
+            ]
+        )
+        runtime, _store = self._runtime(provider)
+        runtime.model_descriptor = ModelDescriptor(
+            "ollama", "gemma4:e4b", ExecutionClass.LOCAL
+        )
+        schema = {
+            "type": "function",
+            "function": {
+                "name": "submit_goal_intake",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"objective": {"type": "string"}},
+                },
+            },
+        }
+
+        turn = runtime._call_provider(
+            [{"role": "user", "content": "Build it."}],
+            [schema],
+            "Return the intake action.",
+            actor="semantic-goal-intake",
+            step=1,
+            stream_text=False,
+        )
+
+        self.assertEqual(provider.calls[0].tools, [])
+        self.assertEqual(turn.tool_calls[0].name, "submit_goal_intake")
+        self.assertEqual(
+            turn.tool_calls[0].args["objective"],
+            "Build the accepted artifact",
+        )
+
+    def test_local_goal_intake_repairs_observed_array_delimiter_mismatch(self) -> None:
+        malformed = (
+            '[{"name":"submit_goal_intake","args":'
+            '{"objective":"Build the accepted artifact",'
+            '"success_criteria":["Artifact exists"]}]]'
+        )
+        provider = ScriptedProvider([AssistantTurn(text=malformed)])
+        runtime, store = self._runtime(provider)
+        runtime.model_descriptor = ModelDescriptor(
+            "ollama", "gemma4:e4b", ExecutionClass.LOCAL
+        )
+        schema = {
+            "type": "function",
+            "function": {
+                "name": "submit_goal_intake",
+                "parameters": {"type": "object"},
+            },
+        }
+
+        turn = runtime._call_provider(
+            [{"role": "user", "content": "Build it."}],
+            [schema],
+            "Return the intake action.",
+            actor="semantic-goal-intake",
+            step=1,
+            stream_text=False,
+        )
+
+        self.assertEqual(turn.tool_calls[0].name, "submit_goal_intake")
+        self.assertEqual(
+            turn.tool_calls[0].args["objective"],
+            "Build the accepted artifact",
+        )
+        receipt = dict(turn.native["action_transport"])
+        self.assertIn("expected '}'", receipt["delimiter_mismatch"])
+        events = store.list_recent_events(limit=50)
+        self.assertTrue(
+            any(
+                event.event_type == "provider.action_transport_normalized"
+                for event in events
+            )
+        )
+
+    def test_local_semantic_router_uses_streamable_json_action_adapter(self) -> None:
+        provider = ScriptedProvider(
+            [
+                AssistantTurn(
+                    text=(
+                        '{"name":"submit_semantic_route","args":'
+                        '{"route":"goal","interpretation":"Build it"}}'
+                    )
+                )
+            ]
+        )
+        runtime, _store = self._runtime(provider)
+        runtime.model_descriptor = ModelDescriptor(
+            "ollama", "gemma4:e4b", ExecutionClass.LOCAL
+        )
+        schema = {
+            "type": "function",
+            "function": {
+                "name": "submit_semantic_route",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "route": {"type": "string"},
+                        "interpretation": {"type": "string"},
+                    },
+                },
+            },
+        }
+
+        turn = runtime._call_provider(
+            [{"role": "user", "content": "Build it."}],
+            [schema],
+            "Return the route action.",
+            actor="semantic-router",
+            step=1,
+            stream_text=False,
+        )
+
+        self.assertEqual(provider.calls[0].tools, [])
+        self.assertEqual(turn.tool_calls[0].name, "submit_semantic_route")
+        self.assertEqual(turn.tool_calls[0].args["route"], "goal")
+
+    def test_every_local_ollama_tool_stage_uses_streamable_json_action_adapter(self) -> None:
+        provider = ScriptedProvider(
+            [AssistantTurn(text='{"name":"write_file","args":{"path":"a.txt","content":"ok"}}')]
+        )
+        runtime, _store = self._runtime(provider)
+        runtime.model_descriptor = ModelDescriptor(
+            "ollama", "gemma4:e4b", ExecutionClass.LOCAL
+        )
+        schema = {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                },
+            },
+        }
+
+        turn = runtime._call_provider(
+            [], [schema], "Implement.", actor="coder", step=1, stream_text=False
+        )
+
+        self.assertEqual(provider.calls[0].tools, [])
+        self.assertIn("NATIVE TOOL TRANSPORT IS DISABLED", provider.calls[0].system)
+        self.assertEqual(turn.tool_calls[0].name, "write_file")
+
     def test_late_abandoned_response_cannot_replace_newer_response(self) -> None:
         provider = _LateThenFreshProvider()
         runtime, _store = self._runtime(

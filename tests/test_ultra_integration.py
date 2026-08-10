@@ -138,6 +138,216 @@ def test_typed_browser_scenarios_survive_lossy_small_model_plan_wording():
     assert bound.modules[0].metadata["browser_scenarios"][0]["name"] == "addition"
 
 
+def test_browser_scenario_property_alias_is_canonicalized_before_validation():
+    normalized, actions = UltraOrchestrator._normalize_typed_payload(
+        "browser_scenarios",
+        {
+            "modules": [
+                {
+                    "module_id": "M001",
+                    "browser_scenarios": [
+                        {
+                            "name": "read result",
+                            "steps": [{"action": "click", "selector": "#run"}],
+                            "assertions": [
+                                {
+                                    "selector": "#result",
+                                    "property": "innerText",
+                                    "equals": "ready",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+        {"modules": [{"module_id": "M001"}]},
+    )
+
+    assertion = normalized["modules"][0]["browser_scenarios"][0]["assertions"][0]
+    assert assertion["property"] == "textContent"
+    assert any("property alias normalized" in item for item in actions)
+    UltraOrchestrator._validate_typed_response("browser_scenarios", normalized)
+
+
+def test_harness_preview_classifies_tool_schema_error_as_contract_failure():
+    calls: list[ToolCall] = []
+    agent = object.__new__(WorkspaceUltraAgent)
+    agent.role = AgentRole.TESTER
+    agent.executor = lambda call, _request: calls.append(call) or (
+        "Error: invalid arguments: 'property' must be one of "
+        "['value', 'text', 'textContent']"
+    )
+    request = AgentRequest(
+        run_id="run",
+        role=AgentRole.TESTER,
+        phase=InnerPhase.TEST.value,
+        system_prompt="test",
+        context={},
+        task={
+            "contract": {
+                "write_paths": ["index.html"],
+                "metadata": {
+                    "browser_scenarios": [
+                        {
+                            "name": "read result",
+                            "steps": [{"action": "click", "selector": "#run"}],
+                            "assertions": [
+                                {
+                                    "selector": "#result",
+                                    "property": "innerText",
+                                    "equals": "ready",
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+        },
+    )
+
+    evidence = agent._harness_html_preview(request)
+
+    assert evidence["failure_kind"] == "contract"
+    assert calls[0].args["interactions"][0]["assertions"][0]["property"] == "textContent"
+
+
+def test_harness_preview_normalizes_project_136_contract_before_tool_execution():
+    calls: list[ToolCall] = []
+    agent = object.__new__(WorkspaceUltraAgent)
+    agent.role = AgentRole.TESTER
+    agent.events = EventBus()
+    agent.executor = lambda call, _request: calls.append(call) or json.dumps(
+        {
+            "status": "running",
+            "verification": "passed",
+            "failure_kind": "",
+            "interaction_targets": [],
+            "interaction_results": [],
+        }
+    )
+    request = AgentRequest(
+        run_id="run",
+        role=AgentRole.TESTER,
+        phase=InnerPhase.TEST.value,
+        system_prompt="test",
+        context={},
+        task={
+            "contract": {
+                "write_paths": ["index.html"],
+                "metadata": {
+                    "browser_scenarios": [
+                        {
+                            "name": "Verify basic HTML load",
+                            "steps": [
+                                {
+                                    "action": "click",
+                                    "role": "button",
+                                    "name": "Initial Button Check",
+                                    "text": "",
+                                }
+                            ],
+                            "assertions": [
+                                {
+                                    "role": "textbox",
+                                    "name": "Canvas Existence",
+                                    "property": "id",
+                                    "equals": "threeD-canvas",
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+        },
+    )
+
+    evidence = agent._harness_html_preview(request)
+
+    assert evidence["verification"] == "passed"
+    interaction = calls[0].args["interactions"][0]
+    assert "text" not in interaction["steps"][0]
+    assert interaction["assertions"][0] == {
+        "selector": "#threeD-canvas",
+        "property": "id",
+        "equals": "threeD-canvas",
+    }
+
+
+def test_harness_preview_classifies_malformed_tool_response_as_tool_failure():
+    agent = object.__new__(WorkspaceUltraAgent)
+    agent.role = AgentRole.TESTER
+    agent.executor = lambda _call, _request: "not-json"
+    request = AgentRequest(
+        run_id="run",
+        role=AgentRole.TESTER,
+        phase=InnerPhase.TEST.value,
+        system_prompt="test",
+        context={},
+        task={"contract": {"write_paths": ["index.html"]}},
+    )
+
+    evidence = agent._harness_html_preview(request)
+
+    assert evidence["failure_kind"] == "tool"
+    assert "malformed JSON" in evidence["error"]
+
+
+def test_same_turn_mutation_recovers_empty_fix_handoff_without_replaying_agent():
+    class WriteThenUnusedProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def call(self, _conversation, _tools, _system, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return AssistantTurn(
+                    tool_calls=[
+                        ToolCall(
+                            "write-fix",
+                            "write_file",
+                            {"path": "index.html", "content": "<h1>fixed</h1>"},
+                        )
+                    ]
+                )
+            return AssistantTurn(text="<unused50>")
+
+    provider = WriteThenUnusedProvider()
+    executed: list[ToolCall] = []
+    agent = WorkspaceUltraAgent(
+        provider,
+        role=AgentRole.CODER,
+        provider_name="ollama",
+        model="gemma4:e4b",
+        executor=lambda call, _request: executed.append(call) or "write completed",
+        events=EventBus(),
+        max_steps=6,
+    )
+    response = agent.execute(
+        AgentRequest(
+            run_id="run",
+            role=AgentRole.CODER,
+            phase=InnerPhase.FIX.value,
+            system_prompt="fix",
+            context={},
+            task={
+                "contract": {
+                    "title": "Fix HTML",
+                    "objective": "Repair the accepted defect.",
+                    "write_paths": ["index.html"],
+                }
+            },
+            node_id="M001",
+        )
+    )
+
+    assert provider.calls == 2
+    assert len([call for call in executed if call.name == "write_file"]) == 1
+    assert response.provider == "harness"
+    assert response.payload["recovered_from_empty_provider_turn"] is True
+    assert response.payload["artifacts"][0]["path"] == "index.html"
+
+
 def test_plan_projection_preserves_approval_bound_module_metadata():
     scenario = {
         "name": "addition",
@@ -1989,10 +2199,9 @@ class UltraIntegrationTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(
-            provider.tools[0]["function"]["name"],
-            "submit_master_plan",
-        )
+        self.assertEqual(provider.tools, [])
+        self.assertIn('"name": "submit_master_plan"', provider.system)
+        self.assertIn("NATIVE TOOL TRANSPORT IS DISABLED", provider.system)
         self.assertIn("call submit_master_plan exactly once", provider.system)
         self.assertEqual(response.payload["modules"][0]["write_paths"], ["index.html"])
         self.assertEqual(len(MasterPlanV1.from_mapping(response.payload).modules), 1)
@@ -2003,6 +2212,432 @@ class UltraIntegrationTests(unittest.TestCase):
                 for event in captured
             )
         )
+
+    def test_local_coder_streams_textual_action_then_executes_governed_write(self):
+        class StreamedActionProvider:
+            reasoning_effort = "medium"
+            max_output_tokens = None
+            force_json = False
+
+            def __init__(self):
+                self.calls = []
+
+            def call(self, conversation, tools, system):
+                self.calls.append((list(tools), system))
+                if len(self.calls) == 1:
+                    return AssistantTurn(
+                        text=json.dumps(
+                            {
+                                "name": "write_file",
+                                "args": {
+                                    "path": "index.html",
+                                    "content": "<!doctype html><title>Ready</title>",
+                                },
+                            }
+                        )
+                    )
+                return AssistantTurn(
+                    text=json.dumps(
+                        {
+                            "payload": {"success": True, "passed": True},
+                            "summary": "Implementation written.",
+                        }
+                    )
+                )
+
+        provider = StreamedActionProvider()
+        executed = []
+        agent = WorkspaceUltraAgent(
+            provider,
+            role=AgentRole.CODER,
+            provider_name="ollama",
+            model="gemma4:e4b",
+            executor=lambda call, _request: executed.append(call) or "Wrote index.html",
+            events=EventBus(),
+            max_steps=3,
+        )
+
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.CODER,
+                phase="implement",
+                system_prompt="Implement the approved module.",
+                context={},
+                task={
+                    "contract": {
+                        "id": "M001",
+                        "title": "Page",
+                        "objective": "Create the page.",
+                        "write_paths": ["index.html"],
+                    }
+                },
+                node_id="M001",
+            )
+        )
+
+        self.assertTrue(all(tools == [] for tools, _system in provider.calls))
+        self.assertIn(
+            "NATIVE TOOL TRANSPORT IS DISABLED",
+            provider.calls[0][1],
+        )
+        self.assertNotIn(
+            "NATIVE TOOL TRANSPORT IS DISABLED",
+            provider.calls[1][1],
+        )
+        write = next(call for call in executed if call.name == "write_file")
+        self.assertEqual(write.args["path"], "index.html")
+        self.assertEqual(provider.reasoning_effort, "off")
+        self.assertTrue(response.payload["success"])
+
+    def test_local_coder_closes_read_budget_and_requests_exact_write(self):
+        class ReadThenWriteProvider:
+            reasoning_effort = "medium"
+            max_output_tokens = None
+
+            def __init__(self):
+                self.calls = []
+
+            def call(self, conversation, _tools, _system):
+                self.calls.append(json.loads(json.dumps(conversation)))
+                if len(self.calls) == 1:
+                    return AssistantTurn(
+                        text=json.dumps(
+                            {
+                                "name": "read_file",
+                                "args": {"path": "index.html"},
+                            }
+                        )
+                    )
+                if len(self.calls) == 2:
+                    packet = json.loads(conversation[0]["content"])
+                    return AssistantTurn(
+                        text=json.dumps(
+                            {
+                                "name": "write_file",
+                                "args": {
+                                    "path": packet["next_target"]["path"],
+                                    "content": "<!doctype html><title>Complete</title>",
+                                },
+                            }
+                        )
+                    )
+                return AssistantTurn(
+                    text=json.dumps(
+                        {
+                            "payload": {"success": True, "passed": True},
+                            "summary": "Mutation handed off.",
+                        }
+                    )
+                )
+
+        provider = ReadThenWriteProvider()
+        executed = []
+        agent = WorkspaceUltraAgent(
+            provider,
+            role=AgentRole.CODER,
+            provider_name="ollama",
+            model="gemma4:e4b",
+            executor=lambda call, _request: executed.append(call) or (
+                "<!doctype html><title>Old</title>"
+                if call.name == "read_file"
+                else "Wrote index.html"
+            ),
+            events=EventBus(),
+            max_steps=8,
+        )
+
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.CODER,
+                phase="implement",
+                system_prompt="Implement the approved module.",
+                context={},
+                task={
+                    "contract": {
+                        "id": "M001",
+                        "title": "Page",
+                        "objective": "Complete the page.",
+                        "acceptance_criteria": ["The required canvas exists."],
+                        "write_paths": ["index.html"],
+                    },
+                    "findings": [
+                        "Add <canvas id=\"threeD-canvas\"></canvas>."
+                    ],
+                },
+                node_id="M001",
+            )
+        )
+
+        packet = json.loads(provider.calls[1][0]["content"])
+        self.assertEqual(packet["next_target"]["path"], "index.html")
+        self.assertEqual(
+            packet["required_corrections"],
+            ["Add <canvas id=\"threeD-canvas\"></canvas>."],
+        )
+        self.assertEqual(
+            packet["acceptance_criteria"],
+            ["The required canvas exists."],
+        )
+        self.assertIn("edit_file action", packet["required_action"])
+        self.assertIn("do not use another read tool", packet["required_action"])
+        self.assertEqual(
+            [call.name for call in executed],
+            ["read_file", "read_file", "write_file"],
+        )
+        self.assertEqual(len(provider.calls), 3)
+        self.assertTrue(response.payload["success"])
+
+    def test_local_coder_read_only_claims_fail_bounded_before_tool_loop_exhaustion(self):
+        class ReadThenClaimProvider:
+            reasoning_effort = "medium"
+            max_output_tokens = None
+
+            def __init__(self):
+                self.calls = 0
+                self.cache_resets = 0
+
+            def reset_model_cache(self):
+                self.cache_resets += 1
+
+            def call(self, _conversation, _tools, _system):
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantTurn(
+                        text=json.dumps(
+                            {
+                                "name": "read_file",
+                                "args": {"path": "index.html"},
+                            }
+                        )
+                    )
+                return AssistantTurn(
+                    text=json.dumps(
+                        {
+                            "payload": {"success": True, "passed": True},
+                            "summary": "Claimed completion without a write.",
+                        }
+                    )
+                )
+
+        provider = ReadThenClaimProvider()
+        agent = WorkspaceUltraAgent(
+            provider,
+            role=AgentRole.CODER,
+            provider_name="ollama",
+            model="gemma4:e4b",
+            executor=lambda _call, _request: "<!doctype html><title>Old</title>",
+            events=EventBus(),
+            max_steps=16,
+        )
+
+        with self.assertRaisesRegex(
+            AgentProtocolError,
+            "structured responses without the required governed mutation",
+        ):
+            agent.execute(
+                AgentRequest(
+                    run_id="run",
+                    role=AgentRole.CODER,
+                    phase="implement",
+                    system_prompt="Implement the approved module.",
+                    context={},
+                    task={
+                        "contract": {
+                            "id": "M001",
+                            "title": "Page",
+                            "objective": "Complete the page.",
+                            "write_paths": ["index.html"],
+                        }
+                    },
+                    node_id="M001",
+                )
+            )
+
+        self.assertEqual(provider.calls, 3)
+        self.assertEqual(provider.cache_resets, 1)
+
+    def test_fix_transport_normalizes_scalar_evidence_and_exact_boolean(self):
+        normalized, actions = UltraOrchestrator._normalize_typed_payload(
+            InnerPhase.FIX.value,
+            {
+                "success": "true",
+                "evidence": {"kind": "mutation", "path": "index.html"},
+                "findings": "handoff preserved",
+                "issues": None,
+            },
+            {},
+        )
+
+        self.assertIs(normalized["success"], True)
+        self.assertEqual(normalized["evidence"][0]["path"], "index.html")
+        self.assertEqual(normalized["findings"], ["handoff preserved"])
+        self.assertEqual(normalized["issues"], [])
+        self.assertTrue(any("scalar normalized to array" in item for item in actions))
+        UltraOrchestrator._validate_typed_response(InnerPhase.FIX.value, normalized)
+
+    def test_fix_withholds_dependency_install_without_finding_or_contract(self):
+        class WriteThenHandoffProvider:
+            reasoning_effort = "medium"
+            max_output_tokens = None
+
+            def __init__(self):
+                self.systems = []
+
+            def call(self, _conversation, _tools, system):
+                self.systems.append(system)
+                if len(self.systems) == 1:
+                    return AssistantTurn(
+                        text=json.dumps(
+                            {
+                                "name": "write_file",
+                                "args": {
+                                    "path": "index.html",
+                                    "content": "<!doctype html><title>Fixed</title>",
+                                },
+                            }
+                        )
+                    )
+                return AssistantTurn(
+                    text=json.dumps(
+                        {
+                            "payload": {"success": True, "evidence": []},
+                            "summary": "Fix mutation handed off.",
+                        }
+                    )
+                )
+
+        provider = WriteThenHandoffProvider()
+        executed = []
+        agent = WorkspaceUltraAgent(
+            provider,
+            role=AgentRole.CODER,
+            provider_name="ollama",
+            model="gemma4:e4b",
+            executor=lambda call, _request: executed.append(call) or "Wrote index.html",
+            events=EventBus(),
+            max_steps=4,
+        )
+
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.CODER,
+                phase=InnerPhase.FIX.value,
+                system_prompt="Repair the approved defect.",
+                context={},
+                task={
+                    "contract": {
+                        "title": "HTML repair",
+                        "objective": "Repair the visible heading.",
+                        "write_paths": ["index.html"],
+                    },
+                    "findings": ["The heading text is incorrect."],
+                },
+                node_id="M001",
+            )
+        )
+
+        self.assertNotIn('"name": "install_dependencies"', provider.systems[0])
+        self.assertEqual(
+            [call.name for call in executed if call.name != "read_file"],
+            ["write_file"],
+        )
+        self.assertEqual(len(provider.systems), 2)
+        self.assertTrue(response.payload["success"])
+
+    def test_local_coder_unused_token_recovers_with_focused_missing_write(self):
+        class UnusedThenWriteProvider:
+            reasoning_effort = "medium"
+            max_output_tokens = None
+            force_json = False
+
+            def __init__(self):
+                self.calls = []
+                self.cache_resets = 0
+
+            def reset_model_cache(self):
+                self.cache_resets += 1
+
+            def call(self, conversation, tools, system):
+                self.calls.append(
+                    {
+                        "conversation": json.loads(json.dumps(conversation)),
+                        "tools": list(tools),
+                        "system": system,
+                    }
+                )
+                if len(self.calls) == 1:
+                    return AssistantTurn(text="<unused50>")
+                if len(self.calls) == 2:
+                    recovery = json.loads(conversation[0]["content"])
+                    target = recovery["next_target"]["path"]
+                    return AssistantTurn(
+                        text=json.dumps(
+                            {
+                                "name": "write_file",
+                                "args": {
+                                    "path": target,
+                                    "content": "export class InputController {}\n",
+                                },
+                            }
+                        )
+                    )
+                return AssistantTurn(
+                    text=json.dumps(
+                        {
+                            "payload": {"success": True, "passed": True},
+                            "summary": "Missing target written.",
+                        }
+                    )
+                )
+
+        provider = UnusedThenWriteProvider()
+        executed = []
+
+        def executor(call, _request):
+            executed.append(call)
+            if call.name == "read_file":
+                return "Error: path does not exist: " + str(call.args.get("path"))
+            return "Wrote " + str(call.args.get("path"))
+
+        agent = WorkspaceUltraAgent(
+            provider,
+            role=AgentRole.CODER,
+            provider_name="ollama",
+            model="gemma4:e4b",
+            executor=executor,
+            events=EventBus(),
+            max_steps=4,
+        )
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.CODER,
+                phase="fix",
+                system_prompt="Repair the approved module.",
+                context={},
+                task={
+                    "contract": {
+                        "id": "M001",
+                        "title": "Input controller",
+                        "objective": "Create the missing input controller.",
+                        "write_paths": ["src/inputController.js"],
+                    }
+                },
+                node_id="M001",
+            )
+        )
+
+        recovery = json.loads(provider.calls[1]["conversation"][0]["content"])
+        self.assertEqual(recovery["next_target"]["path"], "src/inputController.js")
+        self.assertIn("exactly one write_file", recovery["required_action"])
+        self.assertEqual(provider.cache_resets, 1)
+        self.assertEqual(provider.reasoning_effort, "off")
+        self.assertTrue(all(call["tools"] == [] for call in provider.calls))
+        self.assertTrue(any(call.name == "write_file" for call in executed))
+        self.assertTrue(response.payload["success"])
 
     def test_local_master_plan_recovers_empty_internal_token_with_minimal_packet(self):
         class EmptyThenTypedPlanProvider:
@@ -3261,6 +3896,39 @@ class UltraIntegrationTests(unittest.TestCase):
                 )
             finally:
                 if runtime:
+                    runtime.close()
+                store.close()
+
+    def test_ultra_approval_adopts_the_plan_document_revision_and_first_layer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            runtime = None
+            try:
+                with mock.patch.object(
+                    ModelDescriptor,
+                    "create_provider",
+                    lambda _self: PhaseProvider(),
+                ):
+                    runtime = self._runtime(workspace, store)
+                    runtime.start_ultra("Build the demo")
+                    edited = runtime.add_user_task(
+                        "Verify the approved browser handoff",
+                        "The exact approved handoff is verified.",
+                    )
+                    accepted = runtime.approve_ultra(edited.revision)
+
+                self.assertEqual(accepted.fingerprint, edited.fingerprint)
+                self.assertEqual(
+                    runtime.ultra_session.adapter.plan.fingerprint,
+                    edited.fingerprint,
+                )
+                run = runtime.active_ultra_run()
+                self.assertEqual(run.plan_revision, edited.revision)
+                self.assertEqual(run.master_plan_fingerprint, edited.fingerprint)
+                self.assertEqual(len(store.list_work_nodes(run.id)), len(edited.tasks))
+            finally:
+                if runtime is not None:
                     runtime.close()
                 store.close()
 

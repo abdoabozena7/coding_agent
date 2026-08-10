@@ -379,6 +379,32 @@ class OllamaProviderTests(unittest.TestCase):
             600.0,
         )
 
+    def test_stage_policy_can_force_deterministic_temperature(self):
+        provider = OllamaProvider(model="offline")
+        provider.capability_profile = __import__(
+            "agent.local_provider", fromlist=["ModelCapabilityProfile"]
+        ).ModelCapabilityProfile(
+            "offline", tool_call_support=True, health_status="reachable"
+        )
+        provider._post_json = Mock(
+            return_value=io.BytesIO(
+                b'{"message":{"content":"ok"},"done":true}\n'
+            )
+        )
+
+        provider.call(
+            [],
+            [],
+            "system",
+            policy=ProviderCallPolicyV1(
+                stage="semantic-router",
+                temperature=0.0,
+            ),
+        )
+
+        payload = provider._post_json.call_args.args[1]
+        self.assertEqual(payload["options"]["temperature"], 0.0)
+
     def test_internal_off_reasoning_maps_to_ollama_think_false(self):
         provider = OllamaProvider(model="offline", reasoning_effort="off")
         provider.capability_profile = __import__("agent.local_provider", fromlist=["ModelCapabilityProfile"]).ModelCapabilityProfile(

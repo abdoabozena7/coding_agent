@@ -1000,6 +1000,62 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
         self.assertEqual(accepted_goal.metadata["interaction_mode"], "working")
         self.assertEqual(accepted_goal.metadata["execution_strategy"], "staged")
 
+    def test_ultra_plan_previews_the_exact_first_layer_before_approval(self):
+        snapshot = self.client.get(
+            f"/api/sessions/{self.runtime.session_id}/plan"
+        ).json()
+        self.assertIn("Acceptance:", snapshot["document"])
+        self.assertIn("Verification:", snapshot["document"])
+        self.assertIn("Depends on:", snapshot["document"])
+        document = snapshot["document"] + "\n\n2. Verify the finished work\nRun the focused checks."
+
+        prepared = self.client.post(
+            f"/api/sessions/{self.runtime.session_id}/plan/team-preview",
+            headers=self.csrf_headers(),
+            json={"base_revision": 1, "document": document},
+        )
+
+        self.assertEqual(prepared.status_code, 200, prepared.text)
+        preview = prepared.json()
+        self.assertEqual(preview["plan_revision"], 2)
+        self.assertEqual(len(preview["agents"]), 2)
+        self.assertEqual(preview["agents"][1]["name"], "The Finished Work")
+        current = self.client.get(
+            f"/api/sessions/{self.runtime.session_id}/plan"
+        ).json()
+        self.assertEqual(current["team_preview"]["team_fingerprint"], preview["team_fingerprint"])
+
+        stale = self.client.post(
+            f"/api/sessions/{self.runtime.session_id}/plan/approve",
+            headers=self.csrf_headers(),
+            json={
+                "revision": 2,
+                "plan_fingerprint": preview["plan_fingerprint"],
+                "team_fingerprint": "stale-team",
+            },
+        )
+        self.assertEqual(stale.status_code, 409, stale.text)
+
+        approved = self.client.post(
+            f"/api/sessions/{self.runtime.session_id}/plan/approve",
+            headers=self.csrf_headers(),
+            json={
+                "revision": 2,
+                "plan_fingerprint": preview["plan_fingerprint"],
+                "team_fingerprint": preview["team_fingerprint"],
+            },
+        )
+        self.assertEqual(approved.status_code, 200, approved.text)
+        self.assertEqual(self.store.get_goal(self.goal.id).status, GoalStatus.RUNNING)
+
+    def test_legacy_workspace_routes_redirect_to_the_two_public_pages(self):
+        response = self.client.get(
+            f"/sessions/{self.runtime.session_id}/agents",
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 303)
+        self.assertTrue(response.headers["location"].endswith("/live"))
+
     def test_plan_snapshot_exposes_model_aware_diagnostics_only_as_data(self):
         self.store.update_goal_metadata(
             self.goal.id,
@@ -1188,18 +1244,19 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
         self.assertTrue(second.json()["duplicate"])
         self.assertEqual(self.store.get_latest_plan(self.goal.id).status.value, "accepted")
 
-    def test_terminal_fallback_is_rejected_while_web_is_connected(self):
+    def test_terminal_remains_authoritative_while_web_is_connected(self):
         self.runtime.web_control_connected = True
-        response = self.client.post(
-            f"/api/sessions/{self.runtime.session_id}/actions",
-            headers=self.csrf_headers(),
-            json={
-                "action": "retry",
-                "source": "terminal_fallback",
-            },
-        )
-        self.assertEqual(response.status_code, 422)
-        self.assertIn("Web workspace is disconnected", response.json()["error"])
+        with mock.patch.object(self.runtime, "resume", return_value={"status": "ok"}):
+            response = self.client.post(
+                f"/api/sessions/{self.runtime.session_id}/actions",
+                headers=self.csrf_headers(),
+                json={
+                    "action": "retry",
+                    "source": "terminal_fallback",
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["accepted"])
 
     def test_history_and_revision_queries_are_session_isolated(self):
         foreign = "goal-from-another-session"
@@ -1367,10 +1424,15 @@ class SecurityAndLifecycleTests(LocalWebViewTestCase):
     def test_workspace_assets_use_sse_and_incremental_live_regions(self):
         html = self.client.get("/assets/index.html").text
         script = self.client.get("/assets/app.js").text
-        self.assertIn('id="liveWorkflow"', html)
-        self.assertIn('id="liveTimeline"', html)
+        plan_script = self.client.get("/assets/plan.js").text
+        self.assertIn('id="planPage"', html)
+        self.assertIn('id="livePage"', html)
+        self.assertIn('data-live-tab="agents"', html)
+        self.assertIn('data-live-tab="timeline"', html)
         self.assertIn("new EventSource", script)
-        self.assertIn("applyLiveActivity", script)
+        self.assertIn("renderLive", script)
+        self.assertIn("Send to LLM", plan_script)
+        self.assertIn("state.requestDirty", plan_script)
 
     def test_local_server_stops_and_invalidates_session_with_runtime(self):
         server = LocalWebServer(self.runtime).start()
@@ -1382,7 +1444,7 @@ class SecurityAndLifecycleTests(LocalWebViewTestCase):
         self.assertFalse(server.running)
         self.assertTrue(server.security.expired)
 
-    def test_review_ready_event_opens_mandatory_view_without_blocking(self):
+    def test_review_ready_event_does_not_auto_open_a_web_view(self):
         server = LocalWebServer(self.runtime).start()
         self.runtime.local_web_server = server
         with mock.patch("agent.web_views.server.webbrowser.open", return_value=True) as opened:
@@ -1395,8 +1457,7 @@ class SecurityAndLifecycleTests(LocalWebViewTestCase):
             deadline = time.monotonic() + 2
             while not opened.called and time.monotonic() < deadline:
                 time.sleep(0.01)
-        self.assertTrue(opened.called)
-        self.assertIn("/review?token=", opened.call_args.args[0])
+        self.assertFalse(opened.called)
 
 
 class PromptQueueIntegrationTests(LocalWebViewTestCase):

@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+import hashlib
 import re
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import json
 import urllib.error
 import urllib.request
@@ -30,6 +31,30 @@ class NormalizationReceiptV1:
             "input_fingerprint": self.input_fingerprint,
             "output_fingerprint": self.output_fingerprint,
             "actions": list(self.actions),
+            "version": self.version,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ActionProposalNormalizationV1:
+    """Auditable, syntax-only normalization of one textual action proposal."""
+
+    input_fingerprint: str
+    output_fingerprint: str = ""
+    action_name: str = ""
+    actions: tuple[str, ...] = ()
+    json_error: str = ""
+    delimiter_mismatch: str = ""
+    version: int = 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "input_fingerprint": self.input_fingerprint,
+            "output_fingerprint": self.output_fingerprint,
+            "action_name": self.action_name,
+            "actions": list(self.actions),
+            "json_error": self.json_error,
+            "delimiter_mismatch": self.delimiter_mismatch,
             "version": self.version,
         }
 
@@ -161,6 +186,238 @@ def normalize_action_proposal(value: Mapping[str, Any]) -> tuple[str, dict[str, 
     if not name or not isinstance(args, Mapping):
         return None
     return name, dict(args)
+
+
+def _text_fingerprint(value: str) -> str:
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
+def _single_action_from_value(value: Any) -> tuple[Mapping[str, Any] | None, tuple[str, ...], str]:
+    if isinstance(value, Mapping):
+        nested = value.get("tool_calls")
+        if (
+            normalize_action_proposal(value) is None
+            and isinstance(nested, Sequence)
+            and not isinstance(nested, (str, bytes, bytearray))
+        ):
+            if len(nested) != 1:
+                return None, (), "tool_calls must contain exactly one action"
+            item = nested[0]
+            if not isinstance(item, Mapping):
+                return None, (), "single tool_calls item must be an object"
+            name = str(
+                item.get("tool_name")
+                or item.get("name")
+                or item.get("tool")
+                or item.get("action")
+                or ""
+            ).strip()
+            args = item.get("parameters", item.get("arguments", item.get("args", {})))
+            if not name or not isinstance(args, Mapping):
+                return None, (), "nested action must contain a name and object arguments"
+            return {
+                "name": name,
+                "args": dict(args),
+            }, ("unwrapped single nested tool_calls action",), ""
+        return value, (), ""
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        if len(value) != 1:
+            return None, (), "action array must contain exactly one item"
+        if not isinstance(value[0], Mapping):
+            return None, (), "single action array item must be an object"
+        return value[0], ("unwrapped single-item action array",), ""
+    return None, (), "action transport must be an object or a single-item array"
+
+
+def _repair_mismatched_single_action_array(source: str) -> tuple[str | None, tuple[str, ...], str]:
+    """Repair only the observed ``[{name,args...}]]`` delimiter substitution.
+
+    The repair is intentionally narrow: the text must begin with one action
+    envelope, all nested delimiters before the final mismatch must balance, and
+    the only tolerated damage is ``]`` closing an action object followed by one
+    redundant trailing ``]``. No keys or semantic values are created.
+    """
+
+    stripped = str(source or "").strip()
+    if not re.match(r'^\[\s*\{\s*"(?:name|tool|action)"\s*:', stripped):
+        return None, (), ""
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    mismatch_index: int | None = None
+    extra_index: int | None = None
+    for index, character in enumerate(stripped):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+            continue
+        if character in "[{":
+            stack.append(character)
+            continue
+        if character not in "]}":
+            continue
+        expected = "[" if character == "]" else "{"
+        if stack and stack[-1] == expected:
+            stack.pop()
+            continue
+        remainder = stripped[index + 1 :]
+        if (
+            character == "]"
+            and stack == ["[", "{"]
+            and re.fullmatch(r"\s*\]\s*", remainder)
+        ):
+            mismatch_index = index
+            extra_index = index + 1 + remainder.rfind("]")
+            stack.clear()
+            break
+        return None, (), f"unexpected {character!r} at offset {index}"
+    if mismatch_index is None or extra_index is None:
+        return None, (), ""
+    repaired = (
+        stripped[:mismatch_index]
+        + "}]"
+        + stripped[mismatch_index + 1 : extra_index]
+        + stripped[extra_index + 1 :]
+    )
+    try:
+        json.loads(repaired)
+    except json.JSONDecodeError as exc:
+        return None, (), f"bounded delimiter repair remained invalid at offset {exc.pos}: {exc.msg}"
+    return repaired, (
+        "closed mismatched action object before array delimiter",
+        "removed redundant trailing array delimiter",
+    ), "expected '}' for action object but received ']'"
+
+
+def _repair_incomplete_single_action_array(
+    source: str,
+) -> tuple[str | None, tuple[str, ...], str]:
+    """Close only missing outer delimiters on one otherwise-complete action.
+
+    A streamed local response can finish after the action object while omitting
+    the top-level array delimiter. The prefix must identify one action and all
+    semantic values/nested containers must already be complete; only the outer
+    action/object transport delimiters may remain open.
+    """
+
+    stripped = str(source or "").strip()
+    if not re.match(r'^\[\s*\{\s*"(?:name|tool|action)"\s*:', stripped):
+        return None, (), ""
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for index, character in enumerate(stripped):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            stack.append(character)
+        elif character in "]}":
+            expected = "[" if character == "]" else "{"
+            if not stack or stack[-1] != expected:
+                return None, (), f"unexpected {character!r} at offset {index}"
+            stack.pop()
+    if in_string or stack not in (["["], ["[", "{"]):
+        return None, (), ""
+    suffix = "]" if stack == ["["] else "}]"
+    repaired = stripped + suffix
+    try:
+        json.loads(repaired)
+    except json.JSONDecodeError as exc:
+        return None, (), f"bounded outer closure remained invalid at offset {exc.pos}: {exc.msg}"
+    return repaired, (
+        "closed incomplete single-item action array transport",
+    ), f"response ended before outer delimiter {suffix!r}"
+
+
+def extract_action_proposal(
+    text: str,
+) -> tuple[tuple[str, dict[str, Any]] | None, ActionProposalNormalizationV1]:
+    """Extract exactly one allow-listable action from weak-model text.
+
+    This function only repairs transport syntax. The caller still validates the
+    action name, arguments, schema, permissions, and execution policy.
+    """
+
+    source = str(text or "").strip()
+    if source.startswith("```"):
+        source = re.sub(r"^```(?:json)?\s*", "", source, flags=re.IGNORECASE)
+        source = re.sub(r"\s*```$", "", source)
+    input_fingerprint = _text_fingerprint(source)
+    actions: tuple[str, ...] = ()
+    json_error = ""
+    delimiter_mismatch = ""
+    candidate: Mapping[str, Any] | None = None
+    normalized_source = source
+    decoded_complete_transport = False
+    try:
+        decoded, end = json.JSONDecoder().raw_decode(source)
+        if source[end:].strip():
+            json_error = "unexpected trailing content after action envelope"
+        else:
+            decoded_complete_transport = True
+            candidate, actions, json_error = _single_action_from_value(decoded)
+    except json.JSONDecodeError as exc:
+        json_error = f"JSON decode failed at offset {exc.pos}: {exc.msg}"
+
+    if candidate is None:
+        repaired_source, repair_actions, delimiter_mismatch = (
+            _repair_mismatched_single_action_array(source)
+        )
+        if repaired_source is not None:
+            decoded = json.loads(repaired_source)
+            candidate, unwrap_actions, value_error = _single_action_from_value(decoded)
+            actions = (*repair_actions, *unwrap_actions)
+            normalized_source = repaired_source
+            json_error = value_error
+
+    if candidate is None:
+        repaired_source, repair_actions, delimiter_mismatch = (
+            _repair_incomplete_single_action_array(source)
+        )
+        if repaired_source is not None:
+            decoded = json.loads(repaired_source)
+            candidate, unwrap_actions, value_error = _single_action_from_value(decoded)
+            actions = (*repair_actions, *unwrap_actions)
+            normalized_source = repaired_source
+            json_error = value_error
+
+    if candidate is None and not decoded_complete_transport:
+        fallback = extract_first_json_object(source)
+        fallback_proposal = (
+            normalize_action_proposal(fallback) if fallback is not None else None
+        )
+        if fallback_proposal is not None:
+            candidate = fallback
+            actions = (*actions, "extracted action object from bounded surrounding text")
+
+    proposal = normalize_action_proposal(candidate) if candidate is not None else None
+    if proposal is None and not json_error:
+        json_error = "decoded JSON did not contain one name/args action envelope"
+    return proposal, ActionProposalNormalizationV1(
+        input_fingerprint=input_fingerprint,
+        output_fingerprint=(
+            _text_fingerprint(normalized_source) if proposal is not None else ""
+        ),
+        action_name=(proposal[0] if proposal is not None else ""),
+        actions=actions,
+        json_error=json_error,
+        delimiter_mismatch=delimiter_mismatch,
+    )
 
 
 def normalize_generated_tool_args(name: str, args: Mapping[str, Any]) -> dict[str, Any]:
