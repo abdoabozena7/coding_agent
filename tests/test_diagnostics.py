@@ -145,6 +145,7 @@ class AgentReadinessAuditTests(unittest.TestCase):
                 "behavioral_reasoning",
                 "behavioral_swarm_consensus",
                 "behavioral_learning_evaluation",
+                "behavioral_worker_orchestration",
             },
         )
 

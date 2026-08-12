@@ -114,6 +114,30 @@ class QuestionSessionTests(unittest.TestCase):
 
 
 class WorkspaceStoreTests(unittest.TestCase):
+    def test_full_access_resolves_an_existing_tool_approval(self):
+        store = WorkspaceUIStore()
+        request = AttentionRequest(
+            id="approval:preview",
+            kind=AttentionKind.APPROVAL,
+            title="Allow project preview?",
+            message="Start the inspected project.",
+            options=(
+                AttentionOption("allow_once", "Allow once", "allow_once"),
+                AttentionOption("allow_session", "Always allow this session", "allow_session"),
+                AttentionOption("deny", "Deny", "deny"),
+            ),
+            default_key="deny",
+        )
+        event = store.present_attention(request)
+
+        store.set_sleep_mode(True, policy="full")
+
+        self.assertTrue(event.wait(1))
+        resolution = store.take_attention_result(request.id)
+        self.assertIsNotNone(resolution)
+        self.assertEqual(resolution.value, "allow_session")
+        self.assertIsNone(store.active_attention())
+
     def test_simple_is_default_and_f2_state_is_reversible(self):
         store = WorkspaceUIStore()
         self.assertEqual(store.snapshot().mode, ExperienceMode.SIMPLE)
@@ -124,14 +148,14 @@ class WorkspaceStoreTests(unittest.TestCase):
         store = WorkspaceUIStore()
         store.handle_event(
             "sleep.mode_changed",
-            "Sleep Mode enabled.",
+            "Full access automation enabled.",
             {"enabled": True, "policy": "full", "sleep_state": "on"},
         )
         self.assertTrue(store.sleep_enabled())
         self.assertEqual(store.sleep_policy(), "full")
         store.handle_event(
             "sleep.mode_changed",
-            "Sleep Mode disabled.",
+            "Full access automation disabled.",
             {"enabled": False, "policy": "off", "sleep_state": "off"},
         )
         self.assertFalse(store.sleep_enabled())
@@ -145,7 +169,7 @@ class WorkspaceStoreTests(unittest.TestCase):
             status="idle",
             workflow_mode="ultra",
         )
-        self.assertEqual(store.snapshot().workflow_mode, "ultra")
+        self.assertEqual(store.snapshot().workflow_mode, "execution")
         store.update_workflow_mode("unsupported")
         self.assertEqual(store.snapshot().workflow_mode, "ready")
 
@@ -204,6 +228,29 @@ class WorkspaceStoreTests(unittest.TestCase):
         self.assertEqual(completed.hidden_lines, 2)
         self.assertIn("four", completed.output)
         self.assertIsNotNone(completed.duration_seconds)
+
+    def test_repeated_provider_byte_events_update_one_live_row(self):
+        store = WorkspaceUIStore()
+        for sequence, received in ((1, 128), (2, 256), (3, 512)):
+            store.handle_event(
+                "provider.activity",
+                "Model response bytes received",
+                {
+                    "sequence": sequence,
+                    "actor": "semantic-router",
+                    "phase": "routing",
+                    "state": "receiving",
+                    "provider_state": "receiving",
+                    "received_bytes": received,
+                    "received_chunks": sequence,
+                },
+            )
+
+        timeline = store.snapshot().live_timeline
+        self.assertEqual(len(timeline), 1)
+        self.assertEqual(timeline[0].sequence, 3)
+        self.assertEqual(timeline[0].received_bytes, 512)
+        self.assertEqual(timeline[0].received_chunks, 3)
 
     def test_retry_wait_and_recoverable_errors_do_not_claim_the_goal_is_paused(self):
         store = WorkspaceUIStore()
@@ -523,7 +570,7 @@ class WorkspaceStoreTests(unittest.TestCase):
             }
         )
         snapshot = store.snapshot()
-        self.assertEqual(snapshot.workflow_mode, "working")
+        self.assertEqual(snapshot.workflow_mode, "execution")
         self.assertEqual(snapshot.status, "running")
         self.assertEqual(snapshot.waiting_on, "")
         self.assertEqual(snapshot.last_tool, "")
@@ -540,7 +587,7 @@ class WorkspaceStoreTests(unittest.TestCase):
             }
         )
         snapshot = store.snapshot()
-        self.assertEqual(snapshot.workflow_mode, "working")
+        self.assertEqual(snapshot.workflow_mode, "execution")
         self.assertEqual(snapshot.runtime_phase, "planning")
 
     def test_live_routing_snapshot_replaces_stale_idle_progress_phase(self):
@@ -743,8 +790,61 @@ class WorkspaceStoreTests(unittest.TestCase):
         snapshot = store.snapshot()
         self.assertEqual(
             snapshot.swarm.active_labels,
-            ("Three Js Ui Specialist · Build the 3D calculator controls",),
+            ("Three Js Ui Specialist #1 · Build the 3D calculator controls",),
         )
+
+    def test_recovered_agent_attempt_is_not_counted_as_active_attention(self):
+        store = WorkspaceUIStore()
+        store.update_swarm_summary(
+            {
+                "status": "running",
+                "nodes": [{"id": "node-ui", "title": "Build UI", "status": "completed"}],
+                "agents": [
+                    {
+                        "id": "agent-planner-one",
+                        "work_node_id": "node-ui",
+                        "role": "planner",
+                        "phase": "implementation",
+                        "status": "failed",
+                        "error": "path does not exist: index.html",
+                    },
+                    {
+                        "id": "agent-planner-two",
+                        "work_node_id": "node-ui",
+                        "role": "planner",
+                        "phase": "implementation",
+                        "status": "completed",
+                    },
+                ],
+            }
+        )
+
+        swarm = store.snapshot().swarm
+        self.assertEqual(swarm.blocked, 0)
+        self.assertEqual(swarm.agent_lines[0].status, "recovered")
+        self.assertEqual(swarm.agent_lines[0].display_name, "Planner #1")
+        self.assertEqual(swarm.agent_lines[1].display_name, "Planner #2")
+
+    def test_only_terminal_unresolved_branch_requests_attention(self):
+        store = WorkspaceUIStore()
+        store.update_swarm_summary(
+            {
+                "status": "blocked",
+                "nodes": [{"id": "node-ui", "title": "Build UI", "status": "failed"}],
+                "agents": [{
+                    "id": "agent-coder-one",
+                    "work_node_id": "node-ui",
+                    "role": "coder",
+                    "phase": "implementation",
+                    "status": "failed",
+                    "error": "provider result was invalid",
+                }],
+            }
+        )
+
+        swarm = store.snapshot().swarm
+        self.assertEqual(swarm.blocked, 1)
+        self.assertTrue(swarm.agent_lines[0].unresolved)
 
     def test_swarm_summary_keeps_every_agent_run_even_on_one_node(self):
         store = WorkspaceUIStore()

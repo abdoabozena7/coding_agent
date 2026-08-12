@@ -30,10 +30,13 @@ from agent.web_views.service import CoreWebAdapter
 
 
 PUBLIC_COMMANDS = {
-    "/plan",
+    "/ultra-plan",
     "/live",
+    "/output",
+    "/todo",
     "/show-diff",
     "/advanced-tracing",
+    "/access",
     "/settings",
     "/pause",
     "/resume",
@@ -45,7 +48,7 @@ PUBLIC_COMMANDS = {
 
 
 class PublicCommandSurfaceTests(unittest.TestCase):
-    def test_parser_and_palette_have_exactly_eleven_commands(self):
+    def test_parser_and_palette_have_exactly_fourteen_commands(self):
         self.assertEqual({item.name for item in COMMAND_SPECS}, PUBLIC_COMMANDS)
         for command in PUBLIC_COMMANDS - {"/undo"}:
             self.assertIsInstance(parse_command(command).kind, CommandKind)
@@ -79,6 +82,45 @@ class PublicCommandSurfaceTests(unittest.TestCase):
                         f"{path.relative_to(source_root)}: /{match.group(1)}"
                     )
         self.assertEqual(findings, [])
+
+
+class BoundedActionTracingTests(unittest.TestCase):
+    def test_activity_without_a_goal_is_visible_in_web_advanced_timeline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            runtime = AgentRuntime(
+                ScriptedProvider([]),
+                store,
+                workspace,
+                events=EventBus(),
+                config=replace(RuntimeConfig(), repository_index_warmup_files=0),
+                session_id="bounded-action-session",
+            )
+            try:
+                runtime._publish_activity_step(
+                    "Reading README.md",
+                    actor="chat",
+                    phase="working",
+                    state="active",
+                    operation="Reading README.md",
+                )
+                adapter = CoreWebAdapter(runtime)
+                overview = adapter.advanced_trace_overview()
+                timeline = adapter.advanced_trace_timeline(limit=20)
+
+                self.assertEqual(overview["state"], "LIVE")
+                self.assertGreaterEqual(overview["counts"]["events"], 1)
+                self.assertTrue(
+                    any(
+                        item["kind"] == "activity.step"
+                        and item["summary"] == "Reading README.md"
+                        for item in timeline["items"]
+                    )
+                )
+            finally:
+                runtime.close()
+                store.close()
 
 
 class AdvancedTracingIntegrationTests(unittest.TestCase):

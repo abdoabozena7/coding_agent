@@ -913,16 +913,37 @@ class OllamaHandshake:
         if model not in models:
             raise ProviderRequestError(ProviderDiagnostic(True, ProviderFailureKind.MODEL_NOT_INSTALLED, "model_lookup", 404, f"model {model!r} is not installed", self.base_url + "/api/tags"))
         metadata = models[model]
-        capabilities = set(metadata.get("capabilities") or ())
-        details = metadata.get("details") or {}
+        # `/api/tags` is an inventory endpoint and current Ollama releases do
+        # not include the model's multimodal/tool capabilities there.  Those
+        # are authoritative on `/api/show`; relying on tags silently erased
+        # vision support for models that Ollama correctly reported as visual.
+        show_status, shown = self._json("/api/show", {"model": model})
+        capabilities = {
+            str(item).strip().casefold()
+            for item in (shown.get("capabilities") or metadata.get("capabilities") or ())
+            if str(item).strip()
+        }
+        details = shown.get("details") or metadata.get("details") or {}
+        model_info = shown.get("model_info") or {}
+        context_size = details.get("context_length")
+        if context_size is None:
+            context_size = next(
+                (
+                    value for key, value in model_info.items()
+                    if str(key).casefold().endswith(".context_length")
+                    and isinstance(value, int)
+                ),
+                None,
+            )
         return ModelCapabilityProfile(
             model_name=model, base_url=self.base_url, endpoint="/api/chat", api_protocol="native_chat", chat_support="completion" in capabilities,
             completion_support="completion" in capabilities, tool_call_support="tools" in capabilities,
             thinking_support="thinking" in capabilities,
             vision_support="vision" in capabilities, embedding_support="embedding" in capabilities,
-            context_size=details.get("context_length"), health_status="reachable",
+            context_size=context_size, health_status="reachable",
             last_successful_probe=utc_now(), model_fingerprint=str(metadata.get("digest") or ""),
             probe_evidence={"base_url": self.base_url, "version_status": version_status,
-                            "tags_status": tags_status, "ollama_version": version.get("version"),
+                            "tags_status": tags_status, "show_status": show_status,
+                            "ollama_version": version.get("version"),
                             "capabilities": sorted(capabilities)},
         )

@@ -20,7 +20,15 @@ from agent.semantic import RequestedEffect
 from agent.store import StateStore
 from agent.testing import ScriptedProvider
 from agent.ultra import UltraOrchestrator
-from agent.ultra_models import normalize_contract_path
+from agent.ultra_models import (
+    ExecutionClass,
+    ResultPackageV1,
+    TaskContractV1,
+    UltraRun,
+    UltraRunStatus,
+    WorkNode,
+    normalize_contract_path,
+)
 from agent import tools
 
 
@@ -59,7 +67,9 @@ def test_runtime_capability_report_contains_the_real_tool_contract() -> None:
     process = report["start_process"]
     assert "must remain running" in process["description"]
     assert process["lifecycle"] == "managed"
-    assert process["parameters"]["required"] == ["command"]
+    assert process["parameters"]["required"] == [
+        "command", "readiness_type", "readiness_value",
+    ]
     assert "process_id" in process["result_contract"]["fields"]
 
 
@@ -360,6 +370,194 @@ def test_read_only_companion_runtime_does_not_recover_a_live_worker() -> None:
             if store.list_actions(goal.id, status="running"):
                 store.complete_action(action_id, "test cleanup")
             owner.close()
+            store.close()
+
+
+def test_restart_reconciles_terminal_ultra_failure_with_stale_running_goal() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store = StateStore(directory)
+        first = AgentRuntime(ScriptedProvider(), store, directory)
+        restored = None
+        try:
+            goal = store.create_goal(
+                "Restore the failed recursive checkpoint",
+                session_id=first.session_id,
+            )
+            store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+            store.transition_goal(goal.id, GoalStatus.RUNNING)
+            run = store.create_ultra_run(
+                UltraRun(
+                    goal_id=goal.id,
+                    provider="test",
+                    model="weak-local",
+                    execution_class=ExecutionClass.LOCAL,
+                    concurrency=1,
+                )
+            )
+            store.update_goal_metadata(goal.id, ultra_run_id=run.id)
+            store.update_ultra_run(
+                run.id,
+                status=UltraRunStatus.BLOCKED,
+                error="tester returned a malformed typed verdict",
+            )
+            first.close()
+
+            restored = AgentRuntime(
+                ScriptedProvider(),
+                store,
+                directory,
+                session_id=first.session_id,
+            )
+
+            reconciled = store.get_goal(goal.id)
+            assert reconciled.status is GoalStatus.BLOCKED
+            assert reconciled.metadata["resume_action"] == "Retry"
+            assert reconciled.metadata["waiting_on"] == "recovery"
+            assert reconciled.metadata["waiting_question"] == ""
+            assert reconciled.metadata["auto_retryable"] is True
+            assert reconciled.metadata["terminal_ultra_failure"] == {
+                "run_id": run.id,
+                "status": UltraRunStatus.BLOCKED.value,
+                "diagnostic": "tester returned a malformed typed verdict",
+                "mutation_replayed": False,
+            }
+            assert store.get_ultra_run(run.id).status is UltraRunStatus.BLOCKED
+        finally:
+            if restored is not None:
+                restored.close()
+            else:
+                first.close()
+            store.close()
+
+
+def test_restart_reconciles_revision_required_ultra_with_stale_running_goal() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store = StateStore(directory)
+        first = AgentRuntime(ScriptedProvider(), store, directory)
+        restored = None
+        try:
+            goal = store.create_goal(
+                "Restore the stopped quality revision",
+                session_id=first.session_id,
+            )
+            store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+            store.transition_goal(goal.id, GoalStatus.RUNNING)
+            run = store.create_ultra_run(
+                UltraRun(
+                    goal_id=goal.id,
+                    provider="test",
+                    model="weak-local",
+                    execution_class=ExecutionClass.LOCAL,
+                    concurrency=1,
+                )
+            )
+            store.update_goal_metadata(goal.id, ultra_run_id=run.id)
+            store.update_ultra_run(
+                run.id,
+                status=UltraRunStatus.REVISION_REQUIRED,
+                error="browser runtime failed: THREE is not defined",
+            )
+            first.close()
+
+            restored = AgentRuntime(
+                ScriptedProvider(),
+                store,
+                directory,
+                session_id=first.session_id,
+            )
+
+            reconciled = store.get_goal(goal.id)
+            assert reconciled.status is GoalStatus.PAUSED
+            assert reconciled.metadata["resume_action"] == "ultra_replan"
+            assert reconciled.metadata["waiting_on"] == "diagnosis"
+            assert "THREE is not defined" in reconciled.metadata["replan_feedback"]
+            assert reconciled.metadata["terminal_ultra_failure"] == {
+                "run_id": run.id,
+                "status": UltraRunStatus.REVISION_REQUIRED.value,
+                "diagnostic": "browser runtime failed: THREE is not defined",
+                "mutation_replayed": False,
+            }
+        finally:
+            if restored is not None:
+                restored.close()
+            else:
+                first.close()
+            store.close()
+
+
+def test_restart_candidate_error_overrides_stale_harness_contract_label() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store = StateStore(directory)
+        first = AgentRuntime(ScriptedProvider(), store, directory)
+        restored = None
+        try:
+            goal = store.create_goal(
+                "Repair the broken browser application",
+                session_id=first.session_id,
+            )
+            store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+            store.transition_goal(goal.id, GoalStatus.RUNNING)
+            run = store.create_ultra_run(
+                UltraRun(
+                    goal_id=goal.id,
+                    provider="test",
+                    model="weak-local",
+                    execution_class=ExecutionClass.LOCAL,
+                    concurrency=1,
+                )
+            )
+            store.update_goal_metadata(goal.id, ultra_run_id=run.id)
+            store.create_work_node(
+                WorkNode(
+                    ultra_run_id=run.id,
+                    title="Browser integration",
+                    objective="Run the interactive application.",
+                    contract=TaskContractV1(
+                        objective="Run the interactive application.",
+                        success_criteria=("The application starts without runtime errors.",),
+                        write_paths=("index.html",),
+                    ),
+                    result=ResultPackageV1(
+                        summary="Browser verification failed.",
+                        issues=("THREE is not defined", "Required DOM elements were not found"),
+                        metadata={
+                            "component_package": {
+                                "failure_diagnostic": {
+                                    "failure_kind": "contract",
+                                    "blocker_owner": "test_harness",
+                                    "mutation_prohibited": True,
+                                    "failure_fingerprint": "c" * 64,
+                                }
+                            }
+                        },
+                    ),
+                )
+            )
+            store.update_ultra_run(
+                run.id,
+                status=UltraRunStatus.REVISION_REQUIRED,
+                error="Browser quality gate failed.",
+            )
+            first.close()
+
+            restored = AgentRuntime(
+                ScriptedProvider(),
+                store,
+                directory,
+                session_id=first.session_id,
+            )
+
+            reconciled = store.get_goal(goal.id)
+            assert reconciled.status is GoalStatus.PAUSED
+            assert reconciled.metadata["resume_action"] == "ultra_replan"
+            assert reconciled.metadata["auto_retryable"] is True
+            assert "THREE is not defined" in reconciled.metadata["replan_feedback"]
+            assert "verification_blocker" not in reconciled.metadata
+        finally:
+            if restored is not None:
+                restored.close()
+            else:
+                first.close()
             store.close()
 
 

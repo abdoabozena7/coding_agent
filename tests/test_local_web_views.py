@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 import asyncio
+import json
 import tempfile
 import time
 import unittest
@@ -12,6 +13,7 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from agent.config import RuntimeConfig
+from agent.action_outcome import ActionOutcomeContractV1
 from agent.events import EventBus, UIEvent
 from agent.models import Evidence, GoalStatus
 from agent.model_catalog import ExecutionClass
@@ -135,6 +137,182 @@ class LocalWebViewTestCase(unittest.TestCase):
 
 
 class PlanStudioIntegrationTests(LocalWebViewTestCase):
+    def test_output_page_exposes_message_copy_sections_and_safe_assets(self):
+        image = self.workspace / "output" / "browser" / "result.png"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(b"png-bytes")
+        published = self.runtime._publish_output_tool({
+            "title": "Finished result",
+            "message": "The project is ready.",
+            "copy_sections": [{"id": "copy-1", "label": "Copy ready", "text": "Reusable text"}],
+            "assets": [{
+                "id": "image-1", "path": "output/browser/result.png",
+                "label": "Main screen", "kind": "image", "sha256": "a" * 64,
+                "byte_size": image.stat().st_size,
+            }],
+        })
+
+        shell = self.client.get(f"/sessions/{self.runtime.session_id}/output")
+        payload = self.client.get(f"/api/sessions/{self.runtime.session_id}/output").json()
+        asset = self.client.get(payload["assets"][0]["url"])
+
+        self.assertEqual(shell.status_code, 200)
+        self.assertIn("Output · GA3BAD", shell.text)
+        self.assertEqual(payload["output_id"], published["output_id"])
+        self.assertEqual(payload["message"], "The project is ready.")
+        self.assertEqual(payload["copy_sections"][0]["text"], "Reusable text")
+        self.assertEqual(asset.status_code, 200)
+        self.assertEqual(asset.content, b"png-bytes")
+
+    def test_completed_output_repairs_a_stale_pre_evaluation_draft(self):
+        published = self.runtime._publish_output_tool({
+            "title": "Screenshot task",
+            "message": (
+                "I captured the screenshots. To complete the final step, "
+                "I need to evaluate these images visually.\n\n"
+                "Limitation: one optional service was unavailable."
+            ),
+            "copy_sections": [],
+            "assets": [],
+        })
+
+        payload = self.client.get(
+            f"/api/sessions/{self.runtime.session_id}/output"
+        ).json()
+
+        self.assertEqual(payload["output_id"], published["output_id"])
+        self.assertEqual(payload["status"], "ready")
+        self.assertIn("completed successfully", payload["message"])
+        self.assertIn("optional service was unavailable", payload["message"])
+        self.assertNotIn("need to evaluate", payload["message"])
+
+    def test_action_completion_refreshes_the_existing_output_envelope(self):
+        stale = (
+            "I captured the screenshots. To complete the final step, "
+            "I need to evaluate these images visually."
+        )
+        published = self.runtime._publish_output_tool({
+            "title": "Screenshot task",
+            "message": stale,
+            "copy_sections": [],
+            "assets": [],
+        })
+        contract = ActionOutcomeContractV1(require_output=True)
+        contract.observe("publish_output", json.dumps(published))
+
+        self.runtime._refresh_completed_action_output(stale, contract)
+
+        session = self.store.get_workflow_session(self.runtime.session_id)
+        output = dict(session["state"]["latest_output"])
+        self.assertEqual(output["output_id"], published["output_id"])
+        self.assertIn("completed successfully", output["message"])
+        self.assertNotIn("need to evaluate", output["message"])
+
+    def test_web_todo_and_terminal_projection_share_checklists_and_evidence(self):
+        self.store.approve_plan(
+            self.goal.id,
+            self.plan.revision,
+            expected_fingerprint=self.plan.fingerprint,
+        )
+        self.store.transition_task(
+            self.goal.id,
+            self.plan.revision,
+            "T001",
+            "in_progress",
+        )
+        self.store.add_evidence(
+            Evidence(
+                goal_id=self.goal.id,
+                plan_revision=self.plan.revision,
+                task_id="T001",
+                kind="test",
+                summary="The focused behavior check passed.",
+                verified=True,
+            )
+        )
+        self.store.transition_task(
+            self.goal.id,
+            self.plan.revision,
+            "T001",
+            "completed",
+        )
+
+        runtime_snapshot = self.runtime.workflow_runtime_snapshot()
+        context = self.adapter.workspace_context()
+
+        self.assertEqual(context["todo"]["items"], list(runtime_snapshot.task_items))
+        self.assertEqual(context["todo"]["completion_percent"], 100)
+        self.assertEqual(context["todo"]["verification_percent"], 100)
+        task = context["todo"]["items"][0]
+        self.assertEqual(task["checklist"][0]["state"], "verified")
+        self.assertIn(
+            "The focused behavior check passed.",
+            task["checklist"][0]["evidence"],
+        )
+
+    def test_pending_repair_run_preserves_accepted_plan_progress(self):
+        self.store.approve_plan(
+            self.goal.id,
+            self.plan.revision,
+            expected_fingerprint=self.plan.fingerprint,
+        )
+        self.store.transition_task(
+            self.goal.id,
+            self.plan.revision,
+            "T001",
+            "in_progress",
+        )
+        self.store.transition_task(
+            self.goal.id,
+            self.plan.revision,
+            "T001",
+            "completed",
+            evidence=("The accepted implementation checkpoint was recorded.",),
+        )
+        self.store.transition_goal(self.goal.id, GoalStatus.REVISING)
+        repair = self.store.create_plan(
+            self.goal.id,
+            "Repair only the failed verification boundary.",
+            [task_value("R001", "Repair the saved boundary")],
+            **basis("R001"),
+        )
+        self.store.transition_goal(
+            self.goal.id,
+            GoalStatus.AWAITING_PLAN_APPROVAL,
+            reason="repair plan ready",
+        )
+        self.store.create_ultra_run(
+            UltraRun(
+                goal_id=self.goal.id,
+                provider="test",
+                model="offline",
+                status=UltraRunStatus.AWAITING_APPROVAL,
+                plan_revision=None,
+                master_approved=False,
+            )
+        )
+
+        snapshot = self.runtime.workflow_runtime_snapshot()
+        context = self.adapter.workspace_context()
+
+        self.assertEqual([item["id"] for item in snapshot.task_items], ["T001"])
+        self.assertEqual(snapshot.goal_progress["completion_percent"], 100)
+        self.assertEqual(snapshot.goal_progress["plan_revision"], self.plan.revision)
+        self.assertEqual(snapshot.goal_progress["pending_plan_revision"], repair.revision)
+        self.assertEqual(
+            snapshot.goal_progress["projection_basis"],
+            "accepted_plan_during_replan",
+        )
+        self.assertEqual(context["todo"]["total"], 1)
+        self.assertEqual(context["todo"]["completion_percent"], 100)
+        self.assertEqual(context["todo"]["plan_revision"], self.plan.revision)
+        self.assertEqual(context["todo"]["pending_plan_revision"], repair.revision)
+        self.assertEqual(context["current_plan"]["revision"], repair.revision)
+        self.assertEqual(
+            context["current_plan"]["approved_revision"],
+            self.plan.revision,
+        )
+
     def test_real_local_build_surface_starts_goal_without_a_second_router_call(self):
         self.store.transition_goal(
             self.goal.id,
@@ -219,7 +397,7 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
         self.assertEqual(context["runtime"]["liveness"], "waiting")
         self.assertEqual(context["runtime"]["waiting_on"], "user")
         self.assertEqual(context["runtime"]["reason"], "Plan r1 is ready for review.")
-        self.assertEqual(plan["interaction_mode"], "working")
+        self.assertEqual(plan["interaction_mode"], "execution")
 
     def test_automatic_local_fallback_is_projected_from_durable_metadata(self):
         self.store.update_goal_metadata(
@@ -311,7 +489,7 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
-        for section in ("environment", "model", "git", "access", "sleep", "changes", "processes", "agents", "tree", "sources"):
+        for section in ("environment", "model", "git", "access", "changes", "processes", "agents", "tree", "sources"):
             self.assertIn(section, body)
         self.assertEqual(body["environment"]["session_id"], self.runtime.session_id)
         section = self.client.get(
@@ -514,7 +692,7 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
         self.assertEqual(context["runtime"]["liveness"], "waiting")
         self.assertIn("preview_html", context["runtime"]["reason"])
 
-    def test_full_auto_requires_confirmation_and_resumes_pending_tool(self):
+    def test_retired_web_full_auto_action_is_rejected_and_does_not_resume_pending_tool(self):
         fingerprint = "pending-" + ("b" * 64)
         self.store.update_goal_metadata(
             self.goal.id,
@@ -532,29 +710,11 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
         )
         self.assertEqual(rejected.status_code, 422)
 
-        enabled = self.client.post(
-            f"/api/sessions/{self.runtime.session_id}/actions",
-            headers=self.csrf_headers(),
-            json={"action": "sleep_full_on", "value": "FULL AUTO", "source": "web"},
-        )
+        self.assertEqual(rejected.status_code, 422)
+        current = self.store.get_goal(self.goal.id)
+        self.assertNotIn("decision", current.metadata["pending_tool_approval"])
 
-        self.assertEqual(enabled.status_code, 200, enabled.text)
-        self.assertIn("pending action was approved", enabled.json()["message"])
-        context = self.client.get(
-            f"/api/sessions/{self.runtime.session_id}/workspace"
-        ).json()
-        self.assertTrue(context["sleep_enabled"])
-        self.assertEqual(context["sleep_policy"], "full")
-        self.assertIsNone(context["tool_approval"])
-        self.assertEqual(self.store.get_goal(self.goal.id).status, GoalStatus.RUNNING)
-        self.assertTrue(
-            any(
-                item.event_type == "sleep.full_auto_plan_approval"
-                for item in self.store.list_recent_events(self.goal.id, limit=100)
-            )
-        )
-
-    def test_full_auto_tool_boundary_wakes_the_controller_after_restart(self):
+    def test_retired_web_full_auto_action_cannot_wake_the_controller(self):
         self.runtime.approve_plan(1)
         fingerprint = "paused-tool-" + ("d" * 64)
         self.store.update_goal_metadata(
@@ -568,24 +728,14 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
             },
         )
         self.store.transition_goal(self.goal.id, GoalStatus.PAUSED, reason="tool boundary")
-        wake = mock.Mock()
-        adapter = CoreWebAdapter(self.runtime, on_execution_requested=wake)
-
-        receipt = adapter.apply_workspace_action(
-            WorkspaceActionRequest(
-                action="sleep_full_on",
-                value="FULL AUTO",
-                source="web",
-            )
+        response = self.client.post(
+            f"/api/sessions/{self.runtime.session_id}/actions",
+            headers=self.csrf_headers(),
+            json={"action": "sleep_full_on", "value": "FULL AUTO", "source": "web"},
         )
 
-        self.assertTrue(receipt["accepted"])
-        wake.assert_called_once_with()
-        self.assertEqual(self.store.get_goal(self.goal.id).status, GoalStatus.RUNNING)
-        self.assertEqual(
-            self.store.get_goal(self.goal.id).metadata["pending_tool_approval"]["decision"],
-            "allow_once",
-        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.store.get_goal(self.goal.id).status, GoalStatus.PAUSED)
 
     def test_error_taxonomy_distinguishes_quota_from_rate_limit(self):
         self.assertEqual(_error_code("Provider quota exhausted", 429), "quota_exhausted")
@@ -1078,7 +1228,7 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
         snapshot = self.client.get(
             f"/api/sessions/{self.runtime.session_id}/plan"
         ).json()
-        self.assertEqual(snapshot["interaction_mode"], "working")
+        self.assertEqual(snapshot["interaction_mode"], "execution")
         self.assertEqual(snapshot["execution_strategy"], "staged")
         self.assertFalse(snapshot["strategy_locked"])
         self.assertIn("capability_envelope", snapshot)
@@ -1168,9 +1318,15 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
             f"/api/sessions/{self.runtime.session_id}/workspace"
         )
         self.assertEqual(context.status_code, 200)
-        self.assertEqual(context.json()["required_view"], "plan")
-        self.assertEqual(context.json()["attention"]["action"]["label"], "Open plan")
+        initial = context.json()
+        self.assertEqual(initial["required_view"], "plan")
+        self.assertEqual(initial["attention"]["action"]["label"], "Open plan")
+        self.assertEqual(initial["current_plan"]["revision"], 1)
+        self.assertEqual(initial["current_plan"]["summary"], self.plan.summary)
+        self.assertEqual(initial["todo"]["total"], 1)
+        self.assertEqual(initial["todo"]["items"][0]["title"], self.plan.tasks[0].title)
         self.runtime.approve_plan(1)
+        self.runtime._update_execution_lease(stage="working", state="active")
         running = self.client.get(
             f"/api/sessions/{self.runtime.session_id}/workspace"
         ).json()
@@ -1179,6 +1335,73 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
         self.assertIn("activity_sequence", running["runtime"])
         self.assertIn("liveness", running["runtime"])
         self.assertIn("timeline_preview", running["runtime"])
+
+    def test_boundary_lease_projects_paused_consistently_across_web_views(self):
+        self.runtime.approve_plan(1)
+        self.store.update_goal_metadata(
+            self.goal.id,
+            waiting_on="verification",
+            waiting_question="Inspect the saved verification boundary.",
+            resume_action="inspect_verification",
+        )
+        self.runtime._update_execution_lease(
+            stage="ultra-boundary",
+            state="boundary",
+        )
+
+        workspace = self.client.get(
+            f"/api/sessions/{self.runtime.session_id}/workspace"
+        ).json()
+        plan = self.client.get(
+            f"/api/sessions/{self.runtime.session_id}/plan"
+        ).json()
+        thread = self.client.get(
+            f"/api/sessions/{self.runtime.session_id}/thread?after_sequence=0"
+        ).json()
+        workflow_status = next(
+            item for item in thread["items"] if item["type"] == "workflow_status"
+        )
+
+        self.assertEqual(workspace["runtime"]["phase"], "paused")
+        self.assertEqual(workspace["goal"]["status"], "paused")
+        self.assertEqual(workspace["attention"]["state"], "blocked")
+        self.assertEqual(workspace["required_action"]["kind"], "retry")
+        self.assertEqual(plan["goal_status"], "paused")
+        self.assertEqual(workflow_status["payload"]["phase"], "paused")
+        self.assertEqual(workflow_status["payload"]["status"], "paused")
+        self.assertEqual(workflow_status["payload"]["liveness"], "paused")
+
+    def test_exhausted_identical_retry_is_removed_from_web_recovery_actions(self):
+        self.runtime.approve_plan(1)
+        self.store.update_goal_metadata(
+            self.goal.id,
+            waiting_on="verification",
+            waiting_question="The identical verification result was reproduced.",
+            resume_action="inspect_verification",
+            verification_retry_state={
+                "failure_fingerprint": "same-failure",
+                "attempts": 1,
+                "exhausted": True,
+            },
+        )
+        self.runtime._update_execution_lease(
+            stage="ultra-boundary",
+            state="boundary",
+        )
+
+        workspace = self.client.get(
+            f"/api/sessions/{self.runtime.session_id}/workspace"
+        ).json()
+        required = workspace["required_action"]
+        alternatives = {item["kind"] for item in required["alternatives"]}
+
+        self.assertEqual(required["kind"], "switch_model")
+        self.assertEqual(required["label"], "Change model and continue")
+        self.assertTrue(required["retry_exhausted"])
+        self.assertEqual(required["retry_attempts"], 1)
+        self.assertNotIn("retry", alternatives)
+        self.assertIn("inspect", alternatives)
+        self.assertIn("stop", alternatives)
 
     def test_unified_history_execution_aliases_and_required_action(self):
         context = self.client.get(
@@ -1683,8 +1906,77 @@ class ReviewAndAgentIntegrationTests(LocalWebViewTestCase):
         body = response.json()
         self.assertEqual(body["nodes"][0]["id"], self.node.id)
         self.assertEqual(body["agents"][0]["id"], self.agent.id)
+        self.assertEqual(body["agents"][0]["display_name"], "Backend #1")
+        self.assertEqual(body["agents"][0]["short_id"], self.agent.id[-6:])
         self.assertEqual(body["agents"][0]["current_file"], "agent/auth.py")
         self.assertIsNone(body["agents"][0]["progress"])
+
+    def test_failed_attempt_recovered_by_later_run_is_explained_not_blocking(self):
+        failed = self.store.create_agent_run(
+            AgentRun(
+                ultra_run_id=self.run.id,
+                work_node_id=self.node.id,
+                role="backend",
+                provider="test",
+                model="offline",
+                phase="review",
+                status=AgentRunStatus.FAILED,
+                error="path does not exist: agent/auth.py",
+            )
+        )
+        self.store.create_agent_run(
+            AgentRun(
+                ultra_run_id=self.run.id,
+                work_node_id=self.node.id,
+                role="backend",
+                provider="test",
+                model="offline",
+                phase="review",
+                status=AgentRunStatus.COMPLETED,
+            )
+        )
+
+        body = self.client.get(
+            f"/api/sessions/{self.runtime.session_id}/agents"
+        ).json()
+        row = next(item for item in body["agents"] if item["id"] == failed.id)
+        self.assertEqual(row["status"], "recovered")
+        self.assertTrue(row["recovered"])
+        self.assertFalse(row["attention_required"])
+        self.assertIn("not available yet", row["problem"]["summary"])
+
+    def test_terminal_failed_agent_exposes_recovery_actions(self):
+        failed = self.store.create_agent_run(
+            AgentRun(
+                ultra_run_id=self.run.id,
+                work_node_id=self.node.id,
+                role="tester",
+                provider="test",
+                model="offline",
+                phase="test",
+                status=AgentRunStatus.FAILED,
+                error="test.passed must be boolean",
+            )
+        )
+        self.store.transition_goal(
+            self.goal.id,
+            GoalStatus.BLOCKED,
+            reason="saved recursive branch requires recovery",
+        )
+        self.store.update_ultra_run(
+            self.run.id,
+            status=UltraRunStatus.BLOCKED,
+            error="saved recursive branch requires recovery",
+        )
+
+        body = self.client.get(
+            f"/api/sessions/{self.runtime.session_id}/agents"
+        ).json()
+        row = next(item for item in body["agents"] if item["id"] == failed.id)
+        self.assertTrue(row["attention_required"])
+        self.assertEqual(row["resolution_state"], "needs_attention")
+        self.assertEqual(row["action_options"][:3], ["retry", "switch_model", "stop"])
+        self.assertIn("response format", row["problem"]["summary"])
 
     def test_execution_result_exposes_safe_artifacts_and_changed_files(self):
         self.store.add_artifact(

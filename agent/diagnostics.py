@@ -200,7 +200,8 @@ def audit_agent_readiness(
     detected.
     """
 
-    from . import evaluation, reasoning
+    from . import evaluation, reasoning, worker_benchmark
+    from .orchestration import AdaptiveWorkerRouter, EvidenceClaimV1
     from .project_brain import ProjectBrain
     from .repository_index import EmbeddingProvider, RepositoryIndex
     from .store import StateStore
@@ -254,6 +255,40 @@ def audit_agent_readiness(
                 "learn_from_benchmark_trend",
             ),
             message="Quality must be measured with benchmarks and trend/regression records",
+        ),
+        _capability(
+            "evidence_driven_worker_routing",
+            AdaptiveWorkerRouter,
+            ("route",),
+            message="Worker roles must be selected from observable risk signals and bounded budgets",
+        ),
+        _capability(
+            "criterion_evidence_contract",
+            EvidenceClaimV1,
+            ("to_dict", "authoritative", "hard_veto"),
+            message="Acceptance criteria require versioned evidence claims with deterministic veto semantics",
+        ),
+        _capability(
+            "matched_worker_benchmark",
+            worker_benchmark,
+            (
+                "default_fixtures",
+                "FourArmBenchmarkRunner",
+                "evaluate_activation_gate",
+                "paired_bootstrap_delta_interval",
+            ),
+            message="Worker uplift must be measured against single-agent and compute-matched arms",
+        ),
+        _capability(
+            "worker_impact_storage",
+            StateStore,
+            (
+                "record_orchestration_experiment",
+                "record_worker_contribution",
+                "worker_role_utility",
+                "suppressed_worker_roles",
+            ),
+            message="Worker cost, evidence novelty, and verified contribution must be durable",
         ),
         _capability(
             "swarm_intelligence",
@@ -605,11 +640,65 @@ def benchmark_agent_readiness(
             finally:
                 store.close()
 
+    def worker_orchestration_probe() -> tuple[str, ...]:
+        from .orchestration import (
+            AdaptiveWorkerRouter,
+            EvidenceAuthority,
+            EvidenceClaimV1,
+            EvidenceVerdict,
+            TaskRiskSignalsV1,
+            WorkerRole,
+            evidence_decision,
+        )
+        from .worker_benchmark import default_fixtures
+
+        fixtures = default_fixtures()
+        router = AdaptiveWorkerRouter()
+        low = router.route(TaskRiskSignalsV1(declared_risk="low"))
+        high = router.route(
+            TaskRiskSignalsV1(
+                declared_risk="high",
+                security_sensitive=True,
+                missing_evidence_count=2,
+            )
+        )
+        veto = EvidenceClaimV1(
+            criterion_id="security",
+            claim="A deterministic security check failed.",
+            artifact_hash="a" * 64,
+            evidence_refs=("action:diagnostic",),
+            falsification_check="Re-run the deterministic security check.",
+            verdict=EvidenceVerdict.FAILED,
+            authority=EvidenceAuthority.HARNESS,
+            producer_id="diagnostic",
+            verifier_id="harness",
+        )
+        if low.roles or high.roles != (
+            WorkerRole.PREDICTOR,
+            WorkerRole.FALSIFIER,
+            WorkerRole.REPAIRER,
+        ):
+            raise AssertionError("adaptive worker router violated its bounded risk policy")
+        if evidence_decision((veto,)) is not EvidenceVerdict.FAILED:
+            raise AssertionError("deterministic failure did not veto consensus")
+        if len(fixtures) != 24 or any(
+            sum(item.task_class == task_class for item in fixtures) != 4
+            for task_class in {item.task_class for item in fixtures}
+        ):
+            raise AssertionError("worker benchmark is not balanced at 24 fixtures")
+        return (
+            f"fixtures={len(fixtures)}",
+            f"low_extra_workers={len(low.roles)}",
+            f"high_roles={','.join(item.value for item in high.roles)}",
+            "deterministic_veto=passed",
+        )
+
     checks = [
         _behavioral_check("behavioral_code_retrieval", code_retrieval_probe),
         _behavioral_check("behavioral_reasoning", reasoning_probe),
         _behavioral_check("behavioral_swarm_consensus", swarm_probe),
         _behavioral_check("behavioral_learning_evaluation", learning_probe),
+        _behavioral_check("behavioral_worker_orchestration", worker_orchestration_probe),
     ]
     if require_gpu:
         checks.append(

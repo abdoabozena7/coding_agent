@@ -91,6 +91,7 @@ class GeminiProvider:
         thinking=True,
         tool_call_ids=True,
         native_replay=True,
+        vision=True,
     )
 
     def __init__(self, model: str | None = None, reasoning_effort: str = "medium"):
@@ -211,10 +212,23 @@ class GeminiProvider:
 
             flush_tools()
             if role == "user":
+                parts = [types.Part(text=str(message.get("content") or ""))]
+                for image in message.get("images") or ():
+                    if not isinstance(image, Mapping):
+                        continue
+                    data = image.get("data")
+                    if not data:
+                        continue
+                    parts.append(types.Part(
+                        inline_data=types.Blob(
+                            mime_type=str(image.get("mime_type") or "image/png"),
+                            data=base64.b64decode(str(data).encode("ascii"), validate=True),
+                        )
+                    ))
                 contents.append(
                     types.Content(
                         role="user",
-                        parts=[types.Part(text=str(message.get("content") or ""))],
+                        parts=parts,
                     )
                 )
             elif role == "assistant":

@@ -14,7 +14,7 @@ from agent.providers import AssistantTurn, ProviderCapabilities, ToolCall, Usage
 from agent.providers.base import ProviderCallPolicyV1, coerce_tool_args
 from agent.providers.gemini_provider import GeminiProvider
 from agent.providers.ollama_provider import OllamaProvider
-from agent.local_provider import ProviderFailureKind, ProviderRequestError
+from agent.local_provider import OllamaHandshake, ProviderFailureKind, ProviderRequestError
 from agent.providers.openai_provider import OpenAIProvider
 from agent.testing import ScriptedProvider, ScriptedTurn
 
@@ -52,14 +52,56 @@ class NeutralTypesTests(unittest.TestCase):
         self.assertEqual(coerce_tool_args(object()), {})
 
     def test_capability_aliases_are_explicit(self):
-        capabilities = ProviderCapabilities(tool_calling=True, thinking=True)
+        capabilities = ProviderCapabilities(tool_calling=True, thinking=True, vision=True)
         self.assertTrue(capabilities.supports_tools)
         self.assertTrue(capabilities.supports_tool_calling)
         self.assertTrue(capabilities.supports_thinking)
         self.assertFalse(capabilities.supports_streaming)
+        self.assertTrue(capabilities.supports_vision)
+
+
+class OllamaHandshakeTests(unittest.TestCase):
+    def test_probe_reads_capabilities_from_show_instead_of_tags_inventory(self):
+        handshake = OllamaHandshake()
+        handshake._json = Mock(side_effect=[
+            (200, {"version": "0.20.0"}),
+            (200, {"models": [{"name": "gemma4:e4b", "digest": "sha-model"}]}),
+            (200, {
+                "capabilities": ["completion", "vision", "tools", "thinking"],
+                "details": {"family": "gemma4"},
+                "model_info": {"gemma4.context_length": 131072},
+            }),
+        ])
+
+        profile = handshake.probe("gemma4:e4b")
+
+        self.assertTrue(profile.vision_support)
+        self.assertTrue(profile.tool_call_support)
+        self.assertTrue(profile.thinking_support)
+        self.assertEqual(profile.context_size, 131072)
+        self.assertEqual(profile.probe_evidence["show_status"], 200)
+        self.assertEqual(
+            handshake._json.call_args_list[-1].args,
+            ("/api/show", {"model": "gemma4:e4b"}),
+        )
 
 
 class OpenAIProviderTests(unittest.TestCase):
+    def test_image_message_is_sent_as_multimodal_content(self):
+        provider = OpenAIProvider(model="offline")
+        messages = provider._to_messages([
+            {
+                "role": "user", "content": "Judge this image",
+                "images": [{"mime_type": "image/png", "data": "YWJj"}],
+            }
+        ], "system")
+
+        self.assertEqual(messages[1]["content"][0], {"type": "text", "text": "Judge this image"})
+        self.assertEqual(
+            messages[1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,YWJj",
+        )
+
     def test_stream_repairs_missing_id_and_malformed_arguments(self):
         chunks = [
             ns(
@@ -156,6 +198,19 @@ class OpenAIProviderTests(unittest.TestCase):
 
 
 class GeminiProviderTests(unittest.TestCase):
+    def test_image_message_is_sent_as_inline_data(self):
+        provider = GeminiProvider(model="offline")
+        contents = provider._to_contents([
+            {
+                "role": "user", "content": "Judge this image",
+                "images": [{"mime_type": "image/png", "data": "YWJj"}],
+            }
+        ])
+
+        self.assertEqual(contents[0].parts[0].text, "Judge this image")
+        self.assertEqual(contents[0].parts[1].inline_data.mime_type, "image/png")
+        self.assertEqual(contents[0].parts[1].inline_data.data, b"abc")
+
     def _provider_with_stream(self, parts):
         chunk = ns(
             usage_metadata=ns(
@@ -262,6 +317,17 @@ class GeminiProviderTests(unittest.TestCase):
 
 
 class OllamaProviderTests(unittest.TestCase):
+    def test_image_message_uses_ollama_images_field(self):
+        provider = OllamaProvider(model="offline")
+        messages = provider._to_messages([
+            {
+                "role": "user", "content": "Judge this image",
+                "images": [{"mime_type": "image/png", "data": "YWJj"}],
+            }
+        ], "system")
+
+        self.assertEqual(messages[1]["images"], ["YWJj"])
+
     def setUp(self):
         # Provider unit tests use an offline model and mocked HTTP responses.
         # A developer's real GPU-only .env must not turn those mocks into live

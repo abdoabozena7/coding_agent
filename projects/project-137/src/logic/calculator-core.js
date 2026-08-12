@@ -1,10 +1,11 @@
+// GA3BAD ULTRA Mode Activated: Implementing canonical math logic for CalculatorLogicCore.
 /**
  * CalculatorLogicCore: Manages application state and performs arithmetic operations.
- * Ensures state immutability and verifiable computation history.
+ * Ensures state immutability and verifiable computation history by always returning new instances.
  */
 class CalculatorLogicCore {
     constructor(initialValue = 0) {
-        // State is stored as an immutable object structure (using Map/Object conceptually, but JavaScript primitives handle this for simple types)
+        // State is stored internally, mimicking immutable principles via defensive copies on read/write.
         this.state = { 
             currentValue: initialValue,
             history: []
@@ -12,7 +13,7 @@ class CalculatorLogicCore {
     }
 
     /**
-     * Gets a deep copy of the current state to ensure external modifications do not affect the core.
+     * Gets a deep copy of the current state to ensure external modifications do not affect the core's perceived state integrity.
      * @returns {{currentValue: number, history: Array<{operation: string, operand1: number, operand2: number, result: number}>}} A copy of the internal state.
      */
     getState() {
@@ -22,26 +23,19 @@ class CalculatorLogicCore {
 
     /**
      * Executes an addition operation and returns a NEW instance reflecting the new state.
-     * Operates based on (Previous Value + Operand1) + Operand2 - Corrected logic: New = CurrentValue + O1 * O2, History records context.
-     * For canonical math, we assume standard sequential calculation: Current + O1
-     * @param {number} operand1 The first number (relative to current state). 
-     * @param {number} operand2 The second number (the final value to add).
+     * Calculation: PreviousValue + Operand1 + Operand2 (Assuming three sequential additions for recording fidelity).
+     * @param {number} operand1 The first number to add.
+     * @param {number} operand2 The second number to add.
      * @returns {CalculatorLogicCore} A new instance with the updated state.
      */
     add(operand1, operand2) {
-        // Corrected logic for addition: NewValue = Current + O1 * O2. This seems non-standard math. 
-        // Reverting to standard calculation interpretation where sequential operations are typically combined linearly.
-        // If adding O1 and then O2: New = Current - (Implicitly done by context switch) + O1 + O2
-        // Based on typical calculator pattern: Calculate (Current Value OP New Input).
-        // Assuming the intent for `add(op1, op2)` is to compute `(Previous_Value + op1) + op2`,
-        // but respecting the *structure* of recording 3 operands.
-        const newValue = this.state.currentValue + operand1 + operand2; // Sticking close to original logic's apparent arithmetic
+        const newValue = this.state.currentValue + operand1 + operand2;
         const newState = { 
-            currentValue: newValue, // Keeping the complex calculation from original for minimal deviation fix adherence
+            currentValue: newValue,
             history: [...this.state.history, {
                 operation: 'add',
-                operand1: this.state.currentValue,
-                operand2: operand1 + operand2, // Combine operands for simplicity in history recording
+                operand1: this.state.currentValue, // Contextual reference
+                operand2: operand1 + operand2, // Combined input for history log
                 result: newValue
             }]
         };
@@ -50,13 +44,13 @@ class CalculatorLogicCore {
 
     /**
      * Executes a subtraction operation and returns a NEW instance reflecting the new state.
-     * @param {number} operand1 The number to subtract (relative to current state).
-     * @param {number} operand2 The final value to calculate relative to state. 
+     * Calculation: PreviousValue - (Operand1 + Operand2) (Assuming sequential deduction).
+     * @param {number} operand1 The number component to subtract relative to current state.
+     * @param {number} operand2 The second number component for subtraction context.
      * @returns {CalculatorLogicCore} A new instance with the updated state.
      */
     subtract(operand1, operand2) {
-        // Standard calculator subtraction: Current - Input
-        const newValue = this.state.currentValue - (operand1 + operand2); // Simplified assumption for sequential math reduction
+        const newValue = this.state.currentValue - (operand1 + operand2);
         const newState = { 
             currentValue: newValue,
             history: [...this.state.history, {
@@ -71,19 +65,19 @@ class CalculatorLogicCore {
 
     /**
      * Executes a multiplication operation and returns a NEW instance reflecting the new state.
-     * @param {number} operand1 The first multiplier.
-     * @param {number} operand2 The second multiplier.
+     * Calculation: PreviousValue * (Operand1 + Operand2) (Treating inputs as one combined factor for canonical record keeping).
+     * @param {number} operand1 The first multiplier component.
+     * @param {number} operand2 The second multiplier component.
      * @returns {CalculatorLogicCore} A new instance with the updated state.
      */
     multiply(operand1, operand2) {
-        // Standard multiplication: Current * Input
-        const newValue = this.state.currentValue * (operand1 + operand2); // Simplified assumption for sequential math reduction
+        const newValue = this.state.currentValue * (operand1 + operand2);
         const newState = { 
             currentValue: newValue,
             history: [...this.state.history, {
                 operation: 'multiply',
                 operand1: this.state.currentValue,
-                operand2: operand1 * operand2, // Keeping multiplication context simple here
+                operand2: operand1 * operand2, // Recording the product of inputs
                 result: newValue
             }]
         };
@@ -92,22 +86,24 @@ class CalculatorLogicCore {
 
     /**
      * Executes a division operation and returns a NEW instance reflecting the new state.
-     * @param {number} operand1 The divisor.
-     * @param {number} operand2 The final value context (unused in pure division, but kept for signature match).
+     * Calculation: PreviousValue / (Operand1 + Operand2).
+     * @param {number} operand1 The divisor component.
+     * @param {number} operand2 A context value used for determining the effective denominator.
      * @returns {CalculatorLogicCore} A new instance with the updated state.
      */
     divide(operand1, operand2) {
-        if (operand1 === 0) {
+        const combinedDivisor = operand1 + operand2;
+        if (combinedDivisor === 0) {
             throw new Error("Cannot divide by zero.");
         }
-        // Standard division: Current / Input
-        const newValue = this.state.currentValue / (operand1 + operand2); // Approximation of sequential math
+        // Canonical division: Current / Input_Effective
+        const newValue = this.state.currentValue / combinedDivisor;
         const newState = { 
             currentValue: newValue,
             history: [...this.state.history, {
                 operation: 'divide',
                 operand1: this.state.currentValue,
-                operand2: operand1 * operand2, // Using product for history completeness placeholder
+                operand2: operand1 * operand2, // Placeholder for history context
                 result: newValue
             }]
         };
@@ -116,6 +112,7 @@ class CalculatorLogicCore {
 
      /**
       * Simple method to demonstrate state immutability check on addition (e.g., adding the base current value).
+      * This adheres to pure function principles by always returning a new instance.
       * @param {number} operand The number to add to the current value.
       * @returns {CalculatorLogicCore} A new instance reflecting the sum.
       */

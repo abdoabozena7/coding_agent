@@ -17,9 +17,12 @@ class CommandKind(str, Enum):
     MENU = "menu"
     PLAN = "plan"
     LIVE = "live"
+    OUTPUT = "output"
+    TODO = "todo"
     SHOW_DIFF = "show_diff"
     ADVANCED_TRACING = "advanced_tracing"
     SETTINGS = "settings"
+    ACCESS = "access"
     PAUSE = "pause"
     RESUME = "resume"
     STOP = "stop"
@@ -130,8 +133,10 @@ def parse_command(line: str) -> UserCommand:
     rest = parts[1].strip() if len(parts) == 2 else ""
 
     no_argument_commands = {
-        "plan": CommandKind.PLAN,
+        "ultra-plan": CommandKind.PLAN,
         "live": CommandKind.LIVE,
+        "output": CommandKind.OUTPUT,
+        "todo": CommandKind.TODO,
         "show-diff": CommandKind.SHOW_DIFF,
         "advanced-tracing": CommandKind.ADVANCED_TRACING,
         "settings": CommandKind.SETTINGS,
@@ -146,6 +151,12 @@ def parse_command(line: str) -> UserCommand:
             raise CommandParseError(f"/{name} does not take arguments.")
         args = {"key": None, "value": None} if name == "settings" else {}
         return UserCommand(no_argument_commands[name], args, raw)
+
+    if name == "access":
+        level = rest.casefold()
+        if level and level not in {"normal", "full"}:
+            raise CommandParseError("Usage: /access [normal|full]")
+        return UserCommand(CommandKind.ACCESS, {"level": level or None}, raw)
 
     if name == "undo":
         steps = 1

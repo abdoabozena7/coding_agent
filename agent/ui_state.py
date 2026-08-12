@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 import time
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from threading import Event, RLock
 from typing import Any, Callable, Mapping
@@ -157,11 +157,14 @@ class ResourceSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class SwarmAgentLine:
+    id: str = ""
+    display_name: str = "Agent #1"
     role: str = "Agent"
     status: str = "queued"
     phase: str = ""
     task: str = ""
     summary: str = ""
+    unresolved: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,6 +338,7 @@ class WorkspaceSnapshot:
     first_byte_at: float | None = None
     task_items: tuple[Mapping[str, Any], ...] = ()
     next_task: str = ""
+    goal_progress: Mapping[str, Any] = field(default_factory=dict)
     control_surface: str = "terminal_fallback"
 
 
@@ -431,6 +435,7 @@ class WorkspaceUIStore:
         self._stream_state = "idle"
         self._first_byte_at: float | None = None
         self._task_items: tuple[Mapping[str, Any], ...] = ()
+        self._goal_progress: dict[str, Any] = {}
         self._next_task = ""
         self._control_surface = "terminal_fallback"
         self._progress = ProjectProgressSnapshot()
@@ -678,8 +683,13 @@ class WorkspaceUIStore:
     def update_swarm_summary(self, snapshot: Mapping[str, Any] | None) -> None:
         nodes = tuple((snapshot or {}).get("nodes") or ())
         agents = tuple((snapshot or {}).get("agents") or ())
+        run_status = str((snapshot or {}).get("status") or "").casefold()
+        operator_boundary = run_status in {
+            "blocked", "paused", "revision_required", "uncertain", "failed"
+        }
         node_titles: dict[str, str] = {}
         node_statuses: list[str] = []
+        node_status_by_id: dict[str, str] = {}
         for node in nodes:
             node_id = str(
                 (node.get("id") if isinstance(node, Mapping) else getattr(node, "id", ""))
@@ -697,14 +707,17 @@ class WorkspaceUIStore:
                 if isinstance(node, Mapping)
                 else getattr(node, "status", "")
             )
-            node_statuses.append(
-                str(getattr(raw_status, "value", raw_status)).casefold()
-            )
+            normalized_status = str(getattr(raw_status, "value", raw_status)).casefold()
+            node_statuses.append(normalized_status)
+            if node_id:
+                node_status_by_id[node_id] = normalized_status
 
         statuses: list[str] = []
         active_labels: list[str] = []
         agent_lines: list[SwarmAgentLine] = []
-        for agent in agents:
+        records: list[dict[str, Any]] = []
+        role_counts: dict[str, int] = {}
+        for position, agent in enumerate(agents):
             node_id = str(
                 (
                     agent.get("work_node_id") or agent.get("task_id")
@@ -726,6 +739,13 @@ class WorkspaceUIStore:
                 else getattr(agent, "role", "")
             )
             role = " ".join(str(raw_role or "agent").replace("_", " ").split()).title()
+            role_key = role.casefold()
+            role_counts[role_key] = role_counts.get(role_key, 0) + 1
+            display_name = f"{role} #{role_counts[role_key]}"
+            agent_id = str(
+                (agent.get("id") if isinstance(agent, Mapping) else getattr(agent, "id", ""))
+                or ""
+            )
             raw_phase = (
                 agent.get("phase", "")
                 if isinstance(agent, Mapping)
@@ -743,32 +763,77 @@ class WorkspaceUIStore:
                 if isinstance(raw_result, Mapping)
                 else str(getattr(raw_result, "summary", "") or "")
             )
-            if not summary and status == "queued":
-                summary = "Waiting for a dependency or execution slot"
-            agent_lines.append(
-                SwarmAgentLine(
-                    role=role,
-                    status=status,
-                    phase=phase,
-                    task=task,
-                    summary=" ".join(summary.split())[:500],
-                )
+            error = str(
+                (agent.get("error") if isinstance(agent, Mapping) else getattr(agent, "error", ""))
+                or ""
             )
-            if status in {"running", "in_progress", "planning", "testing", "reviewing", "verifying"}:
-                active_labels.append(f"{role} · {task or phase or 'Working'}")
+            records.append({
+                "position": position,
+                "id": agent_id,
+                "display_name": display_name,
+                "role": role,
+                "status": status,
+                "phase": phase,
+                "task": task,
+                "node_id": node_id,
+                "summary": summary,
+                "error": error,
+                "key": (node_id or f"foundation:{phase.casefold()}", role_key, phase.casefold()),
+            })
+
+        problem_values = {"failed", "blocked", "revision_required", "uncertain"}
+        active_values = {"running", "in_progress", "planning", "testing", "reviewing", "verifying"}
+        completed_values = {"completed", "done"}
+        latest_position = {record["key"]: record["position"] for record in records}
+        unresolved_keys: set[tuple[str, str, str]] = set()
+        for record in records:
+            later_exists = latest_position[record["key"]] > record["position"]
+            node_completed = node_status_by_id.get(record["node_id"]) in completed_values
+            unresolved = (
+                record["status"] in problem_values
+                and not later_exists
+                and not node_completed
+                and operator_boundary
+            )
+            if unresolved:
+                unresolved_keys.add(record["key"])
+            shown_status = (
+                "recovered"
+                if record["status"] in problem_values and (later_exists or node_completed)
+                else "recovering"
+                if record["status"] in problem_values and not operator_boundary
+                else record["status"]
+            )
+            summary = record["summary"] or record["error"]
+            if not summary and shown_status == "queued":
+                summary = "Waiting for a dependency or execution slot"
+            if shown_status == "recovered" and not summary:
+                summary = "A later attempt recovered this branch"
+            agent_lines.append(SwarmAgentLine(
+                id=record["id"],
+                display_name=record["display_name"],
+                role=record["role"],
+                status=shown_status,
+                phase=record["phase"],
+                task=record["task"],
+                summary=" ".join(summary.split())[:500],
+                unresolved=unresolved,
+            ))
+            if record["status"] in active_values:
+                active_labels.append(
+                    f"{record['display_name']} · {record['task'] or record['phase'] or 'Working'}"
+                )
         if not statuses:
             statuses = node_statuses
         running_values = {"running", "in_progress", "planning", "testing"}
         reviewing_values = {"reviewing", "verifying"}
-        completed_values = {"completed", "done"}
-        blocked_values = {"failed", "blocked", "revision_required", "uncertain"}
         with self._lock:
             self._swarm = SwarmSummarySnapshot(
                 total=len(agents) if agents else len(nodes),
                 running=sum(item in running_values for item in statuses),
                 reviewing=sum(item in reviewing_values for item in statuses),
                 completed=sum(item in completed_values for item in statuses),
-                blocked=sum(item in blocked_values for item in statuses),
+                blocked=len(unresolved_keys),
                 active_labels=tuple(active_labels[:3]),
                 agent_lines=tuple(agent_lines),
             )
@@ -803,7 +868,7 @@ class WorkspaceUIStore:
                 else "Unsafe decisions still require you."
             )
             self.append_log(f"sleep: {state}; policy={self._sleep_policy}")
-            self.append_transcript("assistant", f"Sleep Mode {state}. {detail}")
+            self.append_transcript("assistant", f"Full access automation {state}. {detail}")
         else:
             self._notify()
         if auto_request is not None:
@@ -1118,6 +1183,8 @@ class WorkspaceUIStore:
                 self._task_items = tuple(
                     dict(item) for item in incoming_tasks if isinstance(item, Mapping)
                 )
+            if isinstance(data.get("goal_progress"), Mapping):
+                self._goal_progress = dict(data["goal_progress"])
             if "next_task" in data:
                 self._next_task = str(data.get("next_task") or "")
             if "last_signal_at" in data and data.get("last_signal_at") is not None:
@@ -1170,11 +1237,11 @@ class WorkspaceUIStore:
                 # carry the interaction mode explicitly; a planning phase in
                 # an ordinary Goal must never relabel the session as Plan.
                 if phase == "completed":
-                    self._workflow_mode = "working"
+                    self._workflow_mode = "execution"
                 elif phase == "plan":
-                    self._workflow_mode = "plan"
+                    self._workflow_mode = "ultra-plan"
                 elif phase not in {"ready", "idle"}:
-                    self._workflow_mode = "working"
+                    self._workflow_mode = "execution"
             self._composer_mode = self._workflow_mode
         self._notify()
 
@@ -1207,6 +1274,27 @@ class WorkspaceUIStore:
             node_id=str(data.get("node_id") or data.get("current_node_id") or ""),
             detail=redact_text(data.get("detail") or "", 1_200),
         )
+        if self._live_timeline:
+            previous = self._live_timeline[-1]
+            repetitive_provider_progress = (
+                entry.kind == "provider.activity"
+                and previous.kind == entry.kind
+                and previous.source == entry.source
+                and previous.actor == entry.actor
+                and previous.phase == entry.phase
+                and previous.state == entry.state
+                and previous.message == entry.message
+            )
+            if repetitive_provider_progress:
+                # Streaming byte/chunk signals can arrive hundreds of times.
+                # Replace the latest identical row with its newest counters so
+                # useful setup, file, and model milestones remain visible.
+                self._live_timeline[-1] = replace(
+                    entry,
+                    started_at=previous.started_at,
+                )
+                self._activity_sequence = max(self._activity_sequence, sequence)
+                return
         self._live_timeline.append(entry)
         self._activity_sequence = max(self._activity_sequence, sequence)
 
@@ -1221,7 +1309,15 @@ class WorkspaceUIStore:
         for key in ("path", "file", "target", "url", "query", "pattern"):
             value = values.get(key)
             if value not in {None, ""}:
-                return redact_text(str(value), 1_200)
+                detail = str(value)
+                if tool == "read_file":
+                    start = values.get("start_line", values.get("line_start"))
+                    end = values.get("end_line", values.get("line_end"))
+                    if start is not None and end is not None:
+                        detail += f" · lines {start}-{end}"
+                    elif start is not None:
+                        detail += f" · from line {start}"
+                return redact_text(detail, 1_200)
         return ""
 
     def _append_tool_call_locked(self, data: Mapping[str, Any]) -> None:
@@ -1331,9 +1427,11 @@ class WorkspaceUIStore:
     @staticmethod
     def _normalize_workflow_label(value: str) -> str:
         normalized = str(value).strip().casefold()
-        if normalized in {"plan", "working", "ultra", "goal", "ready"}:
-            return normalized
-        if normalized in {"normal", "chat", "default"}:
+        if normalized in {"plan", "ultra-plan", "ultra_plan"}:
+            return "ultra-plan"
+        if normalized in {"execution", "working", "ultra", "goal", "normal", "chat", "default"}:
+            return "execution"
+        if normalized == "ready":
             return "ready"
         return "ready"
 
@@ -1423,6 +1521,20 @@ class WorkspaceUIStore:
     def _full_auto_attention_option(request: AttentionRequest) -> AttentionOption | None:
         """Choose only bounded decisions that Full Auto is allowed to wake."""
 
+        if request.kind is AttentionKind.APPROVAL:
+            # Explicit Full access is the session-wide approval boundary.  If
+            # it is enabled while a tool card is already visible, wake that
+            # exact card immediately instead of leaving the worker blocked on
+            # a keyboard answer that the user has just superseded.
+            return next(
+                (
+                    option
+                    for key in ("allow_session", "allow_once", "allow", "yes")
+                    for option in request.options
+                    if option.key == key
+                ),
+                None,
+            )
         if request.kind is AttentionKind.RECOVERY:
             # Recovery cards use one of these stable keys across terminal and
             # Web renderers. Prefer an explicit local continuation when the
@@ -1607,6 +1719,8 @@ class WorkspaceUIStore:
             return
         timeline_kinds = {
             "provider.activity", "workflow.state", "heartbeat",
+            "activity.step", "phase", "step", "checkpoint", "plan", "recovery",
+            "questions", "delegation",
             "approval.requested", "approval.received", "plan.approved.local_web",
             "execution.started", "execution.boundary", "process.waiting",
             "tool_call", "tool_result", "tool.started", "tool.completed", "tool.failed",
@@ -1684,6 +1798,47 @@ class WorkspaceUIStore:
             if message and "message" not in data:
                 data["message"] = message
             self.update_runtime_context(data)
+            return
+        if normalized == "activity.step":
+            operation = " ".join(
+                str(data.get("operation") or message or normalized.replace(".", " ")).split()
+            )
+            phase = str(data.get("phase") or normalized.replace(".", "_"))
+            state = str(data.get("state") or "active").casefold()
+            try:
+                completed_value = int(data["completed"]) if data.get("completed") is not None else None
+            except (TypeError, ValueError):
+                completed_value = None
+            try:
+                total_value = int(data["total"]) if data.get("total") is not None else None
+            except (TypeError, ValueError):
+                total_value = None
+            with self._lock:
+                self._runtime_phase = phase
+                self._active_operation = operation
+                self._waiting_on = str(data.get("waiting_on") or "harness")
+                self._status = phase
+                self._running = state not in {"failed", "waiting"}
+                self._liveness = "client_active" if self._running else self._liveness
+                self._progress = replace(
+                    self._progress,
+                    phase=phase,
+                    active_operation=operation,
+                )
+                self._last_signal_at = time.time()
+                self._heartbeat_at = float(data.get("heartbeat_at") or self._last_signal_at)
+                running = self._running
+            self.set_activity(
+                (
+                    ActivityStage.UNDERSTANDING
+                    if phase in {"routing", "intake", "retrieving_context"}
+                    else ActivityStage.CHECKING
+                ),
+                operation,
+                completed=completed_value,
+                total=total_value,
+                running=running,
+            )
             return
         if normalized == "provider.activity":
             with self._lock:
@@ -2334,6 +2489,7 @@ class WorkspaceUIStore:
                 first_byte_at=self._first_byte_at,
                 task_items=tuple(dict(item) for item in self._task_items),
                 next_task=self._next_task,
+                goal_progress=dict(self._goal_progress),
                 control_surface=self._control_surface,
             )
 

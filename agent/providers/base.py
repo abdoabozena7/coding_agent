@@ -64,6 +64,7 @@ class ProviderCapabilities:
     thinking: bool = False
     tool_call_ids: bool = False
     native_replay: bool = False
+    vision: bool = False
 
     @property
     def supports_streaming(self) -> bool:
@@ -89,6 +90,10 @@ class ProviderCapabilities:
     def preserves_native_replay(self) -> bool:
         return self.native_replay
 
+    @property
+    def supports_vision(self) -> bool:
+        return self.vision
+
     def as_dict(self) -> dict[str, bool]:
         return {
             "streaming": self.streaming,
@@ -96,6 +101,7 @@ class ProviderCapabilities:
             "thinking": self.thinking,
             "tool_call_ids": self.tool_call_ids,
             "native_replay": self.native_replay,
+            "vision": self.vision,
         }
 
 

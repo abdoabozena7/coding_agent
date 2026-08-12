@@ -18,6 +18,9 @@ run-artifacts/*.log
 # Local browser automation state and disposable captures
 .playwright-cli/
 output/playwright/
+output/browser/
+projects/*/output/playwright/
+projects/*/output/browser/
 
 # Generated experiment transcripts and replay inputs
 output/**/*.stderr.log

@@ -58,6 +58,19 @@ from .goal_outcome import (
     GoalOutcomeState,
     OptimizationExperimentV1,
 )
+from .orchestration import (
+    AdaptiveOrchestrationPolicyV1,
+    EvidenceAuthority,
+    EvidenceClaimV1,
+    EvidenceVerdict,
+    OrchestrationArm,
+    OrchestrationExperimentV1,
+    WorkerImpactV1,
+    WorkerRole,
+    approach_fingerprint,
+    classify_worker_impact,
+    evidence_novelty,
+)
 from .models import DomainError, GoalStatus, Plan, PlanStatus, RoleProfile, TaskStatus, utc_now
 from .semantic import RequestedEffect, SemanticGoalV2
 from .providers.base import AssistantTurn, ToolCall
@@ -1639,6 +1652,21 @@ class WorkspaceUltraAgent:
                 "failure_kind": "tool",
             }
         evidence = dict(payload)
+        # A missing model-authored selector is a test-contract problem only
+        # when the page itself is healthy.  Browser runtime/page/network
+        # errors are candidate evidence and must take precedence; otherwise a
+        # real defect such as ``THREE is not defined`` is misrouted to tester
+        # contract repair, product mutation is prohibited, and every Retry
+        # reproduces the same broken application.
+        candidate_runtime_errors = tuple(
+            str(item).strip()
+            for key in ("console_errors", "page_errors", "network_errors")
+            for item in (evidence.get(key, ()) or ())
+            if str(item).strip()
+        )
+        if candidate_runtime_errors:
+            evidence["failure_kind"] = "application"
+            evidence["candidate_runtime_errors"] = list(candidate_runtime_errors)
         html_result = str(
             self.executor(
                 ToolCall("harness-html-readback", "read_file", {"path": target}),
@@ -3786,8 +3814,12 @@ class WorkspaceUltraAgent:
                             passed=bool(tester_receipt.payload.get("passed")),
                             returncode=int(
                                 dict(tester_receipt.payload["test_results"][0]).get(
-                                    "returncode", -1
+                                    "returncode"
                                 )
+                                if dict(tester_receipt.payload["test_results"][0]).get(
+                                    "returncode"
+                                ) is not None
+                                else -1
                             ),
                         )
                         return tester_receipt
@@ -4581,6 +4613,58 @@ class WorkspaceUltraAgent:
                 if requires_mutation and not mutation_observed:
                     mutation_claim_count += 1
                     if mutation_claim_count >= 2:
+                        existing_fix_targets = [
+                            str(item.get("path") or "")
+                            for item in write_target_state
+                            if str(item.get("path") or "") and bool(item.get("exists"))
+                        ]
+                        if (
+                            request.phase == InnerPhase.FIX.value
+                            and existing_fix_targets
+                            and len(existing_fix_targets) == len(write_target_state)
+                        ):
+                            # A weak local model can correctly conclude that a
+                            # prior durable mutation already contains its fix,
+                            # yet fail to emit another (unnecessary) write.
+                            # Treat this only as a no-change candidate and move
+                            # to independent test/reviewer gates. It is not
+                            # acceptance evidence and IMPLEMENT still requires
+                            # an actual governed mutation.
+                            self.events.publish(
+                                "ultra.fix_no_change_candidate",
+                                "A read-only fix claim was routed to independent verification instead of another identical write request.",
+                                run_id=request.run_id,
+                                node_id=request.node_id,
+                                role=self.role.value,
+                                paths=existing_fix_targets,
+                            )
+                            return AgentResponse.from_mapping(
+                                {
+                                    "payload": {
+                                        "success": True,
+                                        "passed": True,
+                                        "phase_receipt_only": True,
+                                        "verification_only": True,
+                                        "no_change_candidate": True,
+                                        "artifacts": existing_fix_targets,
+                                        "evidence": [
+                                            {
+                                                "kind": "approved_existing_artifact",
+                                                "path": path,
+                                                "status": "requires_independent_verification",
+                                            }
+                                            for path in existing_fix_targets
+                                        ],
+                                        "findings": [],
+                                        "issues": [],
+                                    },
+                                    "summary": "Existing approved artifacts were preserved and routed to independent verification.",
+                                    "reasoning_summary": "No new mutation receipt was accepted; tester and reviewer gates remain authoritative.",
+                                },
+                                node_id=request.node_id,
+                                provider="harness",
+                                model="no-change-fix-boundary-v1",
+                            )
                         raise _MutationTransportExhausted(
                             f"{self.role.value} returned {mutation_claim_count} "
                             "structured responses without the required governed "
@@ -5197,6 +5281,15 @@ class StateStoreUltraAdapter(InMemoryUltraState):
         self.workspace = workspace
         self.events = events
         self.run_id: str | None = None
+        goal = self.store.get_goal(goal_id)
+        self.adaptive_orchestration_policy = AdaptiveOrchestrationPolicyV1.from_dict(
+            goal.metadata.get("adaptive_orchestration_policy")
+            if isinstance(goal.metadata.get("adaptive_orchestration_policy"), Mapping)
+            else None
+        )
+        self.adaptive_orchestration_shadow_mode = (
+            self.adaptive_orchestration_policy.shadow_mode
+        )
         self.plan: Plan | None = None
         self.approved = False
         self.task_ids: dict[str, str] = {}
@@ -9018,6 +9111,253 @@ window.buildPreview=(context)=>{
             )
         return current
 
+    def record_adaptive_quality_observations(
+        self,
+        node_id: str,
+        *,
+        candidate_fingerprint: str,
+        observations: Iterable[Mapping[str, Any]],
+        consensus: Mapping[str, Any],
+        gate_passed: bool,
+    ) -> None:
+        """Attribute Ultra review value without calling production data causal."""
+
+        if not self.run_id:
+            return
+        items = tuple(
+            dict(item) for item in observations if isinstance(item, Mapping)
+        )
+        invoked = tuple(
+            item
+            for item in items
+            if isinstance(item.get("response"), AgentResponse)
+            and item["response"].model != "deterministic-review-router-v1"
+        )
+        if not invoked:
+            return
+
+        def trusted_records(response: AgentResponse) -> tuple[Mapping[str, Any], ...]:
+            records: list[Mapping[str, Any]] = []
+            for key in ("test_results", "evidence"):
+                raw = response.payload.get(key, ())
+                values = (
+                    (raw,)
+                    if isinstance(raw, Mapping)
+                    else raw
+                    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes))
+                    else ()
+                )
+                for value in values:
+                    if not isinstance(value, Mapping):
+                        continue
+                    name = str(value.get("name") or value.get("kind") or "")
+                    if (
+                        value.get("artifact_hash")
+                        or value.get("action_id")
+                        or str(value.get("source") or "").casefold() == "harness"
+                        or str(value.get("authority") or "").casefold()
+                        in {"browser", "harness", "test", "user"}
+                        or name.startswith("harness_")
+                    ):
+                        records.append(dict(value))
+            return tuple(records)
+
+        def record_ref(value: Mapping[str, Any]) -> str:
+            return str(
+                value.get("artifact_hash")
+                or value.get("action_id")
+                or value.get("uri")
+                or value.get("name")
+                or value.get("kind")
+                or ""
+            ).strip()
+
+        observation_refs: dict[str, tuple[str, ...]] = {}
+        for item in invoked:
+            response = item["response"]
+            observation_refs[str(item.get("category") or "review")] = tuple(
+                dict.fromkeys(
+                    ref
+                    for ref in (
+                        record_ref(value) for value in trusted_records(response)
+                    )
+                    if ref
+                )
+            )
+        all_refs = tuple(
+            dict.fromkeys(
+                ref for refs in observation_refs.values() for ref in refs if ref
+            )
+        )
+        model_fingerprint = hashlib.sha256(
+            self.descriptor.id.encode("utf-8")
+        ).hexdigest()
+        node = self.store.get_work_node(node_id)
+        task_class = str(
+            node.contract.metadata.get("task_family")
+            or node.kind.value
+            or "general"
+        )
+        total_input = sum(
+            int(item["response"].usage.get("input_tokens", 0) or 0)
+            for item in invoked
+        )
+        total_output = sum(
+            int(item["response"].usage.get("output_tokens", 0) or 0)
+            for item in invoked
+        )
+        experiment = OrchestrationExperimentV1(
+            goal_id=self.goal_id,
+            ultra_run_id=self.run_id,
+            unit_id=node_id,
+            arm=OrchestrationArm.PRODUCTION,
+            model_fingerprint=model_fingerprint,
+            policy_fingerprint=self.adaptive_orchestration_policy.fingerprint,
+            task_class=task_class,
+            candidate_score=1.0 if gate_passed else 0.0,
+            success=gate_passed,
+            false_completion=(
+                str(consensus.get("status") or "").casefold() == "accepted"
+                and not gate_passed
+            ),
+            model_calls=len(invoked),
+            input_tokens=total_input,
+            output_tokens=total_output,
+            causal=False,
+            matched_benchmark=False,
+            metrics={
+                "workflow": "ultra",
+                "shadow_mode": self.adaptive_orchestration_policy.shadow_mode,
+                "consensus_status": str(consensus.get("status") or "not_recorded"),
+                "reviewer_categories": [
+                    str(item.get("category") or "review") for item in invoked
+                ],
+            },
+            evidence=all_refs,
+        )
+        try:
+            self.store.record_orchestration_experiment(experiment)
+            existing_refs: set[str] = set()
+            agent_runs = self.store.list_agent_runs(
+                self.run_id,
+                work_node_id=node_id,
+            )
+            for item in invoked:
+                response = item["response"]
+                category = str(item.get("category") or "review")
+                agent_role = str(item.get("agent_role") or "reviewer")
+                refs = observation_refs.get(category, ())
+                novelty = evidence_novelty(existing_refs, refs)
+                existing_refs.update(refs)
+                trusted = trusted_records(response)
+                failed_records = tuple(
+                    value for value in trusted if value.get("passed") is False
+                )
+                findings = tuple(
+                    str(value).strip()
+                    for key in ("findings", "issues")
+                    for value in (
+                        response.payload.get(key, ())
+                        if isinstance(response.payload.get(key), Sequence)
+                        and not isinstance(response.payload.get(key), (str, bytes))
+                        else ()
+                    )
+                    if str(value).strip()
+                )
+                verified_findings = len(failed_records)
+                false_findings = len(findings) if findings and not failed_records else 0
+                score_delta = novelty if gate_passed and bool(response.payload.get("passed")) else 0.0
+                outcome = classify_worker_impact(
+                    verified_findings=verified_findings,
+                    false_findings=false_findings,
+                    accepted_fixes=0,
+                    novelty=novelty,
+                    score_delta=score_delta,
+                )
+                agent_run = next(
+                    (
+                        run
+                        for run in reversed(agent_runs)
+                        if run.role == agent_role
+                        and run.status is AgentRunStatus.COMPLETED
+                    ),
+                    None,
+                )
+                claim = EvidenceClaimV1(
+                    criterion_id=category,
+                    claim=response.summary or f"{category} quality verdict",
+                    artifact_hash=candidate_fingerprint if refs else "",
+                    evidence_refs=refs,
+                    falsification_check=(
+                        f"Re-run the authoritative {category} gate against artifact "
+                        f"{candidate_fingerprint[:12]}."
+                    ),
+                    verdict=(
+                        EvidenceVerdict.FAILED
+                        if failed_records
+                        else EvidenceVerdict.PASSED
+                        if refs and bool(response.payload.get("passed"))
+                        else EvidenceVerdict.NEEDS_EVIDENCE
+                    ),
+                    authority=(
+                        EvidenceAuthority.HARNESS
+                        if refs
+                        else EvidenceAuthority.MODEL
+                    ),
+                    producer_id=agent_run.id if agent_run is not None else agent_role,
+                    verifier_id="harness" if refs else "",
+                )
+                role = (
+                    WorkerRole.FALSIFIER
+                    if category == "runtime_tests"
+                    else WorkerRole.REVIEWER
+                )
+                self.store.record_worker_contribution(
+                    WorkerImpactV1(
+                        experiment_id=experiment.id,
+                        worker_id=(
+                            agent_run.id
+                            if agent_run is not None
+                            else f"{node_id}:{category}"
+                        ),
+                        agent_run_id=agent_run.id if agent_run is not None else None,
+                        role=role,
+                        task_class=task_class,
+                        model_fingerprint=model_fingerprint,
+                        outcome=outcome,
+                        approach_fingerprint=approach_fingerprint(
+                            role=role,
+                            objective=f"{category}:{node.contract.objective}",
+                            falsification_targets=node.contract.success_criteria,
+                            context_refs=(candidate_fingerprint,),
+                        ),
+                        evidence_novelty=novelty,
+                        verified_findings=verified_findings,
+                        false_findings=false_findings,
+                        accepted_fixes=0,
+                        score_delta=score_delta,
+                        input_tokens=int(response.usage.get("input_tokens", 0) or 0),
+                        output_tokens=int(response.usage.get("output_tokens", 0) or 0),
+                        claims=(claim,),
+                        evidence=refs,
+                        reason=(
+                            "review added authoritative evidence used by the quality gate"
+                            if outcome.value == "useful"
+                            else "review added no independently verified decision-changing evidence"
+                            if outcome.value == "neutral"
+                            else "review emitted unsupported findings"
+                        ),
+                    )
+                )
+        except (DomainError, NotFoundError, StateStoreError, ValueError) as exc:
+            self.store.append_event(
+                "worker.contribution_not_counted",
+                goal_id=self.goal_id,
+                entity_type="work_node",
+                entity_id=node_id,
+                payload={"reason": redact_text(str(exc), 1_000)},
+            )
+
     @staticmethod
     def _repository_preservation_delta(
         *,
@@ -9783,6 +10123,7 @@ class UltraSession:
         reasoning_effort: str = "medium",
         version_control: GitProtectionManager | None = None,
         session_id: str | None = None,
+        adaptive_orchestration_policy: AdaptiveOrchestrationPolicyV1 | None = None,
     ) -> None:
         self.store = store
         self.workspace = workspace
@@ -9795,6 +10136,9 @@ class UltraSession:
         self.reasoning_effort = str(reasoning_effort)
         self.version_control = version_control
         self.session_id = str(session_id or "").strip() or None
+        self.adaptive_orchestration_policy = (
+            adaptive_orchestration_policy or AdaptiveOrchestrationPolicyV1()
+        )
         self.goal_id: str | None = None
         self.adapter: StateStoreUltraAdapter | None = None
         self.orchestrator: UltraOrchestrator | None = None
@@ -10202,6 +10546,34 @@ class UltraSession:
         if call.name not in allowed:
             return f"Error: role {request.role.value} cannot use {call.name}"
         args = dict(call.args) if isinstance(call.args, dict) else {}
+        # ``.`` is a valid directory scope in a task contract, but not a
+        # valid file target. Small/local models often copy that scope into
+        # ``read_file`` verbatim. Normalize the harmless inspection instead
+        # of failing an agent and cascading retries through its branch.
+        if (
+            call.name == "read_file"
+            and str(args.get("path") or ".").strip().replace("\\", "/")
+            in {"", ".", "./"}
+        ):
+            call = ToolCall(
+                id=call.id,
+                name="list_files",
+                args={"path": "."},
+                native=dict(call.native),
+            )
+            args = dict(call.args)
+            self.store.append_event(
+                "tool_contract.normalized",
+                goal_id=self.goal_id,
+                payload={
+                    "actor": request.role.value,
+                    "received": "read_file",
+                    "normalized_to": "list_files",
+                    "path": ".",
+                    "stage": "ultra_execution_directory_scope",
+                    "workspace_mutated": False,
+                },
+            )
         node = self._node(request.node_id)
         if call.name in {"run_bash", "run_command"} and node is not None:
             command = " ".join(str(args.get("command") or "").split()).casefold()
@@ -10560,6 +10932,33 @@ class UltraSession:
                         )
                 else:
                     result = tools.run_tool(call.name, args)
+            if (
+                call.name == "read_file"
+                and str(result).startswith("Error:")
+                and "does not exist" in str(result).casefold()
+                and node is not None
+                and _within_scope(
+                    str(args.get("path") or ""),
+                    tuple(getattr(node.contract, "read_paths", (".",)))
+                    + tuple(node.contract.write_paths),
+                )
+            ):
+                missing_path = str(args.get("path") or "")
+                result = (
+                    f"Observation: {missing_path!r} does not exist yet. "
+                    "Do not repeat this read. If it is this task's output, create it through "
+                    "the approved write tool; otherwise report the missing dependency."
+                )
+                self.store.append_event(
+                    "tool_contract.missing_file_observed",
+                    goal_id=self.goal_id,
+                    payload={
+                        "actor": request.role.value,
+                        "node_id": request.node_id,
+                        "path": missing_path,
+                        "workspace_mutated": False,
+                    },
+                )
             result = redact_text(result, 50_000)
             status = "failed" if result.startswith("Error:") else "completed"
             self.store.complete_action(action_id, redact_text(result, 2_000), status=status)
@@ -10788,6 +11187,10 @@ class UltraSession:
         goal = self.store.create_goal(
             redact_text(objective, 20_000),
             session_id=self.session_id,
+        )
+        self.store.update_goal_metadata(
+            goal.id,
+            adaptive_orchestration_policy=self.adaptive_orchestration_policy.to_dict(),
         )
         if requested_effects:
             self.store.update_goal_metadata(
@@ -12022,10 +12425,10 @@ class UltraSession:
         )
 
     def switch_permissions(self, adapter: PermissionAdapter) -> None:
-        if not self.safe_for_reconfiguration:
-            raise RuntimeError(
-                "pause ULTRA and wait for active agents to reach a safe checkpoint before changing permissions"
-            )
+        # Permission policy changes do not move the workspace or replace the
+        # execution environment, so they can take effect live between worker
+        # tool calls.  Model/provider changes still require the ordinary safe
+        # reconfiguration boundary.
         self.permission_adapter = adapter
         if self.adapter:
             self.adapter.access_level = adapter.access_level
@@ -12378,6 +12781,15 @@ class UltraSession:
                     GoalStatus.BLOCKED,
                     reason=f"ULTRA engine failed: {redact_text(exc, 500)}",
                 )
+            self.store.update_goal_metadata(
+                self.goal_id,
+                retry_reason=(
+                    "The recursive harness stopped at a saved checkpoint. "
+                    "Retry resumes unfinished branches without replaying accepted mutations."
+                ),
+                waiting_on="recovery",
+                auto_retryable=True,
+            )
         except Exception:
             pass
         self.events.publish("error", f"ULTRA execution failed: {redact_text(exc, 500)}")
@@ -12496,8 +12908,22 @@ class UltraSession:
                 )
             elif goal.status is GoalStatus.RUNNING:
                 self.store.transition_goal(self.goal_id, GoalStatus.BLOCKED, reason="ULTRA module wave failed")
+                self.store.update_goal_metadata(
+                    self.goal_id,
+                    retry_reason=(
+                        "One or more recursive branches exhausted their bounded repair attempts. "
+                        "Completed branches and accepted mutations are preserved for retry."
+                    ),
+                    waiting_on="recovery",
+                    auto_retryable=True,
+                )
         except Exception as exc:
             self.events.publish("error", f"ULTRA completion persistence failed: {redact_text(exc, 500)}")
+            # Never leave a durable goal claiming RUNNING after its engine has
+            # reached a terminal result but persistence/final acceptance
+            # raised.  The recovery checkpoint is still authoritative and
+            # the normal Retry action can rebuild from it.
+            self._record_engine_failure(exc)
 
     def pause(self) -> None:
         if not self.orchestrator:

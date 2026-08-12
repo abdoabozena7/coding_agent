@@ -454,9 +454,17 @@ class OllamaProvider:
                 continue
             role = message.get("role")
             if role == "user":
-                messages.append(
-                    {"role": "user", "content": str(message.get("content") or "")}
-                )
+                out: dict[str, Any] = {
+                    "role": "user", "content": str(message.get("content") or "")
+                }
+                images = [
+                    str(item.get("data") or "")
+                    for item in message.get("images") or ()
+                    if isinstance(item, Mapping) and item.get("data")
+                ]
+                if images:
+                    out["images"] = images
+                messages.append(out)
             elif role == "assistant":
                 out: dict[str, Any] = {
                     "role": "assistant",

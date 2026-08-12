@@ -5,6 +5,7 @@ import time
 import unittest
 from collections import Counter
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import Any, Callable, Mapping
 
 from agent.events import EventBus
@@ -33,6 +34,23 @@ from agent.ultra import (
     UltraPhase,
     _bind_explicit_browser_scenarios,
 )
+
+
+def test_mixed_quality_failure_routes_candidate_runtime_defect_to_coder():
+    gate = SimpleNamespace(
+        responses=(
+            AgentResponse(
+                payload={"passed": False, "failure_kind": "contract"},
+                summary="model-authored selector was invalid",
+            ),
+            AgentResponse(
+                payload={"passed": False, "failure_kind": "application"},
+                summary="browser runtime failed",
+            ),
+        )
+    )
+
+    assert UltraOrchestrator._quality_failure_kind(gate) == "application"
 
 
 def test_runtime_effect_plan_requires_concrete_applicable_verification() -> None:
@@ -1371,8 +1389,9 @@ class UltraEngineTests(unittest.TestCase):
         ]
         self.assertEqual(completed[-1].data["completed_nodes"], graph.data["total_nodes"])
 
-    def test_quality_consensus_uses_typed_passed_over_contradictory_declaration(self):
+    def test_quality_consensus_abstains_without_evidence_despite_typed_verdict(self):
         engine, _factory, _plan = prepared_engine()
+        engine.state.adaptive_orchestration_shadow_mode = False
         node = next(iter(engine.nodes.values()))
         records = engine._quality_vote_records(
             node,
@@ -1388,13 +1407,15 @@ class UltraEngineTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(records[0]["verdict"], "accept")
+        self.assertEqual(records[0]["verdict"], "abstain")
         self.assertEqual(records[0]["evidence"]["declared_verdict"], "reject")
-        self.assertEqual(records[1]["verdict"], "reject")
+        self.assertEqual(records[1]["verdict"], "abstain")
         self.assertEqual(records[1]["evidence"]["declared_verdict"], "accept")
+        self.assertFalse(records[0]["evidence"]["evidence_valid"])
 
     def test_authoritative_runtime_evidence_prevents_reasoning_shape_false_rejection(self):
         engine, _factory, _plan = prepared_engine()
+        engine.state.adaptive_orchestration_shadow_mode = False
         node = next(iter(engine.nodes.values()))
         missing_reasoning = {
             "passed": False,
@@ -1423,7 +1444,7 @@ class UltraEngineTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual([item["verdict"] for item in records], ["accept", "accept"])
+        self.assertEqual([item["verdict"] for item in records], ["abstain", "accept"])
         self.assertFalse(
             records[0]["evidence"]["harness_reasoning_evaluation"]["passed"]
         )

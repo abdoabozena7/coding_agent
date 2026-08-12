@@ -48,10 +48,11 @@ class CommandTests(unittest.TestCase):
             ":add Harden paths :: traversal tests pass",
         )
         expected = {
-            "/plan": CommandKind.PLAN,
+            "/ultra-plan": CommandKind.PLAN,
             "/live": CommandKind.LIVE,
             "/show-diff": CommandKind.SHOW_DIFF,
             "/advanced-tracing": CommandKind.ADVANCED_TRACING,
+            "/access": CommandKind.ACCESS,
             "/settings": CommandKind.SETTINGS,
             "/pause": CommandKind.PAUSE,
             "/resume": CommandKind.RESUME,
@@ -291,7 +292,7 @@ class DashboardTests(unittest.TestCase):
         )
         output.encode("ascii")
         self.assertIn("GA3BAD CODING AGENT", output)
-        self.assertIn("MODE WORKING", output)
+        self.assertIn("MODE EXECUTION", output)
         self.assertIn("PLAN r3 / r3", output)
         self.assertIn("[x] T001", output)
         self.assertIn("task-specific advers", output)
@@ -989,7 +990,7 @@ class TerminalUITests(unittest.TestCase):
         self.assertEqual(len(lines[-1]), max(len(line) for line in lines[:5]))
         self.assertEqual(lines[-1], "coding agent".center(len(lines[-1])))
 
-    def test_slash_menu_lists_exactly_eleven_public_commands(self):
+    def test_slash_menu_lists_exactly_fourteen_public_commands(self):
         rendered = render_slash_menu()
         rendered.encode("ascii")
 
@@ -997,7 +998,7 @@ class TerminalUITests(unittest.TestCase):
         self.assertEqual(
             commands,
             [
-                "/plan", "/live", "/show-diff", "/advanced-tracing", "/settings", "/pause",
+                "/ultra-plan", "/live", "/output", "/todo", "/show-diff", "/advanced-tracing", "/settings", "/access", "/pause",
                 "/resume", "/stop", "/undo", "/help", "/quit",
             ],
         )
@@ -1048,7 +1049,7 @@ class TerminalUITests(unittest.TestCase):
 
         console.set_mode("plan")
         self.assertEqual(console.prompt(), "/status")
-        self.assertEqual(prompts[-1], "GA3BAD [PLAN]> ")
+        self.assertEqual(prompts[-1], "GA3BAD [ULTRA PLAN]> ")
 
     def test_ultra_status_is_sparse_and_active_events_are_gold(self):
         view = DashboardView(
@@ -1066,7 +1067,7 @@ class TerminalUITests(unittest.TestCase):
             active_agents=4,
         )
         self.assertNotIn("+---", rendered)
-        self.assertIn("MODE WORKING / STATUS RUNNING", rendered)
+        self.assertIn("MODE EXECUTION / STATUS RUNNING", rendered)
         self.assertIn("Access FULL / CLOUD", rendered)
         self.assertIn("Agents 4", rendered)
 

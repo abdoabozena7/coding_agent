@@ -28,14 +28,14 @@ class RunMode(str, Enum):
         normalized = {
             "chat": "normal", "goal": "normal", "manual": "normal",
             "default": "normal", "auto": "normal", "agent": "normal",
-            "working": "normal", "work": "normal",
+            "working": "normal", "work": "normal", "execution": "normal", "execute": "normal",
             "ultra-plan": "plan", "ultra_plan": "plan", "ultraplan": "plan",
             "deep": "ultra", "max": "ultra",
         }.get(normalized, normalized)
         try:
             return cls(normalized)
         except ValueError as exc:
-            raise ValueError("mode must be 'plan', 'normal', or 'ultra'") from exc
+            raise ValueError("mode must be 'execution' or 'ultra-plan'") from exc
 
 
 class IntakeStatus(str, Enum):

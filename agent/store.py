@@ -103,9 +103,18 @@ from .durable_memory import (
     NextActionPacketV1,
     NextActionStatus,
 )
+from .orchestration import (
+    AdaptiveOrchestrationPolicyV1,
+    OrchestrationArm,
+    OrchestrationExperimentV1,
+    WorkerImpactOutcome,
+    WorkerImpactV1,
+    WorkerRole,
+    should_reprobe_suppressed_role,
+)
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 DEFAULT_SESSION_ID = "workspace-session"
 MAX_PENDING_PROMPTS = 10
 
@@ -449,6 +458,9 @@ class StateStore:
                     existing = 15
                 if existing < 16:
                     self._migrate_v16()
+                    existing = 16
+                if existing < 17:
+                    self._migrate_v17()
                 journal_columns = {
                     str(row[1])
                     for row in self._connection.execute(
@@ -1712,6 +1724,75 @@ class StateStore:
         CREATE INDEX IF NOT EXISTS idx_advanced_trace_goal
             ON advanced_trace_snapshots(goal_id,revision,created_at);
         PRAGMA user_version=16;
+        COMMIT;
+        """
+        self._connection.executescript(schema)
+
+    def _migrate_v17(self) -> None:
+        """Add cross-workflow orchestration experiments and worker attribution."""
+
+        schema = """
+        BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS orchestration_experiments (
+            id TEXT PRIMARY KEY,
+            goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            ultra_run_id TEXT REFERENCES ultra_runs(id) ON DELETE SET NULL,
+            unit_id TEXT NOT NULL,
+            arm TEXT NOT NULL,
+            model_fingerprint TEXT NOT NULL,
+            policy_fingerprint TEXT NOT NULL,
+            task_class TEXT NOT NULL,
+            baseline_score REAL NOT NULL,
+            candidate_score REAL NOT NULL,
+            score_delta REAL NOT NULL,
+            success INTEGER NOT NULL,
+            false_completion INTEGER NOT NULL,
+            model_calls INTEGER NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            gpu_ms INTEGER NOT NULL,
+            causal INTEGER NOT NULL,
+            matched_benchmark INTEGER NOT NULL,
+            metrics_json TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_orchestration_goal
+            ON orchestration_experiments(goal_id,unit_id,created_at);
+        CREATE INDEX IF NOT EXISTS idx_orchestration_comparison
+            ON orchestration_experiments(model_fingerprint,task_class,arm,created_at);
+        CREATE TABLE IF NOT EXISTS worker_contributions (
+            id TEXT PRIMARY KEY,
+            experiment_id TEXT NOT NULL REFERENCES orchestration_experiments(id) ON DELETE CASCADE,
+            worker_id TEXT NOT NULL,
+            delegation_id TEXT REFERENCES delegations(id) ON DELETE SET NULL,
+            agent_run_id TEXT REFERENCES agent_runs(id) ON DELETE SET NULL,
+            role TEXT NOT NULL,
+            task_class TEXT NOT NULL,
+            model_fingerprint TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            approach_fingerprint TEXT NOT NULL,
+            evidence_novelty REAL NOT NULL,
+            verified_findings INTEGER NOT NULL,
+            false_findings INTEGER NOT NULL,
+            accepted_fixes INTEGER NOT NULL,
+            score_delta REAL NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            claims_json TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_worker_contribution_experiment
+            ON worker_contributions(experiment_id,created_at);
+        CREATE INDEX IF NOT EXISTS idx_worker_contribution_learning
+            ON worker_contributions(model_fingerprint,task_class,role,outcome,created_at);
+        CREATE INDEX IF NOT EXISTS idx_worker_contribution_approach
+            ON worker_contributions(experiment_id,approach_fingerprint);
+        PRAGMA user_version=17;
         COMMIT;
         """
         self._connection.executescript(schema)
@@ -6691,6 +6772,333 @@ class StateStore:
             for row in rows
         )
 
+    @staticmethod
+    def _orchestration_experiment_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            **dict(row),
+            "success": bool(row["success"]),
+            "false_completion": bool(row["false_completion"]),
+            "causal": bool(row["causal"]),
+            "matched_benchmark": bool(row["matched_benchmark"]),
+            "metrics": _loads(row["metrics_json"], {}),
+            "evidence": _loads(row["evidence_json"], []),
+            "created_at": _dt(row["created_at"]),
+        }
+
+    def record_orchestration_experiment(
+        self,
+        experiment: OrchestrationExperimentV1,
+    ) -> dict[str, Any]:
+        """Persist a measured arm without implying causality for production runs."""
+
+        with self.transaction() as connection:
+            goal = connection.execute(
+                "SELECT 1 FROM goals WHERE id=?", (experiment.goal_id,)
+            ).fetchone()
+            if goal is None:
+                raise NotFoundError(f"goal not found: {experiment.goal_id}")
+            if experiment.ultra_run_id:
+                ultra = connection.execute(
+                    "SELECT goal_id FROM ultra_runs WHERE id=?",
+                    (experiment.ultra_run_id,),
+                ).fetchone()
+                if ultra is None or str(ultra["goal_id"]) != experiment.goal_id:
+                    raise StateStoreError(
+                        "orchestration experiment Ultra run is missing or belongs to another goal"
+                    )
+            connection.execute(
+                "INSERT INTO orchestration_experiments("
+                "id,goal_id,ultra_run_id,unit_id,arm,model_fingerprint,policy_fingerprint,"
+                "task_class,baseline_score,candidate_score,score_delta,success,false_completion,"
+                "model_calls,input_tokens,output_tokens,latency_ms,gpu_ms,causal,matched_benchmark,"
+                "metrics_json,evidence_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    experiment.id,
+                    experiment.goal_id,
+                    experiment.ultra_run_id,
+                    experiment.unit_id,
+                    experiment.arm.value,
+                    experiment.model_fingerprint,
+                    experiment.policy_fingerprint,
+                    experiment.task_class,
+                    experiment.baseline_score,
+                    experiment.candidate_score,
+                    experiment.score_delta,
+                    int(experiment.success),
+                    int(experiment.false_completion),
+                    experiment.model_calls,
+                    experiment.input_tokens,
+                    experiment.output_tokens,
+                    experiment.latency_ms,
+                    experiment.gpu_ms,
+                    int(experiment.causal),
+                    int(experiment.matched_benchmark),
+                    _json(dict(experiment.metrics)),
+                    _json(list(experiment.evidence)),
+                    _iso(experiment.created_at),
+                ),
+            )
+            self._event(
+                connection,
+                "orchestration.experiment_recorded",
+                goal_id=experiment.goal_id,
+                entity_type="orchestration_experiment",
+                entity_id=experiment.id,
+                payload={
+                    "unit_id": experiment.unit_id,
+                    "arm": experiment.arm.value,
+                    "score_delta": experiment.score_delta,
+                    "causal": experiment.causal,
+                },
+            )
+        return experiment.to_dict()
+
+    def get_orchestration_experiment(self, experiment_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM orchestration_experiments WHERE id=?",
+                (experiment_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"orchestration experiment not found: {experiment_id}")
+        return self._orchestration_experiment_payload(row)
+
+    def list_orchestration_experiments(
+        self,
+        *,
+        goal_id: str | None = None,
+        ultra_run_id: str | None = None,
+        unit_id: str | None = None,
+        arm: OrchestrationArm | str | None = None,
+        limit: int = 200,
+    ) -> tuple[dict[str, Any], ...]:
+        filters: list[str] = []
+        params: list[Any] = []
+        if goal_id:
+            filters.append("goal_id=?")
+            params.append(goal_id)
+        if ultra_run_id:
+            filters.append("ultra_run_id=?")
+            params.append(ultra_run_id)
+        if unit_id:
+            filters.append("unit_id=?")
+            params.append(unit_id)
+        if arm:
+            filters.append("arm=?")
+            params.append(OrchestrationArm(arm).value)
+        sql = "SELECT * FROM orchestration_experiments"
+        if filters:
+            sql += " WHERE " + " AND ".join(filters)
+        sql += " ORDER BY created_at DESC,id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 10_000)))
+        with self._lock:
+            rows = self._connection.execute(sql, tuple(params)).fetchall()
+        return tuple(self._orchestration_experiment_payload(row) for row in rows)
+
+    @staticmethod
+    def _worker_contribution_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            **dict(row),
+            "claims": _loads(row["claims_json"], []),
+            "evidence": _loads(row["evidence_json"], []),
+            "total_tokens": int(row["input_tokens"]) + int(row["output_tokens"]),
+            "created_at": _dt(row["created_at"]),
+        }
+
+    def record_worker_contribution(self, impact: WorkerImpactV1) -> dict[str, Any]:
+        """Record only observable contribution; this is not a causal claim."""
+
+        with self.transaction() as connection:
+            experiment = connection.execute(
+                "SELECT goal_id FROM orchestration_experiments WHERE id=?",
+                (impact.experiment_id,),
+            ).fetchone()
+            if experiment is None:
+                raise NotFoundError(
+                    f"orchestration experiment not found: {impact.experiment_id}"
+                )
+            if impact.delegation_id and connection.execute(
+                "SELECT 1 FROM delegations WHERE id=?", (impact.delegation_id,)
+            ).fetchone() is None:
+                raise NotFoundError(f"delegation not found: {impact.delegation_id}")
+            if impact.agent_run_id and connection.execute(
+                "SELECT 1 FROM agent_runs WHERE id=?", (impact.agent_run_id,)
+            ).fetchone() is None:
+                raise NotFoundError(f"agent run not found: {impact.agent_run_id}")
+            duplicate = connection.execute(
+                "SELECT id FROM worker_contributions WHERE experiment_id=? "
+                "AND approach_fingerprint=? AND worker_id<>? LIMIT 1",
+                (
+                    impact.experiment_id,
+                    impact.approach_fingerprint,
+                    impact.worker_id,
+                ),
+            ).fetchone()
+            if duplicate is not None:
+                raise StateStoreError(
+                    "duplicate worker approach cannot be counted as an independent contribution"
+                )
+            connection.execute(
+                "INSERT INTO worker_contributions("
+                "id,experiment_id,worker_id,delegation_id,agent_run_id,role,task_class,"
+                "model_fingerprint,outcome,approach_fingerprint,evidence_novelty,verified_findings,"
+                "false_findings,accepted_fixes,score_delta,input_tokens,output_tokens,latency_ms,"
+                "claims_json,evidence_json,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    impact.id,
+                    impact.experiment_id,
+                    impact.worker_id,
+                    impact.delegation_id,
+                    impact.agent_run_id,
+                    impact.role.value,
+                    impact.task_class,
+                    impact.model_fingerprint,
+                    impact.outcome.value,
+                    impact.approach_fingerprint,
+                    impact.evidence_novelty,
+                    impact.verified_findings,
+                    impact.false_findings,
+                    impact.accepted_fixes,
+                    impact.score_delta,
+                    impact.input_tokens,
+                    impact.output_tokens,
+                    impact.latency_ms,
+                    _json([item.to_dict() for item in impact.claims]),
+                    _json(list(impact.evidence)),
+                    str(impact.reason)[:4_000],
+                    _iso(impact.created_at),
+                ),
+            )
+            self._event(
+                connection,
+                "worker.contribution_measured",
+                goal_id=str(experiment["goal_id"]),
+                entity_type="worker_contribution",
+                entity_id=impact.id,
+                payload={
+                    "worker_id": impact.worker_id,
+                    "role": impact.role.value,
+                    "outcome": impact.outcome.value,
+                    "score_delta": impact.score_delta,
+                    "evidence_novelty": impact.evidence_novelty,
+                },
+            )
+        return impact.to_dict()
+
+    def list_worker_contributions(
+        self,
+        *,
+        experiment_id: str | None = None,
+        goal_id: str | None = None,
+        model_fingerprint: str | None = None,
+        task_class: str | None = None,
+        role: WorkerRole | str | None = None,
+        limit: int = 500,
+    ) -> tuple[dict[str, Any], ...]:
+        filters: list[str] = []
+        params: list[Any] = []
+        join = ""
+        if experiment_id:
+            filters.append("wc.experiment_id=?")
+            params.append(experiment_id)
+        if goal_id:
+            join = " JOIN orchestration_experiments oe ON oe.id=wc.experiment_id"
+            filters.append("oe.goal_id=?")
+            params.append(goal_id)
+        if model_fingerprint:
+            filters.append("wc.model_fingerprint=?")
+            params.append(model_fingerprint)
+        if task_class:
+            filters.append("wc.task_class=?")
+            params.append(task_class)
+        if role is not None:
+            filters.append("wc.role=?")
+            params.append(WorkerRole(role).value)
+        sql = "SELECT wc.* FROM worker_contributions wc" + join
+        if filters:
+            sql += " WHERE " + " AND ".join(filters)
+        sql += " ORDER BY wc.created_at DESC,wc.id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 10_000)))
+        with self._lock:
+            rows = self._connection.execute(sql, tuple(params)).fetchall()
+        return tuple(self._worker_contribution_payload(row) for row in rows)
+
+    def worker_role_utility(
+        self,
+        *,
+        model_fingerprint: str,
+        task_class: str,
+        role: WorkerRole | str,
+        policy: AdaptiveOrchestrationPolicyV1 | None = None,
+    ) -> dict[str, Any]:
+        selected = policy or AdaptiveOrchestrationPolicyV1()
+        role_value = WorkerRole(role).value
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) AS samples,"
+                "SUM(CASE WHEN outcome=? THEN 1 ELSE 0 END) AS useful,"
+                "AVG(score_delta) AS mean_delta,AVG(evidence_novelty) AS mean_novelty,"
+                "AVG(input_tokens+output_tokens) AS mean_tokens,AVG(latency_ms) AS mean_latency "
+                "FROM worker_contributions WHERE model_fingerprint=? AND task_class=? AND role=?",
+                (
+                    WorkerImpactOutcome.USEFUL.value,
+                    model_fingerprint,
+                    task_class,
+                    role_value,
+                ),
+            ).fetchone()
+        samples = int(row["samples"] or 0)
+        useful = int(row["useful"] or 0)
+        useful_rate = useful / samples if samples else 0.0
+        mean_delta = float(row["mean_delta"] or 0.0)
+        suppressed = (
+            samples >= selected.minimum_learning_samples
+            and useful_rate < selected.suppress_below_useful_rate
+            and mean_delta <= 0.0
+        )
+        return {
+            "model_fingerprint": model_fingerprint,
+            "task_class": task_class,
+            "role": role_value,
+            "samples": samples,
+            "useful": useful,
+            "useful_rate": useful_rate,
+            "mean_score_delta": mean_delta,
+            "mean_evidence_novelty": float(row["mean_novelty"] or 0.0),
+            "mean_tokens": float(row["mean_tokens"] or 0.0),
+            "mean_latency_ms": float(row["mean_latency"] or 0.0),
+            "suppressed": suppressed,
+            "causal": False,
+        }
+
+    def suppressed_worker_roles(
+        self,
+        *,
+        model_fingerprint: str,
+        task_class: str,
+        unit_id: str,
+        roles: Iterable[WorkerRole | str],
+        policy: AdaptiveOrchestrationPolicyV1 | None = None,
+    ) -> tuple[WorkerRole, ...]:
+        selected = policy or AdaptiveOrchestrationPolicyV1()
+        suppressed: list[WorkerRole] = []
+        for raw_role in roles:
+            role = WorkerRole(raw_role)
+            utility = self.worker_role_utility(
+                model_fingerprint=model_fingerprint,
+                task_class=task_class,
+                role=role,
+                policy=selected,
+            )
+            if utility["suppressed"] and not should_reprobe_suppressed_role(
+                unit_id=unit_id,
+                role=role,
+                model_fingerprint=model_fingerprint,
+                fraction=selected.reprobe_fraction,
+            ):
+                suppressed.append(role)
+        return tuple(suppressed)
+
     def record_final_acceptance_evidence(
         self,
         evidence: FinalAcceptanceEvidenceV1,
@@ -7801,6 +8209,28 @@ class StateStore:
                 "UPDATE session_actions SET status=?,result_summary=?,changed_paths_json=?,completed_at=? WHERE id=? AND status='running'",
                 (status, result_summary, _json(list(changed_paths)), _iso(utc_now()), action_id),
             )
+
+    def reconcile_uncertain_session_action(
+        self,
+        action_id: str,
+        result_summary: str,
+        *,
+        status: str = "failed",
+    ) -> None:
+        """Resolve an interrupted session action after deterministic recovery."""
+
+        if status not in {"failed", "denied"}:
+            raise ValueError("uncertain session actions may only reconcile to failed or denied")
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE session_actions SET status=?,result_summary=?,completed_at=? "
+                "WHERE id=? AND status='uncertain'",
+                (status, str(result_summary), _iso(utc_now()), str(action_id)),
+            )
+            if int(cursor.rowcount or 0) != 1:
+                raise StateStoreError(
+                    f"session action {action_id!r} is not an uncertain action"
+                )
 
     def list_session_actions(self, session_id: str) -> tuple[dict[str, Any], ...]:
         with self._lock:

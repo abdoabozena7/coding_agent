@@ -140,8 +140,8 @@ UI, or `--reduced-motion` for lower-motion setup and progress surfaces.
 `F6` toggles **Safe Auto** at any time. The full Sleep policy is configured under
 Runtime in `/settings`; explicit Full Auto can accept tool approvals in the
 selected workspace and every automatic approval is audited. In eligible
-Ultra/Full-Docker sessions, enabling Sleep also attempts to arm the deeper Ultra
-Sleep profile; failure of that stricter gate does not disable Safe Auto.
+Execution/Full-Docker sessions, enabling Sleep also attempts to arm the deeper
+recursive Sleep profile; failure of that stricter gate does not disable Safe Auto.
 
 `F7` opens Change Review for the current immutable checkpoint and `F8` opens the exact
 selected project workspace in the operating-system file explorer. The fixed
@@ -152,9 +152,11 @@ provider. Unknown quotas and limits are shown as unavailable, never estimated.
 
 ## Ultra Plan and durable conversation
 
-The two main interaction choices are **Ultra** and **Ultra Plan**. Both use the
-same recursive Ultra execution engine; Ultra Plan adds a planning boundary before
-mutation. Selecting it opens `/plan` automatically. The browser asks as many
+The two explicit interaction choices are **Execution** and **Ultra Plan**.
+Execution routes each message automatically: conversation becomes evidence-aware
+Chat, while an implementation request enters the recursive execution engine.
+Ultra Plan adds a user-selected planning boundary before mutation. Selecting it
+or entering `/ultra-plan` opens the planning workspace. The browser asks as many
 material questions as needed, presents one editable plan document, then uses two
 explicit confirmations: **Prepare agents** shows the exact first-layer team, and
 **Approve & start** hands that revision back to the terminal. Execution never
@@ -170,15 +172,35 @@ The persistent terminal keeps the durable workspace conversation in its main
 surface. Failed partial model streams and raw reasoning are never promoted into
 durable chat.
 
+### Run, inspect, and deliver visual output
+
+“Run this project” is treated as an operational request: the agent inspects the
+README, manifests, lockfiles, and declared scripts; installs only declared
+project dependencies; starts long-running processes under lifecycle management;
+checks readiness/logs; and repairs an in-scope startup blocker before retrying.
+
+Image delivery is platform-neutral. Browser scenarios save distinct screenshots
+under the project `output/browser/` tree. Exact SHA-256 plus a perceptual hash
+prevent identical and near-identical page states from satisfying a request for
+distinct images, including screenshots restored from an older session.
+`inspect_images` sends the exact current bytes to the selected model, first
+requiring it to pass a pixel-only Vision probe. A conclusive probe failure is
+cached and pauses the task at the visual-evidence gate after one attempt; it is
+never converted into a successful Output. A capable model then scores, ranks,
+and cites visible facts for each image. `publish_output` accepts only current
+Vision-backed images and builds the generic Output page with independently
+copyable sections and attachments. No social-platform mode, template, or
+destination preference is inferred or persisted.
+
 `/pause` records a cooperative pause request and stops new scheduling. The UI
 shows `Pause pending` while the current model/tool/agent drains, and changes the
 goal to PAUSED only after a saved checkpoint. `/resume` appears
 only after that durable state exists. An API call is not presented as a
 server-side job and does not claim to keep running after the computer shuts down.
 
-## ULTRA mode
+## Execution
 
-Ultra execution turns a compact request into `GoalSpecV1`, architecture, and an
+Execution turns a compact request into `GoalSpecV1`, architecture, and an
 approval-bound master plan. After the master plan is applied in Ultra Plan, the background scheduler runs
 the same pipeline for local and cloud models:
 
@@ -198,7 +220,7 @@ versioned decisions and lessons, evaluation runs, redacted prompt traces, memory
 access, and fenced path/leader leases. Component specialists stage one real file
 at a time and publish a manifest; only FinalAssembler owns final output paths.
 
-Before execution, ULTRA derives a typed concern-coverage matrix from the task
+Before execution, the recursive engine derives a typed concern-coverage matrix from the task
 family and repository evidence, not from prompt length. Critical concerns receive
 named owners and executable acceptance checks: spatial semantics, progression,
 world continuity, and frame performance for games; security, data integrity,
@@ -211,13 +233,13 @@ created only when the approved plan has not already divided the responsibility.
 `/live` and `/advanced-tracing` keep the default scrollback uncluttered while
 making concise progress or complete developer evidence available on demand.
 
-During a long ULTRA run, the main body keeps a two-line activity strip with the
+During a long Execution run, the main body keeps a two-line activity strip with the
 human-readable phase, active operation, completed/remaining nodes, elapsed time,
 and an approximate ETA only after enough work has been observed. Blockers add one
 temporary third line. CPU, GPU, RAM, context, model activity, and Sleep state stay
 in the fixed footer rather than interrupting the transcript.
 
-`/live` opens the read-only Ultra Live workspace without starting a nested
+`/live` opens the read-only Execution workspace without starting a nested
 terminal application.
 Every materialized specialist receives a short path-derived name and a read-only
 workspace showing its status, role/phase, capabilities, owned concerns and
@@ -230,9 +252,11 @@ raw chain-of-thought is never stored or shown.
 Plain/redirected terminals retain
 the compact text fallback.
 
-Full permissions are fail-closed and selectable only in Settings after Project
-setup builds the versioned non-root Docker image. The workspace is the only writable bind mount;
-the host home, Docker socket, and credentials are never mounted or injected.
+Full access is selectable through `/access full` or Settings. It is a
+session-wide unattended approval policy for the already selected workspace and
+accepted task, so browser, process, and file tools keep one consistent host
+environment. The optional versioned non-root Docker sandbox remains available
+for explicitly isolated command work; it is not a prerequisite for Full access.
 
 The original command remains supported:
 
@@ -240,23 +264,24 @@ The original command remains supported:
 python agent/main.py --workspace /path/to/project
 ```
 
-## Normal workflow
+## Automatic Chat and Execution workflow
 
 1. Every message enters `Intake/Planning` through Intent Architect. It inspects
    discoverable repository context, creates a canonical execution brief, and asks
    only consequential missing product decisions. Each question has exactly three
    suggestions (the first Recommended) plus a free-form fourth answer.
-2. Normal is the default durable goal workflow. For Ultra-scale complexity, the
-   intake recommends Ultra while keeping Normal as the safe Enter default; it
-   never escalates orchestration or cost silently. The read-only planner then inspects
+2. Execution is the default. Chat is not a selectable mode: the semantic router
+   chooses it per message for conversation or project-aware explanation. A real
+   implementation request enters the durable Goal workflow and the harness selects
+   staged or recursive depth from task demand and model capability. The read-only planner then inspects
    the repository and submits a
    structured plan containing factual applicability evidence, an execution
    strategy, expected workspace changes, and task-bound verification.
 3. Deterministic validation checks every plan; a separate critic is used only
    for complex or high-risk work.
-4. Open `/plan`, edit or revise the plan, then use the explicit Approve & Start action.
+4. Open `/ultra-plan`, edit or revise the plan, then use the explicit Approve & Start action.
 5. Routing and recursive depth are selected from task complexity and model
-   capability. Use `/plan` only when you explicitly want the editable planning
+   capability. Use `/ultra-plan` only when you explicitly want the editable planning
    boundary before mutation. Changes requested during work are applied only after
    the nearest saved checkpoint; Ctrl-C requests that checkpoint cooperatively.
 6. Add guidance or edit the checklist at any checkpoint. The durable objective is
@@ -273,10 +298,10 @@ Architecture ready · 8 modules
 [reviewer] found 2 issues
 Fix loop 2/3
 [Physics · tester] updated
-GA3BAD [ULTRA]>
+GA3BAD [EXECUTION]>
 ```
 
-The logo appears once. Normal output is append-only scrollback; detailed trees,
+The logo appears once. Execution output is append-only scrollback; detailed trees,
 agents, memory, traces, and metrics appear only when requested.
 
 Live activity is intentionally summarized: a tool call and its result resolve as
@@ -291,11 +316,13 @@ model step. Use `/advanced-tracing` when durable technical detail is needed.
 
 | Command | Effect |
 |---|---|
-| `/plan` | Open Ultra Plan and its editable document / first-layer approval flow |
+| `/ultra-plan` | Open Ultra Plan and its editable document / first-layer approval flow |
 | `/live` | Open the simple read-only progress workspace |
+| `/todo` | Inspect the goal, tasks, criteria, and verification evidence |
 | `/show-diff` | Open the standalone read-only workflow diff with live and recorded changes |
 | `/advanced-tracing` | Open the standalone developer trace for the current or a prior run |
 | `/settings` | Open Runtime, Providers, Project, Terminal, and Diagnostics settings |
+| `/access [normal\|full]` | Inspect or change the separate permission profile; Full runs accepted in-scope actions without repeated questions |
 | `/pause` | Request a cooperative saved checkpoint |
 | `/resume` | Continue from the durable checkpoint |
 | `/stop` | Stop now while keeping the saved stage resumable |
@@ -395,10 +422,10 @@ history would be wasteful.
   have deterministic caps.
 - Writes use temp files, `fsync`, identity checks, and atomic replacement; a failed
   edit preserves the original.
-- Read/write work inside the selected project is automatic. Build/test/lint runs
-  are automatic in the Docker sandbox, or ask once per session outside it;
-  dependency installs, network, destructive, and host actions still require a
-  visible explicit decision. Shell children use the workspace as explicit `cwd`
+- Read/write work inside the selected project is automatic. In Normal access,
+  dependency installs, network, destructive, preview, and host actions require
+  one visible session-wide decision; Full access applies the user's explicit
+  unattended grant without further questions. Shell children use the workspace as explicit `cwd`
   and inherit only an operational environment
   allowlist—never API keys or arbitrary secrets.
 - Plan approval does not imply action approval. Tool output is redacted before it

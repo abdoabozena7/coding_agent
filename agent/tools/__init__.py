@@ -10,14 +10,22 @@ from typing import Any, Iterable, Mapping
 
 from . import (
     apply_patch,
+    browser_act,
+    browser_close,
+    browser_inspect,
+    browser_open,
+    browser_screenshot,
+    browser_session,
     edit_file,
     grep,
     inspect_preview,
+    inspect_images,
     install_dependencies,
     list_files,
     materialize_artifact,
     open_path,
     poll_process,
+    publish_output,
     preview_html,
     process_manager,
     read_file,
@@ -64,6 +72,13 @@ TOOL_SPECS = (
     _spec(read_file, "low", "read", paths=("path",)),
     _spec(list_files, "low", "read", paths=("path",)),
     _spec(grep, "low", "read", paths=("path",)),
+    _spec(inspect_images, "low", "read", capability="vision"),
+    _spec(browser_open, "high", "preview", paths=("path",), lifecycle="managed", capability="browser"),
+    _spec(browser_inspect, "low", "preview", lifecycle="managed", capability="browser"),
+    _spec(browser_act, "high", "preview", lifecycle="managed", capability="browser"),
+    _spec(browser_screenshot, "low", "preview", mutates=True, lifecycle="managed", capability="browser"),
+    _spec(browser_close, "low", "preview", lifecycle="managed", capability="browser"),
+    _spec(publish_output, "low", "output"),
     _spec(write_file, "high", "write", mutates=True, paths=("path",)),
     _spec(edit_file, "high", "write", mutates=True, paths=("path",)),
     _spec(apply_patch, "high", "write", mutates=True),
@@ -83,7 +98,9 @@ TOOL_SPECS = (
 
 # Backward-compatible module list plus a central metadata registry.
 TOOLS = [
-    read_file, list_files, grep, write_file, edit_file, apply_patch,
+    read_file, list_files, grep, inspect_images,
+    browser_open, browser_inspect, browser_act, browser_screenshot, browser_close,
+    publish_output, write_file, edit_file, apply_patch,
     materialize_artifact, run_bash, run_command, install_dependencies,
     start_process, poll_process, read_process_output, stop_process, open_path,
     preview_html, inspect_preview, stop_preview,
@@ -103,6 +120,12 @@ def applicability_issue(
 ) -> str:
     """Return a read-only applicability error before any approval is requested."""
 
+    if str(name) == "install_dependencies":
+        return install_dependencies.dependency_applicability_issue(
+            workspace,
+            str(args.get("directory") or "."),
+            str(args.get("manager") or "auto"),
+        )
     if str(name) != "preview_html":
         return ""
     raw_path = str(args.get("path") or "").strip()
@@ -171,6 +194,9 @@ def capability_report() -> tuple[dict[str, Any], ...]:
         if spec.capability == "browser":
             available = bool(browser.get("available") and browser.get("playwright"))
             detail = f"browser={browser.get('channel') or 'missing'}, playwright={'yes' if browser.get('playwright') else 'no'}"
+        elif spec.capability == "vision":
+            available = True
+            detail = "availability is verified against the configured model at call time"
         result.append({
             "name": spec.name,
             "category": spec.category,
@@ -191,10 +217,21 @@ def register_artifact_provider(workspace: str | Path, provider: Any) -> None:
     materialize_artifact.register_provider(workspace, provider)
 
 
+def register_vision_evaluator(workspace: str | Path, evaluator: Any) -> None:
+    inspect_images.register_evaluator(workspace, evaluator)
+
+
+def register_output_publisher(workspace: str | Path, publisher: Any) -> None:
+    publish_output.register_provider(workspace, publisher)
+
+
 def shutdown_workspace_resources(workspace: str | Path) -> None:
     process_manager.shutdown_workspace(workspace)
+    browser_session.shutdown_workspace(workspace)
     web_preview.shutdown_workspace(workspace)
     materialize_artifact.unregister_provider(workspace)
+    inspect_images.unregister_evaluator(workspace)
+    publish_output.unregister_provider(workspace)
 
 
 def requires_approval(name: str, args: dict | None = None) -> bool:
@@ -269,5 +306,6 @@ __all__ = [
     "ToolSecurityError", "ToolSpec", "capability_report", "configure_workspace",
     "get_spec", "get_tool_context", "get_workspace", "mutation_footprint", "names", "requires_approval",
     "risk_map", "run_tool", "run_tool_detailed", "shutdown_workspace_resources",
-    "workspace_context", "register_artifact_provider",
+    "workspace_context", "register_artifact_provider", "register_vision_evaluator",
+    "register_output_publisher",
 ]

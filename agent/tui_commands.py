@@ -34,8 +34,10 @@ class CommandAvailability:
 
 
 COMMAND_SPECS: tuple[CommandSpec, ...] = (
-    CommandSpec("/plan", "open the explicit Ultra Plan workspace", "Workspace", live_safe=True),
+    CommandSpec("/ultra-plan", "open the explicit Ultra Plan workspace", "Workspace", live_safe=True),
     CommandSpec("/live", "open the simple read-only Live workspace", "Workspace", live_safe=True),
+    CommandSpec("/output", "open the latest finished task result", "Workspace", live_safe=True),
+    CommandSpec("/todo", "inspect the goal, tasks, checklists, and verification evidence", "Workspace", live_safe=True),
     CommandSpec(
         "/show-diff",
         "open the simple live workflow diff",
@@ -49,6 +51,13 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         live_safe=True,
     ),
     CommandSpec("/settings", "open runtime, provider, project, terminal, and diagnostic settings", "Session", live_safe=True),
+    CommandSpec(
+        "/access",
+        "switch between Normal and unattended Full access",
+        "Session",
+        arguments="[normal|full]",
+        live_safe=True,
+    ),
     CommandSpec("/pause", "pause active work at a safe boundary", "Control", checkpoint_required=True),
     CommandSpec("/resume", "resume the saved checkpoint", "Control", checkpoint_required=True),
     CommandSpec("/stop", "stop now and keep the saved stage resumable", "Control", checkpoint_required=True),
@@ -64,7 +73,7 @@ CODEX_SLASH_COMMANDS: tuple[tuple[str, str], ...] = ()
 SLASH_COMMANDS = ALL_SLASH_COMMANDS
 
 _GROUP_COPY = {
-    "Workspace": "Open the plan, live view, workflow diff, or developer trace",
+    "Workspace": "Open progress, plan, live view, workflow diff, or developer trace",
     "Control": "Pause, resume, stop, or undo checkpointed work",
     "Session": "Configure, get help, or leave safely",
 }
@@ -79,11 +88,11 @@ COMMAND_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = tuple(
 
 _DESCRIPTIONS = dict(ALL_SLASH_COMMANDS)
 _CONTEXT_COMMANDS: dict[str, tuple[str, ...]] = {
-    "idle": ("/plan", "/live", "/show-diff", "/advanced-tracing", "/settings", "/help", "/quit"),
-    "paused": ("/resume", "/stop", "/show-diff", "/advanced-tracing", "/live", "/settings", "/help", "/quit"),
-    "completed": ("/show-diff", "/live", "/advanced-tracing", "/undo", "/settings", "/help", "/quit"),
+    "idle": ("/ultra-plan", "/todo", "/live", "/output", "/show-diff", "/advanced-tracing", "/access", "/settings", "/help", "/quit"),
+    "paused": ("/todo", "/resume", "/stop", "/show-diff", "/advanced-tracing", "/live", "/output", "/access", "/settings", "/help", "/quit"),
+    "completed": ("/output", "/todo", "/show-diff", "/live", "/advanced-tracing", "/undo", "/access", "/settings", "/help", "/quit"),
 }
-_ACTIVE = ("/pause", "/stop", "/live", "/show-diff", "/advanced-tracing", "/settings", "/help", "/quit")
+_ACTIVE = ("/todo", "/pause", "/stop", "/live", "/output", "/show-diff", "/advanced-tracing", "/access", "/settings", "/help", "/quit")
 
 
 def contextual_commands(status: str) -> tuple[tuple[str, str], ...]:

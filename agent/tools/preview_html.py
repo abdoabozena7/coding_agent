@@ -8,6 +8,9 @@ RESULT_CONTRACT = {
         "verification", "failure_kind", "interaction_targets", "console_errors", "page_errors", "network_errors",
         "screenshot_path", "interaction_results",
     ],
+    "interaction_result_fields": [
+        "name", "passed", "assertions", "error", "screenshot_path",
+    ],
     "passed_evidence": (
         "verification=passed, HTTP 200, empty console/page/network error arrays, "
         "and an existing screenshot_path"

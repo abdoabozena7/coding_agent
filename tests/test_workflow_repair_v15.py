@@ -18,7 +18,12 @@ from agent.testing import (
     semantic_goal_intake_turn,
     semantic_turn,
 )
-from tests.test_runtime import inspect_call, plan_call, plan_pass, review_pass
+from tests.test_runtime import (
+    fixed_specialist_passes,
+    inspect_call,
+    plan_call,
+    plan_pass,
+)
 from tests.test_store import plan_basis, task
 
 
@@ -64,7 +69,7 @@ def _finish_turn() -> dict:
     }
 
 
-def test_hybrid_router_keeps_explanation_in_chat_and_promotes_work_to_recursive_goal() -> None:
+def test_hybrid_router_keeps_explanation_in_chat_and_bounded_work_as_action() -> None:
     with tempfile.TemporaryDirectory() as directory:
         workspace = Path(directory)
         store = StateStore(workspace)
@@ -78,12 +83,6 @@ def test_hybrid_router_keeps_explanation_in_chat_and_promotes_work_to_recursive_
                             response="The workflow persists state so interrupted work can resume.",
                         ),
                         semantic_turn("action", original="create note.txt", effects=("write",)),
-                        semantic_goal_intake_turn(
-                            semantic_goal_intake("create note.txt")
-                        ),
-                        inspect_call(),
-                        plan_call(),
-                        plan_pass(),
                     ]
                 ),
                 store,
@@ -97,12 +96,14 @@ def test_hybrid_router_keeps_explanation_in_chat_and_promotes_work_to_recursive_
             assert chat_result.status == "chat"
             assert runtime.active_goal() is None
 
-            action, action_result = runtime.route_input("create note.txt")
-            assert action.kind is RouteKind.GOAL
-            assert action_result.goal_id == runtime.active_goal().id
-            assert runtime.active_goal().metadata["execution_strategy"] == "recursive"
+            pending, action = runtime._semantic_preflight("create note.txt")
+            assert action.route is RouteKind.ACTION
+            assert pending["strategy_decision"]["strategy"] == "staged"
+            assert runtime.active_goal() is None
             assert not (workspace / "note.txt").exists()
         finally:
+            if "runtime" in locals():
+                runtime.close()
             store.close()
 
 
@@ -158,7 +159,7 @@ def test_pending_normal_approval_survives_restart_and_mutates_exactly_once() -> 
         try:
             second = AgentRuntime(
                 ScriptedProvider(
-                    [_execution_turn(), _finish_turn(), review_pass()]
+                    [_execution_turn(), _finish_turn(), *fixed_specialist_passes()]
                 ),
                 second_store,
                 workspace,
@@ -228,13 +229,13 @@ def test_pending_normal_approval_recovers_across_real_processes() -> None:
             from agent.runtime import AgentRuntime
             from agent.store import StateStore
             from agent.testing import ScriptedProvider
-            from tests.test_runtime import review_pass
+            from tests.test_runtime import fixed_specialist_passes
             from tests.test_workflow_repair_v15 import _execution_turn, _finish_turn
 
             workspace = Path(sys.argv[1])
             store = StateStore(workspace)
             runtime = AgentRuntime(
-                ScriptedProvider([_execution_turn(), _finish_turn(), review_pass()]),
+                ScriptedProvider([_execution_turn(), _finish_turn(), *fixed_specialist_passes()]),
                 store,
                 workspace,
                 approval=lambda *_: True,
@@ -369,6 +370,7 @@ def test_independent_review_scope_expansion_requires_new_approval() -> None:
                         _execution_turn(),
                         _finish_turn(),
                         failed_review,
+                        *fixed_specialist_passes()[1:],
                     ]
                 ),
                 store,
@@ -623,7 +625,7 @@ def test_real_python_project_fails_then_repairs_and_completes() -> None:
                         plan_pass(),
                         failing_implementation,
                         repaired,
-                        review_pass(),
+                        *fixed_specialist_passes(),
                     ]
                 ),
                 store,

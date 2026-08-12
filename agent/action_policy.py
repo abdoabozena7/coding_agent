@@ -24,9 +24,15 @@ class ActionPolicyDecision:
 
 
 _READ_TOOLS = frozenset(
-    {"read_file", "list_files", "grep", "poll_process", "read_process_output", "inspect_preview"}
+    {
+        "read_file", "list_files", "grep", "poll_process", "read_process_output",
+        "inspect_preview", "inspect_images", "browser_inspect", "browser_screenshot",
+        "browser_close", "publish_output",
+    }
 )
-_WRITE_TOOLS = frozenset({"write_file", "edit_file", "apply_patch", "materialize_artifact"})
+_WRITE_TOOLS = frozenset(
+    {"write_file", "edit_file", "apply_patch", "materialize_artifact"}
+)
 _SAFE_COMMAND_RE = re.compile(
     r"^\s*(?:"
     r"git\s+(?:status|diff|log|show)\b|"
@@ -97,6 +103,12 @@ def classify_action(
             ApprovalRequirement.SESSION,
             "project_preview",
             "Allow local project previews for this session",
+        )
+    if tool in {"browser_open", "browser_act"}:
+        return ActionPolicyDecision(
+            ApprovalRequirement.SESSION,
+            "browser_automation",
+            "Allow Playwright browser control for this session",
         )
     if tool in {"stop_process", "stop_preview", "open_path"}:
         return ActionPolicyDecision(

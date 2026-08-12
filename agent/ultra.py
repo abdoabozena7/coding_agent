@@ -544,6 +544,9 @@ class AgentRole(str, Enum):
     CLEAN_CODE_REVIEWER = "clean_code_reviewer"
     SECURITY_REVIEWER = "security_reviewer"
     TEST_QUALITY_REVIEWER = "test_quality_reviewer"
+    ARCHITECTURE_REVIEWER = "architecture_reviewer"
+    FIDELITY_REVIEWER = "fidelity_reviewer"
+    REGRESSION_REVIEWER = "regression_reviewer"
     QUALITY_TRIAGER = "quality_triager"
 
 
@@ -2292,6 +2295,10 @@ class UltraOrchestrator:
         boolean_tokens = {
             "true": True,
             "false": False,
+            "yes": True,
+            "no": False,
+            "1": True,
+            "0": False,
             "pass": True,
             "passed": True,
             "fail": False,
@@ -2306,6 +2313,15 @@ class UltraOrchestrator:
                     actions.append(
                         f"{phase}.{field} exact string verdict normalized to boolean"
                     )
+            elif (
+                not isinstance(raw_boolean, bool)
+                and isinstance(raw_boolean, (int, float))
+                and raw_boolean in {0, 1}
+            ):
+                normalized[field] = bool(raw_boolean)
+                actions.append(
+                    f"{phase}.{field} exact numeric verdict normalized to boolean"
+                )
         if phase == "master_plan":
             # Node identifiers are transport coordinates, not product
             # semantics. Isolate every model-authored id in the current run
@@ -6212,16 +6228,170 @@ class UltraOrchestrator:
             return ()
         return tuple(dict(item) for item in raw if isinstance(item, Mapping))
 
+    @staticmethod
+    def _reviewer_applicability(
+        node: WorkNode,
+        category: str,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Route costly model reviews from accepted, observable change signals."""
+
+        metadata = dict(node.contract.metadata)
+        path_keys = tuple(path.casefold() for path in node.contract.write_paths)
+        raw_concerns = metadata.get("concerns", metadata.get("concern_ids", ()))
+        if isinstance(raw_concerns, str):
+            raw_concerns = (raw_concerns,)
+        concern_keys = {
+            str(item.get("id") or item.get("category") or item).strip().casefold()
+            if isinstance(item, Mapping)
+            else str(item).strip().casefold()
+            for item in raw_concerns or ()
+            if str(item).strip()
+        }
+        code_suffixes = (
+            ".c", ".cc", ".cpp", ".cs", ".go", ".java", ".js", ".jsx",
+            ".php", ".py", ".rb", ".rs", ".sh", ".sql", ".swift", ".ts",
+            ".tsx", ".vue",
+        )
+        test_markers = (
+            "/test", "tests/", "test_", "_test.", ".test.", ".spec.",
+        )
+        security_markers = (
+            "auth", "credential", "permission", "policy", "route", "secret",
+            "security", "session", "token", "webhook",
+        )
+
+        if category == "clean_code":
+            applicable = (
+                not path_keys
+                or "." in path_keys
+                or any(path.endswith(code_suffixes) for path in path_keys)
+                or bool(concern_keys & {"clean_code", "maintainability", "architecture"})
+            )
+            reasons = (
+                "code or maintainability surface changed",
+            ) if applicable else ("change is non-code and covered deterministically",)
+            return applicable, reasons
+        if category == "security":
+            applicable = bool(
+                metadata.get("security_sensitive")
+                or metadata.get("attack_surface_changed")
+                or node.contract.owned_interfaces
+                or concern_keys
+                & {
+                    "authentication", "authorization", "dependency_security",
+                    "permissions", "secrets", "security", "unsafe_apis", "validation",
+                }
+                or any(marker in path for path in path_keys for marker in security_markers)
+            )
+            reasons = (
+                "accepted contract changes an attack surface or security concern",
+            ) if applicable else ("no observable attack-surface change",)
+            return applicable, reasons
+        if category == "test_quality":
+            applicable = bool(
+                metadata.get("tests_changed")
+                or concern_keys & {"test_quality", "tests", "verification"}
+                or any(marker in path for path in path_keys for marker in test_markers)
+            )
+            reasons = (
+                "test artifacts or test-quality concern changed",
+            ) if applicable else ("tests did not change; runtime gates cover this dimension",)
+            return applicable, reasons
+        if category == "architecture":
+            return True, (
+                "architecture is a fixed post-build review dimension",
+            )
+        if category == "fidelity":
+            return True, (
+                "accepted requirements always require a fidelity review",
+            )
+        if category == "regression":
+            return True, (
+                "every completed mutation requires a regression review",
+            )
+        return True, ("runtime verification is always applicable",)
+
+    @staticmethod
+    def _not_applicable_review(
+        category: str,
+        reasons: Sequence[str],
+    ) -> AgentResponse:
+        return AgentResponse(
+            payload={
+                "passed": True,
+                "success": True,
+                "abstained": True,
+                "not_applicable": True,
+                "category": category,
+                "applicability_reasons": list(reasons),
+                "evidence": [
+                    {
+                        "kind": "harness_review_applicability",
+                        "source": "harness",
+                        "passed": True,
+                        "category": category,
+                        "reason": reason,
+                    }
+                    for reason in reasons
+                ],
+            },
+            summary=f"{category} model review was not applicable to this change.",
+            reasoning_summary=(
+                "The deterministic reviewer router found no accepted change signal "
+                "requiring this model role."
+            ),
+            provider="harness",
+            model="deterministic-review-router-v1",
+        )
+
+    @classmethod
+    def _vote_evidence_refs(cls, response: AgentResponse) -> tuple[str, ...]:
+        refs: list[str] = []
+        for key in ("test_results", "evidence", "findings"):
+            raw = response.payload.get(key, ())
+            values = (
+                (raw,)
+                if isinstance(raw, (str, Mapping))
+                else raw
+                if isinstance(raw, Sequence)
+                else ()
+            )
+            for item in values:
+                if isinstance(item, Mapping):
+                    name = str(item.get("name") or item.get("kind") or "")
+                    trusted = bool(
+                        item.get("artifact_hash")
+                        or item.get("action_id")
+                        or str(item.get("source") or "").casefold() == "harness"
+                        or str(item.get("authority") or "").casefold()
+                        in {"browser", "harness", "test", "user"}
+                        or name.startswith("harness_")
+                    )
+                    if trusted:
+                        refs.extend(_strings(item.get("evidence_refs")))
+                    identity = (
+                        item.get("artifact_hash")
+                        or item.get("action_id")
+                        or item.get("uri")
+                        or name
+                    )
+                    if trusted and identity:
+                        refs.append(str(identity))
+        return tuple(dict.fromkeys(item for item in refs if str(item).strip()))
+
     def _quality_vote_records(
         self,
         node: WorkNode,
         responses: tuple[AgentResponse, ...],
     ) -> tuple[Mapping[str, Any], ...]:
         labels = [
-            "clean_code",
             "security",
+            "clean_code",
+            "testing",
+            "architecture",
+            "fidelity",
+            "regression",
             "runtime_tests",
-            "test_quality",
             "triage",
         ]
         if len(responses) > len(labels):
@@ -6251,6 +6421,15 @@ class UltraOrchestrator:
         )
         records: list[Mapping[str, Any]] = []
         for label, response in zip(labels, responses):
+            if label in {"runtime_tests", "triage"} or response.model in {
+                "deterministic-quality-triage-v1",
+                "deterministic-review-router-v1",
+            }:
+                continue
+            if response.provider == "harness":
+                # Harness gates can veto, but a derived deterministic result is
+                # never an additional independent voter.
+                continue
             payload = response.payload
             reasoning_evaluation = _mapping(payload.get("harness_reasoning_evaluation"))
             explicit_consensus_vote = str(
@@ -6292,6 +6471,17 @@ class UltraOrchestrator:
                 and not authoritative_evidence_present
             ):
                 confidence = max(confidence, 1.0)
+            evidence_refs = self._vote_evidence_refs(response)
+            evidence_enforcement_active = not bool(
+                getattr(
+                    getattr(self, "state", None),
+                    "adaptive_orchestration_shadow_mode",
+                    True,
+                )
+            )
+            if not evidence_refs and evidence_enforcement_active:
+                raw_verdict = "abstain"
+                confidence = 0.0
             records.append(
                 {
                     "voter_agent_id": f"{node.id}:{label}",
@@ -6302,6 +6492,8 @@ class UltraOrchestrator:
                     "summary": response.summary,
                     "rationale": response.reasoning_summary or response.summary,
                     "evidence": {
+                        "evidence_refs": list(evidence_refs),
+                        "evidence_valid": bool(evidence_refs),
                         "declared_verdict": declared_verdict,
                         "issues": list(_strings(payload.get("issues"))),
                         "findings": list(_strings(payload.get("findings"))),
@@ -6335,7 +6527,42 @@ class UltraOrchestrator:
         return str(consensus.get("status", "")).casefold() == "accepted"
 
     def _quality_gate_passed(self, result: QualityGateResultV1) -> bool:
-        return all(self._passed(item) for item in result.responses) and self._consensus_accepted(result.consensus)
+        for response in result.responses:
+            if response.model == "deterministic-quality-triage-v1":
+                continue
+            failed_typed_evidence = any(
+                isinstance(item, Mapping)
+                and item.get("passed") is False
+                and (
+                    response.provider == "harness"
+                    or str(item.get("source") or "").casefold() == "harness"
+                    or str(item.get("authority") or "").casefold()
+                    in {"harness", "test", "browser", "user"}
+                    or str(item.get("name") or item.get("kind") or "").startswith(
+                        "harness_"
+                    )
+                )
+                for key in ("test_results", "evidence")
+                for item in (
+                    response.payload.get(key, ())
+                    if isinstance(response.payload.get(key), Sequence)
+                    and not isinstance(response.payload.get(key), (str, bytes))
+                    else ()
+                )
+            )
+            if response.provider == "harness" and not self._passed(response):
+                return False
+            if failed_typed_evidence:
+                return False
+        if result.consensus:
+            return self._consensus_accepted(result.consensus)
+        # Lightweight adapters used in local/offline tests may not persist a
+        # consensus round. Preserve a strict fallback in that case.
+        return all(
+            self._passed(item)
+            for item in result.responses
+            if item.model != "deterministic-quality-triage-v1"
+        )
 
     @staticmethod
     def _quality_failure_kind(result: QualityGateResultV1) -> str:
@@ -6355,6 +6582,11 @@ class UltraOrchestrator:
                             str(interaction.get("failure_kind") or "").casefold()
                         )
         observed.discard("")
+        # Mixed evidence is owned by the candidate whenever any authoritative
+        # gate observed an application defect.  A secondary selector/schema
+        # miss cannot shield a runtime error from the coder repair loop.
+        if "application" in observed:
+            return "application"
         if observed & {"contract", "test_definition", "tool_validation"}:
             return "contract"
         if observed & {"tool", "transport"}:
@@ -6862,41 +7094,88 @@ class UltraOrchestrator:
             ),
             "do_not_claim_evidence_is_missing_when_authoritative_test_evidence_is_supplied": True,
         }
-        clean_code = self._invoke(
-            AgentRole.CLEAN_CODE_REVIEWER,
-            InnerPhase.REVIEW,
-            task={"contract": asdict(node.contract), "candidate": candidate, "authoritative_test_evidence": test_evidence, "evaluation_policy": reviewer_policy, "fresh_review": True, "category": "clean_code", "read_only": True},
-            context=self._new_context(node, AgentRole.CLEAN_CODE_REVIEWER),
-            node_id=node.id,
-        )
-        security = self._invoke(
-            AgentRole.SECURITY_REVIEWER,
-            InnerPhase.REVIEW,
-            task={"contract": asdict(node.contract), "candidate": candidate, "authoritative_test_evidence": test_evidence, "evaluation_policy": reviewer_policy, "fresh_review": True, "category": "security", "read_only": True},
-            context=self._new_context(node, AgentRole.SECURITY_REVIEWER),
-            node_id=node.id,
-        )
-        test_quality = self._invoke(
+
+        def invoke_review(
+            role: AgentRole,
+            category: str,
+        ) -> AgentResponse:
+            applicable, applicability_reasons = self._reviewer_applicability(
+                node,
+                category,
+            )
+            # The adaptive worker stage remains risk-routed.  This is the
+            # separate fixed post-build review stage, so every specialist is
+            # invoked even when its result is an evidence-backed unaffected
+            # verdict rather than a finding.
+            shadow_mode = bool(
+                getattr(self.state, "adaptive_orchestration_shadow_mode", True)
+            )
+            return self._invoke(
+                role,
+                InnerPhase.REVIEW,
+                task={
+                    "contract": asdict(node.contract),
+                    "candidate": candidate,
+                    "authoritative_test_evidence": test_evidence,
+                    "evaluation_policy": reviewer_policy,
+                    "fresh_review": True,
+                    "category": category,
+                    "read_only": True,
+                    "review_applicability": {
+                        "applicable": applicable,
+                        "reasons": list(applicability_reasons),
+                        "shadow_mode": shadow_mode,
+                    },
+                },
+                context=self._new_context(node, role),
+                node_id=node.id,
+            )
+
+        security = invoke_review(AgentRole.SECURITY_REVIEWER, "security")
+        clean_code = invoke_review(AgentRole.CLEAN_CODE_REVIEWER, "clean_code")
+        test_quality = invoke_review(
             AgentRole.TEST_QUALITY_REVIEWER,
-            InnerPhase.REVIEW,
-            task={"contract": asdict(node.contract), "candidate": candidate, "authoritative_test_evidence": test_evidence, "evaluation_policy": reviewer_policy, "fresh_review": True, "category": "test_quality", "read_only": True},
-            context=self._new_context(node, AgentRole.TEST_QUALITY_REVIEWER),
-            node_id=node.id,
+            "test_quality",
         )
-        clean_code = self._scope_leaf_review(node, clean_code)
-        security = self._scope_leaf_review(node, security)
+        architecture = invoke_review(
+            AgentRole.ARCHITECTURE_REVIEWER,
+            "architecture",
+        )
+        fidelity = invoke_review(
+            AgentRole.FIDELITY_REVIEWER,
+            "fidelity",
+        )
+        regression = invoke_review(
+            AgentRole.REGRESSION_REVIEWER,
+            "regression",
+        )
         tests = self._scope_leaf_review(node, tests)
+        security = self._scope_leaf_review(node, security)
+        clean_code = self._scope_leaf_review(node, clean_code)
         test_quality = self._scope_leaf_review(node, test_quality)
-        clean_code = self._reconcile_satisfied_evidence_request(clean_code, test_evidence)
+        architecture = self._scope_leaf_review(node, architecture)
+        fidelity = self._scope_leaf_review(node, fidelity)
+        regression = self._scope_leaf_review(node, regression)
         security = self._reconcile_satisfied_evidence_request(security, test_evidence)
+        clean_code = self._reconcile_satisfied_evidence_request(clean_code, test_evidence)
         test_quality = self._reconcile_satisfied_evidence_request(test_quality, test_evidence)
+        architecture = self._reconcile_satisfied_evidence_request(architecture, test_evidence)
+        fidelity = self._reconcile_satisfied_evidence_request(fidelity, test_evidence)
+        regression = self._reconcile_satisfied_evidence_request(regression, test_evidence)
+        specialist_pairs = tuple(
+            zip(
+                (
+                    "security", "clean_code", "testing",
+                    "architecture", "fidelity", "regression",
+                ),
+                (
+                    security, clean_code, test_quality,
+                    architecture, fidelity, regression,
+                ),
+            )
+        )
         review_pairs = (
-            *tuple(
-                zip(
-                    ("clean_code", "security", "runtime_tests", "test_quality"),
-                    (clean_code, security, tests, test_quality),
-                )
-            ),
+            *specialist_pairs,
             *tuple(
                 (f"harness_evidence_{index}", response)
                 for index, response in enumerate(
@@ -6915,17 +7194,25 @@ class UltraOrchestrator:
             security,
             tests,
             test_quality,
+            architecture,
+            fidelity,
+            regression,
             *authoritative_responses,
         )
         non_abstaining_reviewers = tuple(
             role
-            for role, response in review_pairs
+            for role, response in specialist_pairs
             if not bool(response.payload.get("abstained"))
         )
-        reviewers_passed = bool(non_abstaining_reviewers) and all(
-            self._passed(response)
-            for _, response in review_pairs
-            if not bool(response.payload.get("abstained"))
+        reviewers_passed = (
+            len(non_abstaining_reviewers) == len(specialist_pairs)
+            and all(
+                self._passed(response)
+                for _, response in specialist_pairs
+                if not bool(response.payload.get("abstained"))
+            )
+            and self._passed(tests)
+            and all(self._passed(response) for response in authoritative_responses)
         )
         if not non_abstaining_reviewers:
             reviewers_passed = False
@@ -6947,7 +7234,11 @@ class UltraOrchestrator:
                         "summary": response.summary,
                     }
                     for role, response in review_pairs
-                ],
+                ] + [{
+                    "role": "runtime_tests",
+                    "passed": self._passed(tests),
+                    "summary": tests.summary,
+                }],
                 "confidence": 1.0,
                 "non_abstaining_reviewers": list(non_abstaining_reviewers),
             },
@@ -6968,20 +7259,80 @@ class UltraOrchestrator:
             recorder(node.id, "clean_code", self._passed(clean_code))
             recorder(node.id, "security", self._passed(security))
             recorder(node.id, "test_quality", self._passed(test_quality))
+            recorder(node.id, "architecture", self._passed(architecture))
+            recorder(node.id, "fidelity", self._passed(fidelity))
+            recorder(node.id, "regression", self._passed(regression))
         finding_recorder = getattr(self.state, "record_quality_findings", None)
         if callable(finding_recorder):
             finding_recorder(node.id, "clean_code", self._records(clean_code, "findings"))
             finding_recorder(node.id, "security", self._records(security, "findings"))
             finding_recorder(node.id, "test_quality", self._records(test_quality, "findings"))
+            finding_recorder(node.id, "architecture", self._records(architecture, "findings"))
+            finding_recorder(node.id, "fidelity", self._records(fidelity, "findings"))
+            finding_recorder(node.id, "regression", self._records(regression, "findings"))
         responses = (
-            clean_code,
             security,
-            tests,
+            clean_code,
             test_quality,
+            architecture,
+            fidelity,
+            regression,
+            tests,
             triage,
+            *authoritative_responses,
         )
         consensus = self._record_quality_consensus(node, responses)
-        return QualityGateResultV1(responses=responses, consensus=consensus)
+        result = QualityGateResultV1(responses=responses, consensus=consensus)
+        impact_recorder = getattr(
+            self.state,
+            "record_adaptive_quality_observations",
+            None,
+        )
+        if callable(impact_recorder):
+            impact_recorder(
+                node.id,
+                candidate_fingerprint=_fingerprint(candidate),
+                observations=(
+                    {
+                        "category": "clean_code",
+                        "agent_role": AgentRole.CLEAN_CODE_REVIEWER.value,
+                        "response": clean_code,
+                    },
+                    {
+                        "category": "security",
+                        "agent_role": AgentRole.SECURITY_REVIEWER.value,
+                        "response": security,
+                    },
+                    {
+                        "category": "runtime_tests",
+                        "agent_role": AgentRole.TESTER.value,
+                        "response": tests,
+                    },
+                    {
+                        "category": "test_quality",
+                        "agent_role": AgentRole.TEST_QUALITY_REVIEWER.value,
+                        "response": test_quality,
+                    },
+                    {
+                        "category": "architecture",
+                        "agent_role": AgentRole.ARCHITECTURE_REVIEWER.value,
+                        "response": architecture,
+                    },
+                    {
+                        "category": "fidelity",
+                        "agent_role": AgentRole.FIDELITY_REVIEWER.value,
+                        "response": fidelity,
+                    },
+                    {
+                        "category": "regression",
+                        "agent_role": AgentRole.REGRESSION_REVIEWER.value,
+                        "response": regression,
+                    },
+                ),
+                consensus=consensus,
+                gate_passed=self._quality_gate_passed(result),
+            )
+        return result
 
     @staticmethod
     def _browser_repair_weakening(

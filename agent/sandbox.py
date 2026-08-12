@@ -1,10 +1,10 @@
-"""Fail-closed access policy and a bounded Docker command sandbox.
+"""Session access policy plus an optional bounded Docker command sandbox.
 
-``normal`` access is an adapter over the agent's existing approval-gated tool
-behavior.  ``full`` access is granted only after an explicit one-time Docker
-setup has produced the exact versioned, non-root image described here.  This
-module never installs or starts Docker and never falls back to an unrestricted
-host shell.
+``normal`` keeps approval-gated host tools. ``full`` is the user's explicit
+session-wide unattended permission for the already selected workspace and
+accepted task. Docker remains an optional execution capability, not a hidden
+prerequisite for changing the approval policy: browser/process tools must share
+the host workspace and would otherwise be split across incompatible runtimes.
 """
 
 from __future__ import annotations
@@ -527,24 +527,14 @@ def select_access_level(
     requested: str | AccessLevel,
     sandbox: DockerSandbox,
 ) -> AccessSelection:
-    """Resolve Full fail-closed, explicitly downgrading to Normal if unready."""
+    """Resolve the explicit session access policy independently of Docker."""
 
     requested_level = AccessLevel.parse(requested)
-    if requested_level is AccessLevel.NORMAL:
-        return AccessSelection(requested_level, AccessLevel.NORMAL)
-    status = sandbox.status()
-    if status.ready:
-        return AccessSelection(requested_level, AccessLevel.FULL)
-    reason = status.reason or "Full sandbox is not ready"
-    return AccessSelection(
-        requested_level,
-        AccessLevel.NORMAL,
-        f"Full access unavailable; using Normal: {reason}",
-    )
+    return AccessSelection(requested_level, requested_level)
 
 
 class PermissionAdapter:
-    """Keep Normal behavior intact while routing ready Full shell work safely."""
+    """Apply approval policy while preserving one host execution environment."""
 
     def __init__(self, requested: str | AccessLevel, sandbox: DockerSandbox) -> None:
         self.sandbox = sandbox
@@ -566,7 +556,11 @@ class PermissionAdapter:
     ) -> str:
         if self.access_level is AccessLevel.NORMAL:
             return normal_runner(command)
-        return self.sandbox.run(command, workspace).render()
+        # Full means "do not ask again in this selected workspace", not
+        # "silently move only shell commands into a different filesystem".
+        # All canonical path, sensitive-file, and tool-contract guards still
+        # run inside normal_runner.
+        return normal_runner(command)
 
 
 @dataclass

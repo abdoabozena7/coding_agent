@@ -6,6 +6,7 @@ import hashlib
 import re
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit
@@ -21,7 +22,6 @@ from ..models import (
 )
 from ..model_catalog import ExecutionClass, ModelCatalog
 from ..quality import ChangeSetStatus
-from ..sandbox import AccessLevel, DockerSandbox, PermissionAdapter
 from ..store import NotFoundError, StalePlanError
 from ..ultra_models import AgentRunStatus, WorkNodeStatus
 from ..version_control import GitProtectionManager, VersionControlError
@@ -52,6 +52,11 @@ def _iso_now() -> str:
 
 def _role_name(role: Any) -> str:
     return str(getattr(role, "name", "") or "coder")
+
+
+def _public_interaction_mode(value: Any) -> str:
+    normalized = str(getattr(value, "value", value) or "").strip().casefold()
+    return "ultra-plan" if normalized in {"plan", "ultra-plan", "ultra_plan"} else "execution"
 
 
 _INTERNAL_REPAIR_SUFFIX = re.compile(
@@ -109,6 +114,53 @@ def _public_workflow_reason(
             return "The local model runner is unavailable. The saved request is preserved."
         return "The saved request is ready for recovery."
     return text
+
+
+def _public_agent_problem(value: Any) -> dict[str, str]:
+    """Translate one specialist failure into useful, non-harness copy."""
+
+    text = " ".join(str(value or "").split())
+    lower = text.casefold()
+    if not text:
+        return {
+            "summary": "This attempt stopped without a result.",
+            "detail": "The branch can be retried from its saved checkpoint.",
+        }
+    if "file path is required" in lower or "workspace root" in lower:
+        return {
+            "summary": "The agent tried to read the project folder as a file.",
+            "detail": "The harness now converts that request to a safe folder listing before retrying.",
+        }
+    if "path does not exist" in lower:
+        path = text.split(":", 1)[-1].strip()
+        return {
+            "summary": f"A requested file was not available yet: {path}",
+            "detail": "This usually means another branch had not created it yet. A later attempt may recover automatically.",
+        }
+    if "unused token" in lower or "empty provider" in lower:
+        return {
+            "summary": "The model returned no usable specialist result.",
+            "detail": "The saved task is retried with a smaller typed response packet.",
+        }
+    if "must be boolean" in lower or "structured" in lower or "typed-return" in lower:
+        return {
+            "summary": "The model result did not match the required response format.",
+            "detail": "The harness keeps the task and requests a targeted format repair.",
+        }
+    if "governed mutation" in lower or "without" in lower and "mutation" in lower:
+        return {
+            "summary": "The agent described a change without applying it through an approved tool.",
+            "detail": "No untracked change was accepted; the implementation step can retry safely.",
+        }
+    if "nonetype" in lower or "int() argument" in lower:
+        return {
+            "summary": "The test receipt contained a missing exit code.",
+            "detail": "The harness now records an unknown exit code instead of crashing the branch.",
+        }
+    return {
+        "summary": _public_workflow_reason(text),
+        "detail": "The original diagnostic remains available in Advanced Tracing.",
+    }
 
 
 def _public_provider_recovery(
@@ -803,10 +855,17 @@ class CoreWebAdapter:
                 else "The saved checkpoint is preserved and ready for recovery."
             )
         elif not status_reason:
-            status_reason = f"Working with {runtime_snapshot.provider or 'the selected provider'}/{runtime_snapshot.model or 'model'}."
+            status_reason = (
+                "No worker is active at the saved checkpoint."
+                if runtime_snapshot.phase == "paused"
+                else f"Execution is using {runtime_snapshot.provider or 'the selected provider'}/{runtime_snapshot.model or 'model'}."
+            )
         status_payload = {
             "phase": runtime_snapshot.phase,
-            "status": (context.get("goal") or {}).get("status") or runtime_snapshot.phase,
+            # The Goal row records control-plane intent; the runtime phase is
+            # the evidence-backed liveness projection.  A stale RUNNING Goal
+            # at a boundary must not make the Web feed claim work is active.
+            "status": runtime_snapshot.phase,
             "liveness": runtime_snapshot.liveness,
             "model": runtime_snapshot.model,
             "provider": runtime_snapshot.provider,
@@ -883,6 +942,7 @@ class CoreWebAdapter:
         """Return the left-rail project/task list without exposing secrets."""
 
         session = self.store.get_workflow_session(self.session_id)
+        workflow_sessions = self.store.list_workflow_sessions(limit=100)
         goals = self.store.list_goals(self.session_id, limit=100)
         current = self._workspace_goal()
         updated_at = session.get("updated_at")
@@ -902,9 +962,32 @@ class CoreWebAdapter:
                     "name": self.runtime.workspace.name,
                     "path": str(self.runtime.workspace),
                     "active": True,
-                    "session_mode": str(session.get("session_mode") or "normal"),
+                    "session_mode": _public_interaction_mode(session.get("session_mode") or "normal"),
                     "updated_at": updated_at,
                 }
+            ],
+            "sessions": [
+                {
+                    "id": str(item["id"]),
+                    "title": (
+                        " ".join(
+                            str(dict(item.get("state") or {}).get("session_title") or "").split()
+                        )
+                        or " ".join(str(item.get("goal_objective") or "").split())
+                        or "Previous project session"
+                    ),
+                    "active": str(item["id"]) == self.session_id,
+                    "status": str(
+                        item.get("goal_status")
+                        or item.get("run_state")
+                        or "idle"
+                    ),
+                    "updated_at": str(item.get("updated_at") or ""),
+                    "session_mode": _public_interaction_mode(
+                        item.get("session_mode") or "normal"
+                    ),
+                }
+                for item in workflow_sessions
             ],
             "tasks": [
                 {
@@ -988,10 +1071,6 @@ class CoreWebAdapter:
             "access": {
                 "level": settings.get("access_level", "normal"),
                 "safe_checkpoint": bool(settings.get("safe_checkpoint")),
-            },
-            "sleep": {
-                "enabled": bool(self.runtime.sleep_mode_enabled()),
-                "policy": self.runtime.sleep_mode_policy(),
             },
             "changes": changes,
             "processes": [
@@ -1170,7 +1249,7 @@ class CoreWebAdapter:
             "safe_checkpoint": safe_checkpoint,
             "mode_reconfigurable": not mode_lock.locked,
             "mode_lock_reason": mode_lock.reason if mode_lock.locked else "",
-            "mode": "plan" if self.runtime.interaction_mode.value == "plan" else "working",
+            "mode": "ultra-plan" if self.runtime.interaction_mode.value == "plan" else "execution",
             "model": model,
             "access_level": self.runtime.access_level,
             "concurrency": int(state.get("concurrency") or self.runtime._workflow_concurrency_limit()),
@@ -1249,45 +1328,6 @@ class CoreWebAdapter:
             self.runtime.pause("paused from Workspace")
         elif action == "stop":
             self.runtime.stop_now()
-        elif action in {"sleep_on", "sleep_full_on", "sleep_off"}:
-            if action == "sleep_full_on" and str(request.value or "") != "FULL AUTO":
-                raise ValueError("Type FULL AUTO to confirm unrestricted unattended approvals.")
-            enabled = action != "sleep_off"
-            policy = "full" if action == "sleep_full_on" else "safe"
-            self.runtime.set_sleep_mode(enabled, policy=policy)
-            resumed = False
-            resolved_boundaries: tuple[str, ...] = ()
-            if enabled:
-                auto_resolve_boundary = getattr(self.runtime, "auto_resolve_full_auto_boundary", None)
-                auto_resolve_tool = getattr(self.runtime, "auto_resolve_pending_sleep_approval", None)
-                if policy == "full" and callable(auto_resolve_boundary):
-                    candidate = auto_resolve_boundary()
-                    resolved_boundaries = (
-                        tuple(str(item) for item in candidate)
-                        if isinstance(candidate, (tuple, list, set))
-                        else ()
-                    )
-                elif callable(auto_resolve_tool):
-                    resumed = bool(auto_resolve_tool())
-                resumed = resumed or bool(resolved_boundaries)
-                # Enabling Full Auto from Web must wake the owner even when
-                # the terminal has not yet materialized an in-memory
-                # AttentionRequest (for example, a provider failure is
-                # already durable but the controller is between loop turns).
-                # The wake is a coalesced read of durable state; it never
-                # approves an action by itself and therefore cannot replay a
-                # prompt or bypass the normal boundary policy.
-                if self._on_execution_requested is not None:
-                    self._on_execution_requested()
-            action_message = (
-                "Full Auto enabled. Critic-reviewed plans and every tool approval in this workspace will be accepted and audited."
-                if action == "sleep_full_on"
-                else "Safe Auto enabled. Reversible project checks and previews continue unattended."
-                if action == "sleep_on"
-                else "Unattended approvals are off."
-            )
-            if resumed:
-                action_message += " The pending action was approved and resumed."
         elif action == "switch_model":
             descriptor_id = str(request.value or request.target_id or "").strip()
             if not descriptor_id:
@@ -1336,36 +1376,19 @@ class CoreWebAdapter:
                 "local_git": "Project protection now uses local Git checkpoints without pushing to GitHub.",
                 "snapshot": "Project protection now uses current-run snapshots only.",
             }[provider_name]
-        elif action == "reconfigure_permissions":
-            level = str(request.value or request.target_id or "").strip().casefold()
-            if level not in {AccessLevel.NORMAL.value, AccessLevel.FULL.value}:
-                raise ValueError("Permissions must be Normal or Full.")
-            active = self.runtime.active_goal()
-            if active is not None and active.status in {
-                GoalStatus.RUNNING,
-                GoalStatus.VERIFYING,
-                GoalStatus.REVIEWING,
-                GoalStatus.RECOVERING,
-            }:
-                raise ValueError("Permissions can change only at a safe checkpoint.")
-            sandbox = (
-                self.runtime.permission_adapter.sandbox
-                if self.runtime.permission_adapter is not None
-                else DockerSandbox()
-            )
-            adapter = PermissionAdapter(AccessLevel.parse(level), sandbox)
-            self.runtime.replace_permission_adapter(adapter)
-            action_message = f"Project permissions set to {adapter.access_level.value}."
         elif action == "reconfigure_mode":
             mode = str(request.value or request.target_id or "").strip().casefold()
-            mode = {"working": "normal", "goal": "normal"}.get(mode, mode)
+            mode = {
+                "execution": "normal", "working": "normal", "goal": "normal",
+                "ultra-plan": "plan", "ultra_plan": "plan",
+            }.get(mode, mode)
             if mode not in {"normal", "plan"}:
-                raise ValueError("Workflow defaults must be Working or Plan.")
+                raise ValueError("Workflow defaults must be Execution or Ultra Plan.")
             try:
                 actual = self.runtime.transition_mode(mode)
             except RuntimeError as exc:
                 raise ValueError(str(exc)) from exc
-            action_message = f"Project workflow default set to {'Plan' if actual == 'plan' else 'Working'}."
+            action_message = f"Project workflow default set to {'Ultra Plan' if actual == 'plan' else 'Execution'}."
         elif action == "reconfigure_concurrency":
             try:
                 requested = int(str(request.value or request.target_id or "").strip())
@@ -1504,9 +1527,7 @@ class CoreWebAdapter:
             event_sequence=max(after, self.store.latest_event_sequence()),
             message=action_message if action in {
                 "approve_plan", "allow_tool_session", "switch_model", "continue_local_model",
-                "reconfigure_protection", "reconfigure_permissions", "reconfigure_mode",
-                "reconfigure_concurrency",
-                "sleep_on", "sleep_full_on", "sleep_off"
+                "reconfigure_protection", "reconfigure_mode", "reconfigure_concurrency",
             } else (
                 "Approved by Web · Harness resuming saved action"
                 if action in {"allow_tool", "allow_tool_session", "retry", "resume"}
@@ -1618,6 +1639,90 @@ class CoreWebAdapter:
                 "capacity": 10,
             },
         }
+
+    def output_snapshot(self) -> dict[str, Any]:
+        """Return the latest finished-task handoff for the standalone Output page."""
+
+        session = self.store.get_workflow_session(self.session_id)
+        state = dict(session.get("state") or {})
+        raw = state.get("latest_output")
+        if not isinstance(raw, Mapping):
+            return {
+                "session_id": self.session_id,
+                "status": "empty",
+                "title": "No output yet",
+                "message": "The latest task has not published a final result.",
+                "copy_sections": [],
+                "assets": [],
+                "created_at": None,
+            }
+        output = dict(raw)
+        run_state = str(session.get("run_state") or "idle").casefold()
+        stored_status = str(output.get("status") or "ready").casefold()
+        if run_state in {"blocked", "failed"}:
+            display_status = "needs_attention"
+        elif run_state in {"planning", "executing", "reviewing", "verifying"}:
+            display_status = "working"
+        else:
+            display_status = stored_status
+        message = str(output.get("message") or "")
+        sanitizer = getattr(self.runtime, "_sanitize_completed_action_text", None)
+        if display_status == "ready" and callable(sanitizer):
+            # Backward compatibility for Output envelopes published before
+            # the evidence-complete message synchronizer existed.
+            message = str(sanitizer(message))
+        assets = []
+        for item in output.get("assets") or ():
+            if not isinstance(item, Mapping):
+                continue
+            asset = dict(item)
+            asset_id = str(asset.get("id") or "")
+            if not asset_id:
+                continue
+            asset["url"] = (
+                f"/api/sessions/{self.session_id}/output/assets/{asset_id}"
+            )
+            asset["download_url"] = asset["url"] + "?download=1"
+            assets.append(asset)
+        return {
+            "session_id": self.session_id,
+            "status": display_status,
+            "output_id": str(output.get("output_id") or ""),
+            "title": str(output.get("title") or "Task output"),
+            "message": message,
+            "copy_sections": [
+                dict(item)
+                for item in output.get("copy_sections") or ()
+                if isinstance(item, Mapping)
+            ],
+            "assets": assets,
+            "created_at": output.get("created_at"),
+        }
+
+    def output_asset_path(self, asset_id: str) -> Path:
+        """Resolve an asset only when the latest Output envelope owns it."""
+
+        wanted = str(asset_id or "").strip()
+        snapshot = self.output_snapshot()
+        selected = next(
+            (
+                item
+                for item in snapshot.get("assets") or ()
+                if str(item.get("id") or "") == wanted
+            ),
+            None,
+        )
+        if selected is None:
+            raise NotFoundError(f"output asset not found: {wanted}")
+        workspace = Path(self.runtime.workspace).resolve(strict=True)
+        candidate = (workspace / str(selected.get("path") or "")).resolve(strict=True)
+        try:
+            candidate.relative_to(workspace)
+        except ValueError as exc:
+            raise NotFoundError("output asset is outside this project") from exc
+        if not candidate.is_file():
+            raise NotFoundError("output asset is no longer available")
+        return candidate
 
     def workspace_context(self) -> dict[str, Any]:
         goal = self._workspace_goal()
@@ -1878,8 +1983,12 @@ class CoreWebAdapter:
                 "action": None,
             }
         elif (
-            goal.status in {GoalStatus.BLOCKED, GoalStatus.PAUSED}
-            and runtime_snapshot.phase not in {"working", "starting"}
+            runtime_snapshot.phase
+            in {"paused", "waiting_for_approval", "awaiting_approval"}
+            or (
+                goal.status in {GoalStatus.BLOCKED, GoalStatus.PAUSED}
+                and runtime_snapshot.phase not in {"working", "starting"}
+            )
         ):
             blocker = _public_workflow_reason(
                 goal.metadata.get("waiting_question")
@@ -1939,18 +2048,45 @@ class CoreWebAdapter:
                 "owner": "user",
             }
         elif attention.get("state") == "blocked":
+            verification_retry_state = dict(
+                (goal.metadata if goal is not None else {}).get(
+                    "verification_retry_state"
+                )
+                or {}
+            )
+            retry_exhausted = bool(verification_retry_state.get("exhausted"))
             required_action = {
-                "kind": "retry",
-                "label": "Retry saved stage",
+                "kind": "switch_model" if retry_exhausted else "retry",
+                "label": (
+                    "Change model and continue"
+                    if retry_exhausted
+                    else "Retry saved stage"
+                ),
                 "description": str(attention.get("body") or "Retry the saved stage."),
-                "consequence": "The same stage resumes without replaying accepted mutations.",
+                "consequence": (
+                    "The identical verification result was already reproduced. Choose a materially different model for one fresh bounded attempt."
+                    if retry_exhausted
+                    else "The same stage resumes without replaying accepted mutations."
+                ),
                 "target_view": "execution",
                 "fingerprint": "",
                 "owner": "user",
-                "alternatives": [
-                    {"kind": "switch_model", "label": "Change model"},
-                    {"kind": "stop", "label": "Stop safely"},
-                ],
+                "retry_exhausted": retry_exhausted,
+                "retry_attempts": int(
+                    verification_retry_state.get("attempts") or 0
+                ),
+                "alternatives": (
+                    [
+                        {"kind": "inspect", "label": "Inspect details"},
+                        {"kind": "stop", "label": "Keep paused"},
+                    ]
+                    if retry_exhausted
+                    else [
+                        {"kind": "switch_model", "label": "Change model"},
+                        {"kind": "inspect", "label": "Inspect details"},
+                        {"kind": "stop", "label": "Keep paused"},
+                    ]
+                ),
             }
         local_policy = (
             dict(goal.metadata.get("local_continuation_policy") or {})
@@ -2020,6 +2156,52 @@ class CoreWebAdapter:
             if raw_active_operation
             else ""
         )
+        current_plan = {
+            "revision": latest_plan.revision if latest_plan is not None else None,
+            "approved_revision": (
+                goal.active_plan_revision if goal is not None else None
+            ),
+            "status": latest_plan.status.value if latest_plan is not None else "preparing",
+            "summary": (
+                latest_plan.summary
+                if latest_plan is not None
+                else pending_objective
+                or (goal.objective if goal is not None else "")
+            ),
+            "tasks": [
+                {
+                    "id": task.id,
+                    "title": task.title,
+                    "description": _public_task_description(task.description),
+                    "status": task.status.value,
+                    "dependencies": list(task.depends_on),
+                }
+                for task in (latest_plan.tasks if latest_plan is not None else ())
+            ],
+        }
+        # Terminal `/todo`, the compact TUI checklist, and this Web list all
+        # consume the same durable projection.  Do not independently infer
+        # status from plan tasks here: Ultra work nodes supersede those rows.
+        todo_items = [dict(item) for item in runtime_snapshot.task_items]
+        goal_progress = dict(runtime_snapshot.goal_progress or {})
+        todo = {
+            "items": todo_items,
+            "total": len(todo_items),
+            "done": int(goal_progress.get("done") or 0),
+            "working": int(goal_progress.get("working") or 0),
+            "blocked": int(goal_progress.get("blocked") or 0),
+            "pending": int(goal_progress.get("pending") or 0),
+            "completion_percent": int(goal_progress.get("completion_percent") or 0),
+            "verification_percent": int(goal_progress.get("verification_percent") or 0),
+            "verified_units": int(goal_progress.get("verified_units") or 0),
+            "total_units": int(goal_progress.get("total_units") or 0),
+            "evidence": list(goal_progress.get("evidence") or ()),
+            "plan_revision": goal_progress.get("plan_revision"),
+            "approved_plan_revision": goal_progress.get("approved_plan_revision"),
+            "latest_plan_revision": goal_progress.get("latest_plan_revision"),
+            "pending_plan_revision": goal_progress.get("pending_plan_revision"),
+            "projection_basis": str(goal_progress.get("projection_basis") or ""),
+        }
         payload = {
             "session_id": self.session_id,
             "session_short": self.session_id[:8],
@@ -2031,7 +2213,15 @@ class CoreWebAdapter:
                 {
                     "id": goal.id,
                     "objective": goal.objective,
-                    "status": goal.status.value,
+                    "status": (
+                        "paused"
+                        if goal.status is GoalStatus.RUNNING
+                        and runtime_snapshot.phase
+                        in {"paused", "retrying", "waiting_for_process"}
+                        else "waiting"
+                        if runtime_snapshot.phase == "waiting_for_approval"
+                        else goal.status.value
+                    ),
                     "plan_revision": (
                         goal.active_plan_revision
                         or (latest_plan.revision if latest_plan is not None else None)
@@ -2050,7 +2240,7 @@ class CoreWebAdapter:
                     else None
                 )
             ),
-            "mode": self.runtime.interaction_mode.value,
+            "mode": _public_interaction_mode(self.runtime.interaction_mode.value),
             "runtime": runtime_payload,
             "route": runtime_snapshot.route,
             "execution_strategy": runtime_snapshot.execution_strategy,
@@ -2076,6 +2266,8 @@ class CoreWebAdapter:
                 "can_submit_plan_request": goal is None and pending_semantic is None,
             },
             "queue": queue,
+            "current_plan": current_plan,
+            "todo": todo,
             "updated_at": _iso_now(),
             "control_surface": "web",
             "required_action": required_action,
@@ -2110,8 +2302,6 @@ class CoreWebAdapter:
                 ),
             },
             "history_cursor": int(self.store.latest_event_sequence()),
-            "sleep_enabled": sleep_policy in {"safe", "full"},
-            "sleep_policy": sleep_policy,
             "local_continuation": local_continuation,
             "provider_recovery": provider_recovery,
             "project_sessions": self.sessions_index_snapshot(),
@@ -2203,8 +2393,8 @@ class CoreWebAdapter:
                 "revision": None,
                 "status": "blocked" if provider_boundary else "in_progress",
                 "goal_status": "paused" if provider_boundary else "discovering",
-                "session_mode": str(session["session_mode"]),
-                "interaction_mode": str(
+                "session_mode": _public_interaction_mode(session["session_mode"]),
+                "interaction_mode": _public_interaction_mode(
                     pending_semantic.get("interaction_mode")
                     or self.runtime.interaction_mode.value
                 ),
@@ -2259,8 +2449,8 @@ class CoreWebAdapter:
                 "revision": None,
                 "status": "draft",
                 "goal_status": "idle",
-                "session_mode": "plan",
-                "interaction_mode": "plan",
+                "session_mode": "ultra-plan",
+                "interaction_mode": "ultra-plan",
                 "summary": "",
                 "tasks": [],
                 "global_constraints": [],
@@ -2287,13 +2477,23 @@ class CoreWebAdapter:
                 "team_preview": None,
             }
         plan = self.store.get_latest_plan(goal.id)
+        projected_goal_status = (
+            "paused"
+            if goal.status is GoalStatus.RUNNING
+            and runtime_snapshot.phase
+            in {"paused", "retrying", "waiting_for_process"}
+            else "waiting"
+            if runtime_snapshot.phase == "waiting_for_approval"
+            else goal.status.value
+        )
         if plan is None:
             session = self.store.get_workflow_session(self.session_id)
             session_mode = str(session["session_mode"])
-            goal_blocked = goal.status in {
-                GoalStatus.PAUSED,
-                GoalStatus.BLOCKED,
-                GoalStatus.CANCELLED,
+            goal_blocked = projected_goal_status in {
+                "paused",
+                "blocked",
+                "cancelled",
+                "waiting",
             }
             return {
                 "session_id": self.session_id,
@@ -2305,9 +2505,9 @@ class CoreWebAdapter:
                 "request_fingerprint": str(goal.metadata.get("request_fingerprint") or ""),
                 "revision": None,
                 "status": "blocked" if goal_blocked else "in_progress",
-                "goal_status": goal.status.value,
-                "session_mode": session_mode,
-                "interaction_mode": self.runtime.interaction_mode.value,
+                "goal_status": projected_goal_status,
+                "session_mode": _public_interaction_mode(session_mode),
+                "interaction_mode": _public_interaction_mode(self.runtime.interaction_mode.value),
                 "summary": "GA3BAD is preparing the first durable plan revision.",
                 "tasks": [],
                 "global_constraints": [],
@@ -2354,6 +2554,9 @@ class CoreWebAdapter:
         strategy_decision = dict(goal.metadata.get("strategy_decision") or {})
         execution_nodes: list[dict[str, Any]] = []
         run = self.store.get_active_ultra_run(goal.id)
+        if run is None and not goal.metadata.get("goal_change_sets"):
+            recorded_runs = self.store.list_ultra_runs(goal.id)
+            run = recorded_runs[-1] if recorded_runs else None
         if run is not None:
             execution_nodes = [
                 {
@@ -2381,9 +2584,9 @@ class CoreWebAdapter:
             "revision": plan.revision,
             "fingerprint": plan.fingerprint,
             "status": plan.status.value,
-            "goal_status": goal.status.value,
-            "session_mode": session_mode,
-            "interaction_mode": self.runtime.interaction_mode.value,
+            "goal_status": projected_goal_status,
+            "session_mode": _public_interaction_mode(session_mode),
+            "interaction_mode": _public_interaction_mode(self.runtime.interaction_mode.value),
             "execution_strategy": strategy,
             "strategy_locked": strategy_locked,
             "capability_envelope": dict(goal.metadata.get("model_capability_envelope") or {}),
@@ -3520,6 +3723,9 @@ class CoreWebAdapter:
         } and projected_status == GoalStatus.RUNNING.value:
             projected_status = "paused"
         run = self.store.get_active_ultra_run(goal.id)
+        if run is None and not goal.metadata.get("goal_change_sets"):
+            recorded_runs = self.store.list_ultra_runs(goal.id)
+            run = recorded_runs[-1] if recorded_runs else None
         if run is None:
             # Staged/normal runs intentionally do not create an UltraRun.  The
             # result surface still needs to expose the durable files and
@@ -3587,6 +3793,13 @@ class CoreWebAdapter:
         nodes = self.store.list_work_nodes(run.id)
         node_by_id = {node.id: node for node in nodes}
         agents = self.store.list_agent_runs(run.id)
+        role_counts: dict[str, int] = {}
+        agent_identity: dict[str, tuple[str, int]] = {}
+        for candidate in agents:
+            role_label = " ".join(str(candidate.role or "agent").replace("_", " ").split()).title()
+            role_key = role_label.casefold()
+            role_counts[role_key] = role_counts.get(role_key, 0) + 1
+            agent_identity[candidate.id] = (role_label, role_counts[role_key])
         brain = self.store.list_brain_entries(run.id, limit=500)
         recent = self.store.list_recent_events(goal.id, limit=200)
         artifact_rows = []
@@ -3623,8 +3836,53 @@ class CoreWebAdapter:
             for path in change_set.changed_files
         ))
         agent_rows = []
-        for agent in agents:
+        for position, agent in enumerate(agents):
             node = node_by_id.get(agent.work_node_id or "")
+            role_label, ordinal = agent_identity[agent.id]
+            logical_key = (
+                str(agent.work_node_id or f"foundation:{agent.phase}"),
+                role_label.casefold(),
+                str(agent.phase or "").casefold(),
+            )
+            later_attempts = [
+                other
+                for other in agents[position + 1:]
+                if (
+                    str(other.work_node_id or f"foundation:{other.phase}"),
+                    " ".join(str(other.role or "agent").replace("_", " ").split()).title().casefold(),
+                    str(other.phase or "").casefold(),
+                ) == logical_key
+            ]
+            raw_problem = bool(agent.error) or agent.status in {
+                AgentRunStatus.FAILED,
+                AgentRunStatus.UNCERTAIN,
+            }
+            node_completed = bool(node and node.status is WorkNodeStatus.COMPLETED)
+            recovered = raw_problem and (
+                node_completed
+                or any(other.status is AgentRunStatus.COMPLETED for other in later_attempts)
+            )
+            retrying = raw_problem and not recovered and any(
+                other.status in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING, AgentRunStatus.RATE_LIMITED}
+                for other in later_attempts
+            )
+            superseded = raw_problem and not recovered and not retrying and bool(later_attempts)
+            operator_boundary = goal.status in {GoalStatus.BLOCKED, GoalStatus.PAUSED}
+            attention_required = bool(
+                raw_problem
+                and not (recovered or retrying or superseded)
+                and operator_boundary
+            )
+            displayed_status = (
+                "recovered"
+                if recovered
+                else "retrying"
+                if retrying
+                else "superseded"
+                if superseded
+                else agent.status.value
+            )
+            problem = _public_agent_problem(agent.error) if raw_problem else None
             memory = [
                 {"id": item.id, "title": item.title, "section": item.section.value}
                 for item in brain
@@ -3674,9 +3932,13 @@ class CoreWebAdapter:
             agent_rows.append(
                 {
                     "id": agent.id,
+                    "short_id": agent.id[-6:],
+                    "ordinal": ordinal,
+                    "display_name": f"{role_label} #{ordinal}",
                     "name": agent.role,
                     "role": agent.role,
-                    "status": agent.status.value,
+                    "status": displayed_status,
+                    "raw_status": agent.status.value,
                     "task_id": agent.work_node_id,
                     "task": node.title if node else agent.phase,
                     "goal": node.objective if node else goal.objective,
@@ -3712,8 +3974,31 @@ class CoreWebAdapter:
                         and node_by_id.get(other.work_node_id)
                         and node_by_id[other.work_node_id].parent_id == node.id
                     ),
-                    "blocked": bool(agent.error) or agent.status.value in {"failed", "uncertain"},
-                    "blockers": [agent.error] if agent.error else [],
+                    "blocked": attention_required,
+                    "attention_required": attention_required,
+                    "recovered": recovered,
+                    "retrying": retrying,
+                    "superseded": superseded,
+                    "resolution_state": (
+                        "needs_attention"
+                        if attention_required
+                        else "recovered"
+                        if recovered
+                        else "retrying"
+                        if retrying
+                        else "superseded"
+                        if superseded
+                        else "active"
+                        if agent.status in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING, AgentRunStatus.RATE_LIMITED}
+                        else "complete"
+                    ),
+                    "problem": problem,
+                    "action_options": (
+                        ["retry", "switch_model", "stop", "advanced_tracing"]
+                        if attention_required
+                        else ["advanced_tracing"] if raw_problem else []
+                    ),
+                    "blockers": [problem["summary"]] if problem and attention_required else [],
                     "latest_output": result,
                     "decisions": result.get("decisions", []) if isinstance(result, Mapping) else [],
                     "logs": logs,
@@ -3722,8 +4007,14 @@ class CoreWebAdapter:
                     "plan_revision": run.plan_revision,
                 }
             )
-        node_rows = [
-            {
+        progress_by_id = {
+            str(item.get("id") or ""): dict(item)
+            for item in runtime_snapshot.task_items
+            if str(item.get("id") or "")
+        }
+        node_rows = []
+        for node in nodes:
+            row = {
                 "id": node.id,
                 "title": node.title,
                 "status": node.status.value,
@@ -3742,8 +4033,19 @@ class CoreWebAdapter:
                     WorkNodeStatus.UNCERTAIN,
                 },
             }
-            for node in nodes
-        ]
+            detail = progress_by_id.get(node.id)
+            if detail:
+                row.update({
+                    "state": detail.get("state", row["status"]),
+                    "checklist": list(detail.get("checklist") or ()),
+                    "evidence": list(detail.get("evidence") or ()),
+                    "verified_evidence": list(detail.get("verified_evidence") or ()),
+                    "verification_percent": int(detail.get("verification_percent") or 0),
+                    "result_summary": str(detail.get("result_summary") or ""),
+                    "issues": list(detail.get("issues") or ()),
+                    "changed_files": list(detail.get("changed_files") or ()),
+                })
+            node_rows.append(row)
         return {
             "session_id": self.session_id,
             "session_short": self.session_id[:8],
@@ -3766,6 +4068,7 @@ class CoreWebAdapter:
                 "artifacts": artifact_rows,
                 "changed_files": changed_files,
             },
+            "goal_progress": dict(runtime_snapshot.goal_progress or {}),
             "updated_at": _iso_now(),
             "connection": "connected",
         }

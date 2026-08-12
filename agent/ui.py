@@ -267,9 +267,13 @@ def _fit(text: Any, width: int) -> str:
 def _public_interaction_mode(value: Any) -> str:
     """Hide legacy execution-engine names from the user-facing surface."""
 
-    normalized = str(getattr(value, "value", value) or "goal").strip().casefold()
-    if normalized in {"plan", "working", "ultra", "ready"}:
-        return normalized
+    normalized = str(getattr(value, "value", value) or "execution").strip().casefold()
+    if normalized in {"plan", "ultra-plan", "ultra_plan"}:
+        return "ultra-plan"
+    if normalized in {"normal", "working", "ultra", "goal", "chat", "execution"}:
+        return "execution"
+    if normalized == "ready":
+        return "ready"
     return "ready"
 
 
@@ -351,8 +355,8 @@ def render_workspace(
     status_label = str(view.status or "idle").replace("_", " ").upper()
     public_mode = _public_interaction_mode(view.interaction_mode)
     if str(view.status or "idle").strip().casefold() not in {"idle", "ready", "no_goal"}:
-        if public_mode in {"ready", "goal", "ultra"}:
-            public_mode = "working"
+        if public_mode == "ready":
+            public_mode = "execution"
     header = _fit(
         f"GA3BAD CODING AGENT  MODE {public_mode.upper()} / STATUS {status_label}",
         max(18, width - len(f"{view.provider}/{view.model}") - 2),
@@ -822,7 +826,7 @@ def render_dashboard(view: DashboardView, width: int | None = None) -> str:
                 worker_text = ""
             lines.append("|" + _fit(task_text, left) + "|" + _fit(worker_text, right) + "|")
         if len(view.tasks) > rows or len(view.workers) > rows:
-            task_more = f" ... +{len(view.tasks) - rows} more; use /plan" if len(view.tasks) > rows else ""
+            task_more = f" ... +{len(view.tasks) - rows} more; use /ultra-plan" if len(view.tasks) > rows else ""
             worker_more = f" ... +{len(view.workers) - rows} more" if len(view.workers) > rows else ""
             lines.append("|" + _fit(task_more, left) + "|" + _fit(worker_more, right) + "|")
     else:
@@ -830,7 +834,7 @@ def render_dashboard(view: DashboardView, width: int | None = None) -> str:
         for task in view.tasks[:12]:
             lines.append("|" + _fit(f" {_task_mark(task.status)} {task.id} {task.title}", inner) + "|")
         if len(view.tasks) > 12:
-            lines.append("|" + _fit(f" ... +{len(view.tasks) - 12} more; use /plan", inner) + "|")
+            lines.append("|" + _fit(f" ... +{len(view.tasks) - 12} more; use /ultra-plan", inner) + "|")
         if view.workers:
             lines.append("|" + _fit(" WORKERS / DYNAMIC ROLES", inner) + "|")
             for worker in view.workers[:5]:
@@ -841,7 +845,7 @@ def render_dashboard(view: DashboardView, width: int | None = None) -> str:
     for item in (view.activity[-4:] or ["Ready."]):
         lines.append("|" + _fit(f" {item}", inner) + "|")
     lines.append(rule)
-    commands = " /plan  /live  /show-diff  /advanced-tracing  /settings  /pause  /resume  /stop  /undo  /help  /quit"
+    commands = " /ultra-plan  /live  /output  /show-diff  /advanced-tracing  /settings  /pause  /resume  /stop  /undo  /help  /quit"
     lines.append("|" + _fit(commands, inner) + "|")
     lines.append("+" + "-" * inner + "+")
     return "\n".join(lines)
@@ -1015,7 +1019,7 @@ def render_plan(view: DashboardView, width: int | None = None) -> str:
         render_tasks(view.tasks)
     lines.append("-" * width)
     lines.append(
-        "Use /plan to review, revise, and apply the exact plan in Plan Studio"
+        "Use /ultra-plan to review, revise, and apply the exact plan in Plan Studio"
         if not execution_started
         else "Use /live for simple progress or /advanced-tracing for the complete trace"
     )
@@ -1024,10 +1028,12 @@ def render_plan(view: DashboardView, width: int | None = None) -> str:
 
 HELP_TEXT = """\
 Slash commands
-  /plan               open the explicit Ultra Plan workspace
+  /ultra-plan         open the explicit Ultra Plan workspace
   /live               open the simple read-only workflow view
+  /output             open the latest finished task result
   /show-diff          open the simple live workflow diff
   /advanced-tracing   open the standalone developer trace
+  /access [LEVEL]     use Normal, or Full access with unattended continuation
   /settings           open runtime, provider, project, terminal, and diagnostics settings
   /pause              pause active work at a saved boundary
   /resume             resume the saved checkpoint
@@ -1038,7 +1044,8 @@ Slash commands
 
 Persistent workspace keys
   F2                         Simple / Advanced display
-  F3 / F4 / F6              model / permissions / Sleep Mode
+  F3                         model
+  /access normal|full        change the explicit session access contract
   F7 / F8 / F9              diff / project folder / agents
   arrows / Enter / Escape    navigate / confirm / back
   Page Up / Page Down / End  inspect transcript / resume following
@@ -1060,6 +1067,7 @@ _TOOL_ACTIVITY: dict[str, tuple[str, str, str]] = {
     "run_command": ("run", "Running command", "Ran command"),
     "apply_patch": ("run", "Applying patch", "Applied patch"),
     "materialize_artifact": ("run", "Writing generated artifact", "Wrote generated artifact"),
+    "inspect_images": ("verify", "Evaluating images with the vision model", "Images evaluated"),
     "install_dependencies": ("sync", "Installing project dependencies", "Installed dependencies"),
     "start_process": ("run", "Starting managed process", "Started process"),
     "poll_process": ("sync", "Checking managed process", "Checked process"),
@@ -1587,7 +1595,7 @@ class ConsoleUI:
             self._workspace_store.update_workflow_mode(self._public_workflow_phase)
 
     def set_workflow_phase(self, phase: str) -> None:
-        """Update Plan/Working presentation without changing execution policy."""
+        """Update Ultra Plan/Execution presentation without changing execution policy."""
 
         self._public_workflow_phase = _public_interaction_mode(phase)
         if self._workspace_store is not None:
@@ -1637,7 +1645,7 @@ class ConsoleUI:
         if self._workspace_store is not None:
             return self._workspace_store.set_sleep_mode(enabled, policy=normalized)
         self.write(
-            f"Sleep Mode {'enabled' if enabled else 'disabled'}. "
+            f"Full access automation {'enabled' if enabled else 'disabled'}. "
             + (
                 "Full Auto accepts and audits critic-reviewed plans and every tool approval in this workspace."
                 if self._sleep_policy == "full"
@@ -2335,6 +2343,16 @@ class ConsoleUI:
                 icon = self._icon("✓", "[x]")
                 summary = str(pending.get("done") or _TOOL_ACTIVITY.get(tool_name, ("", "", tool_name))[2])
                 summary += self._tool_detail(tool_name, args if isinstance(args, Mapping) else {})
+                if tool_name == "install_dependencies":
+                    try:
+                        dependency_receipt = json.loads(str(message))
+                    except (TypeError, json.JSONDecodeError):
+                        dependency_receipt = {}
+                    if dependency_receipt.get("status") == "already_satisfied":
+                        summary = "Dependencies already installed" + self._tool_detail(
+                            tool_name,
+                            args if isinstance(args, Mapping) else {},
+                        )
                 if tool_name == "list_files" and "(no files under" in one_line:
                     summary = "Inspected workspace · no project files yet"
                 color = self.green
@@ -2635,7 +2653,7 @@ class ConsoleUI:
             if policy.requirement is ApprovalRequirement.SESSION:
                 self._session_approval_groups.add(policy.group)
             message = (
-                f"Sleep auto-approved {str(name).replace('_', ' ')} "
+                f"Full access auto-approved {str(name).replace('_', ' ')} "
                 f"({policy.reason.lower()})."
             )
             if self._workspace_store is not None:
@@ -2656,7 +2674,7 @@ class ConsoleUI:
             )
         if policy.requirement is ApprovalRequirement.AUTO:
             return ApprovalDecision.ALLOW_ONCE
-        if policy.group in self._session_approval_groups:
+        if "*" in self._session_approval_groups or policy.group in self._session_approval_groups:
             return ApprovalDecision.ALLOW_SESSION
 
         canonical = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
@@ -2678,11 +2696,13 @@ class ConsoleUI:
         ]
         options.append(
             AttentionOption(
-                "allow_session", "Always allow this session",
+                "allow_session",
+                "Always allow this session",
                 ApprovalDecision.ALLOW_SESSION.value,
                 description=(
-                    f"Allow later actions in the {policy.group.replace('_', ' ')} "
-                    "group until this session ends."
+                    "Allow later tool actions for the accepted task inside this workspace "
+                    "until this session ends. Use /access full to also handle bounded "
+                    "workflow questions and retries automatically."
                 ),
                 shortcut="s",
             )
@@ -2715,7 +2735,7 @@ class ConsoleUI:
         except (RuntimeError, TimeoutError, ValueError):
             return ApprovalDecision.UI_ERROR
         if decision is ApprovalDecision.ALLOW_SESSION:
-            self._session_approval_groups.add(policy.group)
+            self._session_approval_groups.add("*")
         return decision
 
     def _select_approval(self, request: Mapping[str, Any]) -> bool:
@@ -2828,7 +2848,7 @@ class ConsoleUI:
         accent = self.gold if self.interaction_mode is InteractionMode.ULTRA else self.green
         label = (
             f"{self.bold}{accent}GA3BAD{self.reset} "
-            f"{self.dim}[{self._public_workflow_phase.upper()}]{self.reset}> "
+            f"{self.dim}[{self._public_workflow_phase.upper().replace('-', ' ')}]{self.reset}> "
         )
         rich_prompt = (
             not self.plain
@@ -2852,10 +2872,6 @@ class ConsoleUI:
                 def _open_model(event) -> None:
                     event.app.exit(result="/settings")
 
-                @bindings.add("f4")
-                def _open_permissions(event) -> None:
-                    event.app.exit(result="/settings")
-
                 @bindings.add("c-k")
                 def _open_commands(event) -> None:
                     event.app.exit(result="/")
@@ -2863,6 +2879,16 @@ class ConsoleUI:
                 @bindings.add("c-q")
                 def _safe_exit(event) -> None:
                     event.app.exit(result="/quit")
+
+                @bindings.add("enter", eager=True)
+                def _accept_completion_and_submit(event) -> None:
+                    """Run a highlighted slash completion with one Enter."""
+
+                    buffer = event.current_buffer
+                    state = buffer.complete_state
+                    if state is not None and state.current_completion is not None:
+                        buffer.apply_completion(state.current_completion)
+                    event.app.exit(result=buffer.text)
 
                 @bindings.add(Keys.BracketedPaste)
                 def _collapse_long_paste(event) -> None:

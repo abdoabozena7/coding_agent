@@ -61,7 +61,7 @@ from .local_provider import ProviderRequestError
 from .models import DomainError, GoalStatus
 from .providers import get_provider
 from .runtime import AgentRuntime, ProviderUnavailableError, RuntimeErrorBase, SliceResult
-from .safety import redact_text
+from .safety import redact_data, redact_text
 from .session_owner import SessionOwnerLease
 from .rock_coding_agent_intro import play_intro
 from .sandbox import AccessLevel, DockerSandbox, PermissionAdapter, SandboxError
@@ -117,7 +117,7 @@ from .ui import (
     contextual_commands,
 )
 from .ultra_models import AgentRunStatus, BrainSection
-from .version_control import GitProtectionManager, GitProtectionStatus
+from .version_control import GitProtectionManager, GitProtectionStatus, VersionControlError
 
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -269,6 +269,7 @@ def _strongest_local_model(
 # hiccup while preventing an unattended run from retrying one broken runner
 # forever when another compatible local model is available.
 _FULL_AUTO_LOCAL_FAILOVER_AFTER = 2
+_AUTOMATIC_SEMANTIC_REPAIR_CYCLES = 2
 
 
 def _next_project_name(root: Path) -> str:
@@ -295,6 +296,41 @@ def _resolve_workspace(path: str | os.PathLike[str], *, create: bool = False) ->
     return resolved
 
 
+def _choose_existing_folder(initial: Path) -> Path | None:
+    """Open the platform folder picker, returning ``None`` when cancelled."""
+
+    dialog_root = None
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        dialog_root = tk.Tk()
+        dialog_root.withdraw()
+        try:
+            dialog_root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        dialog_root.update_idletasks()
+        selected = filedialog.askdirectory(
+            parent=dialog_root,
+            title="Choose an existing project folder",
+            initialdir=str(initial),
+            mustexist=True,
+        )
+        return Path(selected) if selected else None
+    except Exception:
+        # Headless/SSH sessions and minimal Python builds may not provide a
+        # usable GUI. The caller keeps the keyboard menu open or offers the
+        # plain path fallback instead of crashing setup.
+        return None
+    finally:
+        if dialog_root is not None:
+            try:
+                dialog_root.destroy()
+            except Exception:
+                pass
+
+
 def choose_workspace(
     projects_root: str | os.PathLike[str] = DEFAULT_PROJECTS_ROOT,
     *,
@@ -311,6 +347,15 @@ def choose_workspace(
     root.mkdir(parents=True, exist_ok=True)
     root = root.resolve(strict=True)
 
+    def selected_workspace(value: Path) -> Path:
+        """Persist selection before model/provider setup can block or fail."""
+
+        try:
+            record_workspace(value)
+        except (OSError, RuntimeError, ValueError):
+            pass
+        return value
+
     contained: list[Path] = []
     for candidate in root.iterdir():
         if not candidate.is_dir():
@@ -322,13 +367,33 @@ def choose_workspace(
         except (OSError, RuntimeError):
             continue
     contained.sort(key=lambda item: item.name.casefold())
-    contained_keys = {os.path.normcase(str(item)) for item in contained}
-    recent_entries = list_recent_workspaces()
-    external_entries = [
-        item for item in recent_entries
-        if os.path.normcase(str(Path(item["path"]))) not in contained_keys
-    ]
-
+    recent_entries = list_recent_workspaces(limit=50)
+    recent_activity: dict[str, tuple[float, Path, str]] = {}
+    for item in recent_entries:
+        if not item.get("available"):
+            continue
+        workspace = Path(str(item["path"]))
+        key = os.path.normcase(str(workspace))
+        recent_activity[key] = (
+            float(item.get("last_opened") or 0),
+            workspace,
+            str(item.get("name") or workspace.name),
+        )
+    # Backfill projects opened before the global registry existed. A state DB
+    # is durable evidence that the workspace was used by this application.
+    for workspace in contained:
+        state_db = workspace / ".coding-agent" / "state.db"
+        try:
+            activity = state_db.stat().st_mtime
+        except OSError:
+            continue
+        key = os.path.normcase(str(workspace))
+        registered = recent_activity.get(key)
+        if registered is None or activity > registered[0]:
+            recent_activity[key] = (activity, workspace, workspace.name)
+    recent_values = sorted(
+        recent_activity.values(), key=lambda value: value[0], reverse=True
+    )[:5]
     use_rich = (
         rich_terminal_available(input_func=input_func, output=output)
         if rich is None
@@ -336,74 +401,225 @@ def choose_workspace(
     )
     if use_rich:
         next_name = _next_project_name(root)
-        recent: Path | None = None
+        last_workspace: Path | None = None
         if initial is not None:
             try:
                 candidate = Path(initial).expanduser().resolve(strict=True)
-                if candidate in contained:
-                    recent = candidate
+                if candidate.is_dir():
+                    last_workspace = candidate
             except (OSError, RuntimeError):
                 pass
-        if recent is None and contained:
+        if last_workspace is None and recent_values:
+            last_workspace = recent_values[0][1]
+        picker_start = last_workspace or root
+
+        while True:
+            recent_count = len(recent_values)
+            latest_copy = (
+                f"Last opened: {last_workspace.name}\n{last_workspace}"
+                if last_workspace is not None
+                else "No recent project has been recorded yet."
+            )
+            selected = select_choice(
+                (
+                    ChoiceItem(
+                        key="__create__",
+                        label=f"1. Create {next_name}",
+                        description=(
+                            f"Create {root / next_name}\nA clean new folder inside this workspace."
+                        ),
+                        meta="New folder",
+                        value="__create__",
+                    ),
+                    ChoiceItem(
+                        key="__picker__",
+                        label="2. Open an existing folder",
+                        description=(
+                            f"Open the system folder picker.\nIt starts from {picker_start}."
+                        ),
+                        meta="Folder picker",
+                        value="__picker__",
+                    ),
+                    ChoiceItem(
+                        key="__recent__",
+                        label="3. Recent projects",
+                        description=latest_copy,
+                        meta=f"{recent_count} saved" if recent_count else "None yet",
+                        value="__recent__",
+                        disabled=not bool(recent_values),
+                        disabled_reason="Open or create a project first; it will appear here next time.",
+                    ),
+                ),
+                title="How do you want to open a workspace?",
+                subtitle="Press 1, 2, or 3; you can also use the arrow keys and Enter.",
+                initial_key="__recent__" if recent_values else "__create__",
+                filterable=False,
+                step_label=step_label,
+                action_label="Continue",
+                shortcuts={"1": "__create__", "2": "__picker__", "3": "__recent__"},
+                no_color=no_color,
+                reduced_motion=reduced_motion,
+                input_func=input_func,
+                output=output,
+            )
+            if selected is None:
+                raise PickerBack()
+            if selected.value == "__create__":
+                return selected_workspace(_resolve_workspace(root / next_name, create=True))
+            if selected.value == "__picker__":
+                chosen = _choose_existing_folder(picker_start)
+                if chosen is None:
+                    continue
+                return selected_workspace(_resolve_workspace(chosen))
+
+            recent_choice = select_choice(
+                tuple(
+                    ChoiceItem(
+                        key=str(workspace),
+                        label=name,
+                        description=(
+                            f"{workspace}\nRecent project. Enter opens it without changing files."
+                        ),
+                        meta="Last opened" if index == 0 else "Recent",
+                        value=workspace,
+                    )
+                    for index, (_timestamp, workspace, name) in enumerate(recent_values)
+                ),
+                title="Recent projects",
+                subtitle="Choose a saved project, or press Esc to return to the three options.",
+                initial_key=str(last_workspace) if last_workspace is not None else None,
+                filterable=True,
+                step_label=step_label,
+                action_label="Open",
+                no_color=no_color,
+                reduced_motion=reduced_motion,
+                input_func=input_func,
+                output=output,
+            )
+            if recent_choice is None:
+                continue
+            return selected_workspace(Path(recent_choice.value))
+
+    recent_workspaces = [value[1] for value in recent_values]
+    while True:
+        next_name = _next_project_name(root)
+        print("How do you want to open a workspace?", file=output)
+        print(f"  1. Create {next_name}", file=output)
+        print("  2. Open an existing folder", file=output)
+        print(f"  3. Recent projects ({len(recent_workspaces)})", file=output)
+        choice = input_func("choice [1]> ").strip()
+        if not choice or choice == "1":
+            created = root / _next_project_name(root)
+            return selected_workspace(_resolve_workspace(created, create=True))
+        if choice == "2":
+            initial_folder = recent_workspaces[0] if recent_workspaces else root
+            chosen = _choose_existing_folder(initial_folder)
+            if chosen is not None:
+                return selected_workspace(_resolve_workspace(chosen))
             try:
-                recent = max(contained, key=lambda item: item.stat().st_mtime)
-            except OSError:
-                recent = contained[-1]
+                raw_path = input_func("folder path (blank returns)> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if raw_path:
+                try:
+                    return selected_workspace(_resolve_workspace(raw_path))
+                except ValueError as exc:
+                    print(str(exc), file=output)
+            continue
+        if choice == "3":
+            if not recent_workspaces:
+                print("No recent projects yet.", file=output)
+                continue
+            print("Recent projects", file=output)
+            for index, workspace in enumerate(recent_workspaces, start=1):
+                print(f"  {index}. {workspace.name}  {workspace}", file=output)
+            recent_choice = input_func("recent number (blank returns)> ").strip()
+            if recent_choice.isdigit() and 1 <= int(recent_choice) <= len(recent_workspaces):
+                return selected_workspace(recent_workspaces[int(recent_choice) - 1])
+            continue
+        print("Choose 1, 2, or 3.", file=output)
+
+
+def _session_public_title(session: Mapping[str, Any]) -> str:
+    state = dict(session.get("state") or {})
+    title = " ".join(str(state.get("session_title") or "").split())
+    if title:
+        return title
+    objective = " ".join(str(session.get("goal_objective") or "").split())
+    if objective:
+        return textwrap.shorten(objective, width=64, placeholder="…")
+    return "Previous project session"
+
+
+def choose_workspace_session(
+    workspace: Path,
+    *,
+    input_func: Callable[[str], str] = input,
+    output: TextIO = sys.stdout,
+    rich: bool = True,
+    no_color: bool = False,
+    reduced_motion: bool = False,
+) -> str:
+    """Choose a fresh session or a named prior session for one project."""
+
+    state_db = workspace / ".coding-agent" / "state.db"
+    new_id = f"workspace-{uuid.uuid4().hex[:12]}"
+    if not state_db.is_file():
+        return new_id
+    session_store: StateStore | None = None
+    try:
+        session_store = StateStore(workspace)
+        sessions = list(session_store.list_workflow_sessions(limit=50))
+    except (OSError, StateStoreError, ValueError, RuntimeError):
+        return new_id
+    finally:
+        if session_store is not None:
+            session_store.close()
+    if not sessions:
+        return new_id
+
+    if rich:
         choices = [
             ChoiceItem(
-                key=str(workspace),
-                label=workspace.name,
+                key="__new_session__",
+                label="Start a new session",
                 description=(
-                    f"{workspace}\nExisting workspace. Enter opens it without changing files."
+                    "Keep the same project files and settings, but start with a clean "
+                    "conversation and workflow history."
                 ),
-                meta="Recent" if workspace == recent else "Existing",
-                value=workspace,
+                meta="New",
+                value=new_id,
             )
-            for workspace in contained
         ]
-        choices[0:0] = [
-            ChoiceItem(
-                key=str(item["path"]),
-                label=str(item["name"]),
-                description=(
-                    f"{item['path']}\n"
-                    + ("Recent external workspace." if item["available"] else "Folder is currently unavailable.")
-                ),
-                meta="Recent" if item["available"] else "Missing",
-                value=Path(str(item["path"])),
-                disabled=not bool(item["available"]),
-                disabled_reason="The recorded folder no longer exists.",
+        for index, session in enumerate(sessions):
+            status = str(
+                session.get("goal_status")
+                or session.get("run_state")
+                or "idle"
             )
-            for item in external_entries
-        ]
-        choices.extend(
-            (
+            updated = str(session.get("updated_at") or "")
+            choices.append(
                 ChoiceItem(
-                    key="__create__",
-                    label=f"Create {next_name}",
+                    key=str(session["id"]),
+                    label=_session_public_title(session),
                     description=(
-                        f"Create {root / next_name}\nA clean numbered workspace; creation happens only after you choose this row."
+                        "Continue this project's saved conversation and workflow.\n"
+                        f"Updated {updated} · status {status}"
                     ),
-                    meta="New",
-                    value="__create__",
-                ),
-                ChoiceItem(
-                    key="__path__",
-                    label="Open another folder...",
-                    description="Enter an existing directory path outside the numbered project list.",
-                    meta="Custom path",
-                    value="__path__",
-                ),
+                    meta="Recent" if index == 0 else "Saved",
+                    value=str(session["id"]),
+                )
             )
-        )
         selected = select_choice(
             choices,
-            title="Choose a workspace",
-            subtitle="Open an existing project or explicitly create a new one.",
-            initial_key=str(recent) if recent is not None else "__create__",
+            title="Choose a session",
+            subtitle=(
+                f"{workspace.name} has saved sessions. Start clean or continue one by name."
+            ),
+            initial_key="__new_session__",
             filterable=True,
-            step_label=step_label,
-            action_label="Open",
+            step_label="2. Choose a session",
+            action_label="Continue",
             no_color=no_color,
             reduced_motion=reduced_motion,
             input_func=input_func,
@@ -411,49 +627,19 @@ def choose_workspace(
         )
         if selected is None:
             raise PickerBack()
-        if selected.value == "__create__":
-            return _resolve_workspace(root / next_name, create=True)
-        if selected.value == "__path__":
-            try:
-                raw_path = input_func("folder path (leave blank to go back)> ").strip()
-            except (EOFError, KeyboardInterrupt) as exc:
-                raise PickerBack() from exc
-            if not raw_path:
-                raise PickerBack()
-            return _resolve_workspace(raw_path)
-        return Path(selected.value)
+        return str(selected.value)
 
-    plain_workspaces = contained
-    print("Workspaces", file=output)
-    for index, workspace in enumerate(plain_workspaces, start=1):
-        print(f"  {index:>2}. {workspace.name}", file=output)
-    print("Enter a number, a project name, or an existing directory path.", file=output)
-    print("Press Enter to create the next project-NNN workspace.", file=output)
-
+    print(f"Sessions for {workspace.name}", file=output)
+    print("  0. Start a new session", file=output)
+    for index, session in enumerate(sessions, start=1):
+        print(f"  {index}. {_session_public_title(session)}", file=output)
     while True:
-        choice = input_func("workspace> ").strip()
-        if not choice:
-            created = root / _next_project_name(root)
-            return _resolve_workspace(created, create=True)
-        if choice.isdigit():
-            index = int(choice)
-            if 1 <= index <= len(plain_workspaces):
-                return plain_workspaces[index - 1]
-            print("That workspace number is not listed.", file=output)
-            continue
-
-        direct_child = root / choice
-        if direct_child.is_dir():
-            try:
-                resolved = direct_child.resolve(strict=True)
-                if resolved.parent == root:
-                    return resolved
-            except (OSError, RuntimeError):
-                pass
-        try:
-            return _resolve_workspace(choice)
-        except ValueError as exc:
-            print(str(exc), file=output)
+        raw = input_func("session [0]> ").strip()
+        if not raw or raw == "0":
+            return new_id
+        if raw.isdigit() and 1 <= int(raw) <= len(sessions):
+            return str(sessions[int(raw) - 1]["id"])
+        print("Choose a listed session number.", file=output)
 
 
 def choose_model(
@@ -597,43 +783,25 @@ def choose_access_level(
         if rich is None
         else bool(rich)
     )
-    sandbox = sandbox or DockerSandbox()
     if use_rich:
-        status = run_loading_task(
-            sandbox.status,
-            title="Checking Full access",
-            detail="Validating Docker and the GA3BAD sandbox",
-            state="sync",
-            input_func=input_func,
-            output=output,
-            no_color=no_color,
-            reduced_motion=reduced_motion,
-        )
-        if status is None:
-            raise PickerBack()
-        full_reason = status.reason or "Run /setup once before enabling Full access."
         choices = (
             ChoiceItem(
                 key=AccessLevel.NORMAL.value,
                 label="Normal",
                 description=(
-                    "Ask before risky actions. Works without Docker and is recommended for most projects."
+                    "Ask before dependency, process, browser-control, and other risky actions."
                 ),
                 meta="Recommended",
                 value=AccessLevel.NORMAL,
             ),
             ChoiceItem(
                 key=AccessLevel.FULL.value,
-                label="Full",
+                label="Full access",
                 description=(
-                    "Fewer workspace confirmations, isolated inside the configured Docker sandbox."
-                    if status.ready
-                    else f"Unavailable: {full_reason}"
+                    "Run the accepted task unattended in this workspace; auto-resolve approvals and bounded retries."
                 ),
-                meta="Docker ready" if status.ready else "Unavailable",
+                meta="No more questions",
                 value=AccessLevel.FULL,
-                disabled=not status.ready,
-                disabled_reason=full_reason,
             ),
         )
         initial_level = AccessLevel.parse(initial)
@@ -643,8 +811,6 @@ def choose_access_level(
             subtitle="You can change this later with F4 or in Settings.",
             initial_key=(
                 initial_level.value
-                if initial_level is AccessLevel.NORMAL or status.ready
-                else AccessLevel.NORMAL.value
             ),
             filterable=False,
             step_label=step_label,
@@ -657,25 +823,12 @@ def choose_access_level(
         if selected is None:
             raise PickerBack()
         return selected.value
-    status = sandbox.status()
-    full_reason = status.reason or "Run /setup once before enabling Full access."
-    print("Permissions", file=output)
+    print("Access", file=output)
     print("  1. normal  approvals stay enabled", file=output)
-    print(
-        "  2. full    "
-        + (
-            "no workspace confirmations; isolated Docker sandbox is ready"
-            if status.ready
-            else f"unavailable: {full_reason}"
-        ),
-        file=output,
-    )
+    print("  2. full    unattended execution for the accepted task in this workspace", file=output)
     while True:
         choice = input_func("permissions [normal]> ").strip().lower()
         if choice in {"2", "full"}:
-            if not status.ready:
-                print(f"Full access is unavailable: {full_reason}", file=output)
-                continue
             return AccessLevel.FULL
         if choice in {"", "1", "normal"}:
             return AccessLevel.NORMAL
@@ -721,107 +874,55 @@ def choose_project_protection(
         github_unavailable_reason = ""
         if not status.gh_available:
             github_unavailable_reason = (
-                "GitHub CLI is not installed. Install `gh`, run `gh auth login`, then Refresh."
+                "GitHub CLI is not installed. Install `gh`, run `gh auth login`, then reopen project protection."
             )
         elif not status.gh_authenticated:
             github_unavailable_reason = (
-                "GitHub CLI is not signed in. Run `gh auth login`, then Refresh."
+                "GitHub CLI is not signed in. Run `gh auth login`, then reopen project protection."
             )
 
         if status.github_connected:
-            choices = (
-                ChoiceItem(
-                    key="continue_github",
-                    label="Continue with GitHub protection",
-                    description=(
-                        "Accepted results become local checkpoints and are backed up to "
-                        f"{status.remote_url}."
-                    ),
-                    meta="Recommended",
-                    value="continue_github",
+            # The inspection result is authoritative. A connected project does
+            # not need another protection decision every time it is opened.
+            manager.configure(auto_checkpoint=True, auto_push=True, provider="github")
+            return manager.inspect()
+
+        connect_description = (
+            "Create a private repository in your signed-in GitHub account, connect origin, and push the protected baseline."
+            if not github_unavailable_reason
+            else f"Unavailable: {github_unavailable_reason}"
+        )
+        can_connect = not bool(github_unavailable_reason)
+        choices = (
+            ChoiceItem(
+                key="github",
+                label="Connect this project to GitHub",
+                description=connect_description,
+                meta="Recommended" if can_connect else "Unavailable",
+                value="github",
+                disabled=not can_connect,
+                disabled_reason=github_unavailable_reason,
+            ),
+            ChoiceItem(
+                key="local",
+                label="Continue without GitHub",
+                description=(
+                    "Keep or create local Git checkpoints for undo; nothing is published or pushed."
+                    if status.git_available
+                    else "Continue with current-run recovery only because Git is not installed."
                 ),
-                ChoiceItem(
-                    key="refresh",
-                    label="Refresh connection",
-                    description="Check Git and GitHub again without changing the project.",
-                    meta="Recheck",
-                    value="refresh",
-                ),
-                ChoiceItem(
-                    key="local",
-                    label="Keep checkpoints local",
-                    description="Keep multi-step undo, but do not push new checkpoints to GitHub.",
-                    meta="No remote sync",
-                    value="local",
-                ),
-            )
-            initial_key = "continue_github"
-        else:
-            connect_description = (
-                "Create a private GitHub repository, connect origin, and push the protected baseline."
-                if not github_unavailable_reason
-                else f"Unavailable: {github_unavailable_reason}"
-            )
-            if status.dedicated_repository:
-                local_label = "Continue with local Git history"
-                local_description = (
-                    f"Keep {status.commit_count} existing checkpoint(s) locally. "
-                    "Multi-step undo works; there is no off-device backup."
-                )
-            else:
-                local_label = "Enable local Git history"
-                local_description = (
-                    "Create a dedicated repository and protected baseline now. "
-                    "This enables multi-step undo without publishing anything."
-                )
-            can_connect = not bool(github_unavailable_reason)
-            choices = (
-                ChoiceItem(
-                    key="github",
-                    label="Create private GitHub backup",
-                    description=connect_description,
-                    meta="Recommended" if can_connect else "Unavailable",
-                    value="github",
-                    disabled=not can_connect,
-                    disabled_reason=github_unavailable_reason,
-                ),
-                ChoiceItem(
-                    key="local",
-                    label=local_label,
-                    description=local_description,
-                    meta="Recommended" if not can_connect else "Local only",
-                    value="local",
-                    disabled=not status.git_available,
-                    disabled_reason="Git is not installed." if not status.git_available else "",
-                ),
-                ChoiceItem(
-                    key="refresh",
-                    label="Refresh connection",
-                    description=(
-                        "Use this after installing/signing in to GitHub CLI or connecting origin yourself."
-                    ),
-                    meta="Recheck",
-                    value="refresh",
-                ),
-                ChoiceItem(
-                    key="snapshot",
-                    label="Continue without Git history",
-                    description=(
-                        "No version-based undo is available. Ultra can still roll back its current rejected "
-                        "attempt, but older accepted versions cannot be selected later."
-                    ),
-                    meta="Limited undo",
-                    value="snapshot",
-                ),
-            )
-            initial_key = "github" if can_connect else "local" if status.git_available else "snapshot"
+                meta="Local only" if status.git_available else "Limited undo",
+                value="local" if status.git_available else "snapshot",
+            ),
+        )
+        initial_key = "github" if can_connect else "local"
 
         if use_rich:
             selected = select_choice(
                 choices,
                 title="Protect this project before starting",
                 subtitle=(
-                    f"{status.detail} GitHub adds remote backup; local Git provides the version history."
+                    "This project is not connected to GitHub. Connect it automatically, or continue locally without publishing anything."
                 ),
                 initial_key=initial_key,
                 filterable=False,
@@ -853,10 +954,12 @@ def choose_project_protection(
                     break
                 print("Choose one available protection option.", file=output)
 
-        if action == "refresh":
-            continue
         if action == "github":
-            return manager.connect_github_private()
+            try:
+                return manager.connect_github_private()
+            except VersionControlError as exc:
+                print(f"GitHub connection could not be completed: {exc}", file=output)
+                continue
         if action == "local":
             protected = manager.ensure_local_history()
             # An already-connected repository can intentionally disable auto-push.
@@ -864,9 +967,6 @@ def choose_project_protection(
                 manager.configure(auto_checkpoint=True, auto_push=False, provider="local_git")
                 return manager.inspect()
             return protected
-        if action == "continue_github":
-            manager.configure(auto_checkpoint=True, auto_push=True, provider="github")
-            return manager.inspect()
         if action == "snapshot":
             return manager.use_snapshot_only()
 
@@ -893,7 +993,7 @@ def choose_interaction_mode(
             (
                 ChoiceItem(
                     key=InteractionMode.NORMAL.value,
-                    label="Ultra",
+                    label="Execution",
                     description=(
                         "Run the recursive agent workflow from the terminal. The harness "
                         "chooses specialist count from the approved task demand."
@@ -913,7 +1013,7 @@ def choose_interaction_mode(
                 ),
             ),
             title="Choose the next workflow",
-            subtitle="Both use Ultra execution; Ultra Plan adds the browser planning boundary.",
+            subtitle="Execution routes each message automatically; Ultra Plan adds an explicit planning boundary.",
             initial_key=(
                 InteractionMode.PLAN.value
                 if selected_mode is InteractionMode.PLAN
@@ -931,11 +1031,11 @@ def choose_interaction_mode(
             raise PickerBack()
         return selected.value
     print("Mode", file=output)
-    print("  1. ultra        recursive goal controlled from the terminal", file=output)
-    print("  2. ultra-plan   browser planning, then the same Ultra engine", file=output)
+    print("  1. execution    automatic Chat or recursive execution for each message", file=output)
+    print("  2. ultra-plan   explicit browser planning, then Execution", file=output)
     while True:
         choice = input_func("mode> ").strip().lower()
-        aliases = {"1": "normal", "2": "plan", "ultra-plan": "plan", "ultraplan": "plan"}
+        aliases = {"1": "normal", "2": "plan", "execution": "normal", "ultra-plan": "plan", "ultraplan": "plan"}
         choice = aliases.get(choice, choice)
         choice = {
             "working": "normal", "work": "normal", "goal": "normal",
@@ -943,7 +1043,7 @@ def choose_interaction_mode(
         }.get(choice, choice)
         if choice in {"normal", "chat", "plan"}:
             return InteractionMode.parse(choice)
-        print("Choose ultra or ultra-plan.", file=output)
+        print("Choose execution or ultra-plan.", file=output)
 
 
 def choose_concurrency(
@@ -1077,16 +1177,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         type=lambda value: InteractionMode.parse(value).value,
-        metavar="{ultra,ultra-plan}",
+        metavar="{execution,ultra-plan}",
         help=(
-            "Choose terminal-first Ultra or Ultra Plan, which opens browser planning before "
-            "the same recursive execution engine. Legacy normal/working/plan spellings remain accepted."
+            "Choose Execution or Ultra Plan, which opens browser planning before "
+            "the same recursive execution engine. Legacy saved mode spellings remain accepted."
         ),
     )
     parser.add_argument(
         "--permissions",
         choices=(AccessLevel.NORMAL.value, AccessLevel.FULL.value),
-        help="Workspace permission profile. Full is accepted only in the ready Docker sandbox.",
+        help="Workspace permission profile. Full continues the accepted task without further questions.",
     )
     parser.add_argument(
         "--setup-sandbox",
@@ -1267,7 +1367,7 @@ def _set_interaction_mode(
             console.set_workflow_phase(runtime.interaction_mode.value)
         if detailed:
             console.write(
-                "ULTRA selected for the next Goal; recursive execution is now the minimum."
+                "Execution selected for the next Goal; recursive execution is now the minimum."
             )
         return False
     runtime.transition_mode(selected.value)
@@ -1279,7 +1379,7 @@ def _set_interaction_mode(
     if not detailed:
         if changed:
             console.write(
-                "Input set to PLAN." if selected is InteractionMode.PLAN else "Input set to WORKING."
+                "Input set to ULTRA PLAN." if selected is InteractionMode.PLAN else "Input set to EXECUTION."
             )
         return needs_ultra_foundation
     if selected == InteractionMode.PLAN:
@@ -1294,7 +1394,7 @@ def _set_interaction_mode(
         else ""
     )
     console.write(
-        "GOAL workflow selected: routing and execution depth are selected automatically "
+        "EXECUTION active: Chat versus execution, routing, and depth are selected per message "
         f"for the configured model.{suffix}"
     )
     return needs_ultra_foundation
@@ -1312,11 +1412,9 @@ def _show_settings(
         isinstance(pending, Mapping) and str(pending.get("status")) != "completed"
     )
     public_mode = (
-        runtime.interaction_mode.value
-        if in_workflow
-        else "plan"
-        if preferences.mode is InteractionMode.PLAN
-        else "automatic"
+        "ultra-plan"
+        if (runtime.interaction_mode is InteractionModeV2.PLAN if in_workflow else preferences.mode is InteractionMode.PLAN)
+        else "execution"
     )
     safe_values: dict[str, object] = {
         "mode": public_mode,
@@ -1381,7 +1479,7 @@ def _execute_settings(
             _show_settings(runtime, console, preferences, "mode")
         else:
             console.write(
-                "Mode is automatic and model-aware. Use /plan when you explicitly want "
+                "Execution is automatic and model-aware. Use /ultra-plan when you explicitly want "
                 "planning before workspace changes."
             )
         return
@@ -1541,12 +1639,10 @@ def _open_settings_hub(
 
     actions = (
         ChoiceItem("model", "Model & reasoning", "Choose a capable model and effort.", "Runtime"),
-        ChoiceItem("access", "Permissions", "Choose Normal or Full sandbox access.", "Runtime"),
-        ChoiceItem("sleep", "Sleep Mode", "Choose off, safe, or full unattended policy.", "Runtime"),
         ChoiceItem("limits", "Runtime limits", "Edit concurrency and bounded engine limits.", "Runtime"),
         ChoiceItem("api", "Provider credentials", "Add or replace a masked API key.", "Providers"),
         ChoiceItem("provider_health", "Provider readiness", "Run local and provider readiness checks.", "Providers"),
-        ChoiceItem("project", "Project profile", "Reconfigure model, protection, access, and workflow.", "Project"),
+        ChoiceItem("project", "Project profile", "Reconfigure model, protection, and workflow.", "Project"),
         ChoiceItem("sandbox", "Full-access sandbox", "Build or validate the isolated sandbox.", "Project"),
         ChoiceItem("color", "Terminal color", "Choose auto, on, or off.", "Terminal"),
         ChoiceItem("keymap", "Keyboard reference", "Show the current TUI key map.", "Terminal"),
@@ -1572,32 +1668,6 @@ def _open_settings_hub(
         action = str(selected.resolved_value)
         if action == "model":
             _execute_model(runtime, console, None, None)
-        elif action == "access":
-            _execute_permissions(runtime, console, None)
-        elif action == "sleep":
-            choice = select_choice(
-                (
-                    ChoiceItem("off", "Off", "Every approval remains manual."),
-                    ChoiceItem("safe", "Safe", "Accept recommended safe choices only."),
-                    ChoiceItem("full", "Full", "Accept audited plans and tool actions."),
-                ),
-                title="Sleep Mode",
-                subtitle="The policy applies to this workspace session.",
-                initial_key=(runtime.sleep_mode_policy() if runtime.sleep_mode_enabled() else "off"),
-                step_label="Settings · Runtime",
-                action_label="Apply",
-                input_func=console.input_func,
-                output=console.stream,
-                no_color=not console.color,
-                reduced_motion=console.reduced_motion,
-            )
-            if choice is not None:
-                execute_command(
-                    runtime,
-                    console,
-                    internal_action(InternalActionKind.SLEEP, action=str(choice.resolved_value)),
-                    preferences,
-                )
         elif action == "limits":
             _change_runtime_limit_settings(runtime, console)
         elif action == "api":
@@ -1757,6 +1827,22 @@ def _run_auto(runtime: AgentRuntime, console: ConsoleUI) -> SliceResult:
         _show_runtime_state(runtime, console)
 
     result = runtime.continue_until_boundary(on_checkpoint=checkpoint)
+    # Bounded Action requests do not create a Goal row.  Full access still
+    # owns their unattended continuation contract, so consume the same
+    # durable missing-evidence retry claims used by the interactive worker.
+    # The runtime caps these claims with no_action_limit; this loop therefore
+    # cannot become an unbounded retry spinner.
+    while (
+        str(getattr(runtime, "access_level", "normal")).casefold() == "full"
+        and runtime.prepare_automatic_semantic_retry()
+    ):
+        console.write(
+            "Full access is continuing the saved Action for its remaining evidence; "
+            "completed tools will not be replayed."
+        )
+        result = runtime.resume()
+        if not isinstance(result, SliceResult) or result.status != "action_incomplete":
+            break
     # Keep the terminal truthful at every boundary.  The old controller only
     # rendered intermediate callbacks and silently discarded this final value,
     # which made a paused process look idle or still awaiting approval.
@@ -1770,7 +1856,7 @@ def _run_auto(runtime: AgentRuntime, console: ConsoleUI) -> SliceResult:
                 + (f" Waiting on {result.waiting_on}." if result.waiting_on else "")
             )
         elif result.status == "running":
-            console.write(f"Working — {result.message}")
+            console.write(f"Execution — {result.message}")
         else:
             console.write(f"Boundary — {phase}: {result.message}")
     return result
@@ -1781,6 +1867,19 @@ def _current_ultra_run(runtime: AgentRuntime) -> object | None:
         return runtime.active_ultra_run()
     except (AttributeError, StateStoreError):
         return None
+
+
+def _empty_swarm_snapshot() -> dict[str, Any]:
+    """Return session-local empty agent state for a run-free workflow."""
+
+    return {
+        "run_id": "",
+        "status": "idle",
+        "nodes": (),
+        "agents": (),
+        "profiles": {},
+        "traces": {},
+    }
 
 
 def _show_questions(runtime: AgentRuntime, console: ConsoleUI) -> None:
@@ -2060,7 +2159,7 @@ def _open_swarm_inspector(
 def _show_tree(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -> None:
     run = _current_ultra_run(runtime)
     if run is None:
-        console.write("Project tree\n  (no ULTRA run yet)")
+        console.write("Project tree\n  (no Execution run yet)")
         return
     if target is None and _open_swarm_inspector(
         runtime, console, run, initial_tab="tree"
@@ -2108,7 +2207,7 @@ def _show_agents(
 ) -> None:
     run = _current_ultra_run(runtime)
     if run is None:
-        console.write("Agents\n  (no ULTRA run yet)")
+        console.write("Agents\n  (no Execution run yet)")
         return
     if not include_finished and _open_swarm_inspector(
         runtime, console, run, initial_tab="agents"
@@ -2130,7 +2229,7 @@ def _show_agents(
 def _show_agent(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -> None:
     run = _current_ultra_run(runtime)
     if run is None:
-        console.write("Specialist view | READ ONLY\n  (no ULTRA run yet)")
+        console.write("Specialist view | READ ONLY\n  (no Execution run yet)")
         return
     nodes = list(runtime.store.list_work_nodes(run.id))
     agents = list(runtime.store.list_agent_runs(run.id))
@@ -2223,7 +2322,7 @@ def _show_agent(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -
 def _show_memory(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -> None:
     run = _current_ultra_run(runtime)
     if run is None:
-        console.write("Project Brain\n  (no ULTRA run yet)")
+        console.write("Project Brain\n  (no Execution run yet)")
         return
     section = None
     query = ""
@@ -2285,6 +2384,7 @@ def _sessions_text(runtime: AgentRuntime) -> str:
     lines = [f"Sessions · {runtime.workspace.name}", ""]
     for session in sessions:
         current = "*" if str(session["id"]) == runtime.session_id else " "
+        public_title = _session_public_title(session)
         objective = textwrap.shorten(
             " ".join(str(session.get("goal_objective") or "No goal yet").split()),
             width=66,
@@ -2294,12 +2394,13 @@ def _sessions_text(runtime: AgentRuntime) -> str:
         model = dict(state.get("model_snapshot") or {}).get("model") or "unrecorded"
         lines.extend(
             (
-                f"{current} {str(session['id'])[-12:]} · "
+                f"{current} {public_title} · "
                 f"{str(session.get('session_mode') or 'normal').upper()} · "
                 f"{str(session.get('goal_status') or session.get('run_state') or 'idle')} · "
                 f"queued {session.get('queued_count', 0)}",
                 f"    {objective}",
-                f"    model {model} · updated {session.get('updated_at', '')}",
+                f"    model {model} · updated {session.get('updated_at', '')}"
+                f" · internal {str(session['id'])[-8:]}",
             )
         )
     lines.extend(("", "* current session · session switching requires a safe checkpoint"))
@@ -2337,8 +2438,87 @@ def _effective_plan_text(runtime: AgentRuntime) -> str:
             "verifying": "●",
         }.get(task.status.value, "○")
         lines.append(f"  {marker} {task.id} · {task.status.value:<11} · {task.title}")
-    lines.extend(("", "READ ONLY · edit /plan only at an approval-safe checkpoint"))
+    lines.extend(("", "READ ONLY · edit /ultra-plan only at an approval-safe checkpoint"))
     return "\n".join(lines)
+
+
+def _todo_text(runtime: AgentRuntime) -> str:
+    """Render the shared evidence-backed task projection for terminal users."""
+
+    snapshot = runtime.workflow_runtime_snapshot()
+    progress = dict(snapshot.goal_progress or {})
+    items = tuple(snapshot.task_items or ())
+    if not snapshot.objective and not items:
+        return "Goal & To-do\n\nNo goal exists in this session yet."
+
+    completion = int(progress.get("completion_percent") or 0)
+    verification = int(progress.get("verification_percent") or 0)
+    lines = [
+        "Goal & To-do / read only",
+        "",
+        f"GOAL  {snapshot.objective or progress.get('objective') or 'Not recorded'}",
+        (
+            f"PROGRESS  {completion}% complete / {verification}% evidence-verified / "
+            f"{int(progress.get('done') or 0)} done / {int(progress.get('working') or 0)} working / "
+            f"{int(progress.get('pending') or 0)} waiting / {int(progress.get('blocked') or 0)} blocked"
+        ),
+    ]
+    pending_revision = progress.get("pending_plan_revision")
+    projected_revision = progress.get("plan_revision")
+    if pending_revision is not None and projected_revision is not None:
+        lines.append(
+            f"PLAN CONTINUITY  accepted r{projected_revision} progress is shown; "
+            f"repair r{pending_revision} awaits approval and is not counted yet"
+        )
+    goal_evidence = tuple(progress.get("evidence") or ())
+    if goal_evidence:
+        lines.append("EVIDENCE")
+        lines.extend(f"  + {receipt}" for receipt in goal_evidence)
+    lines.extend(("", f"TASKS / {len(items)}", ""))
+    marks = {
+        "done": "[x]",
+        "verified": "[x]",
+        "working": "[>]",
+        "blocked": "[!]",
+        "pending": "[ ]",
+    }
+    for item in items:
+        state = str(item.get("state") or item.get("status") or "pending").casefold()
+        indent = "  " * max(0, int(item.get("depth") or 0))
+        task_id = str(item.get("id") or "task")
+        title = str(item.get("title") or task_id)
+        task_verification = int(item.get("verification_percent") or 0)
+        lines.append(
+            f"{indent}{marks.get(state, '[ ]')} {task_id} / {title} / "
+            f"{state.replace('_', ' ')} / evidence {task_verification}%"
+        )
+        description = " ".join(
+            str(item.get("description") or item.get("objective") or "").split()
+        )
+        if description and description.casefold() != title.casefold():
+            lines.extend(
+                f"{indent}    {line}"
+                for line in textwrap.wrap(description, width=100)
+            )
+        checklist = tuple(item.get("checklist") or ())
+        if checklist:
+            lines.append(f"{indent}    CHECKLIST")
+        for check in checklist:
+            check_state = str(check.get("state") or check.get("status") or state).casefold()
+            check_title = " ".join(str(check.get("title") or "Check").split())
+            lines.append(
+                f"{indent}      {marks.get(check_state, '[ ]')} {check_title}"
+            )
+            for receipt in tuple(check.get("evidence") or ())[:3]:
+                lines.append(f"{indent}          proof: {receipt}")
+        files = tuple(item.get("changed_files") or ())
+        if files:
+            lines.append(f"{indent}    CHANGED  {', '.join(str(path) for path in files)}")
+        issues = tuple(item.get("issues") or ())
+        for issue in issues[:5]:
+            lines.append(f"{indent}    ISSUE  {' '.join(str(issue).split())}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def _project_brain_text(runtime: AgentRuntime, target: str | None = None) -> str:
@@ -2527,7 +2707,7 @@ def _show_thinking(console: ConsoleUI) -> None:
 def _show_insights(runtime: AgentRuntime, console: ConsoleUI, target: str | None) -> None:
     run = _current_ultra_run(runtime)
     if run is None:
-        console.write("Insights\n  (no ULTRA run yet)")
+        console.write("Insights\n  (no Execution run yet)")
         return
     entries = []
     for section in (BrainSection.DECISION, BrainSection.LESSON, BrainSection.KNOWLEDGE):
@@ -2547,7 +2727,7 @@ def _show_metrics(runtime: AgentRuntime, console: ConsoleUI) -> None:
     if run is None:
         console.write(
             f"Metrics\n  provider {runtime.provider_name}/{runtime.model_name}\n"
-            "  (no ULTRA run yet)"
+            "  (no Execution run yet)"
         )
         return
     nodes = runtime.store.list_work_nodes(run.id)
@@ -2760,6 +2940,81 @@ def _execute_permissions(
     console.write(f"permissions = {adapter.access_level.value} (this session)")
 
 
+def _execute_access(
+    runtime: AgentRuntime,
+    console: ConsoleUI,
+    level: str | None,
+) -> None:
+    """Apply the public access profile as one coherent runtime contract.
+
+    Normal keeps the ordinary approval/question boundaries. Full is an
+    explicit unattended opt-in for the selected workspace and accepted task.
+    It keeps browser, process, and file tools in the same host environment and
+    immediately re-evaluates a durable boundary so a paused run can continue.
+    """
+
+    if level is None:
+        sandbox = (
+            runtime.permission_adapter.sandbox
+            if runtime.permission_adapter is not None
+            else DockerSandbox()
+        )
+        try:
+            level = choose_access_level(
+                input_func=console.input_func,
+                output=console.stream,
+                sandbox=sandbox,
+                rich=(
+                    rich_terminal_available(
+                        input_func=console.input_func,
+                        output=console.stream,
+                    )
+                    and not bool(getattr(console, "plain", False))
+                ),
+                initial=runtime.access_level,
+                step_label="Session · Access",
+                no_color=not console.color,
+                reduced_motion=console.reduced_motion,
+            ).value
+        except PickerBack:
+            return
+
+    requested = AccessLevel.parse(level)
+    sandbox = (
+        runtime.permission_adapter.sandbox
+        if runtime.permission_adapter is not None
+        else DockerSandbox()
+    )
+    adapter = PermissionAdapter(requested, sandbox)
+    runtime.replace_permission_adapter(adapter)
+    console.set_runtime_identity(
+        access_level=runtime.access_level,
+        execution_class=runtime.execution_class,
+    )
+
+    if requested is AccessLevel.FULL:
+        runtime.set_session_tool_permissions(True)
+        runtime.set_sleep_mode(True, policy="full")
+        # Update the live owner as well as the durable runtime.  This resolves
+        # an approval card that is already on screen and wakes its waiting
+        # worker; persisting alone would only affect the next checkpoint.
+        console.set_sleep_mode(True, policy="full")
+        resolved = runtime.auto_resolve_full_auto_boundary()
+        suffix = f" Resolved: {', '.join(resolved)}." if resolved else ""
+        console.write(
+            "access = full · unattended continuation is on; tool approvals and "
+            f"bounded workflow questions are handled and audited automatically.{suffix}"
+        )
+    else:
+        runtime.set_session_tool_permissions(False)
+        if runtime.sleep_mode_policy() == "full":
+            runtime.set_sleep_mode(False)
+        console.set_sleep_mode(False)
+        console.write(
+            "access = normal · ordinary approval and question boundaries are active."
+        )
+
+
 def _setup_sandbox(runtime: AgentRuntime, console: ConsoleUI) -> None:
     sandbox = (
         runtime.permission_adapter.sandbox
@@ -2817,20 +3072,10 @@ def _reconfigure_project_setup(
     # Capacity is a safety ceiling, not a user-selected agent count. The
     # semantic task-demand decision chooses the actual concurrency per Goal.
     selected_concurrency = capacity.safe_max
-    selected_access = choose_access_level(
-        input_func=console.input_func,
-        output=console.stream,
-        sandbox=(
-            runtime.permission_adapter.sandbox
-            if runtime.permission_adapter is not None
-            else DockerSandbox()
-        ),
-        rich=not console.plain,
-        initial=runtime.access_level,
-        step_label="Project settings · Permissions",
-        no_color=not console.color,
-        reduced_motion=console.reduced_motion,
-    )
+    # Access is deliberately not part of project setup. Every launch starts in
+    # Normal unless the user explicitly opts into `/access full` for the live
+    # session.
+    selected_access = AccessLevel.parse(runtime.access_level)
     selected_mode = choose_interaction_mode(
         input_func=console.input_func,
         output=console.stream,
@@ -2876,7 +3121,7 @@ def _reconfigure_project_setup(
     )
     console.write(
         "Project settings saved · future launches will reuse this model, protection, "
-        f"automatic capacity (up to {selected_concurrency}), permissions, and workflow default."
+        f"automatic capacity (up to {selected_concurrency}), and workflow default."
     )
 
 
@@ -2978,13 +3223,14 @@ def _open_local_web_view(
         return
     public_view = (
         view_name
-        if view_name in {"plan", "live", "show-diff", "advanced-tracing"}
+        if view_name in {"plan", "live", "output", "show-diff", "advanced-tracing"}
         else "live"
     )
     result = server.open_view(public_view)
     label = {
         "plan": "Ultra Plan",
-        "live": "Ultra Live",
+        "live": "Execution Live",
+        "output": "Output",
         "show-diff": "Workflow Diff",
         "review": "Change Review",
         "agents": "Agent Tree",
@@ -2993,7 +3239,7 @@ def _open_local_web_view(
         "tree": "Execution Tree",
         "diff": "Change Diff",
         "advanced-tracing": "Advanced Tracing",
-    }.get(view_name, "Ultra Live")
+    }.get(view_name, "Execution Live")
     if not isinstance(result, Mapping):
         return
     if result["browser_opened"]:
@@ -3074,7 +3320,7 @@ def execute_command(
         if selected is None:
             console.write(
                 "Workflow type and execution depth are selected automatically after your prompt. "
-                "Use /plan only when you explicitly want planning before workspace changes."
+                "Use /ultra-plan only when you explicitly want planning before workspace changes."
             )
         else:
             needs_ultra_foundation = _set_interaction_mode(
@@ -3082,7 +3328,7 @@ def execute_command(
             )
             if needs_ultra_foundation:
                 console.write(
-                    "Applying Ultra reasoning depth to the saved unified goal."
+                    "Applying recursive Execution depth to the saved unified goal."
                 )
                 runtime.prepare_ultra_from_existing_goal()
         return True
@@ -3097,10 +3343,13 @@ def execute_command(
         return True
     if command.kind == InternalActionKind.KEYMAP:
         console.write(
-            "Keymap: F2 Simple/Advanced display, F3 model, F4 permissions, "
-            "F5 activity, F6 Sleep, F7 diff, F8 project folder, Ctrl+K actions, Ctrl+C "
+            "Keymap: F2 Simple/Advanced display, F3 model, F5 activity, "
+            "F7 diff, F8 project folder, Ctrl+K actions, Ctrl+C "
             "cooperative pause, Ctrl+Q checkpoint-safe exit."
         )
+        return True
+    if command.kind == CommandKind.ACCESS:
+        _execute_access(runtime, console, command.args.get("level"))
         return True
     if command.kind == InternalActionKind.SKILLS:
         rows = tools.capability_report()
@@ -3167,7 +3416,7 @@ def execute_command(
             policy = str(policy_getter() if callable(policy_getter) else ("safe" if enabled else "off"))
             console.set_sleep_mode(enabled, policy=policy if enabled else "safe")
             console.write(
-                f"Sleep Mode {policy if enabled else 'off'} · "
+                f"Access automation {policy if enabled else 'off'} · "
                 + (
                     "critic-reviewed plans, deterministic questions, and every tool approval are accepted and audited"
                     if policy == "full"
@@ -3177,7 +3426,7 @@ def execute_command(
             if preferences.mode is InteractionMode.ULTRA:
                 status = runtime.sleep_profile("status", preferences.mode)
                 console.write(
-                    f"Ultra Sleep profile {status['profile']} · state {status['state']}"
+                    f"Recursive access profile {status['profile']} · state {status['state']}"
                 )
             return True
 
@@ -3204,22 +3453,22 @@ def execute_command(
                     resolved = ()
                 if resolved:
                     console.write(
-                        f"Sleep Mode {policy} resumed the pending "
+                        f"Access automation {policy} resumed the pending "
                         + ("plan and action." if "plan" in resolved else "action.")
                     )
             except Exception as exc:
-                console.write(f"Sleep Mode {policy} is on; pending approval remains visible ({exc}).")
+                console.write(f"Access automation {policy} is on; pending approval remains visible ({exc}).")
         if action == "off":
             runtime.sleep_profile("off", preferences.mode)
         elif preferences.mode is InteractionMode.ULTRA:
             try:
                 status = runtime.sleep_profile("on", preferences.mode)
                 console.write(
-                    f"Ultra Sleep profile {status['profile']} · state {status['state']}"
+                    f"Recursive access profile {status['profile']} · state {status['state']}"
                 )
             except RuntimeError as exc:
                 console.write(
-                    "General Sleep Mode remains on, but deeper Ultra Sleep was not armed: "
+                    "Full access automation remains on, but deeper recursive automation was not armed: "
                     f"{exc}"
                 )
         return True
@@ -3312,6 +3561,12 @@ def execute_command(
     if command.kind == CommandKind.LIVE:
         _open_local_web_view(runtime, console, "live")
         return True
+    if command.kind == CommandKind.OUTPUT:
+        _open_local_web_view(runtime, console, "output")
+        return True
+    if command.kind == CommandKind.TODO:
+        console.write(_todo_text(runtime))
+        return True
     if command.kind == CommandKind.SHOW_DIFF:
         _open_local_web_view(runtime, console, "show-diff")
         return True
@@ -3367,7 +3622,7 @@ def execute_command(
         return True
     if command.kind == InternalActionKind.AUTO:
         if preferences.mode == InteractionMode.ULTRA:
-            console.write("ULTRA execution already runs in the background after master approval.")
+            console.write("Execution already runs in the background after master approval.")
             _show_runtime_state(runtime, console)
             return True
         _run_auto(runtime, console)
@@ -3411,12 +3666,18 @@ def execute_command(
         else:
             result = runtime.apply_command(command)
     elif preferences.mode == InteractionMode.ULTRA and command.kind == InternalActionKind.RUN:
-        console.write("ULTRA module waves run in the background; use /live, /advanced-tracing, or /pause.")
+        console.write("Execution waves run in the background; use /live, /advanced-tracing, or /pause.")
         result = None
     else:
         result = runtime.apply_command(command)
     if isinstance(result, SliceResult):
         console.write(result.message)
+        if result.completed:
+            if result.status != "action_completed":
+                publisher = getattr(runtime, "publish_result_output", None)
+                if callable(publisher):
+                    publisher(result.message, title="Task output")
+            _open_local_web_view(runtime, console, "output")
     if (
         result is not None
         and runtime.sleep_mode_policy() == "full"
@@ -3473,7 +3734,7 @@ def execute_command(
                 CommandKind.TEXT: "guidance received",
                 InternalActionKind.GOAL: "goal submitted",
             }[command.kind]
-            console.write(f"Working: {reason}; continuing automatically.")
+            console.write(f"Execution: {reason}; continuing automatically.")
             _run_auto(runtime, console)
     return True
 
@@ -3553,7 +3814,7 @@ def _plan_attention(
             ),
             AttentionOption(
                 "approve", "Approve & work", "approve",
-                description="Approve this revision and continue the same Goal in Working.",
+                description="Approve this revision and continue the same Goal in Execution.",
                 shortcut="a",
             ),
         ]
@@ -3613,6 +3874,76 @@ def _plan_attention(
         cancel_key="cancel",
         auto_resolve_safe=False,
     )
+
+
+def _recovery_boundary_inspection(
+    goal: Any,
+    reason: str,
+) -> tuple[str, str]:
+    """Explain one saved recovery boundary without pretending work is active."""
+
+    metadata = dict(getattr(goal, "metadata", {}) or {})
+    blocker = dict(metadata.get("verification_blocker") or {})
+    retry_state = dict(metadata.get("verification_retry_state") or {})
+    retry_exhausted = bool(retry_state.get("exhausted"))
+    owner = str(blocker.get("blocker_owner") or "").strip().casefold()
+    owner_copy = {
+        "test_harness": (
+            "The verification harness rejected its own result contract. This is a "
+            "verification-system failure, not evidence that the candidate code is wrong."
+        ),
+        "tooling": (
+            "A verification tool failed before it could judge the candidate code."
+        ),
+        "environment": (
+            "The verification environment failed before it could judge the candidate code."
+        ),
+    }.get(
+        owner,
+        "The saved verification boundary needs a fresh bounded attempt before work can continue.",
+    )
+    mutation_copy = (
+        "The accepted files were preserved and no product mutation is allowed from this diagnosis."
+        if bool(blocker.get("mutation_prohibited"))
+        else "Completed files and evidence remain preserved at the checkpoint."
+    )
+    public = " ".join(
+        (
+            owner_copy,
+            mutation_copy,
+            (
+                "No agent is working while this checkpoint is paused. The identical retry "
+                "was already reproduced, so change the model or inspect the evidence before continuing."
+                if retry_exhausted
+                else "No agent is working while this checkpoint is paused. Choose Retry "
+                "to rerun only unfinished verification work."
+            ),
+        )
+    )
+    fingerprint = str(blocker.get("failure_fingerprint") or "").strip()
+    technical = json.dumps(
+        redact_data(
+            {
+                "reason": reason,
+                "waiting_on": metadata.get("waiting_on"),
+                "resume_action": metadata.get("resume_action"),
+                "blocker_owner": blocker.get("blocker_owner"),
+                "failure_kind": blocker.get("failure_kind"),
+                "failure_fingerprint": fingerprint,
+                "occurrences": blocker.get("occurrences"),
+                "verification_repair_attempts": blocker.get(
+                    "verification_repair_attempts"
+                ),
+                "infrastructure_retries": blocker.get("infrastructure_retries"),
+                "mutation_prohibited": blocker.get("mutation_prohibited"),
+                "verification_retry_state": retry_state,
+            }
+        ),
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    )
+    return public, technical
 
 
 def _completion_attention(
@@ -3691,7 +4022,6 @@ def _action_attention(store: WorkspaceUIStore) -> AttentionRequest:
         AttentionOption("status", copy("Task status", "حالة المهمة"), "status", description=copy("Show the durable goal and plan state.", "اعرض حالة الهدف والخطة المحفوظة."), shortcut="t"),
         AttentionOption("changes", copy("Review changes", "مراجعة التغييرات"), "changes", description=copy("Show the current Git diff.", "اعرض تغييرات Git الحالية."), shortcut="r"),
         AttentionOption("result", copy("Managed previews", "المعاينات المُدارة"), "result", description=copy("List running previews and processes.", "اعرض المعاينات والعمليات الجارية."), shortcut="o"),
-        AttentionOption("permissions", copy("Permissions", "الصلاحيات"), "permissions", description=copy("Choose normal or ready Docker access.", "اختر الوصول العادي أو Docker الجاهز."), shortcut="p"),
         AttentionOption("advanced", copy("Advanced details", "تفاصيل متقدمة"), "advanced", description=copy("Show technical activity in the workspace.", "اعرض النشاط التقني في مساحة العمل."), shortcut="a"),
     ]
     values.append(
@@ -3771,9 +4101,9 @@ def _persistent_interactive_loop(
         workflow_mode=preferences.mode.value,
     )
     # Hydrate the presentation store from the durable session before either
-    # surface starts rendering.  Sleep can be toggled from Web while the
+    # surface starts rendering. Access automation can change while the
     # terminal process is reconnecting; without this initial projection the
-    # terminal footer would incorrectly start at ``Sleep off`` until the next
+    # terminal footer would incorrectly start at Normal until the next
     # event arrived.
     try:
         raw_sleep_enabled = runtime.sleep_mode_enabled()
@@ -3917,6 +4247,7 @@ def _persistent_interactive_loop(
         last_swarm_refresh = 0.0
         cached_swarm_snapshot: Mapping[str, Any] = {}
         workspace_auto_opened = False
+        last_preview_probe = 0.0
         pending_plan_attention_id = ""
         pending_plan_key = ""
         pending_completion_attention_id = ""
@@ -3974,7 +4305,7 @@ def _persistent_interactive_loop(
             return ""
 
         def open_managed_preview(url: str) -> None:
-            """Open a preview only after the user selects the completion action."""
+            """Open one trusted managed preview in the user's browser."""
 
             if not url:
                 store.append_transcript(
@@ -4026,11 +4357,6 @@ def _persistent_interactive_loop(
             requested = AccessLevel.parse(
                 str(state.get("access_level", AccessLevel.NORMAL.value))
             )
-            if requested is AccessLevel.FULL and not sandbox.status().ready:
-                raise RuntimeError(
-                    "Recovery required: the saved Full sandbox is unavailable; "
-                    "the original session settings were preserved."
-                )
             concurrency = max(1, min(8, int(state.get("concurrency", 1))))
             next_config = replace(
                 RuntimeConfig.from_env(),
@@ -4085,7 +4411,7 @@ def _persistent_interactive_loop(
                 "assistant",
                 f"Switched to session {target[-12:]} at its saved checkpoint · "
                 f"{descriptor.model} · "
-                f"{'plan' if preferences.mode is InteractionMode.PLAN else 'working'} · "
+                f"{'ultra-plan' if preferences.mode is InteractionMode.PLAN else 'execution'} · "
                 f"{concurrency} agent(s).",
             )
 
@@ -4317,12 +4643,6 @@ def _persistent_interactive_loop(
             return resolution.text.strip() if resolution.key == "custom" else ""
 
         def handle_permissions() -> None:
-            sandbox = (
-                runtime.permission_adapter.sandbox
-                if runtime.permission_adapter is not None
-                else DockerSandbox()
-            )
-            status = sandbox.status()
             options = [
                 AttentionOption(
                     "normal", "Normal", "normal",
@@ -4330,25 +4650,23 @@ def _persistent_interactive_loop(
                     shortcut="n", primary=runtime.access_level == "normal",
                 )
             ]
-            if status.ready:
-                options.append(
-                    AttentionOption(
-                        "full", "Full Docker", "full",
-                        description="Run build and test actions in the ready Docker sandbox.",
-                        shortcut="f", primary=runtime.access_level == "full",
-                    )
+            options.append(
+                AttentionOption(
+                    "full", "Full access", "full",
+                    description=(
+                        "Continue the accepted task in this workspace without more "
+                        "tool questions; bounded retries and recovery are automatic."
+                    ),
+                    shortcut="f", primary=runtime.access_level == "full",
                 )
+            )
             options.append(AttentionOption("cancel", "Cancel", "", shortcut="c"))
             choice = store.request_attention(
                 AttentionRequest(
                     id=f"permissions:{time.monotonic_ns()}",
                     kind=AttentionKind.APPROVAL,
                     title="Choose permissions",
-                    message=(
-                        "Full Docker is unavailable until /setup completes successfully."
-                        if not status.ready
-                        else "Choose where project commands may run."
-                    ),
+                    message="Choose the approval policy for this session.",
                     options=tuple(options),
                     default_key="cancel",
                     cancel_key="cancel",
@@ -4543,14 +4861,14 @@ def _persistent_interactive_loop(
         def handle_workflow_mode(*, apply: bool = True) -> str | None:
             options = [
                 AttentionOption(
-                    "normal", "Working", "normal",
+                    "normal", "Execution", "normal",
                     description=(
                         "Send normally. Route and model-aware execution depth are selected after the request."
                     ),
                     shortcut="w", primary=preferences.mode is not InteractionMode.PLAN,
                 ),
                 AttentionOption(
-                    "plan", "Plan", "plan",
+                    "plan", "Ultra Plan", "plan",
                     description=(
                         "Open a plan before mutation, then Approve & work continues the same Goal."
                     ),
@@ -4564,8 +4882,8 @@ def _persistent_interactive_loop(
                     kind=AttentionKind.QUESTION,
                     title="Choose how to send the next request",
                     message=(
-                        "Working lets the system choose Chat, Action, or Goal and the required "
-                        "execution depth. Plan prepares the same Goal before any mutation."
+                        "Execution chooses Chat, Action, or Goal per message and selects the required "
+                        "depth. Ultra Plan prepares the same Goal before any mutation."
                     ),
                     options=tuple(options),
                     default_key=(
@@ -4584,7 +4902,7 @@ def _persistent_interactive_loop(
                     if needs_ultra_foundation:
                         start(
                             runtime.prepare_ultra_from_existing_goal,
-                            summary="Applying Ultra reasoning depth",
+                            summary="Applying recursive Execution depth",
                         )
                 return str(resolution.value)
             return None
@@ -4715,17 +5033,14 @@ def _persistent_interactive_loop(
             if command.kind in {InternalActionKind.AGENTS, InternalActionKind.AGENT, InternalActionKind.TREE}:
                 run = _current_ultra_run(runtime)
                 if run is None:
-                    cached_swarm_snapshot = {
-                        "run_id": "",
-                        "status": "idle",
-                        "nodes": (),
-                        "agents": (),
-                        "profiles": {},
-                        "traces": {},
-                    }
+                    cached_swarm_snapshot = _empty_swarm_snapshot()
                 else:
                     cached_swarm_snapshot = _swarm_inspector_snapshot(runtime, run)
-                    store.update_swarm_summary(cached_swarm_snapshot)
+                # Always replace the dashboard projection.  This matters when
+                # switching from a historical run to a fresh session in the
+                # same TUI process: absence of a run is authoritative empty
+                # state, not permission to retain the previous panel.
+                store.update_swarm_summary(cached_swarm_snapshot)
                 last_swarm_refresh = time.monotonic()
                 app.open_swarm(
                     cached_swarm_snapshot,
@@ -4750,6 +5065,16 @@ def _persistent_interactive_loop(
                 return True
             if command.kind is CommandKind.LIVE:
                 _open_local_web_view(runtime, console, "live")
+                return True
+            if command.kind is CommandKind.OUTPUT:
+                _open_local_web_view(runtime, console, "output")
+                return True
+            if command.kind is CommandKind.TODO:
+                app.open_details(
+                    "Goal, tasks, and evidence",
+                    _todo_text(runtime),
+                    kind="todo",
+                )
                 return True
             if command.kind is CommandKind.SHOW_DIFF:
                 _open_local_web_view(runtime, console, "show-diff")
@@ -4933,6 +5258,11 @@ def _persistent_interactive_loop(
                                 )
                         except Exception as exc:
                             store.append_log(f"swarm snapshot: {exc}")
+                    elif cached_swarm_snapshot:
+                        cached_swarm_snapshot = _empty_swarm_snapshot()
+                        store.update_swarm_summary(cached_swarm_snapshot)
+                        if app.overlay_kind == "swarm":
+                            app.update_swarm(cached_swarm_snapshot)
                     last_swarm_refresh = now
                 if active_work is not None and work_done.is_set():
                     active_work.join()
@@ -5124,6 +5454,61 @@ def _persistent_interactive_loop(
                                 if getattr(runtime, "ultra_session", None) is not None
                                 else parse_command("/resume")
                             )
+                        # Schema/semantic contract failures are internal weak-
+                        # model recovery work, not user decisions. Give them a
+                        # fresh bounded routing cycle in every access mode before
+                        # presenting any recovery surface. Provider/network
+                        # failures and authority questions still retain their
+                        # explicit boundaries.
+                        validation_category = str(
+                            validation_error.get("category") or ""
+                        ).casefold()
+                        automatic_contract_cycle = int(
+                            pending_semantic.get("automatic_contract_repair_cycles") or 0
+                        ) if semantic_recovery else 0
+                        if (
+                            semantic_recovery
+                            and validation_category in {"schema", "semantic"}
+                            and automatic_contract_cycle < _AUTOMATIC_SEMANTIC_REPAIR_CYCLES
+                        ):
+                            automatic_contract_cycle += 1
+                            pending_retry = dict(pending_semantic)
+                            pending_retry.update({
+                                "status": "awaiting_provider",
+                                "schema_attempts": 0,
+                                "semantic_attempts": 0,
+                                "route_schema_attempts": 0,
+                                "route_semantic_attempts": 0,
+                                "automatic_contract_repair_cycles": automatic_contract_cycle,
+                            })
+                            runtime._save_pending_semantic_turn(pending_retry)
+                            repair_message = (
+                                "Weak-model route contract was incomplete · "
+                                f"automatic fresh recovery {automatic_contract_cycle}/"
+                                f"{_AUTOMATIC_SEMANTIC_REPAIR_CYCLES}"
+                            )
+                            store.handle_event(
+                                "activity.step",
+                                repair_message,
+                                {
+                                    "source": "HARNESS",
+                                    "actor": "semantic-router",
+                                    "phase": "routing",
+                                    "state": "active",
+                                    "operation": "Reopening the saved request with a clean structured context",
+                                    "detail": provider_message,
+                                    "waiting_on": "model",
+                                },
+                            )
+                            store.append_log(
+                                "semantic.auto_contract_repair: "
+                                f"cycle={automatic_contract_cycle} category={validation_category}"
+                            )
+                            start(
+                                parse_command("/resume"),
+                                summary=repair_message,
+                            )
+                            continue
                         store.set_activity(ActivityStage.PROBLEM, title, running=False)
                         store.append_transcript(
                             "assistant",
@@ -5588,6 +5973,32 @@ def _persistent_interactive_loop(
                         callable(take_execution_request) and take_execution_request()
                     )
                     approved_goal = runtime.active_goal()
+                    automatic_ultra_replan = bool(
+                        approved_goal is not None
+                        and approved_goal.status is GoalStatus.PAUSED
+                        and bool(approved_goal.metadata.get("auto_retryable"))
+                        and str(approved_goal.metadata.get("resume_action") or "")
+                        == "ultra_replan"
+                    )
+                    if automatic_ultra_replan:
+                        repair_fingerprint = str(
+                            approved_goal.metadata.get("automatic_replan_fingerprint")
+                            or approved_goal.id
+                        )
+                        runtime.store.update_goal_metadata(
+                            approved_goal.id,
+                            auto_retryable=False,
+                            automatic_replan_started_for=repair_fingerprint,
+                        )
+                        store.append_transcript(
+                            "assistant",
+                            "Candidate-code evidence was found. Rebuilding the failed branch automatically from the saved checkpoint.",
+                        )
+                        start(
+                            parse_command("/resume"),
+                            summary="Repairing the failed candidate branch",
+                        )
+                        continue
                     if approved_goal is not None and approved_goal.status is not GoalStatus.RUNNING:
                         # A goal that reached a durable user boundary may be
                         # resumed later by Full Auto.  It must be eligible for
@@ -5683,6 +6094,20 @@ def _persistent_interactive_loop(
                                     summary="Full Auto · retrying the saved provider checkpoint",
                                 )
                                 continue
+                        if (
+                            str(pending_retry.get("status") or "").casefold()
+                            == "needs_evidence"
+                            and runtime.prepare_automatic_semantic_retry()
+                        ):
+                            store.append_transcript(
+                                "assistant",
+                                "Full access is retrying the saved Action with its missing-evidence receipt; completed tool evidence will not be replayed.",
+                            )
+                            start(
+                                parse_command("/resume"),
+                                summary="Full access · retrying missing deliverables",
+                            )
+                            continue
                     waiting_goal = runtime.active_goal()
                     waiting_until = (
                         waiting_goal.metadata.get("retry_not_before")
@@ -5869,13 +6294,45 @@ def _persistent_interactive_loop(
                                 == "cloud"
                                 and provider_recovery.get("error")
                             )
-                            recovery_options = [
-                                AttentionOption(
-                                    "retry", "Retry", "retry", shortcut="r",
-                                    recommended=not cloud_provider_boundary,
-                                    primary=not cloud_provider_boundary,
-                                ),
-                            ]
+                            verification_retry_state = dict(
+                                waiting_goal.metadata.get("verification_retry_state")
+                                or {}
+                            )
+                            verification_retry_exhausted = bool(
+                                verification_retry_state.get("exhausted")
+                            )
+                            inspection_summary, inspection_details = (
+                                _recovery_boundary_inspection(waiting_goal, reason)
+                            )
+                            recovery_options = []
+                            if not verification_retry_exhausted:
+                                recovery_options.append(
+                                    AttentionOption(
+                                        "retry",
+                                        "Retry saved checkpoint",
+                                        "retry",
+                                        shortcut="r",
+                                        recommended=not cloud_provider_boundary,
+                                        primary=not cloud_provider_boundary,
+                                        description=(
+                                            "Rerun unfinished verification only; accepted work is preserved."
+                                        ),
+                                    )
+                                )
+                            else:
+                                recovery_options.append(
+                                    AttentionOption(
+                                        "model",
+                                        "Change model and continue",
+                                        "model",
+                                        shortcut="m",
+                                        recommended=True,
+                                        primary=True,
+                                        description=(
+                                            "Use a materially different model before one fresh bounded attempt."
+                                        ),
+                                    )
+                                )
                             if cloud_provider_boundary:
                                 recovery_options.append(
                                     AttentionOption(
@@ -5889,8 +6346,30 @@ def _persistent_interactive_loop(
                                 )
                             recovery_options.extend(
                                 (
-                                    AttentionOption("inspect", "Inspect", "inspect", shortcut="i"),
-                                    AttentionOption("stop", "Pause safely", "stop", shortcut="s"),
+                                    AttentionOption(
+                                        "inspect",
+                                        "Inspect why it stopped",
+                                        "inspect",
+                                        shortcut="i",
+                                        description=(
+                                            "Read the saved evidence only; this keeps the workflow paused."
+                                        ),
+                                    ),
+                                    AttentionOption(
+                                        "live",
+                                        "Open Live website",
+                                        "live",
+                                        shortcut="w",
+                                    ),
+                                    AttentionOption(
+                                        "stop",
+                                        "Keep paused",
+                                        "stop",
+                                        shortcut="s",
+                                        description=(
+                                            "Leave the checkpoint saved without cancelling the goal."
+                                        ),
+                                    ),
                                 )
                             )
                             store.set_activity(ActivityStage.PAUSED, f"Paused — {reason}", running=False)
@@ -5900,24 +6379,70 @@ def _persistent_interactive_loop(
                                     kind=AttentionKind.RECOVERY,
                                     title="Workflow paused",
                                     message=reason,
+                                    details=inspection_details,
                                     options=tuple(recovery_options),
-                                    default_key="retry",
-                                    cancel_key="inspect",
+                                    default_key=(
+                                        "model"
+                                        if verification_retry_exhausted
+                                        else "retry"
+                                    ),
+                                    cancel_key="stop",
                                 )
                             )
                             if resolution.value == "retry":
-                                start(parse_command("/resume"), summary="Resuming saved checkpoint")
+                                start(runtime.resume, summary="Resuming saved checkpoint")
+                            elif resolution.value == "model":
+                                if handle_model():
+                                    runtime.store.update_goal_metadata(
+                                        waiting_goal.id,
+                                        verification_retry_state={
+                                            **verification_retry_state,
+                                            "attempts": 0,
+                                            "exhausted": False,
+                                            "last_outcome": "model_changed",
+                                            "model": runtime.model_name,
+                                        },
+                                        resume_action="retry_verification",
+                                    )
+                                    start(
+                                        runtime.resume,
+                                        summary="Model changed آ· resuming saved verification",
+                                    )
                             elif resolution.value == "local":
                                 if handle_model(local_only=True, automatic=True):
                                     start(
                                         runtime.resume,
                                         summary="Cloud checkpoint saved · continuing with the strongest local model",
                                     )
+                            elif resolution.value == "inspect":
+                                store.append_transcript(
+                                    "assistant",
+                                    f"Checkpoint inspection: {inspection_summary}",
+                                )
+                                store.set_mode(ExperienceMode.ADVANCED)
+                                store.set_activity(
+                                    ActivityStage.PAUSED,
+                                    "Paused · checkpoint inspected · no worker is running",
+                                    running=False,
+                                )
+                                # Inspect is observational. Keep the durable
+                                # boundary actionable instead of consuming its
+                                # one-shot presentation key and stranding the
+                                # user at an empty paused screen.
+                                shown_boundaries.discard(boundary_key)
+                            elif resolution.value == "live":
+                                _open_local_web_view(runtime, console, "live")
+                                shown_boundaries.discard(boundary_key)
                             elif resolution.value == "stop":
-                                try:
-                                    runtime.cancel("CANCEL")
-                                except Exception as exc:
-                                    store.append_log(f"safe pause: {exc}")
+                                store.set_activity(
+                                    ActivityStage.PAUSED,
+                                    "Paused at the saved checkpoint · use /resume when ready",
+                                    running=False,
+                                )
+                                store.append_transcript(
+                                    "assistant",
+                                    "The checkpoint remains paused. The goal was not cancelled and no work is running.",
+                                )
                             continue
                     session = question_session(runtime)
                     if session is not None and session.current is not None:
@@ -6046,6 +6571,25 @@ def _persistent_interactive_loop(
                         goal is not None
                         and str(goal.status.value) == "completed"
                     )
+                    # Internal browser verification intentionally runs headless
+                    # to avoid a tab storm.  The terminal controller promotes
+                    # the first stable managed preview to one visible browser
+                    # tab, then persists the handoff receipt across restarts.
+                    if goal is not None and not bool(
+                        goal.metadata.get("preview_browser_opened_at")
+                    ) and time.monotonic() - last_preview_probe >= 1.0:
+                        last_preview_probe = time.monotonic()
+                        preview_url = managed_preview_url()
+                        if preview_url:
+                            open_managed_preview(preview_url)
+                            try:
+                                runtime.store.update_goal_metadata(
+                                    goal.id,
+                                    preview_browser_opened_at=time.time(),
+                                    preview_browser_url=preview_url,
+                                )
+                            except StateStoreError:
+                                pass
                     if pending_completion_attention_id and (
                         not goal_completed
                         or goal_id != pending_completion_goal_id
@@ -6081,6 +6625,15 @@ def _persistent_interactive_loop(
 
                     if goal_completed and goal_id not in completed_goals:
                         completed_goals.add(goal_id)
+                        if not bool(goal.metadata.get("completion_browser_handoff_opened_at")):
+                            _open_local_web_view(runtime, console, "live")
+                            try:
+                                runtime.store.update_goal_metadata(
+                                    goal_id,
+                                    completion_browser_handoff_opened_at=time.time(),
+                                )
+                            except StateStoreError:
+                                pass
                         view = runtime.dashboard()
                         completed = sum(task.status in {"done", "skipped"} for task in view.tasks)
                         actual_files = tuple(dict.fromkeys(
@@ -6168,6 +6721,8 @@ def _persistent_interactive_loop(
                         )
                     continue
                 text = item.text.strip()
+                if item.kind == "command" and text:
+                    app.acknowledge_command(text, completed=False)
                 if item.kind == "plan_save" and text:
                     if active_work is None:
                         clear_pending_plan_attention(origin="plan_edit")
@@ -6315,8 +6870,11 @@ def _persistent_interactive_loop(
                             store.append_transcript("user", text)
                             start(parse_command(text), summary="Starting the replacement request")
                         continue
-                store.observe_user_text(text)
-                store.append_transcript("user", text)
+                # Palette commands are written by the UI before they enter
+                # this background queue, giving Enter an immediate receipt.
+                if item.kind != "command":
+                    store.observe_user_text(text)
+                    store.append_transcript("user", text)
                 if active_work is not None:
                     try:
                         active_command = parse_command(text)
@@ -6327,7 +6885,7 @@ def _persistent_interactive_loop(
                         store.append_transcript("assistant", f"I couldn’t understand that: {exc}")
                         continue
                     observer_kinds = {
-                        InternalActionKind.STATUS, CommandKind.PLAN, CommandKind.LIVE,
+                        InternalActionKind.STATUS, CommandKind.PLAN, CommandKind.LIVE, CommandKind.OUTPUT, CommandKind.TODO,
                         CommandKind.ADVANCED_TRACING, InternalActionKind.REVIEW, InternalActionKind.DIFF,
                         CommandKind.SETTINGS,
                         InternalActionKind.CHAT, InternalActionKind.EXPLORER,
@@ -6343,6 +6901,29 @@ def _persistent_interactive_loop(
                     }
                     if active_command.kind is CommandKind.MENU and text == "/":
                         active_command = UserCommand(CommandKind.TEXT, {"text": text}, raw=text)
+                    if active_command.kind is CommandKind.ACCESS:
+                        # Access is a live permission policy, not a workflow
+                        # strategy mutation.  Apply it immediately so `/access
+                        # full` can release the approval card the user is
+                        # currently looking at instead of queueing it behind
+                        # that same blocked worker.
+                        try:
+                            _execute_access(
+                                runtime,
+                                console,
+                                active_command.args.get("level"),
+                            )
+                            store.append_transcript(
+                                "assistant",
+                                f"Access is now {runtime.access_level.upper()} for this session.",
+                            )
+                            app.acknowledge_command(text, completed=True)
+                        except (RuntimeErrorBase, SandboxError, ValueError) as exc:
+                            store.append_transcript(
+                                "assistant",
+                                f"Access could not be changed: {redact_text(exc, 500)}",
+                            )
+                        continue
                     if active_command.kind in {
                         InternalActionKind.MODE,
                         InternalActionKind.MODEL,
@@ -6394,7 +6975,8 @@ def _persistent_interactive_loop(
                             )
                             continue
                         if open_live_observer(active_command):
-                            pass
+                            if item.kind == "command":
+                                app.acknowledge_command(text, completed=True)
                         elif active_command.kind is InternalActionKind.STATUS:
                             current = store.snapshot()
                             progress = current.progress
@@ -6577,6 +7159,8 @@ def _persistent_interactive_loop(
                         )
                         continue
                 if open_live_observer(command):
+                    if item.kind == "command":
+                        app.acknowledge_command(text, completed=True)
                     continue
                 if command.kind is InternalActionKind.MODEL and not command.args.get("model") and not command.args.get("effort"):
                     start(handle_model, summary="Checking available models")
@@ -6743,6 +7327,7 @@ def _legacy_interactive_loop(
     work_errors: list[BaseException] = []
     deferred_picker_question: str | None = None
     deferred_plan_review: str | None = None
+    deferred_access: UserCommand | None = None
     queued_guidance: list[str] = []
 
     def work(command: UserCommand) -> None:
@@ -6772,8 +7357,11 @@ def _legacy_interactive_loop(
         InternalActionKind.TREE,
         CommandKind.PLAN,
         CommandKind.LIVE,
+        CommandKind.OUTPUT,
+        CommandKind.TODO,
         CommandKind.ADVANCED_TRACING,
         CommandKind.SETTINGS,
+        CommandKind.ACCESS,
         InternalActionKind.QUESTIONS,
         InternalActionKind.METRICS,
         InternalActionKind.MEMORY,
@@ -6816,6 +7404,13 @@ def _legacy_interactive_loop(
                     console.write(
                         f"Saved {saved} queued guidance note(s) at the safe checkpoint."
                     )
+            if deferred_access is not None:
+                pending_access = deferred_access
+                deferred_access = None
+                try:
+                    execute_command(runtime, console, pending_access, preferences)
+                except Exception as exc:
+                    console.write(f"Access change could not be applied: {redact_text(exc, 500)}")
         if active_work is None:
             session = question_session(runtime)
             pending_id = (
@@ -6884,6 +7479,17 @@ def _legacy_interactive_loop(
                     console.write("Stopped now. The saved stage is resumable; late output will be ignored.")
                 except Exception as exc:
                     console.write(f"Stop could not be completed: {redact_text(exc, 500)}")
+                continue
+            if active_work is not None and command.kind is CommandKind.ACCESS:
+                try:
+                    execute_command(runtime, console, command, preferences)
+                except RuntimeStateError:
+                    deferred_access = command
+                    runtime.checkpoint_interrupt()
+                    console.write(
+                        "Access change queued; the active worker is stopping at a safe "
+                        "checkpoint, then the selected profile will be applied automatically."
+                    )
                 continue
             if active_work is not None and command.kind not in active_observer_kinds:
                 console.write(
@@ -6977,7 +7583,11 @@ def _descriptor_from_saved_snapshot(snapshot: object) -> ModelDescriptor | None:
         return None
 
 
-def _load_saved_project_setup(workspace: Path) -> dict[str, Any]:
+def _load_saved_project_setup(
+    workspace: Path,
+    *,
+    session_id: str | None = None,
+) -> dict[str, Any]:
     """Read the durable project profile used to make reopening quiet.
 
     Model/access/mode/concurrency live in the existing workflow session state;
@@ -6986,16 +7596,29 @@ def _load_saved_project_setup(workspace: Path) -> dict[str, Any]:
     the runtime and the terminal/Web status surfaces.
     """
 
-    setup: dict[str, Any] = {"state": {}, "session_mode": "normal"}
+    setup: dict[str, Any] = {
+        "state": {},
+        "session_mode": "normal",
+        "selected_session_found": False,
+    }
     state_db = workspace / ".coding-agent" / "state.db"
     if state_db.is_file():
         store: StateStore | None = None
         try:
             store = StateStore(workspace)
             session: Mapping[str, Any] | None = None
-            try:
-                session = store.get_workflow_session("workspace-session")
-            except (StateStoreError, KeyError):
+            if session_id:
+                try:
+                    session = store.get_workflow_session(session_id)
+                    setup["selected_session_found"] = True
+                except (StateStoreError, KeyError):
+                    session = None
+            if session is None:
+                try:
+                    session = store.get_workflow_session("workspace-session")
+                except (StateStoreError, KeyError):
+                    session = None
+            if session is None:
                 sessions = store.list_workflow_sessions(limit=20)
                 session = sessions[0] if sessions else None
             if session is not None:
@@ -7135,12 +7758,16 @@ def _interactive_setup(
 
     workspace: Path | None = None
     descriptor: ModelDescriptor | None = None
-    requested_access: AccessLevel | None = None
+    # Normal is the safe, non-interactive launch default. Full access is a
+    # session opt-in through `/access full` (the CLI flag remains available for
+    # explicit automation/backward compatibility).
+    requested_access: AccessLevel | None = AccessLevel.NORMAL
     # The interactive composer is route-neutral. The semantic gateway selects
     # Chat, Action, or Goal only after seeing the request and model envelope.
     # Explicit --mode remains a compatibility/automation override.
     selected_mode: InteractionMode | None = None
     selected_concurrency: int | None = None
+    selected_session_id: str | None = None
     saved_setup: dict[str, Any] = {}
 
     if args.workspace:
@@ -7152,23 +7779,27 @@ def _interactive_setup(
         raise ValueError("--create-workspace requires --workspace")
 
     def hydrate_saved_setup() -> None:
-        nonlocal descriptor, requested_access, selected_mode, selected_concurrency, saved_setup
+        nonlocal descriptor, selected_mode, selected_concurrency, saved_setup
         if workspace is None:
             return
-        saved_setup = _load_saved_project_setup(workspace)
+        saved_setup = _load_saved_project_setup(
+            workspace,
+            session_id=selected_session_id,
+        )
         saved_state = dict(saved_setup.get("state") or {})
         if descriptor is None:
             descriptor = _descriptor_from_saved_snapshot(saved_state.get("model_snapshot"))
-        if requested_access is None:
-            try:
-                if saved_state.get("access_level") is not None:
-                    requested_access = AccessLevel.parse(str(saved_state["access_level"]))
-            except ValueError:
-                requested_access = None
         # Workflow presentation is a per-session choice. A fresh thread may
         # reuse the project's model, protection, and permission profile, but
         # it must not silently inherit an old Ultra Plan selection.
-        if selected_mode is None and not args.new_session:
+        if (
+            selected_mode is None
+            and not args.new_session
+            and (
+                not selected_session_id
+                or bool(saved_setup.get("selected_session_found"))
+            )
+        ):
             saved_mode = str(
                 saved_state.get("interaction_mode")
                 or saved_setup.get("session_mode")
@@ -7237,8 +7868,6 @@ def _interactive_setup(
             steps.append(("protection", "2. Protect this project"))
         if descriptor is None:
             steps.append(("model", "3. Choose a model"))
-        if requested_access is None:
-            steps.append(("permissions", "4. Set permissions"))
         return steps
 
     steps = build_steps()
@@ -7258,6 +7887,18 @@ def _interactive_setup(
                     step_label=step_label,
                     no_color=not console.color,
                     reduced_motion=console.reduced_motion,
+                )
+                selected_session_id = (
+                    None
+                    if args.new_session
+                    else choose_workspace_session(
+                        workspace,
+                        input_func=console.input_func,
+                        output=console.stream,
+                        rich=rich,
+                        no_color=not console.color,
+                        reduced_motion=console.reduced_motion,
+                    )
                 )
                 hydrate_saved_setup()
                 # The workspace picker is the first decision.  Once it has
@@ -7289,17 +7930,6 @@ def _interactive_setup(
                     no_color=not console.color,
                     reduced_motion=console.reduced_motion,
                 )
-            elif stage == "permissions":
-                requested_access = choose_access_level(
-                    input_func=console.input_func,
-                    output=console.stream,
-                    sandbox=sandbox,
-                    rich=rich,
-                    initial=requested_access or AccessLevel.NORMAL,
-                    step_label=step_label,
-                    no_color=not console.color,
-                    reduced_motion=console.reduced_motion,
-                )
         except UserExitRequested:
             return None
         except PickerBack:
@@ -7326,6 +7956,7 @@ def _interactive_setup(
         SessionPreferences(
             mode=selected_mode or InteractionMode.NORMAL,
             concurrency=selected_concurrency,
+            selected_session_id=selected_session_id,
         ),
     )
 
@@ -7462,12 +8093,6 @@ def main(argv: Iterable[str] | None = None) -> int:
             requested_access = AccessLevel.parse(
                 str(state.get("access_level", AccessLevel.NORMAL.value))
             )
-            if requested_access is AccessLevel.FULL and not sandbox.status().ready:
-                raise RuntimeError(
-                    "Recovery: this session requires its saved Full sandbox, but that sandbox "
-                    "is not ready. Run with --setup-sandbox or choose recovery explicitly; "
-                    "the saved permission profile was not replaced."
-                )
             preferences = SessionPreferences(
                 mode=(
                     InteractionMode.PLAN
@@ -7480,7 +8105,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             console.write(
                 f"Resuming {session_id[:12]} from its saved checkpoint · "
                 f"{descriptor.provider}/{descriptor.model} · "
-                f"{'plan' if preferences.mode is InteractionMode.PLAN else 'working'} · "
+                f"{'ultra-plan' if preferences.mode is InteractionMode.PLAN else 'execution'} · "
                 f"{preferences.concurrency} agent(s)"
             )
         elif args.new_session and not interactive_launch:
@@ -7552,6 +8177,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             if setup is None:
                 return 0
             workspace, descriptor, sandbox, requested_access, preferences = setup
+            if preferences.selected_session_id:
+                session_id = preferences.selected_session_id
         else:
             if args.workspace:
                 workspace_path = Path(args.workspace).expanduser()
@@ -7685,6 +8312,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             permission_adapter=permission_adapter,
             session_id=session_id,
         )
+        # Full autonomy never survives a fresh launch implicitly. The public
+        # contract is Normal by default; only an explicit Full access selection
+        # may arm unattended retries and boundary resolution for this session.
+        full_access_selected = permission_adapter.access_level is AccessLevel.FULL
+        if (
+            runtime.sleep_mode_enabled() != full_access_selected
+            or (full_access_selected and runtime.sleep_mode_policy() != "full")
+        ):
+            runtime.set_sleep_mode(full_access_selected, policy="full")
+        runtime.set_session_tool_permissions(full_access_selected)
         from .web_views import LocalWebServer
 
         runtime.local_web_server = LocalWebServer(runtime).start()
@@ -7785,7 +8422,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 and goal.metadata.get("ultra_run_id")
             ):
                 console.write(
-                    "ULTRA approval accepted; waiting for autonomous execution "
+                    "Execution approval accepted; waiting for autonomous execution "
                     "to reach completion or a real boundary."
                 )
                 runtime.continue_until_boundary()
@@ -7795,7 +8432,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 if preferences.mode == InteractionMode.ULTRA:
                     if runtime.ultra_session is not None and runtime.ultra_session.running:
                         console.write(
-                            "ULTRA convergence is active. Quality-only specialist revisions "
+                            "Execution convergence is active. Quality-only specialist revisions "
                             "will continue inside the approved scope until product acceptance "
                             "or a real external/scope blocker."
                         )

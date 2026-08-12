@@ -53,12 +53,16 @@
     return status === "added" ? "A" : status === "deleted" ? "D" : "M";
   }
 
-  function renderChrome(snapshot) {
+  function renderHeartbeat(snapshot) {
     const badge = $("stateBadge");
     badge.textContent = snapshot.state || "IDLE";
     badge.dataset.state = String(snapshot.state || "idle").toLowerCase();
     $("updatedLabel").textContent = `${snapshot.goal_status || "idle"} · updated ${timeLabel(snapshot.updated_at)}`;
     $("advancedLink").href = `/sessions/${encodeURIComponent(sessionId)}/advanced-tracing#changes`;
+  }
+
+  function renderChrome(snapshot) {
+    renderHeartbeat(snapshot);
     const picker = $("changePicker");
     picker.replaceChildren();
     (snapshot.changes || []).forEach((change) => {
@@ -186,7 +190,7 @@
       });
       if (!initial && signature === state.signature) {
         state.snapshot = snapshot;
-        renderChrome(snapshot);
+        renderHeartbeat(snapshot);
         return;
       }
       state.signature = signature;

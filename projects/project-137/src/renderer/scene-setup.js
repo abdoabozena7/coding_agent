@@ -23,7 +23,14 @@ export function setupScene() {
     // 3. Renderer Setup
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(window.innerWidth, window.innerHeight * 0.8); // Make it slightly smaller than the viewport height to leave room for other UI elements if needed
-    document.getElementById('container').appendChild(renderer.domElement);
+    // Assuming an element with id='container' exists in the main HTML file.
+    const container = document.getElementById('container');
+    if (!container) {
+        console.error("Could not find target DOM element with id 'container'. Renderer initialization failed.");
+        return { scene, renderer, camera }; // Return empty/partial setup if DOM is missing
+    }
+    renderer.domElement.id = "three-d-calculator";
+    container.appendChild(renderer.domElement);
 
     // Handle window resizing
     window.addEventListener('resize', () => {
@@ -47,10 +54,9 @@ export function setupScene() {
     const keyDepth = 0.1; 
     const keySizeX = 1.5;
     const keySizeY = 1.5;
-    // const padding = 0.2; // Not explicitly used for positioning in the final simplified grid approach
 
     // A. Backing surface/housing for the keypad
-    // Dimensions: X=4 * (keySizeX + gap) + width_buffer, Y=3 * (keySizeY + gap) + height_buffer, Z=depth
+    // Simplified dimensions based on structure: 4 wide, 3 high.
     const housingWidth = 4 * keySizeX + 2; 
     const housingHeight = 3 * keySizeY + 1.5; 
     const housingGeometry = new THREE.BoxGeometry(housingWidth, housingHeight, keyDepth);
@@ -58,7 +64,7 @@ export function setupScene() {
     housingMesh.position.set(0, 0, -0.5); // Positioned slightly in front of the origin
     keypadGroup.add(housingMesh);
 
-    // Define Key positions manually for a clear static grid approximation (3 keys wide, 4 rows high)
+    // Define Key positions manually for a clear static grid approximation (3 keys wide, ~4 rows high)
     const keyPositions = [
         { x: -1.5, y: 1.0, z: 0 }, // Top Left (AC/Memory spot area)
         { x: 0, y: 1.0, z: 0 },  // Top Middle
@@ -70,13 +76,15 @@ export function setupScene() {
         
         { x: -1.5, y: -1.0, z: 0 }, // Row 3 Left
         { x: 0, y: -1.0, z: 0 },  // Row 3 Center
-        { x: 1.5, y: -1.0, z: 0 },  // Row 3 Right (Operator area)
+        { x: 1.5, y: -1.0, z: 0 }  // Row 3 Right (Operator area)
     ];
 
     const keyGeometry = new THREE.BoxGeometry(keySizeX * 0.9, keySizeY * 0.9, keyDepth);
 
-    keyPositions.forEach(pos => {
+    keyPositions.forEach((pos, index) => {
+        // Assign unique identifiers/data properties that InteractionManager can read later if needed.
         const keyMesh = new THREE.Mesh(keyGeometry, keyMaterial);
+        keyMesh.userData = { type: "button", id: `btn-${index}` };
         // Center the mesh on the calculated position (adjusting for slightly smaller geometry)
         keyMesh.position.set(pos.x, pos.y + (keySizeY * 0.45), pos.z);
         keypadGroup.add(keyMesh);

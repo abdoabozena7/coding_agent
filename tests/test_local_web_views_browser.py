@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import base64
 import tempfile
 import unittest
 
@@ -99,6 +100,43 @@ class LocalWebViewsBrowserTests(unittest.TestCase):
     def assert_browser_clean(self) -> None:
         self.assertEqual(self.console_errors, [])
         self.assertEqual(self.page_errors, [])
+
+    def test_standalone_output_renders_copy_ready_text_and_images(self):
+        image = self.workspace / "output" / "browser" / "screen.png"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+        self.runtime._publish_output_tool({
+            "title": "Browser task complete",
+            "message": "The browser opened and the requested screenshot was captured.",
+            "copy_sections": [{"id": "copy-1", "label": "Copy ready", "text": "Reusable final text"}],
+            "assets": [{
+                "id": "image-1", "path": "output/browser/screen.png",
+                "label": "Captured page", "kind": "image", "sha256": "a" * 64,
+                "byte_size": image.stat().st_size,
+            }],
+        })
+        page = self.page()
+        page.goto(self.server.url_for("output"), wait_until="networkidle")
+
+        self.assertEqual(page.get_by_role("heading", name="Result", exact=True).count(), 1)
+        self.assertEqual(page.get_by_text("Browser task complete", exact=True).count(), 0)
+        self.assertEqual(page.get_by_text("Reusable final text", exact=True).count(), 1)
+        self.assertEqual(page.get_by_role("button", name="Copy response").count(), 1)
+        self.assertEqual(page.get_by_role("button", name="Copy section").count(), 1)
+        image_locator = page.locator(".asset img")
+        image_locator.scroll_into_view_if_needed()
+        page.wait_for_function(
+            "image => image.complete && image.naturalWidth > 0",
+            arg=image_locator.element_handle(),
+        )
+        self.assertGreater(image_locator.evaluate("image => image.naturalWidth"), 0)
+        page.get_by_role("button", name="Copy section").click()
+        page.get_by_role("button", name="Copied").wait_for(timeout=2_000)
+        self.assertEqual(page.get_by_role("button", name="Copied").count(), 1)
+        page.screenshot(path=self.artifacts / "output-page.png", full_page=True)
+        self.assert_browser_clean()
 
     def start_running_fixture(self) -> tuple[WorkNode, AgentRun]:
         self.runtime.approve_plan(1)
@@ -256,17 +294,17 @@ class LocalWebViewsBrowserTests(unittest.TestCase):
         editor.wait_for()
         editor.fill(editor.input_value() + "\n\n2. Verify the result\nRun the focused browser checks.")
 
-        self.assertEqual(page.get_by_role("button", name="Start Ultra").count(), 0)
-        page.get_by_role("button", name="Update run preview").click()
-        page.get_by_role("heading", name="Run preview").wait_for()
+        self.assertEqual(page.get_by_role("button", name="Start Execution").count(), 0)
+        page.get_by_role("button", name="Update Execution preview").click()
+        page.get_by_role("heading", name="Execution preview").wait_for()
         self.assertEqual(page.locator(".team-member").count(), 2)
         self.assertEqual(self.store.get_latest_plan(self.goal.id).revision, 2)
         self.assertIsNone(self.store.get_goal(self.goal.id).active_plan_revision)
         page.wait_for_timeout(3800)
         page.screenshot(path=self.artifacts / "ultra-plan-team-preview.png", full_page=True)
 
-        page.get_by_role("button", name="Start Ultra").click()
-        page.get_by_role("heading", name="Ultra is running.").wait_for()
+        page.get_by_role("button", name="Start Execution").click()
+        page.get_by_role("heading", name="Execution is running.").wait_for()
         self.assertEqual(self.store.get_goal(self.goal.id).active_plan_revision, 2)
         page.wait_for_timeout(200)
         self.assertTrue(page.evaluate("window.__closeRequested"))
@@ -281,7 +319,7 @@ class LocalWebViewsBrowserTests(unittest.TestCase):
         self.runtime.transition_mode("plan")
         page = self.page()
         page.goto(self.server.url_for("plan"))
-        editor = page.get_by_label("What should Ultra plan?")
+        editor = page.get_by_label("What should Ultra Plan prepare?")
         editor.wait_for()
         draft = "Keep this detailed prompt while live events refresh the page."
         editor.fill(draft)
@@ -292,7 +330,7 @@ class LocalWebViewsBrowserTests(unittest.TestCase):
         self.assertTrue(editor.evaluate("node => document.activeElement === node"))
 
         page.reload()
-        restored = page.get_by_label("What should Ultra plan?")
+        restored = page.get_by_label("What should Ultra Plan prepare?")
         restored.wait_for()
         self.assertEqual(restored.input_value(), draft)
         self.assertLess(restored.bounding_box()["height"], 180)

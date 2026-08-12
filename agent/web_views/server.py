@@ -41,7 +41,7 @@ from .service import CoreWebAdapter
 
 VIEWS = frozenset({
     "plan", "live", "thread", "review", "agents", "execution", "history",
-    "tree", "diff", "show-diff", "advanced-tracing",
+    "tree", "diff", "show-diff", "advanced-tracing", "output",
 })
 
 
@@ -188,16 +188,21 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
             raise HTTPException(status_code=404, detail="view not found")
         standalone_trace = view_name == "advanced-tracing"
         standalone_diff = view_name == "show-diff"
+        standalone_output = view_name == "output"
         public_view = (
             "advanced-tracing"
             if standalone_trace
             else (
                 "show-diff"
                 if standalone_diff
-                else ("plan" if view_name == "plan" else "live")
+                else (
+                    "output"
+                    if standalone_output
+                    else ("plan" if view_name == "plan" else "live")
+                )
             )
         )
-        if not standalone_trace and not standalone_diff:
+        if not standalone_trace and not standalone_diff and not standalone_output:
             adapter.request_view(public_view)
         token = request.query_params.get("token", "")
         if token:
@@ -237,7 +242,13 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
             static_dir / (
                 "advanced-tracing.html"
                 if standalone_trace
-                else ("show-diff.html" if standalone_diff else "index.html")
+                else (
+                    "show-diff.html"
+                    if standalone_diff
+                    else "output.html"
+                    if standalone_output
+                    else "index.html"
+                )
             ),
             media_type="text/html",
         )
@@ -261,6 +272,25 @@ def create_app(adapter: CoreWebAdapter, security: SessionSecurity) -> FastAPI:
     async def get_workspace(session_id: str):
         check_session(session_id)
         return adapter.workspace_context()
+
+    @app.get("/api/sessions/{session_id}/output")
+    async def get_output(session_id: str):
+        check_session(session_id)
+        return adapter.output_snapshot()
+
+    @app.get("/api/sessions/{session_id}/output/assets/{asset_id}")
+    async def get_output_asset(
+        session_id: str,
+        asset_id: str,
+        download: bool = False,
+    ):
+        check_session(session_id)
+        path = adapter.output_asset_path(asset_id)
+        return FileResponse(
+            path,
+            filename=path.name if download else None,
+            content_disposition_type="attachment" if download else "inline",
+        )
 
     @app.get("/api/sessions/{session_id}/thread")
     async def get_thread(
@@ -742,7 +772,7 @@ class LocalWebServer:
         return base + ("?" + urlencode({"token": self.security.token}) if include_token else "")
 
     def open_view(self, view_name: str) -> dict[str, Any]:
-        if view_name not in {"advanced-tracing", "show-diff"}:
+        if view_name not in {"advanced-tracing", "show-diff", "output"}:
             self.adapter.request_view(view_name)
         url = self.url_for(view_name)
         opened = bool(webbrowser.open(url, new=2))

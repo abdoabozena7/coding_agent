@@ -232,6 +232,7 @@ def semantic_turn(
     effects: Iterable[str] = (),
     needs_workspace_tools: bool | None = None,
     interpretation: str = "scripted semantic decision",
+    session_title: str = "Scripted session",
     outcome_kind: str = "",
     goal_intake: Mapping[str, Any] | None = None,
     task_demand: Mapping[str, Any] | None = None,
@@ -249,6 +250,7 @@ def semantic_turn(
     args: dict[str, Any] = {
         "route": str(route),
         "outcome_kind": str(outcome_kind),
+        "session_title": str(session_title),
         "interpretation": interpretation,
         "requested_effects": {
             name: name in effect_values

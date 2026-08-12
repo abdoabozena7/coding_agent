@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -11,12 +12,15 @@ from unittest import mock
 
 from agent.cli import (
     _interactive_setup,
+    _execute_access,
     _latest_recoverable_session_id,
+    _recovery_boundary_inspection,
     build_parser,
     choose_access_level,
     choose_interaction_mode,
     choose_project_protection,
     choose_workspace,
+    choose_workspace_session,
     execute_command,
     interactive_loop,
     main,
@@ -47,6 +51,77 @@ class _TTY(io.StringIO):
 
 
 class CLITests(unittest.TestCase):
+    def setUp(self):
+        self._workspace_registry_temp = tempfile.TemporaryDirectory()
+        registry_file = Path(self._workspace_registry_temp.name) / "workspaces.json"
+        self._workspace_registry_patch = mock.patch(
+            "agent.workspace_registry.registry_path", return_value=registry_file
+        )
+        self._workspace_registry_patch.start()
+
+    def tearDown(self):
+        self._workspace_registry_patch.stop()
+        self._workspace_registry_temp.cleanup()
+
+    def test_saved_sessions_are_selected_by_semantic_title_not_internal_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            with StateStore(workspace) as store:
+                store.save_workflow_session(
+                    "internal-old-id",
+                    goal_id=None,
+                    session_mode="normal",
+                    plan_state="none",
+                    run_state="idle",
+                    state={"session_title": "Fix checkout validation"},
+                )
+                store.save_workflow_session(
+                    "internal-new-id",
+                    goal_id=None,
+                    session_mode="normal",
+                    plan_state="none",
+                    run_state="idle",
+                    state={"session_title": "Capture dashboard screenshots"},
+                )
+            output = io.StringIO()
+            selected = choose_workspace_session(
+                workspace,
+                input_func=lambda _prompt: "1",
+                output=output,
+                rich=False,
+            )
+
+        self.assertEqual(selected, "internal-new-id")
+        rendered = output.getvalue()
+        self.assertIn("Capture dashboard screenshots", rendered)
+        self.assertNotIn("internal-new-id", rendered)
+
+    def test_recovery_inspection_explains_idle_harness_boundary(self):
+        goal = SimpleNamespace(
+            metadata={
+                "waiting_on": "verification",
+                "resume_action": "retry_verification",
+                "verification_blocker": {
+                    "blocker_owner": "test_harness",
+                    "failure_kind": "contract",
+                    "failure_fingerprint": "a" * 64,
+                    "mutation_prohibited": True,
+                    "occurrences": 1,
+                },
+            }
+        )
+
+        summary, details = _recovery_boundary_inspection(
+            goal,
+            "The saved verification boundary needs attention.",
+        )
+
+        self.assertIn("verification-system failure", summary)
+        self.assertIn("No agent is working", summary)
+        self.assertIn("accepted files were preserved", summary)
+        self.assertIn('"blocker_owner": "test_harness"', details)
+        self.assertIn('"resume_action": "retry_verification"', details)
+
     def test_explicit_resume_prefers_goal_owning_session_over_newer_empty_default(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -186,7 +261,7 @@ class CLITests(unittest.TestCase):
                         "execution_class": "local",
                         "capabilities": ["tools", "structured_output"],
                     },
-                    "access_level": "normal",
+                    "access_level": "full",
                     "concurrency": 1,
                     "interaction_mode": "working",
                 },
@@ -495,6 +570,140 @@ class CLITests(unittest.TestCase):
         self.assertEqual(captured["cancel"], "cancel")
         self.assertTrue(web_opened.is_set())
         open_view.assert_called_once_with(runtime, console, "plan")
+
+    def test_paused_boundary_inspect_keeps_actions_and_retry_resumes_typed_runtime(self):
+        import time
+
+        from agent.cli import _persistent_interactive_loop
+
+        resumed = Event()
+        captured = {}
+
+        class FakeApp:
+            def __init__(self, store, *, on_exit, **_kwargs):
+                self.store = store
+                self.on_exit = on_exit
+                self.overlay_kind = ""
+
+            def run(self):
+                first_request = ""
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    request = self.store.active_attention()
+                    if request is None:
+                        time.sleep(0.01)
+                        continue
+                    if not first_request:
+                        first_request = request.id
+                        captured["first_options"] = {
+                            option.value for option in request.options
+                        }
+                        self.store.resolve_attention("inspect")
+                    elif request.id != first_request:
+                        captured["second_options"] = {
+                            option.value for option in request.options
+                        }
+                        captured["details"] = request.details
+                        captured["mode"] = self.store.snapshot().mode.value
+                        self.store.resolve_attention("retry")
+                        break
+                    time.sleep(0.01)
+                resumed.wait(3)
+                exit_deadline = time.monotonic() + 2
+                while time.monotonic() < exit_deadline:
+                    if self.on_exit():
+                        return
+                    time.sleep(0.02)
+
+            def stop(self):
+                return None
+
+            def close_overlay(self):
+                return None
+
+            def restore_composer(self, *_args, **_kwargs):
+                return None
+
+            def open_details(self, *_args, **_kwargs):
+                return None
+
+            def open_swarm(self, *_args, **_kwargs):
+                return None
+
+            def update_swarm(self, *_args, **_kwargs):
+                return None
+
+        goal = SimpleNamespace(
+            id="goal-verification-pause",
+            objective="Verify the calculator",
+            status=GoalStatus.PAUSED,
+            active_plan_revision=2,
+            updated_at=SimpleNamespace(isoformat=lambda: "2026-08-11T09:19:05Z"),
+            metadata={
+                "waiting_question": "The verification harness needs a saved retry.",
+                "waiting_on": "verification",
+                "resume_action": "retry_verification",
+                "verification_blocker": {
+                    "blocker_owner": "test_harness",
+                    "failure_kind": "contract",
+                    "failure_fingerprint": "a" * 64,
+                    "mutation_prohibited": True,
+                },
+                "pending_tool_approval": {},
+            },
+        )
+        runtime = mock.Mock()
+        runtime.workspace = Path("workspace")
+        runtime.session_id = "verification-session"
+        runtime.model_name = "gemma4:e4b"
+        runtime.reasoning_effort = "off"
+        runtime.execution_class = "local"
+        runtime.interaction_mode = SimpleNamespace(value="working")
+        runtime.active_goal.return_value = goal
+        runtime.dashboard.return_value = SimpleNamespace(
+            status="paused",
+            tasks=(),
+            objective=goal.objective,
+            goal_id=goal.id,
+            plan_revision=2,
+        )
+        runtime.sleep_mode_enabled.return_value = False
+        runtime.sleep_mode_policy.return_value = "off"
+        runtime.store.list_timeline_entries.return_value = []
+        runtime.store.count_queued_prompts.return_value = 0
+        runtime.store.list_queued_prompts.return_value = []
+        runtime.store.claim_next_prompt.return_value = None
+        runtime.store.get_workflow_session.return_value = {"state": {}}
+        runtime.store.get_accepted_plan.return_value = None
+        runtime.local_web_server.take_execution_request.return_value = False
+        runtime.version_control.diff.return_value = ""
+        runtime.resume.side_effect = lambda: resumed.set()
+        console = mock.Mock()
+        console.stream = io.StringIO()
+        console.color = False
+
+        with mock.patch("agent.cli.PersistentWorkspaceApp", FakeApp), mock.patch(
+            "agent.cli.TelemetrySampler"
+        ) as telemetry, mock.patch(
+            "agent.cli.question_session", return_value=None
+        ), mock.patch(
+            "agent.cli._current_ultra_run", return_value=None
+        ), mock.patch(
+            "agent.cli._show_runtime_state"
+        ):
+            telemetry.return_value.start.return_value = None
+            telemetry.return_value.stop.return_value = None
+            _persistent_interactive_loop(runtime, console, SessionPreferences())
+
+        self.assertEqual(
+            captured["first_options"],
+            {"retry", "inspect", "live", "stop"},
+        )
+        self.assertEqual(captured["second_options"], captured["first_options"])
+        self.assertEqual(captured["mode"], "advanced")
+        self.assertIn('"blocker_owner": "test_harness"', captured["details"])
+        runtime.resume.assert_called_once_with()
+        runtime.cancel.assert_not_called()
 
     def test_completed_goal_presents_handoff_and_opens_project_folder(self):
         import time
@@ -1425,7 +1634,7 @@ class CLITests(unittest.TestCase):
             )
         )
         self.assertTrue(console.sleep_enabled)
-        self.assertIn("deeper Ultra Sleep was not armed", output.getvalue())
+        self.assertIn("deeper recursive automation was not armed", output.getvalue())
 
     def test_plain_project_protection_defaults_to_local_git_when_gh_is_missing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1442,10 +1651,34 @@ class CLITests(unittest.TestCase):
             self.assertTrue(status.dedicated_repository)
             self.assertFalse(status.github_connected)
             self.assertIn("Recommended", output.getvalue())
+            self.assertIn("Continue without GitHub", output.getvalue())
+            self.assertNotIn("Refresh connection", output.getvalue())
+            self.assertNotIn("Continue without Git history", output.getvalue())
             self.assertTrue((Path(directory) / ".git").is_dir())
 
-    def test_plain_access_picker_cannot_select_full_when_docker_is_not_ready(self):
-        answers = iter(("2", "1"))
+    def test_connected_github_project_is_accepted_without_another_picker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = GitProtectionManager(directory)
+            manager.ensure_local_history()
+            subprocess.run(
+                ["git", "remote", "add", "origin", "https://github.com/example/project.git"],
+                cwd=directory,
+                check=True,
+                capture_output=True,
+            )
+
+            status = choose_project_protection(
+                directory,
+                rich=False,
+                input_func=lambda _prompt: self.fail("connected repositories must not ask again"),
+                output=io.StringIO(),
+            )
+
+            self.assertTrue(status.github_connected)
+            self.assertTrue(manager.load_config().auto_push)
+
+    def test_plain_access_picker_selects_full_without_docker(self):
+        answers = iter(("2",))
         output = io.StringIO()
         sandbox = SimpleNamespace(
             status=lambda: SimpleNamespace(ready=False, reason="Docker is not ready.")
@@ -1458,8 +1691,8 @@ class CLITests(unittest.TestCase):
             sandbox=sandbox,
         )
 
-        self.assertEqual(selected.value, "normal")
-        self.assertIn("Full access is unavailable", output.getvalue())
+        self.assertEqual(selected.value, "full")
+        self.assertNotIn("Full access is unavailable", output.getvalue())
 
     def test_mode_picker_exposes_only_ultra_and_ultra_plan(self):
         answers = iter(("2",))
@@ -1503,10 +1736,13 @@ class CLITests(unittest.TestCase):
         self.assertEqual(parse_command("/").kind, CommandKind.MENU)
         self.assertEqual(parse_command("/   ").kind, CommandKind.MENU)
         expected = {
-            "/plan": CommandKind.PLAN,
+            "/ultra-plan": CommandKind.PLAN,
             "/live": CommandKind.LIVE,
+            "/output": CommandKind.OUTPUT,
+            "/todo": CommandKind.TODO,
             "/show-diff": CommandKind.SHOW_DIFF,
             "/advanced-tracing": CommandKind.ADVANCED_TRACING,
+            "/access": CommandKind.ACCESS,
             "/settings": CommandKind.SETTINGS,
             "/pause": CommandKind.PAUSE,
             "/resume": CommandKind.RESUME,
@@ -1520,6 +1756,8 @@ class CLITests(unittest.TestCase):
         )
         self.assertEqual(parse_command("/undo").args, {"steps": 1})
         self.assertEqual(parse_command("/undo 3").args, {"steps": 3})
+        self.assertEqual(parse_command("/access full").args, {"level": "full"})
+        self.assertEqual(parse_command("/access normal").args, {"level": "normal"})
         for removed in (
             "/thinking", "/doctor", "/skills", "/processes", "/diff",
             "/model gemma4:e4b", "/mode ultra", "/approve 1", "/continue",
@@ -1527,7 +1765,7 @@ class CLITests(unittest.TestCase):
             with self.subTest(command=removed):
                 with self.assertRaisesRegex(UnknownCommandParseError, "/help"):
                     parse_command(removed)
-        for malformed_public in ("/settings color off", "/plan edit"):
+        for malformed_public in ("/settings color off", "/ultra-plan edit", "/access unsafe"):
             with self.assertRaises(CommandParseError):
                 parse_command(malformed_public)
 
@@ -1550,7 +1788,7 @@ class CLITests(unittest.TestCase):
             self.assertEqual(code, 0)
             rendered = output.getvalue()
             self.assertIn("Session settings", rendered)
-            self.assertIn("mode       = automatic", rendered)
+            self.assertIn("mode       = execution", rendered)
             self.assertNotIn("API_KEY", rendered)
 
     def test_startup_mode_is_persisted_before_the_first_intake(self):
@@ -1753,6 +1991,83 @@ class CLITests(unittest.TestCase):
         with self.assertRaises(UnknownCommandParseError):
             parse_command("/doctor --record")
 
+    def test_access_full_combines_permissions_with_unattended_continuation(self):
+        from agent.runtime import AgentRuntime
+        from agent.sandbox import AccessLevel, PermissionAdapter
+
+        class ReadySandbox:
+            def status(self):
+                return SimpleNamespace(ready=True, reason="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(directory)
+            runtime = AgentRuntime(
+                ScriptedProvider([]),
+                store,
+                directory,
+                permission_adapter=PermissionAdapter(AccessLevel.NORMAL, ReadySandbox()),
+            )
+            output = io.StringIO()
+            console = ConsoleUI(stream=output, color=False)
+            try:
+                _execute_access(runtime, console, "full")
+                self.assertEqual(runtime.access_level, "full")
+                self.assertEqual(runtime.sleep_mode_policy(), "full")
+                self.assertIn("unattended continuation is on", output.getvalue())
+
+                _execute_access(runtime, console, "normal")
+                self.assertEqual(runtime.access_level, "normal")
+                self.assertEqual(runtime.sleep_mode_policy(), "off")
+            finally:
+                runtime.close()
+                store.close()
+
+    def test_access_full_needs_no_docker_and_releases_visible_approval(self):
+        from agent.runtime import AgentRuntime
+        from agent.sandbox import AccessLevel, PermissionAdapter
+        from agent.ui_state import AttentionKind, AttentionOption, AttentionRequest
+
+        class UnreadySandbox:
+            def status(self):
+                raise AssertionError("Full access policy must not depend on Docker readiness")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = StateStore(directory)
+            runtime = AgentRuntime(
+                ScriptedProvider([]),
+                state,
+                directory,
+                permission_adapter=PermissionAdapter(AccessLevel.NORMAL, UnreadySandbox()),
+            )
+            output = io.StringIO()
+            console = ConsoleUI(stream=output, color=False)
+            workspace_ui = WorkspaceUIStore()
+            console.bind_workspace_store(workspace_ui)
+            request = AttentionRequest(
+                id="approval:live-access",
+                kind=AttentionKind.APPROVAL,
+                title="Allow start process?",
+                message="Start the selected project preview.",
+                options=(
+                    AttentionOption("allow_once", "Allow once", "allow_once"),
+                    AttentionOption("allow_session", "Always allow this session", "allow_session"),
+                    AttentionOption("deny", "Deny", "deny"),
+                ),
+                default_key="deny",
+            )
+            event = workspace_ui.present_attention(request)
+            try:
+                _execute_access(runtime, console, "full")
+                self.assertTrue(event.wait(1))
+                resolution = workspace_ui.take_attention_result(request.id)
+                self.assertIsNotNone(resolution)
+                self.assertEqual(resolution.value, "allow_session")
+                self.assertEqual(runtime.access_level, "full")
+                self.assertEqual(runtime._approval_session_groups(), {"*"})
+            finally:
+                runtime.close()
+                state.close()
+
     def test_settings_mutate_and_query_runtime_config_for_this_session(self):
         output = io.StringIO()
         console = ConsoleUI(stream=output, color=False)
@@ -1902,6 +2217,74 @@ class CLITests(unittest.TestCase):
             self.assertEqual(selected.name, "project-002")
             self.assertTrue(selected.is_dir())
 
+    def test_workspace_launcher_opens_recent_projects_as_a_second_keyboard_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            older = root / "project-001"
+            recent = root / "project-002"
+            older.mkdir()
+            (recent / ".coding-agent").mkdir(parents=True)
+            (recent / ".coding-agent" / "state.db").write_bytes(b"used")
+            captured = []
+
+            def select(items, **kwargs):
+                screen = {"items": tuple(items), **kwargs}
+                captured.append(screen)
+                if kwargs["title"] == "How do you want to open a workspace?":
+                    return next(item for item in screen["items"] if item.value == "__recent__")
+                return screen["items"][0]
+
+            with (
+                mock.patch("agent.cli.list_recent_workspaces", return_value=()),
+                mock.patch("agent.cli.select_choice", side_effect=select),
+                mock.patch("agent.cli.record_workspace") as remember,
+            ):
+                selected = choose_workspace(root, rich=True)
+
+            self.assertEqual(selected, recent)
+            self.assertEqual(
+                [item.value for item in captured[0]["items"]],
+                ["__create__", "__picker__", "__recent__"],
+            )
+            self.assertEqual(
+                captured[0]["shortcuts"],
+                {"1": "__create__", "2": "__picker__", "3": "__recent__"},
+            )
+            self.assertEqual(captured[1]["title"], "Recent projects")
+            self.assertEqual(captured[1]["items"][0].label, "project-002")
+            self.assertEqual(captured[1]["items"][0].meta, "Last opened")
+            remember.assert_called_once_with(recent)
+
+    def test_workspace_launcher_opens_system_folder_picker_from_last_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "projects"
+            root.mkdir()
+            last = root / "project-001"
+            chosen = Path(directory) / "existing-app"
+            last.mkdir()
+            chosen.mkdir()
+
+            def select(items, **_kwargs):
+                return next(item for item in items if item.value == "__picker__")
+
+            recent = ({
+                "path": str(last),
+                "name": last.name,
+                "last_opened": 10,
+                "available": True,
+            },)
+            with (
+                mock.patch("agent.cli.list_recent_workspaces", return_value=recent),
+                mock.patch("agent.cli.select_choice", side_effect=select),
+                mock.patch("agent.cli._choose_existing_folder", return_value=chosen) as picker,
+                mock.patch("agent.cli.record_workspace") as remember,
+            ):
+                selected = choose_workspace(root, rich=True)
+
+            self.assertEqual(selected, chosen)
+            picker.assert_called_once_with(last)
+            remember.assert_called_once_with(chosen)
+
     def test_unprefixed_exit_is_ordinary_composer_text(self):
         self.assertEqual(parse_command("exit").kind, CommandKind.TEXT)
         self.assertEqual(parse_command("quit").kind, CommandKind.TEXT)
@@ -1983,7 +2366,7 @@ class CLITests(unittest.TestCase):
                 "high",
             )
         )
-        self.assertIn("Sleep auto-approved", output.getvalue())
+        self.assertIn("Full access auto-approved", output.getvalue())
 
         console.input_func = lambda _prompt: (_ for _ in ()).throw(EOFError())
         with self.assertRaisesRegex(RuntimeError, "approval interface is unavailable"):
@@ -2073,8 +2456,9 @@ class CLITests(unittest.TestCase):
         self.assertIn("npm install package-x", request.message)
         self.assertIn("allow_session", [item.key for item in request.options])
         session_option = next(item for item in request.options if item.key == "allow_session")
-        self.assertEqual(session_option.label, "Always allow this session")
-        self.assertIn("until this session ends", session_option.description)
+        self.assertEqual(session_option.label, "Always allow dangerous command")
+        self.assertIn("only in the dangerous command group", session_option.description)
+        self.assertIn("/access full", session_option.description)
         primary = [item.key for item in request.options if item.primary]
         self.assertEqual(primary, ["deny"])
         store.resolve_selected_attention()

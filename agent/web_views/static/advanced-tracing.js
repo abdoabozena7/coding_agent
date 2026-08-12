@@ -180,7 +180,9 @@
     badge.dataset.state = String(overview.state || "empty").toLowerCase();
     $("runLabel").textContent = overview.goal_id
       ? `${overview.provider || "provider"}/${overview.model || "model"} · ${overview.status || "recorded"} · ${String(overview.goal_id).slice(-8)}`
-      : "No durable goal is available yet";
+      : overview.state === "LIVE"
+        ? `${overview.provider || "provider"}/${overview.model || "model"} · bounded workspace activity`
+        : "No durable activity is available yet";
     const counts = overview.counts || {};
     $("countOverview").textContent = "1";
     $("countTimeline").textContent = counts.events ?? 0;
@@ -292,8 +294,18 @@
       type: "scheduled", data: item, title: `${item.name || item.role || "agent"} · ${item.phase || "scheduled"}`, detail: item.packet_preview || "Waiting for its durable turn.",
       kind: `queue ${item.sequence || "—"}`, chips: [item.status], id: item.id,
     }));
+    const workerImpact = filtered(data.worker_contributions || [], (item) => `${item.role} ${item.outcome} ${item.reason} ${item.task_class}`).map((item) => traceRow({
+      type: "worker-impact", data: item, title: `${item.role} · ${item.outcome}`, detail: `${item.reason || "No verified contribution reason."} · Δ ${Number(item.score_delta || 0).toFixed(3)}`,
+      time: shortTime(item.created_at), chips: [`${item.total_tokens || 0} tokens`, `${item.latency_ms || 0} ms`, `novelty ${Number(item.evidence_novelty || 0).toFixed(2)}`], id: item.id,
+    }));
+    const experiments = filtered(data.orchestration_experiments || [], (item) => `${item.arm} ${item.task_class} ${item.metrics?.risk_tier || ""}`).map((item) => traceRow({
+      type: "orchestration-experiment", data: item, title: `${item.arm} · ${item.task_class}`, detail: `${item.causal ? "matched causal benchmark" : "observational only"} · score ${Number(item.candidate_score || 0).toFixed(3)} · ${item.model_calls || 0} calls`,
+      time: shortTime(item.created_at), chips: [item.success ? "success" : "not passed", item.false_completion ? "false completion" : "evidence gated"], id: item.id,
+    }));
     content.replaceChildren(
       sectionBlock("Model evidence", listOrEmpty(models, "No model calls are recorded for this run.")),
+      sectionBlock("Worker impact", listOrEmpty(workerImpact, "No verified worker contributions are recorded.")),
+      sectionBlock("Orchestration experiments", listOrEmpty(experiments, "No orchestration experiments are recorded.")),
       sectionBlock("Recursive nodes", listOrEmpty(nodes, "No recursive work nodes are recorded.")),
       sectionBlock("Agent calls", listOrEmpty(agents, "No agent calls are recorded.")),
       sectionBlock("Scheduled and waiting", listOrEmpty(scheduled, "No scheduled agents are waiting.")),

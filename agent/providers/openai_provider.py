@@ -44,6 +44,7 @@ class OpenAIProvider:
         thinking=False,
         tool_call_ids=True,
         native_replay=False,
+        vision=True,
     )
 
     def __init__(self, model: str | None = None, reasoning_effort: str = "medium"):
@@ -67,9 +68,26 @@ class OpenAIProvider:
                 continue
             role = message.get("role")
             if role == "user":
-                messages.append(
-                    {"role": "user", "content": str(message.get("content") or "")}
-                )
+                images = message.get("images") or ()
+                if images:
+                    content: list[dict[str, Any]] = [
+                        {"type": "text", "text": str(message.get("content") or "")}
+                    ]
+                    for image in images:
+                        if not isinstance(image, Mapping):
+                            continue
+                        mime_type = str(image.get("mime_type") or "image/png")
+                        data = str(image.get("data") or "")
+                        if data:
+                            content.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime_type};base64,{data}"},
+                            })
+                    messages.append({"role": "user", "content": content})
+                else:
+                    messages.append(
+                        {"role": "user", "content": str(message.get("content") or "")}
+                    )
             elif role == "assistant":
                 out: dict[str, Any] = {
                     "role": "assistant",

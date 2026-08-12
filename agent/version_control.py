@@ -331,11 +331,11 @@ class GitProtectionManager:
         status = self.inspect()
         if not status.gh_available:
             raise VersionControlError(
-                "GitHub CLI is unavailable. Install `gh`, run `gh auth login`, then choose Refresh."
+                "GitHub CLI is unavailable. Install `gh`, run `gh auth login`, then reopen project protection."
             )
         if not status.gh_authenticated:
             raise VersionControlError(
-                "GitHub CLI is not authenticated. Run `gh auth login`, then choose Refresh."
+                "GitHub CLI is not authenticated. Run `gh auth login`, then reopen project protection."
             )
         if not status.dedicated_repository:
             status = self.ensure_local_history()
@@ -345,7 +345,7 @@ class GitProtectionManager:
         if status.remote_url:
             raise VersionControlError(
                 "This project already has a non-GitHub `origin`. Connect GitHub manually "
-                "with a different remote name, then choose Refresh."
+                "with a different remote name, then reopen project protection."
             )
         name = self._repo_slug(repository_name or self.workspace.name)
         self._run(

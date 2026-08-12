@@ -32,6 +32,40 @@ from agent.workflow import SessionMode
 
 
 class QualityConvergenceTests(unittest.TestCase):
+    def test_repository_warmup_prunes_dependencies_and_generated_builds_before_descent(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root)
+            (workspace / "src").mkdir()
+            (workspace / "src" / "app.jsx").write_text(
+                "export function App(){ return <main>Ready</main>; }",
+                encoding="utf-8",
+            )
+            (workspace / "node_modules" / "pkg").mkdir(parents=True)
+            (workspace / "node_modules" / "pkg" / "index.js").write_text(
+                "throw new Error('dependency must not be indexed')",
+                encoding="utf-8",
+            )
+            (workspace / "dist" / "assets").mkdir(parents=True)
+            (workspace / "dist" / "assets" / "bundle.js").write_text(
+                "const generated = true;" * 10_000,
+                encoding="utf-8",
+            )
+
+            progress = []
+            index = RepositoryIndex(workspace, embedding_provider=HashingEmbeddingProvider())
+            index.update_all(
+                max_files=200,
+                on_progress=lambda message, data: progress.append((message, dict(data))),
+            )
+
+            self.assertIn("src/app.jsx", index.entries)
+            self.assertFalse(any("node_modules" in path for path in index.entries))
+            self.assertFalse(any(path.startswith("dist/") for path in index.entries))
+            self.assertEqual(progress[0][0], "Scanning project files")
+            self.assertTrue(any("Indexing" in message for message, _data in progress))
+            self.assertTrue(progress[-1][0].startswith("Repository index ready"))
+            self.assertEqual(progress[-1][1]["state"], "completed")
+
     def test_fresh_evaluation_meets_explicit_target(self):
         dimension = QualityDimensionV1("functional", "works", minimum_score=.8)
         target = QualityTargetV1("build", ("index.html",), QualityRubricV1((dimension,)), hard_gates=("tests",))
@@ -251,6 +285,45 @@ def login(user_id):
             self.assertEqual(index.last_update_stats["seen"], 1)
             self.assertEqual(index.last_update_stats["removed"], 0)
             self.assertEqual(set(index.entries), {"a.py", "b.py", "c.py"})
+
+    def test_repository_partial_scan_always_prunes_stale_ignored_cache_paths(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root)
+            Path(workspace, "src").mkdir()
+            Path(workspace, "src", "app.py").write_text(
+                "def app():\n    return 'ready'\n", encoding="utf-8"
+            )
+            Path(workspace, "dist", "assets").mkdir(parents=True)
+            Path(workspace, "dist", "assets", "bundle.js").write_text(
+                "const bundled = true;", encoding="utf-8"
+            )
+            index = RepositoryIndex(workspace, embedding_provider=HashingEmbeddingProvider())
+            analysis = index._analyze_file("dist/assets/bundle.js")
+            index._commit_analysis(*analysis)
+            self.assertIn("dist/assets/bundle.js", index.entries)
+
+            index.update_all(max_files=1)
+
+            self.assertNotIn("dist/assets/bundle.js", index.entries)
+            self.assertEqual(index.last_update_stats["removed"], 1)
+
+    def test_fast_context_slice_does_not_score_the_repository_graph(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root)
+            Path(workspace, "app.py").write_text(
+                "def run_app():\n    return 'ready'\n", encoding="utf-8"
+            )
+            index = RepositoryIndex(workspace, embedding_provider=HashingEmbeddingProvider())
+            index.update_all()
+
+            with patch.object(index, "search_graph", side_effect=AssertionError("graph search ran")):
+                context = index.context_slice(
+                    "run app",
+                    max_entries=4,
+                    include_graph_neighborhood=False,
+                )
+
+            self.assertTrue(context.entries)
 
     def test_repository_index_persistent_cache_reuses_across_instances(self):
         class CountingEmbeddingProvider:

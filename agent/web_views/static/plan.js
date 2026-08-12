@@ -28,7 +28,7 @@ function planRequirementCoverage(plan) {
 
 function planRequestComposer() {
   return `<form class="plan-composer" id="requestComposer">
-    <label class="sr-only" for="planRequest">What should Ultra plan?</label>
+    <label class="sr-only" for="planRequest">What should Ultra Plan prepare?</label>
     <textarea id="planRequest" rows="1" placeholder="Describe what you want to build…">${escapeHtml(state.requestDraft)}</textarea>
     <div class="composer-footer"><span>Draft saved here · Ctrl + Enter to send</span><button id="submitPlanRequest" class="primary-button" type="submit">Send to LLM</button></div>
   </form>`;
@@ -60,7 +60,7 @@ function planQuestionMarkup(question) {
     <textarea id="freeAnswer" rows="1" placeholder="Write a precise answer…">${escapeHtml(state.questionDraft)}</textarea>
     <div class="composer-footer"><span>Draft saved here · Ctrl + Enter to send</span><button class="primary-button" type="submit">Send answer</button></div>
   </form>`;
-  return `<article class="chat-message assistant-message question-stage"><span class="message-role">Ultra · one question</span><h2>${escapeHtml(question.question)}</h2><p>I will keep every earlier detail and continue the plan after this answer.</p>${choices ? `<div class="choices">${choices}</div>` : ""}</article>${composer}`;
+  return `<article class="chat-message assistant-message question-stage"><span class="message-role">Ultra Plan · one question</span><h2>${escapeHtml(question.question)}</h2><p>I will keep every earlier detail and continue the plan after this answer.</p>${choices ? `<div class="choices">${choices}</div>` : ""}</article>${composer}`;
 }
 
 function bindPlanQuestion(question) {
@@ -85,9 +85,9 @@ function bindPlanQuestion(question) {
 
 function planTeamMarkup(preview) {
   return `<article id="teamStage" class="chat-message assistant-message team-stage">
-    <div class="message-heading"><div><span class="message-role">Ultra · first layer</span><h2>Run preview</h2></div><p>${preview.agents.length} dependency-aware agent${preview.agents.length === 1 ? "" : "s"}. The recursive harness grows child nodes only when the work needs real boundaries.</p></div>
+    <div class="message-heading"><div><span class="message-role">Ultra Plan · first layer</span><h2>Execution preview</h2></div><p>${preview.agents.length} dependency-aware agent${preview.agents.length === 1 ? "" : "s"}. The recursive harness grows child nodes only when the work needs real boundaries.</p></div>
     <div class="team-list">${preview.agents.map((agent, index) => `<article class="team-member"><header><h3>${escapeHtml(agent.name)}</h3><span class="agent-index">A${String(index + 1).padStart(2, "0")}</span></header><p>${escapeHtml(agent.mission)}</p><small>${escapeHtml(agent.role)}${agent.depends_on?.length ? ` · after ${escapeHtml(agent.depends_on.join(", "))}` : " · ready first"}</small></article>`).join("")}</div>
-    <div class="document-actions"><span class="handoff-note"><i></i>The terminal will receive this exact plan and first layer.</span><button id="approveStart" class="primary-button" type="button">Start Ultra</button></div>
+    <div class="document-actions"><span class="handoff-note"><i></i>The terminal will receive this exact plan and first layer.</span><button id="approveStart" class="primary-button" type="button">Start Execution</button></div>
   </article>`;
 }
 
@@ -110,14 +110,14 @@ renderPlan = function renderPlanConversation() {
   }
 
   if (plan.state === "new_request") {
-    root.innerHTML = `<section class="plan-chat empty-chat"><div class="plan-thread"><div class="chat-welcome"><span class="eyebrow">ULTRA PLAN</span><h1>What should we plan?</h1><p>Send a short request or a complete brief. Every detail stays attached while Ultra inspects the workspace and writes the full plan.</p><small>No code runs until you review the plan and start Ultra.</small></div></div>${planRequestComposer()}</section>`;
+    root.innerHTML = `<section class="plan-chat empty-chat"><div class="plan-thread"><div class="chat-welcome"><span class="eyebrow">ULTRA PLAN</span><h1>What should we plan?</h1><p>Send a short request or a complete brief. Every detail stays attached while Ultra Plan inspects the workspace and writes the full plan.</p><small>No code runs until you review the plan and start Execution.</small></div></div>${planRequestComposer()}</section>`;
     bindRequestComposer();
     return;
   }
 
   if (plan.state === "preparing_plan" || !plan.revision) {
     const stopped = ["paused", "blocked", "cancelled"].includes(String(plan.goal_status));
-    root.innerHTML = `<section class="plan-chat"><div class="plan-thread">${planUserMessage(plan)}<article class="chat-message assistant-message planning-message"><span class="message-role">Ultra</span><div class="planning-copy"><div><h2>${escapeHtml(stopped ? "The saved plan needs attention." : "Writing the complete plan…")}</h2><p>${escapeHtml(plan.runtime?.active_operation || plan.summary || "Inspecting the workspace, preserving every request detail, and defining verifiable work.")}</p></div><span class="status-badge ${stopped ? "blocked" : "running"}">${stopped ? "Waiting" : "Planning"}</span></div><div class="planning-lines" aria-hidden="true"><span></span><span></span><span></span></div></article></div></section>`;
+    root.innerHTML = `<section class="plan-chat"><div class="plan-thread">${planUserMessage(plan)}<article class="chat-message assistant-message planning-message"><span class="message-role">Ultra Plan</span><div class="planning-copy"><div><h2>${escapeHtml(stopped ? "The saved plan needs attention." : "Writing the complete plan…")}</h2><p>${escapeHtml(plan.runtime?.active_operation || plan.summary || "Inspecting the workspace, preserving every request detail, and defining verifiable work.")}</p></div><span class="status-badge ${stopped ? "blocked" : "running"}">${stopped ? "Waiting" : "Planning"}</span></div><div class="planning-lines" aria-hidden="true"><span></span><span></span><span></span></div></article></div></section>`;
     return;
   }
 
@@ -130,11 +130,11 @@ renderPlan = function renderPlanConversation() {
   const preview = plan.team_preview;
   root.innerHTML = `<section class="plan-chat"><div class="plan-thread">${planUserMessage(plan)}
     <article class="chat-message assistant-message document-stage">
-      <div class="message-heading"><div><span class="message-role">Ultra · plan r${escapeHtml(plan.revision)}</span><h2>Here is the complete plan.</h2></div><p>Edit it directly before preparing the run.</p></div>
+      <div class="message-heading"><div><span class="message-role">Ultra Plan · r${escapeHtml(plan.revision)}</span><h2>Here is the complete plan.</h2></div><p>Edit it directly before preparing Execution.</p></div>
       <label class="sr-only" for="planDocument">Editable plan document</label>
       <textarea id="planDocument" class="plan-document" spellcheck="true">${escapeHtml(state.planDocument || plan.document || "")}</textarea>
       ${planRequirementCoverage(plan)}
-      <div class="document-actions"><p id="documentState">${preview ? "This plan matches the team shown below." : "Nothing changes in the workspace yet."}</p><button id="prepareAgents" class="primary-button" type="button">${preview ? "Update run preview" : "Preview the run"}</button></div>
+      <div class="document-actions"><p id="documentState">${preview ? "This plan matches the team shown below." : "Nothing changes in the workspace yet."}</p><button id="prepareAgents" class="primary-button" type="button">${preview ? "Update Execution preview" : "Preview Execution"}</button></div>
     </article>${preview ? planTeamMarkup(preview) : ""}</div></section>`;
 
   const editor = $("#planDocument");
@@ -142,7 +142,7 @@ renderPlan = function renderPlanConversation() {
     state.planDocument = editor.value;
     state.documentDirty = true;
     $("#teamStage")?.classList.add("hidden");
-    $("#prepareAgents").textContent = "Update run preview";
+    $("#prepareAgents").textContent = "Update Execution preview";
     $("#documentState").textContent = "Your edit is safe in this tab. Update the preview when ready.";
   });
   $("#prepareAgents").addEventListener("click", prepareAgents);
@@ -161,7 +161,7 @@ submitPlanRequest = async function submitPlanRequestToLlm() {
     writeDraft("plan-request", "");
     state.requestDraft = "";
     state.requestDirty = false;
-    toast("Request saved. Ultra is writing the plan.");
+    toast("Request saved. Ultra Plan is writing the plan.");
     await refresh({ force: true });
   } catch (error) {
     toast(error.message, true);
@@ -178,7 +178,7 @@ answerQuestion = async function answerPlanQuestion(question, value) {
     writeDraft("plan-answer", "", state.activeQuestionId);
     state.questionDraft = "";
     state.questionDirty = false;
-    toast("Answer saved. Ultra is continuing the plan.");
+    toast("Answer saved. Ultra Plan is continuing the plan.");
     await refresh({ force: true });
   } catch (error) { toast(error.message, true); }
 };
@@ -193,7 +193,7 @@ prepareAgents = async function preparePlanRunPreview() {
     await api("/plan/team-preview", { method: "POST", body: JSON.stringify({ base_revision: state.plan.revision, document: documentValue }) });
     state.documentDirty = false;
     state.planDocument = documentValue;
-    toast("The run preview is ready.");
+    toast("The Execution preview is ready.");
     await refresh({ force: true });
   } catch (error) {
     toast(error.message, true);
@@ -204,7 +204,7 @@ prepareAgents = async function preparePlanRunPreview() {
 
 approveAndStart = async function startUltraFromPlan() {
   const preview = state.plan?.team_preview;
-  if (!preview) return toast("Update the run preview before starting.", true);
+  if (!preview) return toast("Update the Execution preview before starting.", true);
   const button = $("#approveStart");
   button.disabled = true;
   button.textContent = "Starting…";
@@ -214,12 +214,12 @@ approveAndStart = async function startUltraFromPlan() {
     clearInterval(state.pollTimer);
     renderHandoff(false);
     setConnection("", "Terminal handoff");
-    toast("Plan sent. The terminal is starting Ultra.");
+    toast("Plan sent. The terminal is starting Execution.");
     setTimeout(() => window.close(), 120);
   } catch (error) {
     toast(error.message, true);
     button.disabled = false;
-    button.textContent = "Start Ultra";
+    button.textContent = "Start Execution";
   }
 };
 

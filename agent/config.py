@@ -18,6 +18,7 @@ class InteractionMode(str, Enum):
     ULTRA = "ultra"
     CHAT = "normal"
     GOAL = "normal"
+    EXECUTION = "normal"
 
     @classmethod
     def parse(cls, value: str | "InteractionMode") -> "InteractionMode":
@@ -27,7 +28,7 @@ class InteractionMode(str, Enum):
         try:
             return cls(normalized)
         except ValueError as exc:
-            raise ValueError("mode must be 'plan', 'normal', or 'ultra'") from exc
+            raise ValueError("mode must be 'execution' or 'ultra-plan'") from exc
 
 
 class ReasoningEffort(str, Enum):
@@ -55,6 +56,7 @@ class SessionPreferences:
 
     mode: InteractionMode = InteractionMode.NORMAL
     concurrency: int = 1
+    selected_session_id: str | None = None
 
     @classmethod
     def from_env(cls, mode: str | None = None) -> "SessionPreferences":

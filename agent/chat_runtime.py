@@ -108,6 +108,13 @@ class RequestedEffectV2(str, Enum):
             "edit_file": "write",
             "apply_patch": "write",
             "materialize_artifact": "write",
+            "browser_open": "preview",
+            "browser_inspect": "preview",
+            "browser_act": "preview",
+            "browser_screenshot": "preview",
+            "browser_close": "preview",
+            "publish_output": "preview",
+            "inspect_images": "read",
             "run_command": "run",
             "execute_shell": "run",
             "run_shell": "run",
@@ -131,6 +138,101 @@ _MUTATING_EFFECTS = frozenset(
     {RequestedEffectV2.WRITE, RequestedEffectV2.RUN, RequestedEffectV2.INSTALL,
      RequestedEffectV2.PREVIEW, RequestedEffectV2.EXTERNAL}
 )
+
+
+def normalize_operational_action_transport(
+    value: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Contract a weak-model outcome label without widening its authority.
+
+    Small local models sometimes correctly select the bounded ``action`` route
+    for running or previewing an existing project while describing the desired
+    result as a ``runnable_product``.  The route validator used to reject that
+    label before it could inspect the model-authored effects, discarding an
+    otherwise complete decision and asking the model to repeat the whole tool
+    call.  Normalize only that narrow, non-writing shape to the canonical
+    ``workspace_operation`` outcome.  No route, effect, or authority span is
+    invented here.
+    """
+
+    source = dict(value)
+    nested = source.get("semantic_turn")
+    if isinstance(nested, Mapping):
+        for field in ("outcome_kind", "requested_effects", "needs_workspace_tools"):
+            if field not in source and field in nested:
+                source[field] = nested[field]
+    route = str(source.get("route") or "").strip().casefold()
+    outcome = str(source.get("outcome_kind") or "").strip().casefold()
+    if route != RouteKind.ACTION.value or outcome not in {
+        "runnable_product", "durable_project",
+    }:
+        return source, ""
+    try:
+        needs_tools = _transport_bool(
+            source.get("needs_workspace_tools", False),
+            field="needs_workspace_tools",
+        )
+    except ValueError:
+        return source, ""
+    raw_effects = source.get("requested_effects", ())
+    if isinstance(raw_effects, Mapping):
+        effect_values = [
+            name
+            for name, selected in raw_effects.items()
+            if selected is True
+            or (
+                isinstance(selected, Sequence)
+                and not isinstance(selected, (str, bytes))
+                and bool(selected)
+            )
+        ]
+    elif isinstance(raw_effects, str):
+        effect_values = [raw_effects]
+    elif isinstance(raw_effects, Sequence) and not isinstance(raw_effects, (str, bytes)):
+        effect_values = list(raw_effects)
+    else:
+        return source, ""
+    try:
+        effects = {
+            RequestedEffectV2.parse(item)
+            for item in effect_values
+            if str(item or "").strip().casefold()
+            not in {"", "none", "no_effect", "no effects", "no requested effects"}
+        }
+    except ValueError:
+        return source, ""
+    if (
+        not needs_tools
+        or not effects
+        or RequestedEffectV2.WRITE in effects
+        or RequestedEffectV2.EXTERNAL in effects
+    ):
+        return source, ""
+    source["outcome_kind"] = "workspace_operation"
+    return source, (
+        f"action + {outcome} normalized to action + workspace_operation "
+        "because the authored effects contain no source write or external side effect"
+    )
+
+
+def normalize_nonchat_direct_response_transport(
+    value: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Remove a weak-model chat-only surplus field from a Goal payload.
+
+    ``direct_response`` has no authority and is never used for Goal execution;
+    local models nevertheless often restate their interpretation in that field.
+    Keeping the authored route, interpretation, effects, and spans while
+    clearing this forbidden duplicate is a transport repair, not a semantic
+    guess.
+    """
+
+    source = dict(value)
+    route = str(source.get("route") or "").strip().casefold()
+    if route == RouteKind.GOAL.value and str(source.get("direct_response") or "").strip():
+        source["direct_response"] = ""
+        return source, "removed chat-only direct_response from the authored goal route"
+    return source, ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,6 +478,7 @@ SemanticIntakeV2 = SemanticGoalIntakeV3
 class SemanticRouteDecisionV3:
     route: RouteKind
     outcome_kind: str
+    session_title: str
     interpretation: str
     requested_effects: tuple[RequestedEffectV2, ...]
     authority_spans: Mapping[str, tuple[str, ...]]
@@ -399,11 +502,12 @@ class SemanticRouteDecisionV3:
         # Some providers preserve all authored fields but wrap a subset under
         # the function's semantic_turn label. Flatten that transport shape;
         # this copies model output verbatim and never supplies semantics.
-        source = dict(value)
+        source, _direct_response_normalization = normalize_nonchat_direct_response_transport(value)
+        source, _outcome_normalization = normalize_operational_action_transport(source)
         nested = source.get("semantic_turn")
         if isinstance(nested, Mapping):
             for field in (
-                "outcome_kind", "interpretation", "requested_effects", "uncertainty",
+                "outcome_kind", "session_title", "interpretation", "requested_effects", "uncertainty",
                 "clarification_question", "task_demand", "goal_intake",
             ):
                 if field not in source and field in nested:
@@ -460,6 +564,14 @@ class SemanticRouteDecisionV3:
         interpretation = str(value.get("interpretation") or "").strip()
         if not interpretation:
             raise ValueError("interpretation is required")
+        session_title = " ".join(str(value.get("session_title") or "").split())
+        if not session_title:
+            # Backward-compatible transport repair for already-persisted V3
+            # decisions. The text still comes from the model-authored
+            # interpretation; current provider schemas require session_title.
+            session_title = " ".join(interpretation.split()[:10])[:80]
+        if len(session_title) > 80 or len(session_title.split()) > 10:
+            raise ValueError("session_title must be a concise semantic title of at most 10 words")
         raw_effects = value.get("requested_effects", ())
         if isinstance(raw_effects, Mapping):
             selected_effects: list[str] = []
@@ -581,6 +693,7 @@ class SemanticRouteDecisionV3:
         return cls(
             route=route,
             outcome_kind=outcome_kind,
+            session_title=session_title,
             interpretation=interpretation,
             requested_effects=effects,
             authority_spans=spans,
@@ -598,6 +711,7 @@ class SemanticRouteDecisionV3:
         return SemanticRouteDecisionV3(
             route=self.route,
             outcome_kind=self.outcome_kind,
+            session_title=self.session_title,
             interpretation=self.interpretation,
             requested_effects=self.requested_effects,
             authority_spans=self.authority_spans,
@@ -617,10 +731,36 @@ class SemanticRouteDecisionV3:
         return SemanticRouteDecisionV3(
             route=RouteKind.GOAL,
             outcome_kind="durable_project",
+            session_title=self.session_title,
             interpretation=self.interpretation,
             requested_effects=self.requested_effects,
             authority_spans=self.authority_spans,
             needs_workspace_tools=self.needs_workspace_tools,
+            direct_response="",
+            uncertainty=self.uncertainty,
+            clarification_question=self.clarification_question,
+            task_demand=self.task_demand,
+            goal_intake=None,
+        )
+
+    def contract_operational_goal_to_action(self) -> "SemanticRouteDecisionV3":
+        """Keep read/run/install/preview-only existing-project work bounded."""
+
+        if self.route is not RouteKind.GOAL:
+            return self
+        if not self.requested_effects or any(
+            effect in {RequestedEffectV2.WRITE, RequestedEffectV2.EXTERNAL}
+            for effect in self.requested_effects
+        ):
+            return self
+        return SemanticRouteDecisionV3(
+            route=RouteKind.ACTION,
+            outcome_kind="workspace_operation",
+            session_title=self.session_title,
+            interpretation=self.interpretation,
+            requested_effects=self.requested_effects,
+            authority_spans=self.authority_spans,
+            needs_workspace_tools=True,
             direct_response="",
             uncertainty=self.uncertainty,
             clarification_question=self.clarification_question,
@@ -640,12 +780,17 @@ class SemanticRouteDecisionV3:
 
     @property
     def allowed_categories(self) -> frozenset[str]:
-        categories = {"read"}
+        # Output publication is a presentation boundary available to every
+        # bounded action. It grants no workspace or external authority.
+        categories = {"read", "output"}
         mapping = {
             RequestedEffectV2.WRITE: {"write"},
-            RequestedEffectV2.RUN: {"command", "process"},
+            # Running a declared project includes narrowly installing only its
+            # already-declared local dependencies. The install tool remains a
+            # separately approved critical action and is not required evidence.
+            RequestedEffectV2.RUN: {"command", "process", "install"},
             RequestedEffectV2.INSTALL: {"install"},
-            RequestedEffectV2.PREVIEW: {"preview", "open", "process"},
+            RequestedEffectV2.PREVIEW: {"preview", "open", "process", "media"},
         }
         for effect in self.requested_effects:
             categories.update(mapping.get(effect, set()))
@@ -661,7 +806,7 @@ class SemanticRouteDecisionV3:
             RequestedEffectV2.WRITE: {"write"},
             RequestedEffectV2.RUN: {"command", "process"},
             RequestedEffectV2.INSTALL: {"install"},
-            RequestedEffectV2.PREVIEW: {"preview", "open"},
+            RequestedEffectV2.PREVIEW: {"preview", "open", "media"},
             RequestedEffectV2.EXTERNAL: {"external"},
         }
         return tuple(
@@ -674,6 +819,7 @@ class SemanticRouteDecisionV3:
             "version": self.version,
             "route": self.route.value,
             "outcome_kind": self.outcome_kind,
+            "session_title": self.session_title,
             "interpretation": self.interpretation,
             "requested_effects": {
                 item.value: item in self.requested_effects for item in RequestedEffectV2
@@ -750,6 +896,10 @@ _ROUTE_PROPERTIES: dict[str, Any] = {
             "runnable_product", "durable_project",
         ],
     },
+    "session_title": {
+        "type": "string",
+        "description": "A concise 2-10 word user-facing title for this session, based on the actual request.",
+    },
     "interpretation": {"type": "string"},
     "requested_effects": {
         "type": "object",
@@ -806,7 +956,7 @@ SEMANTIC_ROUTE_SCHEMA = _tool_schema(
     "Classify the actual requested outcome and effects. This is semantic interpretation, not execution.",
     {
         "type": "object",
-        "required": ["route", "outcome_kind", "interpretation", "requested_effects", "authority_spans", "needs_workspace_tools", "direct_response", "uncertainty", "clarification_question", "task_demand"],
+        "required": ["route", "outcome_kind", "session_title", "interpretation", "requested_effects", "authority_spans", "needs_workspace_tools", "direct_response", "uncertainty", "clarification_question", "task_demand"],
         "properties": _ROUTE_PROPERTIES,
         "additionalProperties": False,
     },

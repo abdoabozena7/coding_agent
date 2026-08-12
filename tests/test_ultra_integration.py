@@ -293,6 +293,66 @@ def test_harness_preview_classifies_malformed_tool_response_as_tool_failure():
     assert "malformed JSON" in evidence["error"]
 
 
+def test_harness_preview_candidate_runtime_error_overrides_missing_selector_contract():
+    calls: list[ToolCall] = []
+    agent = object.__new__(WorkspaceUltraAgent)
+    agent.role = AgentRole.TESTER
+
+    def execute(call: ToolCall, _request: AgentRequest) -> str:
+        calls.append(call)
+        if call.name == "preview_html":
+            return json.dumps(
+                {
+                    "verification": "failed",
+                    "failure_kind": "contract",
+                    "console_errors": ["ReferenceError: THREE is not defined"],
+                    "page_errors": [
+                        "Required DOM element result was not found"
+                    ],
+                    "network_errors": [],
+                    "interaction_results": [{
+                        "error": "interaction target matched no elements: Button A"
+                    }],
+                }
+            )
+        return "<!doctype html><main id='app'></main>"
+
+    agent.executor = execute
+    request = AgentRequest(
+        run_id="run",
+        role=AgentRole.TESTER,
+        phase=InnerPhase.TEST.value,
+        system_prompt="test",
+        context={},
+        task={
+            "contract": {
+                "write_paths": ["index.html"],
+                "metadata": {
+                    "browser_scenarios": [{
+                        "name": "addition",
+                        "steps": [{
+                            "action": "click",
+                            "role": "button",
+                            "name": "Button A",
+                        }],
+                        "assertions": [{
+                            "selector": "#result",
+                            "property": "textContent",
+                            "equals": "2",
+                        }],
+                    }]
+                },
+            }
+        },
+    )
+
+    evidence = agent._harness_html_preview(request)
+
+    assert evidence["failure_kind"] == "application"
+    assert "THREE is not defined" in evidence["candidate_runtime_errors"][0]
+    assert calls[0].name == "preview_html"
+
+
 def test_same_turn_mutation_recovers_empty_fix_handoff_without_replaying_agent():
     class WriteThenUnusedProvider:
         def __init__(self) -> None:
@@ -702,6 +762,8 @@ def test_final_evidence_missing_boolean_uses_only_authoritative_operational_gate
         ("review", "passed", "true", True),
         ("review", "passed", "FAILED", False),
         ("global_review", "passed", "pass", True),
+        ("test", "passed", "YES", True),
+        ("test", "passed", "0", False),
         ("integrate", "success", "false", False),
     ],
 )
@@ -720,6 +782,19 @@ def test_exact_string_verdict_is_mechanically_normalized(
     assert normalized[field] is expected
     assert any("exact string verdict normalized" in item for item in actions)
     UltraOrchestrator._validate_typed_response(phase, normalized)
+
+
+@pytest.mark.parametrize("raw, expected", [(1, True), (0, False), (1.0, True)])
+def test_exact_numeric_verdict_is_mechanically_normalized(raw, expected):
+    normalized, actions = UltraOrchestrator._normalize_typed_payload(
+        "test",
+        {"passed": raw},
+        {},
+    )
+
+    assert normalized["passed"] is expected
+    assert any("exact numeric verdict normalized" in item for item in actions)
+    UltraOrchestrator._validate_typed_response("test", normalized)
 
 
 def test_ambiguous_string_verdict_is_not_invented():
@@ -1885,6 +1960,104 @@ class UltraIntegrationTests(unittest.TestCase):
                 session.close()
                 store.close()
 
+    def test_ultra_normalizes_workspace_root_file_read_to_directory_listing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            goal = store.create_goal("Inspect a new workspace")
+            session = UltraSession(
+                store=store,
+                workspace=workspace,
+                descriptor=self._descriptor(),
+                permission_adapter=PermissionAdapter("normal", DockerSandbox()),
+                approval=lambda *_args: True,
+                events=EventBus(),
+                config=UltraConfig(),
+                agent_steps=2,
+            )
+            session.goal_id = goal.id
+            contract = TaskContractV1(
+                id="M001",
+                title="Create page",
+                objective="Create index.html.",
+                acceptance_criteria=("The page exists.",),
+                verification=("read_file index.html",),
+                write_paths=("index.html",),
+            )
+            node = mock.Mock(contract=contract, write_paths=contract.write_paths, pre_write_hashes={})
+            request = AgentRequest(
+                run_id="run",
+                role=AgentRole.CODER,
+                phase="implement",
+                system_prompt="Inspect then implement.",
+                context={},
+                task={},
+                node_id="node",
+            )
+            try:
+                with mock.patch.object(session, "_node", return_value=node):
+                    result = session._execute_tool(
+                        ToolCall("root-read", "read_file", {"path": "."}),
+                        request,
+                    )
+
+                self.assertIn("no files under", result)
+                self.assertEqual(store.list_actions(goal.id)[0]["tool_name"], "list_files")
+                self.assertTrue(any(
+                    event.event_type == "tool_contract.normalized"
+                    for event in store.list_recent_events(goal.id, limit=20)
+                ))
+            finally:
+                session.close()
+                store.close()
+
+    def test_ultra_treats_missing_in_scope_output_as_observation_not_harness_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = StateStore(workspace)
+            goal = store.create_goal("Create one new file")
+            session = UltraSession(
+                store=store,
+                workspace=workspace,
+                descriptor=self._descriptor(),
+                permission_adapter=PermissionAdapter("normal", DockerSandbox()),
+                approval=lambda *_args: True,
+                events=EventBus(),
+                config=UltraConfig(),
+                agent_steps=2,
+            )
+            session.goal_id = goal.id
+            contract = TaskContractV1(
+                id="M001",
+                title="Create file",
+                objective="Create index.html.",
+                acceptance_criteria=("The file exists.",),
+                verification=("read_file index.html",),
+                write_paths=("index.html",),
+            )
+            node = mock.Mock(contract=contract, write_paths=contract.write_paths, pre_write_hashes={})
+            request = AgentRequest(
+                run_id="run",
+                role=AgentRole.CODER,
+                phase="implement",
+                system_prompt="Create the output.",
+                context={},
+                task={},
+                node_id="node",
+            )
+            try:
+                with mock.patch.object(session, "_node", return_value=node):
+                    result = session._execute_tool(
+                        ToolCall("missing-read", "read_file", {"path": "index.html"}),
+                        request,
+                    )
+
+                self.assertTrue(result.startswith("Observation:"))
+                self.assertEqual(store.list_actions(goal.id)[0]["status"], "completed")
+            finally:
+                session.close()
+                store.close()
+
     def test_ultra_replays_completed_identical_mutation_receipt_without_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -2457,6 +2630,70 @@ class UltraIntegrationTests(unittest.TestCase):
 
         self.assertEqual(provider.calls, 3)
         self.assertEqual(provider.cache_resets, 1)
+
+    def test_local_fix_read_only_claim_routes_existing_artifact_to_verification(self):
+        class ReadThenClaimProvider:
+            reasoning_effort = "medium"
+            max_output_tokens = None
+
+            def __init__(self):
+                self.calls = 0
+
+            def reset_model_cache(self):
+                return None
+
+            def call(self, _conversation, _tools, _system):
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantTurn(
+                        text=json.dumps(
+                            {"name": "read_file", "args": {"path": "index.html"}}
+                        )
+                    )
+                return AssistantTurn(
+                    text=json.dumps(
+                        {
+                            "payload": {"success": True, "passed": True},
+                            "summary": "The saved artifact already contains the repair.",
+                        }
+                    )
+                )
+
+        provider = ReadThenClaimProvider()
+        agent = WorkspaceUltraAgent(
+            provider,
+            role=AgentRole.CODER,
+            provider_name="ollama",
+            model="gemma4:e4b",
+            executor=lambda _call, _request: "<!doctype html><title>Existing repair</title>",
+            events=EventBus(),
+            max_steps=16,
+        )
+
+        response = agent.execute(
+            AgentRequest(
+                run_id="run",
+                role=AgentRole.CODER,
+                phase="fix",
+                system_prompt="Repair the approved module.",
+                context={},
+                task={
+                    "contract": {
+                        "id": "M001",
+                        "title": "Page",
+                        "objective": "Repair the page.",
+                        "write_paths": ["index.html"],
+                    },
+                    "findings": ["Confirm the saved runtime repair."],
+                },
+                node_id="M001",
+            )
+        )
+
+        self.assertTrue(response.payload["verification_only"])
+        self.assertTrue(response.payload["no_change_candidate"])
+        self.assertEqual(response.payload["artifacts"], ["index.html"])
+        self.assertEqual(provider.calls, 3)
 
     def test_fix_transport_normalizes_scalar_evidence_and_exact_boolean(self):
         normalized, actions = UltraOrchestrator._normalize_typed_payload(
@@ -3763,6 +4000,23 @@ class UltraIntegrationTests(unittest.TestCase):
                 agents = store.list_agent_runs(run.id)
                 traces = store.list_prompt_traces(run.id)
                 self.assertGreaterEqual(len(agents), 10)
+                fixed_specialist_roles = [
+                    "security_reviewer",
+                    "clean_code_reviewer",
+                    "test_quality_reviewer",
+                    "architecture_reviewer",
+                    "fidelity_reviewer",
+                    "regression_reviewer",
+                ]
+                observed_specialists = [
+                    item.role for item in agents
+                    if item.role in fixed_specialist_roles
+                ]
+                self.assertGreaterEqual(len(observed_specialists), 6)
+                self.assertEqual(
+                    observed_specialists[:6],
+                    fixed_specialist_roles,
+                )
                 self.assertGreaterEqual(len(traces), 10)
                 trace_ids = {trace.id for trace in traces}
                 self.assertTrue(
@@ -3783,7 +4037,14 @@ class UltraIntegrationTests(unittest.TestCase):
                 self.assertTrue(
                     all(
                         item.review_status
-                        == {"clean_code": "passed", "security": "passed", "test_quality": "passed"}
+                        == {
+                            "clean_code": "passed",
+                            "security": "passed",
+                            "test_quality": "passed",
+                            "architecture": "passed",
+                            "fidelity": "passed",
+                            "regression": "passed",
+                        }
                         for item in change_sets
                     )
                 )

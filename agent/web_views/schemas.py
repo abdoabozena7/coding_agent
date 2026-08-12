@@ -126,7 +126,7 @@ class WorkspaceContextPayload(BaseModel):
     current_view: Literal["plan", "review", "agents", "execution", "history", "thread"]
     checkpoint_id: str | None = None
     goal: dict[str, Any] | None = None
-    mode: Literal["working", "plan"]
+    mode: Literal["execution", "ultra-plan"]
     attention: dict[str, Any]
     navigation: dict[str, dict[str, Any]]
     capabilities: dict[str, bool]
@@ -146,13 +146,13 @@ class WorkspaceContextPayload(BaseModel):
     pending_question: dict[str, Any] | None = None
     workflow_identity: dict[str, Any] = Field(default_factory=dict)
     history_cursor: int = 0
-    sleep_enabled: bool = False
-    sleep_policy: Literal["off", "safe", "full"] = "off"
     local_continuation: dict[str, Any] | None = None
     provider_recovery: dict[str, Any] | None = None
     # Additive left-rail projection.  Keeping it in the workspace snapshot
     # avoids a second polling race while preserving the standalone index API.
     project_sessions: dict[str, Any] = Field(default_factory=dict)
+    current_plan: dict[str, Any] = Field(default_factory=dict)
+    todo: dict[str, Any] = Field(default_factory=dict)
 
 
 class WorkspaceActionRequest(BaseModel):
@@ -162,8 +162,8 @@ class WorkspaceActionRequest(BaseModel):
 
     action: Literal[
         "approve_plan", "allow_tool", "allow_tool_session", "deny_tool", "retry", "resume",
-        "answer", "pause", "stop", "sleep_on", "sleep_full_on", "sleep_off", "switch_model",
-        "continue_local_model", "reconfigure_protection", "reconfigure_permissions",
+        "answer", "pause", "stop", "switch_model",
+        "continue_local_model", "reconfigure_protection",
         "reconfigure_mode", "reconfigure_concurrency",
     ]
     target_id: str | None = Field(default=None, max_length=200)
@@ -252,7 +252,7 @@ class QueuePromptPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     text: str = Field(min_length=1, max_length=20_000)
-    mode: Literal["working", "plan", "normal", "ultra"] | None = None
+    mode: Literal["execution", "ultra-plan", "working", "plan", "normal", "ultra"] | None = None
 
 
 class QueueReorderPayload(BaseModel):

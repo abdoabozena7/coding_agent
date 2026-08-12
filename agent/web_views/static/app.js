@@ -12,6 +12,7 @@ const legacyTab = ["agents", "tree", "execution"].includes(requestedShell)
   ? "agents" : ["history"].includes(requestedShell) ? "timeline" : "overview";
 const initialPage = requestedShell === "plan" ? "plan" : "live";
 const csrf = decodeURIComponent((document.cookie.match(/(?:^|; )ga3bad_csrf=([^;]*)/) || [])[1] || "");
+$("#outputNav").href = `/sessions/${encodeURIComponent(sessionId)}/output`;
 
 function draftStorageKey(kind, suffix = "") {
   return `ga3bad:${sessionId}:${kind}${suffix ? `:${suffix}` : ""}`;
@@ -144,7 +145,7 @@ function showFatal(error) {
 }
 
 function runtimeStatus() {
-  return state.context?.goal?.status || state.context?.runtime?.phase || state.plan?.goal_status || "idle";
+  return state.context?.runtime?.phase || state.context?.goal?.status || state.plan?.goal_status || "idle";
 }
 
 function updateChrome() {
@@ -158,8 +159,8 @@ function updateChrome() {
   });
   $("#planPage").classList.toggle("hidden", state.page !== "plan");
   $("#livePage").classList.toggle("hidden", state.page !== "live");
-  $("#statusKicker").textContent = state.page === "plan" ? "ULTRA PLAN" : "ULTRA LIVE";
-  $("#statusTitle").textContent = runtime.active_operation || runtime.current_task || context.attention?.title || (state.page === "plan" ? "Plan the next Ultra run" : "No active work");
+  $("#statusKicker").textContent = state.page === "plan" ? "ULTRA PLAN" : "EXECUTION";
+  $("#statusTitle").textContent = runtime.active_operation || runtime.current_task || context.attention?.title || (state.page === "plan" ? "Plan the next Execution run" : "No active work");
   $("#statusDetail").textContent = runtime.reason || context.attention?.body || "The terminal runtime is the source of truth.";
   const badge = $("#statusBadge");
   badge.textContent = statusLabel(status);
@@ -224,14 +225,29 @@ function renderBlocker() {
     add("Deny", "deny_tool");
     add("Stop safely", "stop", "danger-button");
   } else {
-    add("Retry", "retry", "primary-button");
-    add("Change model", "switch_model");
-    add("Stop safely", "stop", "danger-button");
+    const choices = [
+      { kind: required.kind, label: required.label || "Continue" },
+      ...(required.alternatives || []),
+    ].filter((choice, index, all) => choice?.kind && all.findIndex((item) => item?.kind === choice.kind) === index);
+    choices.forEach((choice, index) => add(
+      choice.label || choice.kind,
+      choice.kind,
+      choice.kind === "stop" ? "danger-button" : index === 0 ? "primary-button" : "secondary-button",
+    ));
   }
 }
 
 async function runBlockerAction(action, required) {
   if (action === "switch_model") return openModelPicker(true);
+  if (action === "inspect") {
+    const runtime = state.context?.runtime || {};
+    const reason = required.description || state.context?.attention?.body || runtime.reason || "The workflow is paused at a saved checkpoint.";
+    return openDrawer(
+      "READ-ONLY CHECKPOINT",
+      "Why work stopped",
+      `<p>${escapeHtml(reason)}</p><dl class="detail-list"><div><dt>State</dt><dd>${escapeHtml(runtime.phase || "paused")}</dd></div><div><dt>Waiting on</dt><dd>${escapeHtml(runtime.waiting_on || state.context?.waiting_on || "recovery")}</dd></div><div><dt>Next action</dt><dd>${escapeHtml(required.retry_exhausted ? "Change model for one fresh attempt" : state.context?.resume_action || "Retry saved stage")}</dd></div></dl><p><small>Inspect is read-only. It does not start a worker or consume the saved checkpoint.</small></p>`,
+    );
+  }
   try {
     const fingerprint = required.fingerprint || state.context?.tool_approval?.action_fingerprint || "";
     const result = await api("/actions", {
@@ -254,7 +270,7 @@ let answerQuestion;
 let prepareAgents;
 let approveAndStart;
 function renderHandoff(completed) {
-  $("#planRoot").innerHTML = `<section class="handoff"><div class="handoff-inner"><div class="handoff-mark">${completed ? "✓" : "→"}</div><span class="eyebrow">${completed ? "ULTRA COMPLETE" : "TERMINAL HANDOFF"}</span><h1>${completed ? "The work is complete." : "Ultra is running."}</h1><p>${completed ? "Open Live to inspect the final tree, timeline and recorded changes." : "The exact plan and first-layer team were accepted. You can close this tab and return to the terminal; execution does not depend on the tab closing."}</p><div class="button-row centered-actions"><button id="openLiveAfterHandoff" class="secondary-button" type="button">Open Live</button></div></div></section>`;
+  $("#planRoot").innerHTML = `<section class="handoff"><div class="handoff-inner"><div class="handoff-mark">${completed ? "✓" : "→"}</div><span class="eyebrow">${completed ? "EXECUTION COMPLETE" : "TERMINAL HANDOFF"}</span><h1>${completed ? "The work is complete." : "Execution is running."}</h1><p>${completed ? "Open Live to inspect the final tree, timeline and recorded changes." : "The exact plan and first-layer team were accepted. You can close this tab and return to the terminal; execution does not depend on the tab closing."}</p><div class="button-row centered-actions"><button id="openLiveAfterHandoff" class="secondary-button" type="button">Open Live</button></div></div></section>`;
   $("#openLiveAfterHandoff").addEventListener("click", () => navigate("live", "overview"));
 }
 
@@ -275,21 +291,58 @@ function activityRows(limit = 5) {
   return rows.slice(-limit).reverse();
 }
 
+function todoDetailMarkup(item) {
+  const checklist = item.checklist || [];
+  const dependencies = item.dependencies || [];
+  const evidence = item.verified_evidence?.length ? item.verified_evidence : (item.evidence || []);
+  const changed = item.changed_files || [];
+  const issues = item.issues || [];
+  const paths = [...new Set([...(item.read_paths || []), ...(item.write_paths || [])])];
+  const checks = checklist.length
+    ? `<ol class="todo-detail-checklist">${checklist.map((check) => `<li class="todo-${escapeHtml(check.state || check.status || "pending")}"><span class="todo-mark" aria-hidden="true"></span><div><strong>${escapeHtml(check.title || "Check")}</strong><small>${escapeHtml(statusLabel(check.state || check.status || "pending"))}</small>${(check.evidence || []).length ? `<ul class="evidence-list">${check.evidence.map((receipt) => `<li>${escapeHtml(receipt)}</li>`).join("")}</ul>` : ""}</div></li>`).join("")}</ol>`
+    : `<p class="muted-note">No smaller checklist was recorded for this task.</p>`;
+  return `<section class="todo-detail"><p>${escapeHtml(item.description || item.objective || "No task description was recorded.")}</p><div class="todo-progress"><strong>${Number(item.verification_percent || 0)}%</strong><span>evidence verified</span></div><h3>Checklist</h3>${checks}<dl class="facts"><div><dt>Status</dt><dd>${escapeHtml(statusLabel(item.state || item.status))}</dd></div><div><dt>Role</dt><dd>${escapeHtml(item.assigned_role || "Harness selected")}</dd></div><div><dt>Attempts</dt><dd>${Number(item.attempts || 0)}</dd></div><div><dt>Dependencies</dt><dd>${escapeHtml(dependencies.join(", ") || "None")}</dd></div><div><dt>Files read</dt><dd>${escapeHtml((item.read_paths || []).join(", ") || "None")}</dd></div><div><dt>Files changing</dt><dd>${escapeHtml((item.write_paths || []).join(", ") || "None")}</dd></div><div><dt>Files in scope</dt><dd>${escapeHtml(paths.join(", ") || "Not recorded")}</dd></div><div><dt>Changed files</dt><dd>${escapeHtml(changed.join(", ") || "None")}</dd></div></dl>${evidence.length ? `<h3>Verification evidence</h3><ul class="evidence-list">${evidence.map((receipt) => `<li>${escapeHtml(receipt)}</li>`).join("")}</ul>` : `<p class="muted-note">No authoritative verification receipt has been recorded yet.</p>`}${issues.length ? `<h3>Open findings</h3><ul class="issue-list">${issues.map((issue) => `<li>${escapeHtml(issue)}</li>`).join("")}</ul>` : ""}</section>`;
+}
+
+function openTodo(item) {
+  openDrawer("TASK DETAILS", item.title || item.id || "Task", todoDetailMarkup(item));
+}
+
 function renderOverview() {
   const root = $("#liveRoot");
   const context = state.context || {};
   const runtime = context.runtime || {};
   const data = state.agents || { nodes: [], agents: [], result: {} };
   const nodes = data.nodes || [];
-  const done = nodes.filter((node) => ["completed", "done", "integrated"].includes(String(node.status))).length;
+  const todo = context.todo || { items: [] };
+  const plan = context.current_plan || {};
+  const todoItems = todo.items || [];
+  const done = Number(todo.done ?? nodes.filter((node) => ["completed", "done", "integrated"].includes(String(node.status))).length);
   const active = (data.agents || []).find((agent) => ["running", "in_progress"].includes(String(agent.status))) || null;
-  const current = active?.last_action || active?.task || runtime.active_operation || runtime.current_task || context.attention?.title || "No active work";
-  const remaining = Math.max(0, nodes.length - done);
+  const paused = ["paused", "retrying", "waiting_for_approval"].includes(String(runtime.phase || ""));
+  const current = paused
+    ? runtime.current_task || runtime.active_operation || context.attention?.title || "Saved checkpoint"
+    : active?.last_action || active?.task || runtime.active_operation || runtime.current_task || context.attention?.title || "No active work";
+  const remaining = Math.max(0, Number(todo.total ?? nodes.length) - done);
   const eta = runtime.eta_seconds ? formatDuration(runtime.eta_seconds) : "—";
   const events = activityRows();
   const files = data.result?.changed_files || [];
-  root.innerHTML = `<section class="overview"><div class="now-row"><div class="now-main"><span class="eyebrow">NOW</span><h2>${escapeHtml(current)}</h2><p>${escapeHtml(runtime.reason || context.attention?.body || "Live state is projected from the terminal runtime.")}</p></div><div class="metric"><strong>${done}</strong><span>Completed</span></div><div class="metric"><strong>${remaining}</strong><span>Remaining</span></div><div class="metric"><strong>${eta}</strong><span>ETA</span></div></div><section class="overview-section"><h3>Recent activity</h3>${events.length ? `<ol class="activity-list">${events.map((event) => `<li><time>${escapeHtml(formatTime(event.timestamp))}</time><p>${escapeHtml(event.message || event.operation || "Activity recorded")}</p></li>`).join("")}</ol>` : `<p>No activity has been recorded yet.</p>`}</section><section class="overview-section"><h3>Recorded changes</h3><div>${files.length ? `<ul class="file-list">${files.map((file) => `<li><button class="file-button" data-file="${escapeHtml(file)}" type="button">${escapeHtml(file)}</button></li>`).join("")}</ul>` : `<p>No file changes have been recorded.</p>`}</div></section><section class="overview-section"><h3>Execution model</h3><p>${escapeHtml(`${runtime.provider || "provider"}/${runtime.model || "model"} · ${context.execution_strategy || "recursive"} · ${runtime.execution_class || "runtime"}`)}</p></section></section>`;
+  const planTasks = (plan.tasks || []).slice(0, 12);
+  const planContinuity = todo.pending_plan_revision && todo.plan_revision
+    ? `<p class="todo-continuity"><strong>Progress kept from accepted plan r${escapeHtml(todo.plan_revision)}.</strong> Repair plan r${escapeHtml(todo.pending_plan_revision)} is waiting for approval and is not counted yet.</p>`
+    : "";
+  const planMarkup = plan.summary
+    ? `<details class="readonly-plan" open><summary><span>Plan r${escapeHtml(plan.revision || "—")}${plan.approved_revision && plan.approved_revision !== plan.revision ? ` / accepted r${escapeHtml(plan.approved_revision)}` : ""}</span><em>${escapeHtml(statusLabel(plan.status || "preparing"))}</em></summary><p>${escapeHtml(plan.summary)}</p>${planTasks.length ? `<ol>${planTasks.map((task) => `<li><strong>${escapeHtml(task.title)}</strong><small>${escapeHtml(task.description || statusLabel(task.status))}</small></li>`).join("")}</ol>` : ""}</details>`
+    : `<p>The current plan appears here as soon as it is saved.</p>`;
+  const todoMarkup = todoItems.length
+    ? `${planContinuity}<div class="todo-percentages"><span><strong>${Number(todo.completion_percent || 0)}%</strong> complete</span><span><strong>${Number(todo.verification_percent || 0)}%</strong> evidence verified</span></div><ol class="todo-list">${todoItems.slice(0, 30).map((item) => `<li class="todo-${escapeHtml(item.state || "pending")}"><span class="todo-mark" aria-hidden="true"></span><button data-todo-node="${escapeHtml(item.id)}" type="button"><strong>${escapeHtml(item.title || "Task")}</strong><small>${escapeHtml(item.state === "working" ? "Working now" : statusLabel(item.status || item.state))} / ${Number(item.verification_percent || 0)}% verified</small></button></li>`).join("")}</ol>${todoItems.length > 30 ? `<p class="muted-note">${todoItems.length - 30} more tasks remain visible in Agents.</p>` : ""}`
+    : `<p>The to-do list appears when the plan is materialized.</p>`;
+  root.innerHTML = `<section class="overview"><div class="now-row"><div class="now-main"><span class="eyebrow">NOW</span><h2>${escapeHtml(current)}</h2><p>${escapeHtml(runtime.reason || context.attention?.body || "Live state is projected from the terminal runtime.")}</p></div><div class="metric"><strong>${done}</strong><span>Completed</span></div><div class="metric"><strong>${remaining}</strong><span>Remaining</span></div><div class="metric"><strong>${eta}</strong><span>ETA</span></div></div><div class="plan-todo-grid"><section class="overview-section"><h3>Current plan</h3>${planMarkup}</section><section class="overview-section"><h3>To-do</h3><p class="todo-summary">${Number(todo.working || 0)} working · ${Number(todo.done || 0)} done · ${Number(todo.pending || 0)} waiting${Number(todo.blocked || 0) ? ` · ${Number(todo.blocked)} blocked` : ""}</p>${todoMarkup}</section></div><section class="overview-section"><h3>Recent activity</h3>${events.length ? `<ol class="activity-list">${events.map((event) => `<li><time>${escapeHtml(formatTime(event.timestamp))}</time><p>${escapeHtml(event.message || event.operation || "Activity recorded")}</p></li>`).join("")}</ol>` : `<p>No activity has been recorded yet.</p>`}</section><section class="overview-section"><h3>Recorded changes</h3><div>${files.length ? `<ul class="file-list">${files.map((file) => `<li><button class="file-button" data-file="${escapeHtml(file)}" type="button">${escapeHtml(file)}</button></li>`).join("")}</ul>` : `<p>No file changes have been recorded.</p>`}</div></section><section class="overview-section"><h3>Execution model</h3><p>${escapeHtml(`${runtime.provider || "provider"}/${runtime.model || "model"} · ${context.execution_strategy || "recursive"} · ${runtime.execution_class || "runtime"}`)}</p></section></section>`;
   $$('[data-file]').forEach((button) => button.addEventListener("click", () => openDiff(button.dataset.file)));
+  $$('[data-todo-node]').forEach((button) => button.addEventListener("click", () => {
+    const item = todoItems.find((candidate) => candidate.id === button.dataset.todoNode);
+    if (item) openTodo(item);
+  }));
 }
 
 function treeMarkup(nodes, parentId = null) {
@@ -316,8 +369,9 @@ function agentButton(agent) {
   const status = agent.status || "queued";
   const attempt = Number(agent.attempt || 1);
   const phase = agent.phase ? statusLabel(agent.phase) : "Specialist";
-  const detail = agent.last_action || `${phase}${attempt > 1 ? ` / attempt ${attempt}` : ""}`;
-  return `<button class="agent-node agent-run status-${escapeHtml(status)}${state.selectedNode === selectionId ? " selected" : ""}" data-node="${escapeHtml(selectionId)}" type="button"><span class="dot" aria-hidden="true"></span><span><strong>${escapeHtml(agent.name || agent.role || "Agent")}</strong><small>${escapeHtml(detail)}</small></span><em>${escapeHtml(statusLabel(status))}</em></button>`;
+  const workDetail = agent.last_action || `${phase}${attempt > 1 ? ` / attempt ${attempt}` : ""}`;
+  const detail = `${agent.short_id ? `ID ${agent.short_id} · ` : ""}${workDetail}`;
+  return `<button class="agent-node agent-run status-${escapeHtml(status)}${state.selectedNode === selectionId ? " selected" : ""}" data-node="${escapeHtml(selectionId)}" type="button"><span class="dot" aria-hidden="true"></span><span><strong>${escapeHtml(agent.display_name || agent.name || agent.role || "Agent")}</strong><small>${escapeHtml(detail)}</small></span><em>${escapeHtml(statusLabel(status))}</em></button>`;
 }
 
 function agentBranchMarkup(agents) {
@@ -335,6 +389,23 @@ function agentResultMarkup(agent) {
   return `<section class="agent-result"><h3>Latest result</h3><p>${escapeHtml(summary)}</p>${changed.length ? `<h4>Changed files</h4><ul>${changed.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : ""}${tests.length ? `<h4>Checks</h4><ul>${tests.slice(-5).map((item) => `<li>${escapeHtml(item.summary || item.name || item.command || JSON.stringify(item))}</li>`).join("")}</ul>` : ""}${artifacts.length ? `<h4>Artifacts</h4><ul>${artifacts.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : ""}${issues.length ? `<h4>Issues</h4><ul>${issues.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : ""}</section>`;
 }
 
+function agentProblemMarkup(agent) {
+  if (!agent.problem) return "";
+  const stateLabel = agent.recovered
+    ? "Recovered automatically"
+    : agent.retrying
+    ? "A replacement attempt is running"
+    : agent.superseded
+    ? "Superseded by a later attempt"
+    : agent.attention_required
+    ? "Action is available"
+    : "Recorded attempt issue";
+  const actions = agent.attention_required
+    ? `<div class="agent-action-row"><button data-agent-remedy="retry" type="button">Retry saved branch</button><button data-agent-remedy="model" type="button">Change model</button><button data-agent-remedy="advanced" type="button">Technical details</button></div>`
+    : `<div class="agent-action-row"><button data-agent-remedy="advanced" type="button">Technical details</button></div>`;
+  return `<section class="agent-problem resolution-${escapeHtml(agent.resolution_state || "recorded")}"><span class="eyebrow">${escapeHtml(stateLabel)}</span><h3>${escapeHtml(agent.problem.summary || "This attempt needs attention")}</h3><p>${escapeHtml(agent.problem.detail || "The saved checkpoint remains available.")}</p>${actions}</section>`;
+}
+
 function selectedAgentMarkup() {
   const data = state.agents || { nodes: [], agents: [], core: {} };
   if (state.selectedNode === "core") {
@@ -344,11 +415,11 @@ function selectedAgentMarkup() {
     const agentId = state.selectedNode.slice(6);
     const agent = (data.agents || []).find((item) => item.id === agentId) || {};
     const node = (data.nodes || []).find((item) => item.id === agent.task_id) || {};
-    return `<span class="eyebrow">${escapeHtml(agent.role || "SPECIALIST")}</span><h2>${escapeHtml(agent.name || "Agent")}</h2><p>${escapeHtml(agent.goal || node.objective || "No mission recorded.")}</p><dl class="facts"><div><dt>Status</dt><dd>${escapeHtml(statusLabel(agent.status))}</dd></div><div><dt>Current work</dt><dd>${escapeHtml(agent.last_action || agent.phase || "Waiting")}</dd></div><div><dt>Model</dt><dd>${escapeHtml([agent.provider, agent.model].filter(Boolean).join("/") || "Not recorded")}</dd></div><div><dt>Elapsed</dt><dd>${escapeHtml(formatDuration(agent.elapsed_seconds))}</dd></div><div><dt>Attempt</dt><dd>${escapeHtml(agent.attempt || 1)}</dd></div><div><dt>Files read</dt><dd>${escapeHtml((agent.files_inspected || []).join(", ") || "None")}</dd></div><div><dt>Files changing</dt><dd>${escapeHtml((agent.files_modifying || []).join(", ") || "None")}</dd></div><div><dt>Blockers</dt><dd>${escapeHtml((agent.blockers || []).join(" / ") || "None")}</dd></div></dl>${agentResultMarkup(agent)}`;
+    return `<span class="eyebrow">${escapeHtml(agent.role || "SPECIALIST")}</span><h2>${escapeHtml(agent.display_name || agent.name || "Agent")}</h2><p class="agent-id">ID ${escapeHtml(agent.short_id || agent.id || "—")}</p><p>${escapeHtml(agent.goal || node.objective || "No mission recorded.")}</p>${agentProblemMarkup(agent)}<dl class="facts"><div><dt>Status</dt><dd>${escapeHtml(statusLabel(agent.status))}</dd></div><div><dt>Current work</dt><dd>${escapeHtml(agent.last_action || agent.phase || "Waiting")}</dd></div><div><dt>Model</dt><dd>${escapeHtml([agent.provider, agent.model].filter(Boolean).join("/") || "Not recorded")}</dd></div><div><dt>Elapsed</dt><dd>${escapeHtml(formatDuration(agent.elapsed_seconds))}</dd></div><div><dt>Attempt</dt><dd>${escapeHtml(agent.attempt || 1)}</dd></div><div><dt>Files read</dt><dd>${escapeHtml((agent.files_inspected || []).join(", ") || "None")}</dd></div><div><dt>Files changing</dt><dd>${escapeHtml((agent.files_modifying || []).join(", ") || "None")}</dd></div><div><dt>Blockers</dt><dd>${escapeHtml((agent.blockers || []).join(" / ") || "None")}</dd></div></dl>${agentResultMarkup(agent)}`;
   }
   const node = (data.nodes || []).find((item) => item.id === state.selectedNode) || {};
   const assigned = (data.agents || []).filter((item) => item.task_id === state.selectedNode);
-  return `<span class="eyebrow">TASK</span><h2>${escapeHtml(node.title || "Task")}</h2><p>${escapeHtml(node.objective || "No mission recorded.")}</p><dl class="facts"><div><dt>Status</dt><dd>${escapeHtml(statusLabel(node.status))}</dd></div><div><dt>Assigned role</dt><dd>${escapeHtml(node.assigned_role || "Harness selected")}</dd></div><div><dt>Agent runs</dt><dd>${assigned.length}</dd></div><div><dt>Attempts</dt><dd>${escapeHtml(node.attempts || 0)}</dd></div><div><dt>Files read</dt><dd>${escapeHtml((node.read_paths || []).join(", ") || "None")}</dd></div><div><dt>Files changing</dt><dd>${escapeHtml((node.write_paths || []).join(", ") || "None")}</dd></div><div><dt>Blockers</dt><dd>${node.blocked ? "Blocked" : "None"}</dd></div></dl>`;
+  return `<span class="eyebrow">TASK</span><h2>${escapeHtml(node.title || "Task")}</h2>${todoDetailMarkup(node)}<dl class="facts"><div><dt>Agent runs</dt><dd>${assigned.length}</dd></div><div><dt>Blockers</dt><dd>${node.blocked ? "Blocked" : "None"}</dd></div></dl>`;
 }
 
 function renderAgents() {
@@ -364,6 +435,15 @@ function renderAgents() {
   $$('[data-node]').forEach((button) => button.addEventListener("click", () => {
     state.selectedNode = button.dataset.node;
     renderAgents();
+  }));
+  $$('[data-agent-remedy]').forEach((button) => button.addEventListener("click", () => {
+    const remedy = button.dataset.agentRemedy;
+    if (remedy === "advanced") {
+      location.href = `/sessions/${encodeURIComponent(sessionId)}/advanced-tracing`;
+      return;
+    }
+    if (remedy === "model") return openModelPicker(true);
+    if (remedy === "retry") return runBlockerAction("retry", state.context?.required_action || {});
   }));
 }
 

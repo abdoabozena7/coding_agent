@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import io
+import base64
 import hashlib
 import json
 import subprocess
@@ -17,7 +18,18 @@ from agent.cli import _run_auto
 from agent.hardware import HardwareProbeResult, probe_local_gpu
 from agent.model_catalog import ExecutionClass, ModelDescriptor
 from agent.models import DelegationStatus, GoalStatus, PlanStatus, TaskStatus
-from agent.providers.base import ToolCall
+from agent.providers.base import ProviderCapabilities, ToolCall
+from agent.orchestration import (
+    AdaptiveOrchestrationPolicyV1,
+    AdaptiveWorkerRouter,
+    EvidenceVerdict,
+    FIXED_SPECIALIST_REVIEW_ORDER,
+    MutationPolicy,
+    SpecialistReviewRole,
+    WorkerMissionV2,
+    WorkerRole,
+    WorkerVisibility,
+)
 from agent.runtime import (
     AgentRuntime,
     RuntimeStateError,
@@ -207,7 +219,7 @@ def finish_call():
     }
 
 
-def review_pass():
+def review_pass(*checked_task_ids: str):
     return {
         "tool_calls": [
             {
@@ -217,11 +229,18 @@ def review_pass():
                     "verdict": "pass",
                     "summary": "Objective and criteria are directly evidenced.",
                     "issues": [],
-                    "checked_task_ids": ["T001"],
+                    "checked_task_ids": list(checked_task_ids or ("T001",)),
                 },
             }
         ]
     }
+
+
+def fixed_specialist_passes(*checked_task_ids: str):
+    return [
+        review_pass(*checked_task_ids)
+        for _role in FIXED_SPECIALIST_REVIEW_ORDER
+    ]
 
 
 def stored_plan_basis(*task_ids: str):
@@ -282,6 +301,39 @@ class RuntimeTestCase(unittest.TestCase):
 
 
 class SleepModeTests(RuntimeTestCase):
+    def test_fresh_session_does_not_inherit_another_sessions_ultra_run(self):
+        historical_session = "historical-session"
+        historical_runtime = AgentRuntime(
+            ScriptedProvider([], model="weak-local-model"),
+            self.store,
+            self.workspace,
+            config=self.config,
+            session_id=historical_session,
+        )
+        fresh_runtime = AgentRuntime(
+            ScriptedProvider([], model="weak-local-model"),
+            self.store,
+            self.workspace,
+            config=self.config,
+            session_id="fresh-session",
+        )
+        try:
+            historical_goal = self.store.create_goal(
+                "Run the old recursive browser workflow",
+                session_id=historical_session,
+            )
+            historical_run = self.store.create_ultra_run(
+                goal_id=historical_goal.id,
+                provider="ollama",
+                model="weak-local-model",
+            )
+            self.assertEqual(historical_runtime.active_ultra_run().id, historical_run.id)
+            self.assertIsNone(fresh_runtime.active_goal())
+            self.assertIsNone(fresh_runtime.active_ultra_run())
+        finally:
+            historical_runtime.close()
+            fresh_runtime.close()
+
     def test_runtime_recreates_a_missing_session_envelope_from_authority(self):
         runtime = AgentRuntime(
             ScriptedProvider([], model="local-test"),
@@ -365,6 +417,44 @@ class SleepModeTests(RuntimeTestCase):
         snapshot = runtime.workflow_runtime_snapshot()
         self.assertEqual(snapshot.waiting_on, "model")
         self.assertIn("Local model runner unavailable", snapshot.reason)
+
+    def test_snapshot_discards_provider_operation_from_previous_attempt(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([], model="local-test"),
+            self.store,
+            self.workspace,
+            config=self.config,
+        )
+        goal = self.store.create_goal(
+            "Resume the current saved task",
+            session_id=runtime.session_id,
+        )
+        self.store.transition_goal(
+            goal.id,
+            GoalStatus.AWAITING_PLAN_APPROVAL,
+            reason="plan ready",
+        )
+        self.store.transition_goal(goal.id, GoalStatus.RUNNING, reason="started")
+        self.store.update_goal_metadata(
+            goal.id,
+            waiting_question="Current checkpoint needs a new repair strategy.",
+            resume_action="ultra_replan",
+        )
+        self.store.transition_goal(goal.id, GoalStatus.PAUSED, reason="saved boundary")
+        with runtime._live_activity_lock:
+            runtime._live_provider_activity = {
+                "state": "completed",
+                "actor": "old-agent",
+                "operation": "The same saved verification failure was reproduced",
+                "last_signal_at": 1.0,
+            }
+
+        snapshot = runtime.workflow_runtime_snapshot()
+
+        self.assertEqual(snapshot.phase, "paused")
+        self.assertNotIn("same saved verification failure", snapshot.active_operation.casefold())
+        self.assertIn("saved checkpoint", snapshot.active_operation.casefold())
+        self.assertEqual(snapshot.provider_request_state, "idle")
 
     def test_sleep_mode_change_is_broadcast_for_other_ui_surfaces(self):
         runtime = AgentRuntime(
@@ -568,7 +658,7 @@ class SleepModeTests(RuntimeTestCase):
             self.store.get_goal(goal.id).metadata.get("pending_tool_approval"), {}
         )
 
-    def test_allow_session_is_reused_for_matching_policy_group(self):
+    def test_allow_session_is_reused_for_every_tool_group_in_the_session(self):
         decisions = iter(["allow_session"])
         runtime = AgentRuntime(
             ScriptedProvider([]),
@@ -589,7 +679,19 @@ class SleepModeTests(RuntimeTestCase):
                 "run_command", {"command": "npm install second-package"}, "critical"
             )
         )
-        self.assertIn("dangerous_command", runtime._approval_session_groups())
+        self.assertTrue(
+            runtime._approval_allowed(
+                "start_process",
+                {
+                    "command": "npm run dev",
+                    "cwd": "client",
+                    "readiness_type": "url",
+                    "readiness_value": "http://localhost:3000",
+                },
+                "critical",
+            )
+        )
+        self.assertEqual(runtime._approval_session_groups(), {"*"})
         self.assertTrue(
             any(item.event_type == "approval.session_reused" for item in self.store.list_events())
         )
@@ -856,6 +958,139 @@ class SleepModeTests(RuntimeTestCase):
         self.assertEqual(snapshot.liveness, "waiting")
         self.assertIn("preview_html", snapshot.reason)
 
+    def test_empty_cleared_tool_approval_does_not_override_paused_verification(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]),
+            self.store,
+            self.workspace,
+            config=self.config,
+        )
+        goal = self.store.create_goal(
+            "Keep a failed verification checkpoint actionable",
+            session_id=runtime.session_id,
+        )
+        self.store.transition_goal(
+            goal.id,
+            GoalStatus.AWAITING_PLAN_APPROVAL,
+            reason="plan ready",
+        )
+        self.store.transition_goal(goal.id, GoalStatus.RUNNING, reason="execution")
+        self.store.transition_goal(
+            goal.id,
+            GoalStatus.PAUSED,
+            reason="verification harness needs a retry",
+        )
+        self.store.update_goal_metadata(
+            goal.id,
+            pending_tool_approval={},
+            waiting_question="Verification stopped at a saved checkpoint.",
+            waiting_on="verification",
+            resume_action="retry_verification",
+            verification_blocker={
+                "blocker_owner": "test_harness",
+                "failure_kind": "contract",
+                "mutation_prohibited": True,
+            },
+        )
+
+        snapshot = runtime.workflow_runtime_snapshot()
+
+        self.assertEqual(snapshot.phase, "paused")
+        self.assertEqual(snapshot.waiting_on, "verification")
+        self.assertEqual(snapshot.resume_action, "retry_verification")
+        self.assertNotEqual(snapshot.liveness, "waiting")
+
+    def test_running_goal_at_boundary_lease_is_projected_as_paused_not_working(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]),
+            self.store,
+            self.workspace,
+            config=self.config,
+        )
+        goal = self.store.create_goal(
+            "Do not invent a live worker",
+            session_id=runtime.session_id,
+        )
+        self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.store.transition_goal(goal.id, GoalStatus.RUNNING)
+        self.store.update_goal_metadata(
+            goal.id,
+            waiting_on="verification",
+            retry_reason="Saved verification boundary.",
+            resume_action="retry_verification",
+        )
+        runtime._update_execution_lease(
+            stage="ultra-boundary",
+            state="boundary",
+        )
+
+        snapshot = runtime.workflow_runtime_snapshot()
+
+        self.assertEqual(snapshot.phase, "paused")
+        self.assertEqual(snapshot.liveness, "paused")
+        self.assertEqual(snapshot.waiting_on, "verification")
+        self.assertEqual(snapshot.resume_action, "retry_verification")
+
+    def test_live_execution_lease_keeps_running_goal_working(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]),
+            self.store,
+            self.workspace,
+            config=self.config,
+        )
+        goal = self.store.create_goal(
+            "Keep real work visible",
+            session_id=runtime.session_id,
+        )
+        self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.store.transition_goal(goal.id, GoalStatus.RUNNING)
+        runtime._update_execution_lease(stage="working", state="active")
+
+        snapshot = runtime.workflow_runtime_snapshot()
+
+        self.assertEqual(snapshot.phase, "working")
+        self.assertEqual(snapshot.liveness, "client_active")
+
+    def test_expired_execution_lease_with_stale_action_is_paused(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]),
+            self.store,
+            self.workspace,
+            config=self.config,
+        )
+        goal = self.store.create_goal(
+            "Do not mistake a stale action for a worker",
+            session_id=runtime.session_id,
+        )
+        self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.store.transition_goal(goal.id, GoalStatus.RUNNING)
+        self.store.begin_action(goal.id, "run_command", {"command": "stale"})
+        runtime._update_execution_lease(stage="working", state="active")
+        self.store.mutate_workflow_session(
+            runtime.session_id,
+            lambda current: {
+                **current,
+                "state": {
+                    **dict(current.get("state") or {}),
+                    "execution_lease": {
+                        **dict(
+                            dict(current.get("state") or {}).get(
+                                "execution_lease"
+                            )
+                            or {}
+                        ),
+                        "expires_at": 0.0,
+                    },
+                },
+            },
+        )
+
+        snapshot = runtime.workflow_runtime_snapshot()
+
+        self.assertEqual(snapshot.phase, "paused")
+        self.assertEqual(snapshot.liveness, "paused")
+        self.assertIn("heartbeat expired", snapshot.reason.casefold())
+
     def test_durable_sleep_auto_approves_safe_preview_after_ui_restart(self):
         runtime = AgentRuntime(
             ScriptedProvider([]),
@@ -933,6 +1168,160 @@ class UltraQualityFeedbackTests(RuntimeTestCase):
 
 
 class PlanningAndCompletionTests(RuntimeTestCase):
+    def test_fixed_specialist_review_runs_in_order_and_binds_fresh_revision(self):
+        runtime = AgentRuntime(
+            ScriptedProvider([]),
+            self.store,
+            self.workspace,
+            config=self.config,
+        )
+        goal = self.store.create_goal(
+            "Build reviewed behavior",
+            session_id=runtime.session_id,
+        )
+        self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+        plan = self.store.create_plan(
+            goal.id,
+            "Build and review",
+            [{
+                "id": "T001",
+                "title": "Build behavior",
+                "description": "Implement the accepted behavior.",
+                "acceptance_criteria": ["The behavior passes fresh verification."],
+                "verification": ["Run the focused test."],
+                "depends_on": [],
+                "risk": "high",
+            }],
+            **stored_plan_basis("T001"),
+        )
+        self.store.approve_plan(goal.id, plan.revision)
+        seen = []
+
+        def review(_goal, _plan, _claim, *, specialist_role=None, review_steps_override=None):
+            seen.append((specialist_role, review_steps_override))
+            return {
+                "verdict": "pass",
+                "summary": f"{specialist_role.value} passed.",
+                "issues": [],
+                "checked_task_ids": ["T001"],
+            }
+
+        with mock.patch.object(runtime, "_review_completion", side_effect=review):
+            first_gate, first_verdict = runtime._review_completion_specialists(
+                self.store.get_goal(goal.id),
+                plan,
+                {"summary": "done"},
+            )
+            self.store.update_goal_metadata(goal.id, mutation_sequence=1)
+            second_gate, _second_verdict = runtime._review_completion_specialists(
+                self.store.get_goal(goal.id),
+                plan,
+                {"summary": "repaired"},
+            )
+
+        self.assertEqual(
+            [item[0] for item in seen[:6]],
+            list(FIXED_SPECIALIST_REVIEW_ORDER),
+        )
+        self.assertTrue(all(item[1] == 2 for item in seen))
+        self.assertIs(first_gate.verdict, EvidenceVerdict.PASSED)
+        self.assertEqual(first_verdict["verdict"], "pass")
+        self.assertEqual(second_gate.mutation_sequence, 1)
+        self.assertNotEqual(first_gate.artifact_hash, second_gate.artifact_hash)
+        specialist_evidence = [
+            item for item in self.store.list_evidence(goal.id)
+            if item.kind == "specialist_review"
+        ]
+        self.assertEqual(len(specialist_evidence), 12)
+        self.assertEqual(
+            {item.data["role"] for item in specialist_evidence[-6:]},
+            {item.value for item in SpecialistReviewRole},
+        )
+        started_events = [
+            item for item in runtime.events.list_live_events(limit=100)
+            if item.actor.startswith("specialist-review:")
+            and item.operation.startswith("Reviewing ")
+        ]
+        self.assertEqual(
+            [item.actor.removeprefix("specialist-review:") for item in started_events[-6:]],
+            [item.value for item in FIXED_SPECIALIST_REVIEW_ORDER],
+        )
+
+    def test_runtime_vision_evaluator_sends_current_image_bytes_to_model(self):
+        response = {
+            "status": "evaluated",
+            "model": "vision-scripted",
+            "evaluations": [{
+                "path": "shot.png", "readable": True,
+                "visual_quality_score": 88, "requirement_fit_score": 91,
+                "strengths": ["clear"], "issues": [], "visible_facts": ["screen visible"],
+            }],
+            "ranking": ["shot.png"],
+            "selected": ["shot.png"],
+            "copy_facts": ["screen visible"],
+        }
+        provider = ScriptedProvider([
+            json.dumps({"token": "VISION-731"}),
+            json.dumps(response),
+        ])
+        provider.capabilities = ProviderCapabilities(
+            streaming=True, tool_calling=True, vision=True
+        )
+        runtime = AgentRuntime(
+            provider,
+            self.store,
+            self.workspace,
+            config=self.config,
+            sleeper=lambda _seconds: None,
+        )
+        image_bytes = b"current-image-bytes"
+        Path(self.workspace, "shot.png").write_bytes(image_bytes)
+        try:
+            payload = json.loads(agent_tools.run_tool("inspect_images", {
+                "paths": ["shot.png"],
+                "purpose": "Choose the clearest screenshot",
+                "criteria": "Readable and relevant",
+            }))
+        finally:
+            runtime.close()
+
+        self.assertEqual(payload["status"], "evaluated")
+        self.assertEqual(provider.calls[0].conversation[0]["images"][0]["path"], "__vision_capability_probe__.png")
+        sent = provider.calls[1].conversation[0]["images"][0]
+        self.assertEqual(base64.b64decode(sent["data"]), image_bytes)
+        self.assertEqual(sent["path"], "shot.png")
+
+    def test_runtime_vision_probe_blocks_a_model_that_cannot_read_pixels(self):
+        provider = ScriptedProvider([
+            json.dumps({"token": "VISION-713"}),
+        ])
+        provider.capabilities = ProviderCapabilities(
+            streaming=True, tool_calling=True, vision=True
+        )
+        runtime = AgentRuntime(
+            provider,
+            self.store,
+            self.workspace,
+            config=self.config,
+            sleeper=lambda _seconds: None,
+        )
+        Path(self.workspace, "shot.png").write_bytes(b"current-image-bytes")
+        try:
+            # This test isolates the selected model's pixel probe. Installed
+            # local fallback models are covered separately and must not make
+            # the assertion depend on the developer machine's Ollama catalog.
+            with mock.patch("agent.runtime.installed_vision_models", return_value=()):
+                result = agent_tools.run_tool("inspect_images", {
+                    "paths": ["shot.png"],
+                    "purpose": "Choose the clearest screenshot",
+                    "criteria": "Readable and relevant",
+                })
+        finally:
+            runtime.close()
+
+        self.assertIn("could not read the pixel-only OCR probe", result)
+        self.assertEqual(provider.remaining, 0)
+
     def test_explicit_path_parser_does_not_treat_three_js_product_name_as_a_file(self):
         self.assertEqual(
             _extract_explicit_workspace_paths(
@@ -1414,6 +1803,66 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             current.metadata["verification_blocker"]["blocker_owner"],
             "test_harness",
         )
+        self.assertEqual(
+            current.metadata["verification_retry_state"]["attempts"],
+            0,
+        )
+        self.assertFalse(
+            current.metadata["verification_retry_state"]["exhausted"]
+        )
+
+    def test_ultra_convergence_disables_an_identical_repeated_verification_retry(self):
+        runtime, _provider = self.runtime([])
+        goal = self.store.create_goal(
+            "Stop repeating the identical browser verification",
+            session_id=runtime.session_id,
+        )
+        fingerprint = "b" * 64
+        self.store.update_goal_metadata(
+            goal.id,
+            ultra_run_id="ultra-contract-repeat",
+            verification_retry_state={
+                "failure_fingerprint": fingerprint,
+                "attempts": 1,
+                "exhausted": False,
+                "last_outcome": "running",
+            },
+        )
+        self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.store.transition_goal(goal.id, GoalStatus.RUNNING)
+        self.store.transition_goal(goal.id, GoalStatus.REVISING)
+        revision_required = SimpleNamespace(
+            run=SimpleNamespace(phase="revision_required"),
+            node_results=(
+                SimpleNamespace(
+                    findings=("same browser contract failure",),
+                    component_package={
+                        "failure_diagnostic": {
+                            "failure_kind": "contract",
+                            "blocker_owner": "test_harness",
+                            "mutation_prohibited": True,
+                            "failure_fingerprint": fingerprint,
+                        }
+                    },
+                ),
+            ),
+            global_result=None,
+        )
+
+        with mock.patch.object(runtime, "_ensure_ultra_session"), mock.patch.object(
+            runtime,
+            "wait_for_ultra",
+            return_value=revision_required,
+        ):
+            runtime.converge_ultra()
+
+        paused = self.store.get_goal(goal.id)
+        self.assertEqual(paused.status, GoalStatus.PAUSED)
+        self.assertEqual(paused.metadata["resume_action"], "inspect_verification")
+        self.assertTrue(paused.metadata["verification_retry_state"]["exhausted"])
+        self.assertIn("disabled", paused.metadata["waiting_question"].casefold())
+        with self.assertRaisesRegex(RuntimeStateError, "identical verification retry"):
+            runtime.resume()
 
     def test_ultra_convergence_honors_strategy_repetition_limit(self):
         runtime, _provider = self.runtime([])
@@ -1523,6 +1972,91 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         ultra_replan.assert_called_once()
         normal_plan.assert_not_called()
         self.assertEqual(self.store.get_plan(goal.id, expanded.revision).status, PlanStatus.REJECTED)
+
+    def test_resume_rebuilds_a_finished_in_memory_ultra_session(self):
+        runtime, _provider = self.runtime([])
+        goal = self.store.create_goal(
+            "Resume the stopped recursive scheduler",
+            session_id=runtime.session_id,
+        )
+        task = {
+            "id": "T001",
+            "title": "Finish verification",
+            "description": "Finish only the saved verification boundary.",
+            "acceptance_criteria": ["Verification finishes."],
+            "verification": ["Inspect the saved evidence."],
+            "depends_on": [],
+            "risk": "low",
+        }
+        plan = self.store.create_plan(
+            goal.id,
+            "Approved plan",
+            [task],
+            applicability_evidence=[{
+                "fact": "Workspace inspected.",
+                "source": "inspection:I001",
+                "supports_tasks": ["T001"],
+            }],
+            execution_strategy="Finish saved verification.",
+            expected_changes=[{
+                "path": "index.html",
+                "intent": "Preserve the accepted artifact.",
+                "supports_tasks": ["T001"],
+            }],
+        )
+        self.store.transition_goal(goal.id, GoalStatus.AWAITING_PLAN_APPROVAL)
+        self.store.approve_plan(
+            goal.id,
+            plan.revision,
+            expected_fingerprint=plan.fingerprint,
+        )
+        self.store.update_goal_metadata(
+            goal.id,
+            ultra_run_id="ultra-stopped",
+            resume_action="retry_verification",
+            verification_blocker={
+                "failure_fingerprint": "a" * 64,
+                "blocker_owner": "test_harness",
+            },
+        )
+        self.store.transition_goal(goal.id, GoalStatus.PAUSED)
+        stopped = SimpleNamespace(running=False, close=mock.Mock())
+        replacement = SimpleNamespace(running=True, resume=mock.Mock())
+        runtime.ultra_session = stopped
+        run = SimpleNamespace(
+            id="ultra-stopped",
+            config={},
+            goal_spec=object(),
+            architecture_spec=object(),
+            master_approved=True,
+            status=SimpleNamespace(value="revision_required"),
+        )
+
+        def restore(run_id):
+            self.assertEqual(run_id, "ultra-stopped")
+            runtime.ultra_session = replacement
+            return replacement
+
+        with mock.patch.object(
+            runtime,
+            "active_ultra_run",
+            return_value=run,
+        ), mock.patch.object(
+            runtime,
+            "restore_ultra",
+            side_effect=restore,
+        ) as restore_ultra:
+            resumed = runtime.resume()
+
+        self.assertEqual(resumed.status, GoalStatus.RUNNING)
+        stopped.close.assert_called_once_with()
+        restore_ultra.assert_called_once_with("ultra-stopped")
+        replacement.resume.assert_not_called()
+        retry_state = self.store.get_goal(goal.id).metadata[
+            "verification_retry_state"
+        ]
+        self.assertEqual(retry_state["attempts"], 1)
+        self.assertFalse(retry_state["exhausted"])
 
     def test_ultra_replan_contract_exhaustion_is_a_resumable_boundary(self):
         from agent.ultra import AgentProtocolError
@@ -1748,7 +2282,9 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         }}]}
         runtime, provider = self.runtime([
             inspect_call(), castle_plan, plan_pass(), first_turn, failed_review,
+            *fixed_specialist_passes("T001")[1:],
             broken_turn, repaired_turn, final_review,
+            *fixed_specialist_passes("T001", "T002")[1:],
         ])
         plan = runtime.start_goal("Create a detailed animated castle siege in one self-contained HTML file")
         goal_id = runtime.active_goal().id
@@ -1846,7 +2382,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
                 {"id": "preview", "name": "preview_html", "args": {"path": "index.html", "open_browser": False, "settle_ms": 0}},
                 finish_call(),
             ]},
-            review_pass(),
+            *fixed_specialist_passes(),
         ])
         plan = runtime.start_goal("Create a polished visual page")
         runtime.approve_plan(plan.revision)
@@ -1908,7 +2444,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
 
         session = self.store.get_workflow_session(runtime.session_id)
         self.assertEqual(session["state"]["interaction_mode"], "working")
-        self.assertEqual(session["state"]["minimum_strategy"], "recursive")
+        self.assertEqual(session["state"]["minimum_strategy"], "staged")
 
     def test_normal_can_visit_plan_and_return_to_normal(self):
         runtime, _provider = self.runtime([])
@@ -2533,6 +3069,26 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         self.assertIn("durable retry policy", output.getvalue())
         provider.assert_exhausted()
 
+    def test_full_auto_continues_bounded_action_missing_evidence_without_user_retry(self):
+        runtime = mock.Mock()
+        runtime.access_level = "full"
+        runtime.continue_until_boundary.return_value = SliceResult(
+            "ready", "There is no active goal."
+        )
+        runtime.prepare_automatic_semantic_retry.side_effect = [True, False]
+        runtime.resume.return_value = SliceResult(
+            "action_incomplete",
+            "Still collecting screenshots.",
+            phase="paused",
+        )
+        output = io.StringIO()
+
+        result = _run_auto(runtime, ConsoleUI(stream=output, color=False))
+
+        runtime.resume.assert_called_once_with()
+        self.assertEqual(result.status, "action_incomplete")
+        self.assertIn("Full access is continuing", output.getvalue())
+
     def test_repeated_no_progress_slices_self_reprompt_without_retry_limit(self):
         provider = ScriptedProvider([
             inspect_call(), plan_call(), plan_pass(),
@@ -2578,7 +3134,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
                         finish_call(),
                     ]
                 },
-                review_pass(),
+                *fixed_specialist_passes(),
             ]
         )
         plan = runtime.start_goal("Build persistent behavior")
@@ -2624,6 +3180,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
                 {"tool_calls": [finish_call()]},
                 review_pass(),
                 complete_review,
+                *fixed_specialist_passes("T001", "T002")[1:],
             ]
         )
         plan = runtime.start_goal("Build and integrate persistent behavior")
@@ -2637,7 +3194,7 @@ class PlanningAndCompletionTests(RuntimeTestCase):
         reviewer_calls = [
             call for call in provider.calls if "independent final reviewer" in call.system
         ]
-        self.assertEqual(len(reviewer_calls), 2)
+        self.assertEqual(len(reviewer_calls), 7)
         rejection_context = "\n".join(
             str(message.get("content", ""))
             for message in reviewer_calls[1].conversation
@@ -2666,9 +3223,8 @@ class PlanningAndCompletionTests(RuntimeTestCase):
                 plan_pass(),
                 {"tool_calls": [finish_call()]},
                 inspect_evidence,
-                inspect_evidence,
-                inspect_evidence,
                 review_pass(),
+                *fixed_specialist_passes()[1:],
             ]
         )
         plan = runtime.start_goal("Build persistent behavior")
@@ -2686,14 +3242,14 @@ class PlanningAndCompletionTests(RuntimeTestCase):
             call for call in provider.calls
             if "independent final reviewer" in call.system
         ]
-        self.assertEqual(len(reviewer_calls), 4)
+        self.assertEqual(len(reviewer_calls), 7)
         final_tools = {
-            item["function"]["name"] for item in reviewer_calls[-1].tools
+            item["function"]["name"] for item in reviewer_calls[1].tools
         }
         self.assertEqual(final_tools, {"submit_review"})
         final_context = "\n".join(
             str(message.get("content", ""))
-            for message in reviewer_calls[-1].conversation
+            for message in reviewer_calls[1].conversation
         )
         self.assertIn("FINAL REVIEW VERDICT TURN", final_context)
         provider.assert_exhausted()
@@ -3295,6 +3851,184 @@ class PlanningAndCompletionTests(RuntimeTestCase):
 
 
 class DelegationAndReviewTests(RuntimeTestCase):
+    def test_adaptive_policy_activation_requires_passed_matching_benchmark(self):
+        runtime, provider = self.runtime(
+            [inspect_call(), plan_call(), plan_pass()]
+        )
+        plan = runtime.start_goal("Build persistent behavior")
+        runtime.approve_plan(plan.revision)
+        active_policy = AdaptiveOrchestrationPolicyV1(shadow_mode=False)
+        with self.assertRaises(RuntimeStateError):
+            runtime.configure_adaptive_orchestration(active_policy)
+
+        goal = runtime.active_goal()
+        model_fingerprint = str(
+            dict(goal.metadata["model_capability_envelope"])["model_fingerprint"]
+        )
+        report = SimpleNamespace(
+            model_fingerprint=model_fingerprint,
+            activation=SimpleNamespace(passed=True),
+        )
+        configured = runtime.configure_adaptive_orchestration(
+            active_policy,
+            benchmark_report=report,
+        )
+        self.assertFalse(configured["shadow_mode"])
+        self.assertFalse(
+            self.store.get_goal(goal.id).metadata["adaptive_orchestration_policy"][
+                "shadow_mode"
+            ]
+        )
+
+        rolled_back = runtime.configure_adaptive_orchestration(
+            AdaptiveOrchestrationPolicyV1(shadow_mode=True)
+        )
+        self.assertTrue(rolled_back["shadow_mode"])
+        provider.assert_exhausted()
+
+    def test_challenger_candidate_is_materialized_only_in_agent_staging(self):
+        runtime, provider = self.runtime(
+            [inspect_call(), plan_call(), plan_pass()]
+        )
+        plan = runtime.start_goal("Build persistent behavior")
+        runtime.approve_plan(plan.revision)
+        goal = runtime.active_goal()
+        task = runtime.latest_plan().tasks[0]
+        mission = WorkerMissionV2(
+            role=WorkerRole.CHALLENGER,
+            objective="Produce an independent implementation candidate.",
+            success_criteria=task.acceptance_criteria,
+            visibility=WorkerVisibility.CONTRACT_ONLY,
+            mutation_policy=MutationPolicy.STAGING_ONLY,
+            allowed_tools=("read_file",),
+        )
+
+        evidence = runtime._materialize_staged_worker_candidate(
+            goal=goal,
+            plan=runtime.latest_plan(),
+            task=task,
+            mission=mission,
+            report={
+                "staged_candidate": {
+                    "approach_summary": "Use a smaller transaction boundary.",
+                    "files": [
+                        {"path": "artifact.txt", "content": "independent candidate\n"}
+                    ],
+                }
+            },
+        )
+
+        staged_path = self.workspace / evidence.data["files"][0]["stage_path"]
+        self.assertTrue(staged_path.is_file())
+        self.assertEqual(staged_path.read_text(), "independent candidate\n")
+        self.assertFalse((self.workspace / "artifact.txt").exists())
+        self.assertFalse(evidence.verified)
+        provider.assert_exhausted()
+
+    def test_worker_evidence_is_invalidated_after_a_later_mutation(self):
+        runtime, provider = self.runtime(
+            [inspect_call(), plan_call(), plan_pass()]
+        )
+        plan = runtime.start_goal("Build persistent behavior")
+        runtime.approve_plan(plan.revision)
+        goal = runtime.active_goal()
+        task = runtime.latest_plan().tasks[0]
+        evidence = self.store.add_evidence(
+            goal_id=goal.id,
+            plan_revision=plan.revision,
+            task_id=task.id,
+            kind="tool_result",
+            summary="Focused restart test passed.",
+            data={
+                "action_id": "focused-test",
+                "tool": "run_command",
+                "mutation_sequence": 0,
+            },
+            created_by="harness",
+            verified=True,
+        )
+        report = {
+            "claims": [
+                {
+                    "criterion_id": "T001:AC1",
+                    "claim": "Restart behavior and tests pass.",
+                    "evidence_refs": [f"evidence:{evidence.id}"],
+                    "falsification_check": "Re-run the focused restart test.",
+                }
+            ]
+        }
+
+        fresh = runtime._fresh_authoritative_task_evidence(
+            goal, runtime.latest_plan(), task.id
+        )
+        self.assertTrue(runtime._worker_claim_coverage(task, report, fresh)[0])
+
+        self.store.update_goal_metadata(goal.id, mutation_sequence=1)
+        stale = runtime._fresh_authoritative_task_evidence(
+            goal, runtime.latest_plan(), task.id
+        )
+        self.assertFalse(stale)
+        self.assertFalse(runtime._worker_claim_coverage(task, report, stale)[0])
+        provider.assert_exhausted()
+
+    def test_active_adaptive_policy_rejects_worker_success_without_fresh_evidence(self):
+        worker_return = {
+            "tool_calls": [
+                {
+                    "id": "return-no-evidence",
+                    "name": "return_work",
+                    "args": {
+                        "outcome": "success",
+                        "summary": "The implementation appears correct.",
+                        "evidence": ["Model-authored prose only."],
+                        "changed_paths": [],
+                        "remaining_risks": [],
+                        "proposed_subtasks": [],
+                    },
+                }
+            ]
+        }
+        runtime, provider = self.runtime(
+            [inspect_call(), plan_call(), plan_pass(), worker_return]
+        )
+        runtime.adaptive_orchestration_policy = AdaptiveOrchestrationPolicyV1(
+            shadow_mode=False
+        )
+        runtime.worker_router = AdaptiveWorkerRouter(
+            runtime.adaptive_orchestration_policy
+        )
+        plan = runtime.start_goal("Build persistent behavior")
+        runtime.approve_plan(plan.revision)
+        goal = runtime.active_goal()
+
+        report = runtime._delegate(
+            goal,
+            runtime.latest_plan(),
+            {
+                "task_id": "T001",
+                "role": "Failure predictor. State testable risks without trusting builder confidence.",
+                "task": "Predict a concrete failure before accepting the implementation.",
+                "success_criteria": ["Every claim cites fresh harness evidence."],
+                "context": "Builder says the work is complete.",
+                "allowed_tools": ["read_file", "write_file", "run_command"],
+                "worker_role": "predictor",
+            },
+        )
+
+        delegation = self.store.list_delegations(goal.id)[0]
+        experiment = self.store.list_orchestration_experiments(goal_id=goal.id)[0]
+        self.assertEqual(report["outcome"], "partial")
+        self.assertIn("NEEDS_EVIDENCE", report["remaining_risks"][-1])
+        self.assertEqual(delegation.status, DelegationStatus.FAILED)
+        self.assertEqual(experiment["false_completion"], 1)
+        worker_request = next(
+            call
+            for call in provider.calls
+            if "<WORKER_BRIEF>" in call.conversation[0]["content"]
+        )
+        self.assertNotIn('"write_file"', worker_request.conversation[0]["content"])
+        provider.assert_exhausted()
+
     def test_dynamic_role_worker_has_isolated_context_and_structured_result(self):
         role = (
             "Crash-consistency investigator. Inspect transaction boundaries and report only "
@@ -3339,7 +4073,7 @@ class DelegationAndReviewTests(RuntimeTestCase):
                     {"id": "verify-worker", "name": "list_files", "args": {"path": "."}},
                     task_update("done", ["worker evidence reviewed"], "verified"), finish_call()
                 ]},
-                review_pass(),
+                *fixed_specialist_passes(),
             ]
         )
         plan = runtime.start_goal("Build persistent behavior")
@@ -3350,6 +4084,11 @@ class DelegationAndReviewTests(RuntimeTestCase):
         delegation = self.store.list_delegations(goal_id)[0]
         self.assertEqual(delegation.role.mission, role)
         self.assertEqual(delegation.status, DelegationStatus.COMPLETED)
+        experiment = self.store.list_orchestration_experiments(goal_id=goal_id)[0]
+        contribution = self.store.list_worker_contributions(goal_id=goal_id)[0]
+        self.assertEqual(experiment["false_completion"], 1)
+        self.assertEqual(experiment["causal"], 0)
+        self.assertEqual(contribution["outcome"], "neutral")
         # The worker call is fresh: it sees one WORKER_BRIEF user message, not the
         # coordinator's full conversation.
         worker_request = next(call for call in provider.calls if "focused worker" in call.system)
@@ -3418,7 +4157,11 @@ class DelegationAndReviewTests(RuntimeTestCase):
             ]
         }
         runtime, provider = self.runtime(
-            [inspect_call(), plan_call(), plan_pass(), {"tool_calls": [finish_call()]}, shell_attempt, review_pass()]
+            [
+                inspect_call(), plan_call(), plan_pass(),
+                {"tool_calls": [finish_call()]}, shell_attempt, review_pass(),
+                *fixed_specialist_passes()[1:],
+            ]
         )
         plan = runtime.start_goal("Build persistent behavior")
         runtime.approve_plan(plan.revision)
@@ -3685,6 +4428,7 @@ class RecoveryRuntimeTests(RuntimeTestCase):
                     task_update("done", ["initial test"], "tested"), finish_call()
                 ]},
                 failed_review,
+                *fixed_specialist_passes()[1:],
             ]
         )
         plan = runtime.start_goal("Build persistent behavior")
@@ -3698,6 +4442,22 @@ class RecoveryRuntimeTests(RuntimeTestCase):
         self.assertEqual(revised.revision, 2)
         self.assertEqual(revised.status, PlanStatus.ACCEPTED)
         self.assertIn("Prove restart recovery", [task.title for task in revised.tasks])
+        repair_task = next(
+            task for task in revised.tasks
+            if task.title == "Prove restart recovery"
+        )
+        self.assertEqual(repair_task.origin, "repairer")
+        self.assertEqual(repair_task.metadata["required_worker_role"], "repairer")
+        self.assertTrue(repair_task.metadata["fresh_verification_required"])
+        repair_route, _model_fingerprint, _suppressed = runtime._normal_worker_route(
+            goal,
+            revised,
+            repair_task,
+        )
+        self.assertEqual(repair_route.roles, (WorkerRole.REPAIRER,))
         self.assertEqual(goal.metadata["convergence_state"], "refining")
-        self.assertEqual(goal.metadata["refinement_actions"][-1]["source"], "independent-reviewer")
+        self.assertEqual(
+            goal.metadata["refinement_actions"][-1]["source"],
+            "fixed-specialist-evidence-gate",
+        )
         provider.assert_exhausted()

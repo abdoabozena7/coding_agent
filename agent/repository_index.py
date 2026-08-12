@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import fnmatch
 import hashlib
@@ -17,7 +16,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 import re
 import subprocess
-from typing import Iterable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -335,7 +334,7 @@ class RepositoryIndex:
     # first semantic route and make the UI look frozen.  Keep the fast lexical
     # and embedding ranking available, but defer graph expansion until an idle
     #/explicit inspection path can afford it.
-    _GRAPH_NEIGHBORHOOD_MAX_VECTORS = 20_000
+    _GRAPH_NEIGHBORHOOD_MAX_VECTORS = 2_000
     _FAST_RETRIEVAL_MAX_TEXT_VECTORS = 20_000
     _INDEXABLE_SUFFIXES = {
         ".py", ".html", ".htm", ".js", ".jsx", ".mjs", ".cjs",
@@ -350,6 +349,18 @@ class RepositoryIndex:
         "env",
         "__pycache__",
         "node_modules",
+        # Generated dependency/build trees are not repository source.  They
+        # must be pruned before traversal rather than filtered after rglob has
+        # already walked them; otherwise a normal Node project can spend
+        # minutes here before the first provider request is even created.
+        "dist",
+        "build",
+        "coverage",
+        ".next",
+        ".nuxt",
+        ".svelte-kit",
+        ".turbo",
+        "out",
         ".mypy_cache",
         ".pytest_cache",
         ".coding-agent",
@@ -361,6 +372,7 @@ class RepositoryIndex:
         *,
         embedding_provider: EmbeddingProvider | None = None,
         cache_path: str | Path | None = None,
+        autoload_cache: bool = True,
     ):
         self.workspace = Path(workspace).resolve()
         self.entries: dict[str, tuple[IndexEntry, ...]] = {}
@@ -380,7 +392,7 @@ class RepositoryIndex:
             "removed": 0,
             "loaded": 0,
         }
-        if self.cache_path is not None:
+        if self.cache_path is not None and autoload_cache:
             self.load_cache()
 
     def update(self, relative_path: str) -> tuple[IndexEntry, ...]:
@@ -689,13 +701,29 @@ class RepositoryIndex:
             return False
         return snapshot.size == int(stat.st_size) and snapshot.mtime_ns == int(stat.st_mtime_ns)
 
+    @classmethod
+    def _is_skipped_relative_path(cls, relative_path: str) -> bool:
+        """Return whether a cached path is inside an authoritative skip tree."""
+
+        skipped = {item.casefold() for item in cls._SKIP_DIRS}
+        return any(
+            part.casefold() in skipped
+            for part in PurePosixPath(str(relative_path).replace("\\", "/")).parts[:-1]
+        )
+
     def update_all(
         self,
         *,
         suffixes: Iterable[str] | None = None,
         max_files: int | None = None,
         force: bool = False,
+        on_progress: Callable[[str, Mapping[str, Any]], None] | None = None,
     ) -> tuple[IndexEntry, ...]:
+        def report(message: str, **data: Any) -> None:
+            if on_progress is not None:
+                on_progress(message, data)
+
+        report("Scanning project files", phase="scanning", state="active", completed=0, total=0)
         allowed = {item.casefold() for item in (suffixes or self._INDEXABLE_SUFFIXES)}
         collected: list[IndexEntry] = []
         indexed = 0
@@ -704,13 +732,48 @@ class RepositoryIndex:
         stats = {"seen": 0, "updated": 0, "reused": 0, "removed": 0, "loaded": len(self.entries)}
         self._cache_save_suspended = True
         try:
-            paths = sorted(self.workspace.rglob("*"))
+            # Old caches may predate an ignored directory or may have been
+            # created before traversal pruning existed. A bounded warmup cannot
+            # treat every unseen source file as deleted, but ignored build and
+            # dependency trees are authoritative and must always be evicted.
+            ignored_cached_paths = tuple(
+                relative
+                for relative in self.entries
+                if self._is_skipped_relative_path(relative)
+            )
+            if ignored_cached_paths:
+                report(
+                    f"Removing {len(ignored_cached_paths)} stale generated cache paths",
+                    phase="indexing",
+                    state="active",
+                    completed=0,
+                    total=len(ignored_cached_paths),
+                )
+                for relative in ignored_cached_paths:
+                    self._remove_path(relative)
+                    stats["removed"] += 1
+            paths: list[Path] = []
+            # os.walk(topdown=True) lets us remove ignored directories before
+            # the filesystem descends into them. Path.rglob discovers every
+            # file first, so filtering its results is far too late for projects
+            # with existing node_modules, build output, or coverage artifacts.
+            skipped = {item.casefold() for item in self._SKIP_DIRS}
+            for root, directories, filenames in os.walk(self.workspace, topdown=True):
+                directories[:] = sorted(
+                    name
+                    for name in directories
+                    if name.casefold() not in skipped
+                )
+                root_path = Path(root)
+                for filename in sorted(filenames):
+                    path = root_path / filename
+                    if path.suffix.casefold() in allowed:
+                        paths.append(path)
+                        if max_files is not None and len(paths) >= max(1, int(max_files)):
+                            break
+                if max_files is not None and len(paths) >= max(1, int(max_files)):
+                    break
             for path in paths:
-                if not path.is_file():
-                    continue
-                relative_parts = path.relative_to(self.workspace).parts
-                if any(part in self._SKIP_DIRS for part in relative_parts[:-1]):
-                    continue
                 if path.suffix.casefold() not in allowed:
                     continue
                 relative = path.relative_to(self.workspace).as_posix()
@@ -722,22 +785,50 @@ class RepositoryIndex:
                 else:
                     changed_paths.append(relative)
                 indexed += 1
-                if max_files is not None and indexed >= max(1, int(max_files)):
-                    break
+            report(
+                f"Project scan complete · {len(paths)} source files found",
+                phase="scanning",
+                state="completed",
+                completed=len(paths),
+                total=len(paths),
+            )
             if changed_paths:
-                worker_count = min(
-                    len(changed_paths),
-                    max(1, min(32, (os.cpu_count() or 2) + 4)),
+                # tree-sitter language parsers used by the optional language
+                # pack are not guaranteed to be thread-safe. Parallel parsing
+                # intermittently deadlocked on ordinary JSX projects, leaving
+                # the TUI at "first tool" with no provider/GPU activity. The
+                # bounded warmup (200 files by default) is faster and reliable
+                # sequentially once generated/dependency trees are pruned.
+                total_changed = len(changed_paths)
+                report(
+                    f"Indexing {total_changed} changed source files",
+                    phase="indexing",
+                    state="active",
+                    completed=0,
+                    total=total_changed,
                 )
-                with ThreadPoolExecutor(
-                    max_workers=worker_count,
-                    thread_name_prefix="repository-ast",
-                ) as pool:
-                    analyses = tuple(pool.map(self._analyze_file, changed_paths))
-                for analysis in analyses:
+                for change_index, relative in enumerate(changed_paths, 1):
+                    analysis = self._analyze_file(relative)
                     self._commit_analysis(*analysis)
                     collected.extend(analysis[1])
                     stats["updated"] += 1
+                    if change_index == total_changed or change_index % 25 == 0:
+                        report(
+                            f"Indexing project source · {change_index}/{total_changed} files",
+                            phase="indexing",
+                            state="active" if change_index < total_changed else "completed",
+                            completed=change_index,
+                            total=total_changed,
+                            current_file=relative,
+                        )
+            elif paths:
+                report(
+                    f"Repository index is current · reused {stats['reused']} files",
+                    phase="indexing",
+                    state="completed",
+                    completed=stats["reused"],
+                    total=len(paths),
+                )
         finally:
             self._cache_save_suspended = False
         if max_files is None:
@@ -748,11 +839,19 @@ class RepositoryIndex:
                     stats["removed"] += 1
         self.last_update_stats = stats
         if self.cache_path is not None:
+            report("Saving repository index", phase="indexing", state="active")
             self.save_cache()
         # HNSW rebuild is intentionally lazy. Rebuilding the entire graph on a
         # 50-file incremental batch makes update latency proportional to the
         # whole repository. The next semantic query rebuilds once; lexical and
         # graph retrieval remain immediately available meanwhile.
+        report(
+            f"Repository index ready · {len(self.entries)} files",
+            phase="indexing",
+            state="completed",
+            completed=len(self.entries),
+            total=len(self.entries),
+        )
         return tuple(collected)
 
     def _ensure_hnsw(self) -> bool:
@@ -1258,6 +1357,7 @@ class RepositoryIndex:
         kinds: tuple[str, ...] = (),
         relation_kinds: tuple[str, ...] = (),
         limit: int = 50,
+        include_graph: bool = True,
     ) -> tuple[SearchHit, ...]:
         terms = [term.casefold() for term in re.findall(r"[\w.-]+", query)]
         query_vector = self._vector(query)
@@ -1318,7 +1418,7 @@ class RepositoryIndex:
                 if embedding >= 0.08:
                     add(item, embedding * 10.0, "embedding")
 
-        if not large_index:
+        if include_graph and not large_index:
             for relation in self.search_graph(query, relation_kinds=relation_kinds):
                 names = {relation.source, relation.target}
                 for entry in self.entries.get(relation.path, ()):
@@ -1557,6 +1657,7 @@ class RepositoryIndex:
             kinds=kinds,
             relation_kinds=relation_kinds,
             limit=candidate_limit,
+            include_graph=include_graph_neighborhood,
         )
         selected: list[IndexEntry] = []
         selected_keys: set[tuple[str, str, str, int]] = set()

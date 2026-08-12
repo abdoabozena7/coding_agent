@@ -26,12 +26,12 @@ class CommandAvailabilityTests(unittest.TestCase):
         matches = matching_commands("/", snapshot=idle)
         self.assertEqual(
             [item.name for item in matches[:5]],
-            ["/plan", "/live", "/show-diff", "/advanced-tracing", "/settings"],
+            ["/ultra-plan", "/todo", "/live", "/output", "/show-diff"],
         )
         self.assertEqual(
             {item.name for item in COMMAND_SPECS},
             {
-                "/plan", "/live", "/show-diff", "/advanced-tracing", "/settings", "/pause",
+                "/ultra-plan", "/todo", "/live", "/output", "/show-diff", "/advanced-tracing", "/settings", "/access", "/pause",
                 "/resume", "/stop", "/undo", "/help", "/quit",
             },
         )
@@ -44,13 +44,13 @@ class CommandAvailabilityTests(unittest.TestCase):
     def test_running_palette_keeps_only_direct_recovery_controls(self):
         running = SimpleNamespace(status="running", running=True, undo_available=False)
         names = {item.name for item in matching_commands("", snapshot=running)}
-        self.assertTrue({"/pause", "/stop", "/live", "/show-diff", "/advanced-tracing", "/settings"} <= names)
+        self.assertTrue({"/todo", "/pause", "/stop", "/live", "/output", "/show-diff", "/advanced-tracing", "/access", "/settings"} <= names)
         self.assertNotIn("/resume", names)
 
     def test_recovery_palette_keeps_resume_and_stop_discoverable(self):
         recovering = SimpleNamespace(status="recovering", running=True, undo_available=False)
         names = {item.name for item in matching_commands("", snapshot=recovering)}
-        self.assertTrue({"/pause", "/stop", "/live", "/show-diff", "/advanced-tracing"} <= names)
+        self.assertTrue({"/todo", "/pause", "/stop", "/live", "/output", "/show-diff", "/advanced-tracing"} <= names)
 
 
 if __name__ == "__main__":

@@ -29,11 +29,15 @@ class InteractionModeV2(str, Enum):
             "chat": "working",
             "goal": "working",
             "default": "working",
+            "execution": "working",
+            "execute": "working",
+            "ultra-plan": "plan",
+            "ultra_plan": "plan",
         }.get(normalized, normalized)
         try:
             return cls(normalized)
         except ValueError as exc:
-            raise ValueError("interaction mode must be 'working' or 'plan'") from exc
+            raise ValueError("interaction mode must be 'execution' or 'ultra-plan'") from exc
 
 
 class ExecutionStrategyV1(str, Enum):

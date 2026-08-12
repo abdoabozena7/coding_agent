@@ -112,6 +112,9 @@ def test_natural_and_explanatory_turns_are_one_inference_chat(prompt: str, respo
             assert len(agent.provider.calls) == 1
             assert agent.active_goal() is None
             assert store.list_session_actions(agent.session_id) == ()
+            state = store.get_workflow_session(agent.session_id)["state"]
+            assert state["session_title"] == "Scripted session"
+            assert state["session_title_source"] == "model_first_semantic_response"
         finally:
             agent.close(); store.close()
 
@@ -156,6 +159,128 @@ def test_weak_model_scalar_and_descriptive_route_shapes_are_normalized() -> None
     assert decision.needs_workspace_tools is True
     assert decision.task_demand.visual_runtime == 1
     assert decision.task_demand.rationale == ("A model-authored reason",)
+
+
+def test_semantic_intake_reads_project_manifest_with_visible_line_progress() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        (workspace / "package.json").write_text(
+            json.dumps({
+                "name": "clinic-app",
+                "scripts": {"dev": "vite", "test": "vitest"},
+                "dependencies": {"react": "latest"},
+            }),
+            encoding="utf-8",
+        )
+        agent, store = runtime(workspace, [])
+        try:
+            facts = agent._intake_repository_facts("run this project")
+            live = agent.events.list_live_events(limit=100)
+
+            assert any("Project package manifest" in fact for fact in facts)
+            assert any(item.message == "Opening package.json" for item in live)
+            assert any(item.message.startswith("Read package.json:1-") for item in live)
+            completed = next(
+                item for item in live if item.message.startswith("Read package.json:1-")
+            )
+            assert "scripts dev, test" in completed.operation
+        finally:
+            agent.close(); store.close()
+
+
+def test_weak_model_operational_action_outcome_is_repaired_without_retry() -> None:
+    prompt = "Run this web project, open it, and capture screenshots"
+    authored = semantic_route(
+        "action",
+        original=prompt,
+        outcome_kind="runnable_product",
+        effects=("read", "run", "preview"),
+        interpretation="Run and inspect the existing web project.",
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        agent, store = runtime(workspace, [authored])
+        try:
+            _pending, decision = agent._semantic_preflight(prompt)
+
+            assert decision.route.value == "action"
+            assert decision.outcome_kind == "workspace_operation"
+            assert len(agent.provider.calls) == 1
+            pending = store.get_workflow_session(agent.session_id)["state"]["pending_semantic_turn"]
+            assert pending["status"] == "routed"
+            assert pending["schema_attempts"] == 0
+            assert pending["semantic_attempts"] == 0
+            assert any(
+                event.event_type == "semantic_turn.transport_repaired"
+                for event in store.list_recent_events(limit=100)
+            )
+        finally:
+            agent.close(); store.close()
+
+
+def test_weak_model_goal_surplus_response_contracts_to_action_without_retry() -> None:
+    prompt = "Run this web project, open it, and capture screenshots"
+    authored = semantic_route(
+        "goal",
+        original=prompt,
+        outcome_kind="runnable_product",
+        effects=("run", "preview"),
+        interpretation="Run and inspect the existing web project.",
+    )
+    authored["tool_calls"][0]["args"]["direct_response"] = (
+        "I need to run and inspect this project."
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        agent, store = runtime(workspace, [authored])
+        try:
+            _pending, decision = agent._semantic_preflight(prompt)
+
+            assert decision.route.value == "action"
+            assert decision.outcome_kind == "workspace_operation"
+            assert decision.direct_response == ""
+            assert len(agent.provider.calls) == 1
+            repair = next(
+                event for event in store.list_recent_events(limit=100)
+                if event.event_type == "semantic_turn.transport_repaired"
+            )
+            assert any("direct_response" in item for item in repair.payload["repairs"])
+        finally:
+            agent.close(); store.close()
+
+
+def test_evidence_resume_reuses_the_accepted_route_without_model_rerouting() -> None:
+    prompt = "Run this web project, open it, and capture screenshots"
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        agent, store = runtime(workspace, [
+            semantic_route(
+                "action",
+                original=prompt,
+                outcome_kind="workspace_operation",
+                effects=("read", "run", "preview"),
+            )
+        ])
+        try:
+            pending, first = agent._semantic_preflight(prompt)
+            pending.update({
+                "status": "needs_evidence",
+                # A prior buggy resume could leave the stage projection at
+                # route.  The persisted validated decision is authoritative.
+                "stage": "route",
+                "result_status": "action_incomplete",
+            })
+            agent._save_pending_semantic_turn(pending)
+            agent.provider = ScriptedProvider([])
+
+            resumed, decision = agent._semantic_preflight(resume_pending=True)
+
+            assert decision.fingerprint == first.fingerprint
+            assert decision.route.value == "action"
+            assert resumed["route_decision"]["route"] == "action"
+            assert agent.provider.calls == []
+        finally:
+            agent.close(); store.close()
 
 
 def test_exact_input_bytes_remain_the_semantic_source_of_truth() -> None:
@@ -259,7 +384,7 @@ def test_observed_gemma_intake_transport_completes_end_to_end_without_fatal() ->
             agent.close(); store.close()
 
 
-def test_resume_promotes_legacy_pending_working_intake_to_recursive() -> None:
+def test_resume_keeps_adaptive_minimum_for_a_low_demand_goal() -> None:
     prompt = "Create a calculator"
     with tempfile.TemporaryDirectory() as directory:
         workspace = Path(directory)
@@ -284,8 +409,8 @@ def test_resume_promotes_legacy_pending_working_intake_to_recursive() -> None:
             resumed, decision = agent._semantic_preflight(resume_pending=True)
 
             assert decision.goal_intake is not None
-            assert resumed["minimum_strategy"] == "recursive"
-            assert resumed["strategy_decision"]["strategy"] == "recursive"
+            assert resumed["minimum_strategy"] == "staged"
+            assert resumed["strategy_decision"]["strategy"] == "staged"
         finally:
             agent.close(); store.close()
 
@@ -475,23 +600,59 @@ def test_unadvertised_plan_question_is_rejected_without_spending_stage_budget() 
             agent.close(); store.close()
 
 
-def test_recursive_working_promotes_action_before_any_workspace_execution() -> None:
+def test_bounded_action_is_not_promoted_to_goal_by_weak_model_strategy() -> None:
     prompt = "Create note.txt"
     with tempfile.TemporaryDirectory() as directory:
         workspace = Path(directory)
 
         agent, store = runtime(workspace, [
             semantic_turn("action", original=prompt, effects=("write",)),
-            semantic_goal_intake_turn(semantic_goal_intake(prompt)),
-            inspect_call(), plan_call(), plan_pass(),
         ])
         try:
-            decision, plan = agent.route_input(prompt)
-            assert decision.kind.value == "goal"
-            assert plan.goal_id == agent.active_goal().id
-            assert agent.active_goal().metadata["execution_strategy"] == "recursive"
+            pending, decision = agent._semantic_preflight(prompt)
+            assert decision.route.value == "action"
+            assert pending["strategy_decision"]["strategy"] == "staged"
+            assert agent.active_goal() is None
             assert store.list_session_actions(agent.session_id) == ()
             assert not (workspace / "note.txt").exists()
+        finally:
+            agent.close(); store.close()
+
+
+def test_run_preview_only_goal_output_is_contracted_to_bounded_action() -> None:
+    prompt = "Run this web project, open it, and capture screenshots"
+    high_demand = {
+        "reasoning": 3,
+        "implementation": 2,
+        "context_breadth": 3,
+        "coordination": 3,
+        "verification": 3,
+        "visual_runtime": 4,
+        "component_count": 3,
+        "independently_parallelizable": True,
+        "rationale": ["Weak-model browser work needs several bounded tool steps."],
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        agent, store = runtime(workspace, [
+            semantic_route(
+                "goal",
+                original=prompt,
+                outcome_kind="runnable_product",
+                effects=("read", "run", "install", "preview"),
+                task_demand=high_demand,
+            ),
+        ])
+        try:
+            pending, decision = agent._semantic_preflight(prompt)
+
+            assert decision.route.value == "action"
+            assert pending["strategy_decision"]["strategy"] == "staged"
+            assert agent.active_goal() is None
+            assert any(
+                event.event_type == "semantic_turn.operational_goal_contracted"
+                for event in store.list_recent_events(limit=100)
+            )
         finally:
             agent.close(); store.close()
 
@@ -803,10 +964,9 @@ def test_plan_mode_rejects_changing_action_and_model_repairs_to_goal() -> None:
             assert session["state"]["interaction_mode"] == "plan"
             assert not (workspace / "note.txt").exists()
             routed = [event for event in store.list_recent_events(limit=100) if event.event_type == "semantic_turn.routed"]
-            # Ultra Plan promotes a changing Action to the recursive Goal path
-            # immediately; it no longer burns a semantic repair just to reach
-            # the engine shared by both public modes.
-            assert routed[-1].payload["semantic_attempts"] == 0
+            # Plan mode cannot execute a changing Action. The semantic gateway
+            # repairs that mismatch to a Goal before any workspace tool runs.
+            assert routed[-1].payload["semantic_attempts"] == 1
         finally:
             agent.close(); store.close()
 

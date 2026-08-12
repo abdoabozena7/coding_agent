@@ -160,10 +160,21 @@ class AdvancedTraceProjection:
                     raise ValueError("run does not belong to this session goal")
             elif runs:
                 self.run = runs[-1]
-        self.events = (
-            self.store.list_events(self.goal.id, limit=10_000)
-            if self.goal is not None
-            else ()
+        # Advanced Tracing is session-wide, not Goal-only.  Bounded Actions
+        # (run/open/screenshot) intentionally create no Goal, but their visible
+        # activity still belongs in the same ordered observer timeline.
+        all_events = self.store.list_recent_events(limit=10_000)
+        self.events = tuple(
+            event
+            for event in all_events
+            if (
+                (self.goal is not None and event.goal_id == self.goal.id)
+                or (
+                    str(event.entity_type or "") == "workflow_session"
+                    and str(event.entity_id or "") == self.session_id
+                )
+                or str((event.payload or {}).get("session_id") or "") == self.session_id
+            )
         )
 
     @property
@@ -173,7 +184,7 @@ class AdvancedTraceProjection:
     @property
     def state(self) -> str:
         if self.goal is None:
-            return "EMPTY"
+            return "LIVE" if self.events else "EMPTY"
         return (
             "FROZEN"
             if str(self.goal.status.value) in TERMINAL_TRACE_STATUSES
@@ -438,7 +449,24 @@ class AdvancedTraceProjection:
         agents: list[dict[str, Any]] = []
         scheduled: list[dict[str, Any]] = []
         registry: list[dict[str, Any]] = []
+        orchestration_experiments: list[dict[str, Any]] = []
+        worker_contributions: list[dict[str, Any]] = []
         model_stats: dict[str, dict[str, Any]] = {}
+        if self.goal is not None:
+            orchestration_experiments = [
+                _jsonable(item)
+                for item in self.store.list_orchestration_experiments(
+                    goal_id=self.goal.id,
+                    limit=2_000,
+                )
+            ]
+            worker_contributions = [
+                _jsonable(item)
+                for item in self.store.list_worker_contributions(
+                    goal_id=self.goal.id,
+                    limit=5_000,
+                )
+            ]
         if self.run is not None:
             nodes = [_jsonable(item) for item in self.store.list_work_nodes(self.run.id)]
             agent_rows = self.store.list_agent_runs(self.run.id)
@@ -608,6 +636,30 @@ class AdvancedTraceProjection:
             "agents": agents,
             "scheduled": scheduled,
             "registry": registry,
+            "orchestration_experiments": orchestration_experiments,
+            "worker_contributions": worker_contributions,
+            "worker_impact_summary": {
+                "useful": sum(
+                    str(item.get("outcome")) == "useful"
+                    for item in worker_contributions
+                ),
+                "neutral": sum(
+                    str(item.get("outcome")) == "neutral"
+                    for item in worker_contributions
+                ),
+                "harmful": sum(
+                    str(item.get("outcome")) == "harmful"
+                    for item in worker_contributions
+                ),
+                "total_tokens": sum(
+                    int(item.get("total_tokens") or 0)
+                    for item in worker_contributions
+                ),
+                "total_latency_ms": sum(
+                    int(item.get("latency_ms") or 0)
+                    for item in worker_contributions
+                ),
+            },
             "models": sorted(model_stats.values(), key=lambda item: (-item["calls"], item["model"])),
         }
 
@@ -767,12 +819,31 @@ class AdvancedTraceProjection:
 
     def overview(self) -> dict[str, Any]:
         if self.goal is None:
+            runtime_snapshot = self.adapter.runtime.workflow_runtime_snapshot()
+            session = self.store.get_workflow_session(self.session_id)
+            session_state = dict(session.get("state") or {})
             return {
                 "session_id": self.session_id,
-                "state": "EMPTY",
-                "status": "idle",
+                "state": self.state,
+                "status": str(runtime_snapshot.phase or runtime_snapshot.liveness or "idle"),
+                "provider": getattr(self.adapter.runtime, "provider_name", ""),
+                "model": getattr(self.adapter.runtime, "model_name", ""),
+                "mode": getattr(getattr(self.adapter.runtime, "interaction_mode", None), "value", "working"),
+                "objective": str(
+                    session_state.get("session_title")
+                    or session_state.get("original_objective")
+                    or "Bounded workspace activity"
+                ),
+                "cutoff_sequence": self.events[-1].sequence if self.events else 0,
                 "runs": self.available_runs(),
-                "counts": {},
+                "counts": {
+                    "events": len(self.events),
+                    "files": 0,
+                    "problems": 0,
+                    "nodes": 0,
+                    "agents": 0,
+                    "scheduled": 0,
+                },
                 "inspect_next": [],
             }
         files = self.files()
@@ -801,6 +872,7 @@ class AdvancedTraceProjection:
                 "nodes": len(agents["nodes"]),
                 "agents": len(agents["agents"]),
                 "scheduled": len(agents["scheduled"]),
+                "worker_contributions": len(agents["worker_contributions"]),
             },
             "inspect_next": files["inspect_next"],
             "runs": self.available_runs(),

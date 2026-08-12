@@ -7,11 +7,13 @@ import atexit
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 from threading import RLock, Thread
 import time
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import ProxyHandler, build_opener
 import uuid
 
 from ._security import get_workspace, resolve_workspace_path, safe_os_error
@@ -19,6 +21,12 @@ from .run_bash import MAX_COMMAND_CHARS, _scrubbed_environment, _terminate
 
 
 MAX_LOG_BYTES = 1_000_000
+_DIRECT_HTTP = build_opener(ProxyHandler({}))
+_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_LOOPBACK_URL = re.compile(
+    r"https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?(?:/[^\s\x1b]*)?",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -47,6 +55,8 @@ class ManagedProcess:
 
 _LOCK = RLock()
 _PROCESSES: dict[tuple[str, str], ManagedProcess] = {}
+_STOPPED: dict[tuple[str, str], dict[str, object]] = {}
+_MAX_STOPPED_RECEIPTS = 256
 
 
 def _drain_output(stream: object, handle: object) -> None:
@@ -85,7 +95,7 @@ def _ready(item: ManagedProcess, readiness_type: str, readiness_value: str) -> b
     if item.process.poll() is not None:
         return False
     if readiness_type == "none":
-        return True
+        return False
     if readiness_type == "port":
         port = int(readiness_value)
         with socket.socket() as sock:
@@ -95,8 +105,12 @@ def _ready(item: ManagedProcess, readiness_type: str, readiness_value: str) -> b
         if not readiness_value.startswith(("http://127.0.0.1:", "http://localhost:")):
             raise ValueError("readiness URL must use loopback HTTP")
         try:
-            with urlopen(readiness_value, timeout=0.5) as response:
+            # Loopback readiness must never inherit a corporate/system proxy;
+            # otherwise a healthy local Vite/Next server can be reported dead.
+            with _DIRECT_HTTP.open(readiness_value, timeout=0.5) as response:
                 return 200 <= int(response.status) < 500
+        except HTTPError as exc:
+            return int(exc.code) < 500
         except OSError:
             return False
     if readiness_type == "log":
@@ -105,6 +119,56 @@ def _ready(item: ManagedProcess, readiness_type: str, readiness_value: str) -> b
         except OSError:
             return False
     raise ValueError("unknown readiness_type")
+
+
+def _discovered_loopback_urls(item: ManagedProcess) -> tuple[str, ...]:
+    """Extract bounded loopback URLs announced by the running process.
+
+    Dev servers frequently select or configure a port different from the
+    model's guess.  Their own ready log is stronger evidence than that guess,
+    including ANSI-coloured Vite output where escape bytes can occur between
+    the colon and port.
+    """
+
+    try:
+        data = item.log_path.read_bytes()[-64_000:]
+    except OSError:
+        return ()
+    clean = _ANSI_ESCAPE.sub("", data.decode("utf-8", errors="replace"))
+    found: list[str] = []
+    for match in _LOOPBACK_URL.finditer(clean):
+        candidate = match.group(0).rstrip(".,;:!?)]}'\"")
+        if candidate and candidate not in found:
+            found.append(candidate)
+    return tuple(found)
+
+
+def _discover_ready_url(item: ManagedProcess) -> str:
+    for candidate in _discovered_loopback_urls(item):
+        if _ready(item, "url", candidate):
+            return candidate
+    return ""
+
+
+def _validate_readiness(readiness_type: str, readiness_value: str) -> tuple[str, str]:
+    kind = str(readiness_type or "none").strip().casefold()
+    value = str(readiness_value or "").strip()
+    if kind == "none":
+        raise ValueError(
+            "start_process requires a real readiness signal; use port, url, or a non-empty log marker"
+        )
+    if kind == "port":
+        if not value.isdigit() or not 1 <= int(value) <= 65535:
+            raise ValueError("port readiness_value must be an integer from 1 to 65535")
+    elif kind == "url":
+        if not value.startswith(("http://127.0.0.1:", "http://localhost:")):
+            raise ValueError("URL readiness_value must use loopback HTTP")
+    elif kind == "log":
+        if not value:
+            raise ValueError("log readiness requires a non-empty readiness_value")
+    else:
+        raise ValueError("readiness_type must be port, url, or log")
+    return kind, value
 
 
 def start(
@@ -119,6 +183,9 @@ def start(
     if len(command) > MAX_COMMAND_CHARS or "\x00" in command:
         return "Error: command is invalid or too long"
     try:
+        readiness_type, readiness_value = _validate_readiness(
+            readiness_type, readiness_value
+        )
         working = _cwd(cwd)
         state = get_workspace() / ".coding-agent" / "processes"
         state.mkdir(parents=True, exist_ok=True)
@@ -146,18 +213,43 @@ def start(
         reader.start()
         with _LOCK:
             _PROCESSES[_key(process_id)] = item
+        requested_readiness = {
+            "type": str(readiness_type),
+            "value": str(readiness_value),
+        }
+        effective_type = str(readiness_type)
+        effective_value = str(readiness_value)
+        readiness_source = "declared"
         deadline = time.monotonic() + max(0, min(int(timeout_seconds), 300))
         ready = False
         while time.monotonic() <= deadline:
             ready = _ready(item, readiness_type, readiness_value)
+            if not ready and readiness_type in {"url", "port"}:
+                discovered_url = _discover_ready_url(item)
+                if discovered_url:
+                    ready = True
+                    effective_type = "url"
+                    effective_value = discovered_url
+                    readiness_source = "process_log"
             if ready or process.poll() is not None:
                 break
             time.sleep(0.1)
         payload = item.snapshot()
         payload["ready"] = ready
+        payload["readiness"] = {
+            "type": effective_type,
+            "value": effective_value,
+        }
+        payload["requested_readiness"] = requested_readiness
+        payload["readiness_source"] = readiness_source
+        if effective_type == "url":
+            payload["readiness_url"] = effective_value
+        elif effective_type == "port" and effective_value.isdigit():
+            payload["readiness_url"] = f"http://127.0.0.1:{effective_value}"
         if not ready:
             payload["output_tail"] = output(process_id, 80, raw=True)
             stop(process_id)
+            payload["process_stopped"] = True
             return "Error: managed process did not become ready: " + json.dumps(payload, ensure_ascii=False)
         return json.dumps(payload, ensure_ascii=False)
     except (OSError, ValueError) as exc:
@@ -189,9 +281,13 @@ def output(process_id: str, lines: int = 100, *, raw: bool = False) -> str:
 
 
 def stop(process_id: str) -> str:
+    key = _key(process_id)
     with _LOCK:
-        item = _PROCESSES.pop(_key(process_id), None)
+        item = _PROCESSES.pop(key, None)
+        previous = _STOPPED.get(key)
     if item is None:
+        if previous is not None:
+            return json.dumps({**previous, "already_stopped": True}, ensure_ascii=False)
         return f"Error: unknown managed process {process_id!r}"
     if item.process.poll() is None:
         _terminate(item.process)
@@ -218,6 +314,11 @@ def stop(process_id: str) -> str:
         time.sleep(0.20)
     payload = item.snapshot()
     payload["stopped"] = True
+    payload["already_stopped"] = False
+    with _LOCK:
+        _STOPPED[key] = dict(payload)
+        while len(_STOPPED) > _MAX_STOPPED_RECEIPTS:
+            _STOPPED.pop(next(iter(_STOPPED)))
     return json.dumps(payload, ensure_ascii=False)
 
 

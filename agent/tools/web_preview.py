@@ -37,8 +37,8 @@ class Preview:
     id: str
     token: str
     entry_path: str
-    server: ThreadingHTTPServer
-    thread: Thread
+    server: ThreadingHTTPServer | None
+    thread: Thread | None
     url: str
     artifact_dir: Path
     browser_process: subprocess.Popen[bytes] | None = None
@@ -123,7 +123,16 @@ def _key(preview_id: str) -> tuple[str, str]:
     return str(get_workspace()), preview_id
 
 
-def _browser_executable() -> tuple[str | None, str | None]:
+def _browser_executables() -> tuple[tuple[str, str], ...]:
+    """Return every installed Chromium-family browser in stable priority order.
+
+    A visible browser can close during startup for reasons outside the project
+    (profile policy, a transient Chrome crash, or an already-running browser
+    update).  Exposing every installed engine lets the persistent controller
+    retry the same verified page with Edge/Chromium instead of incorrectly
+    treating that launch failure as a dead project runtime.
+    """
+
     candidates: list[tuple[str, str | None]] = [
         ("chrome", shutil.which("google-chrome") or shutil.which("chrome")),
         ("msedge", shutil.which("msedge")),
@@ -136,20 +145,45 @@ def _browser_executable() -> tuple[str | None, str | None]:
                 ("chrome", str(Path(root) / "Google/Chrome/Application/chrome.exe")),
                 ("msedge", str(Path(root) / "Microsoft/Edge/Application/msedge.exe")),
             ])
+    installed: list[tuple[str, str]] = []
+    seen: set[str] = set()
     for channel, value in candidates:
-        if value and Path(value).is_file():
-            return channel, value
+        if not value or not Path(value).is_file():
+            continue
+        resolved = str(Path(value).resolve())
+        key = resolved.casefold() if os.name == "nt" else resolved
+        if key in seen:
+            continue
+        seen.add(key)
+        installed.append((channel, resolved))
+    return tuple(installed)
+
+
+def _browser_executable() -> tuple[str | None, str | None]:
+    installed = _browser_executables()
+    if installed:
+        return installed[0]
     return None, None
 
 
 def browser_capability() -> dict[str, Any]:
-    channel, executable = _browser_executable()
+    candidates = _browser_executables()
+    channel, executable = candidates[0] if candidates else (None, None)
     try:
         import playwright.sync_api  # noqa: F401
         playwright_available = True
     except ImportError:
         playwright_available = False
-    return {"playwright": playwright_available, "channel": channel, "executable": executable, "available": bool(executable)}
+    return {
+        "playwright": playwright_available,
+        "channel": channel,
+        "executable": executable,
+        "available": bool(candidates),
+        "candidates": [
+            {"channel": candidate_channel, "executable": candidate_executable}
+            for candidate_channel, candidate_executable in candidates
+        ],
+    }
 
 
 def _interaction_locator(page: Any, item: Mapping[str, Any]) -> Any:
@@ -214,17 +248,49 @@ def _interaction_target_inventory(page: Any) -> list[dict[str, str]]:
     """Return bounded, authoritative targets for a subsequent repair request."""
 
     values = page.locator(
-        "button,input,select,textarea,a,canvas,[role],[data-value],[id]"
+        "button,input,select,textarea,summary,a[href],[role='button'],[role='link'],"
+        "[role='textbox'],[role='checkbox'],[role='radio'],[role='combobox'],[data-value]"
     ).evaluate_all(
-        """elements => elements.slice(0, 100).map(element => ({
-            tag: (element.tagName || '').toLowerCase(),
-            id: element.id || '',
-            role: element.getAttribute('role') || '',
-            name: element.getAttribute('aria-label') || element.innerText || element.value || '',
-            text: element.innerText || element.textContent || '',
-            data_value: element.getAttribute('data-value') || '',
-            type: element.getAttribute('type') || ''
-        }))"""
+        """elements => elements.slice(0, 100).map(element => {
+            const tag = (element.tagName || '').toLowerCase();
+            const type = (element.getAttribute('type') || '').toLowerCase();
+            const dataValue = element.getAttribute('data-value') || '';
+            let role = element.getAttribute('role') || '';
+            if (!role && tag === 'button') role = 'button';
+            else if (!role && tag === 'summary') role = 'button';
+            else if (!role && tag === 'a') role = 'link';
+            else if (!role && tag === 'select') role = 'combobox';
+            else if (!role && tag === 'textarea') role = 'textbox';
+            else if (!role && tag === 'input' && type === 'checkbox') role = 'checkbox';
+            else if (!role && tag === 'input' && type === 'radio') role = 'radio';
+            else if (!role && tag === 'input' && ['button','submit','reset'].includes(type)) role = 'button';
+            else if (!role && tag === 'input' && type !== 'file') role = 'textbox';
+            let selector = '';
+            if (element.id && document.querySelectorAll('#' + CSS.escape(element.id)).length === 1) {
+                selector = '#' + CSS.escape(element.id);
+            } else if (tag === 'input' && type && document.querySelectorAll(tag + '[type="' + CSS.escape(type) + '"]').length === 1) {
+                selector = tag + '[type="' + CSS.escape(type) + '"]';
+            } else if (tag === 'summary' && document.querySelectorAll('summary').length === 1) {
+                selector = 'summary';
+            } else if (dataValue && document.querySelectorAll('[data-value="' + CSS.escape(dataValue) + '"]').length === 1) {
+                selector = '[data-value="' + CSS.escape(dataValue) + '"]';
+            } else if (tag === 'a' && element.getAttribute('href')) {
+                const href = element.getAttribute('href');
+                const hrefSelector = 'a[href="' + CSS.escape(href) + '"]';
+                if (document.querySelectorAll(hrefSelector).length === 1) selector = hrefSelector;
+            }
+            return {
+                tag,
+                id: element.id || '',
+                role,
+                selector,
+                name: element.getAttribute('aria-label') || element.innerText || element.value || '',
+                text: element.innerText || element.textContent || '',
+                data_value: dataValue,
+                href: element.getAttribute('href') || '',
+                type
+            };
+        })"""
     )
     inventory: list[dict[str, str]] = []
     for raw in values if isinstance(values, list) else ():
@@ -232,7 +298,7 @@ def _interaction_target_inventory(page: Any) -> list[dict[str, str]]:
             continue
         item = {
             key: str(raw.get(key) or "").strip()[:240]
-            for key in ("tag", "id", "role", "name", "text", "data_value", "type")
+            for key in ("tag", "id", "role", "selector", "name", "text", "data_value", "href", "type")
         }
         if any(item.values()):
             inventory.append(item)
@@ -292,9 +358,10 @@ def _run_interaction_scenarios(
     page: Any,
     url: str,
     scenarios: Sequence[Mapping[str, Any]],
+    screenshot_directory: Path | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    for raw in scenarios[:20]:
+    for index, raw in enumerate(scenarios[:20], start=1):
         scenario = dict(raw)
         name = str(scenario.get("name") or "browser interaction")[:160]
         receipt: dict[str, Any] = {"name": name, "passed": False, "assertions": []}
@@ -368,6 +435,13 @@ def _run_interaction_scenarios(
             receipt["passed"] = bool(assertions) and all(item["passed"] for item in assertions)
             if not receipt["passed"]:
                 receipt["error"] = "one or more interaction assertions failed"
+            if screenshot_directory is not None:
+                screenshot_directory.mkdir(parents=True, exist_ok=True)
+                scene_path = screenshot_directory / (
+                    f"{index:02d}-{_safe_segment(name, 'scene')}.png"
+                )
+                page.screenshot(path=str(scene_path), full_page=True)
+                receipt["screenshot_path"] = str(scene_path)
         except Exception as exc:
             receipt["error"] = f"{type(exc).__name__}: {exc}"
             receipt["failure_kind"] = (
@@ -414,7 +488,12 @@ def _verify(url: str, screenshot_path: Path, settle_ms: int, interactions: Seque
             response = page.goto(url, wait_until="load", timeout=30_000)
             page.wait_for_timeout(max(0, min(int(settle_ms), 10_000)))
             result["interaction_targets"] = _interaction_target_inventory(page)
-            interaction_results = _run_interaction_scenarios(page, url, interactions)
+            interaction_results = _run_interaction_scenarios(
+                page,
+                url,
+                interactions,
+                screenshot_path.parent / "scenes",
+            )
             result["interaction_results"] = interaction_results
             for item in interaction_results:
                 if not item.get("passed"):
@@ -518,6 +597,73 @@ def create(path: str, open_browser: bool = True, verify: bool = True, settle_ms:
         return f"Error: HTML preview could not start: {safe_os_error(exc) if isinstance(exc, OSError) else exc}"
 
 
+def create_url(
+    url: str,
+    open_browser: bool = True,
+    verify: bool = True,
+    settle_ms: int = 1500,
+    interactions: Sequence[Mapping[str, Any]] = (),
+) -> str:
+    """Attach browser verification to an already-running loopback web app."""
+
+    try:
+        parsed = urlsplit(str(url).strip())
+        if (
+            parsed.scheme not in {"http", "https"}
+            or (parsed.hostname or "").casefold() not in {"127.0.0.1", "localhost", "::1"}
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return "Error: preview_url accepts only credential-free loopback http(s) URLs"
+        normalized_url = parsed._replace(fragment="").geturl()
+        try:
+            with urlopen(normalized_url, timeout=5) as response:
+                http_status = int(response.status)
+        except OSError as exc:
+            return f"Error: local web application health check failed: {safe_os_error(exc)}"
+        preview_id = "preview-" + secrets.token_hex(8)
+        artifact_dir = _artifact_directory()
+        preview = Preview(
+            preview_id,
+            "",
+            normalized_url,
+            None,
+            None,
+            normalized_url,
+            artifact_dir,
+        )
+        screenshot = artifact_dir / f"{preview_id}.png"
+        preview.verification = (
+            _verify(normalized_url, screenshot, settle_ms, interactions)
+            if verify
+            else {"status": "not_requested"}
+        )
+        opened, open_error = _open_visible(preview) if open_browser else (False, None)
+        with _LOCK:
+            _PREVIEWS[_key(preview_id)] = preview
+        return json.dumps(
+            {
+                "status": "running",
+                "preview_id": preview_id,
+                "url": normalized_url,
+                "http_status": http_status,
+                "browser_opened": opened,
+                "browser_error": open_error,
+                "verification": preview.verification.get("status"),
+                "failure_kind": preview.verification.get("failure_kind", ""),
+                "interaction_targets": preview.verification.get("interaction_targets", []),
+                "console_errors": preview.verification.get("console_errors", []),
+                "page_errors": preview.verification.get("page_errors", []),
+                "network_errors": preview.verification.get("network_errors", []),
+                "screenshot_path": preview.verification.get("screenshot_path"),
+                "interaction_results": preview.verification.get("interaction_results", []),
+            },
+            ensure_ascii=False,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return f"Error: local URL preview could not start: {safe_os_error(exc) if isinstance(exc, OSError) else exc}"
+
+
 def inspect(preview_id: str, settle_ms: int = 500) -> str:
     with _LOCK:
         preview = _PREVIEWS.get(_key(preview_id))
@@ -533,7 +679,11 @@ def stop(preview_id: str) -> str:
         preview = _PREVIEWS.pop(_key(preview_id), None)
     if preview is None:
         return f"Error: unknown preview {preview_id!r}"
-    preview.server.shutdown(); preview.server.server_close(); preview.thread.join(timeout=3)
+    if preview.server is not None:
+        preview.server.shutdown()
+        preview.server.server_close()
+    if preview.thread is not None:
+        preview.thread.join(timeout=3)
     if preview.browser_process and preview.browser_process.poll() is None:
         _terminate(preview.browser_process)
     if preview.profile_path:
@@ -554,7 +704,11 @@ def shutdown_workspace(workspace: str | Path) -> None:
         for item in items:
             _PREVIEWS.pop((root, item.id), None)
     for preview in items:
-        preview.server.shutdown(); preview.server.server_close()
+        if preview.server is not None:
+            preview.server.shutdown()
+            preview.server.server_close()
+        if preview.thread is not None:
+            preview.thread.join(timeout=3)
         if preview.browser_process and preview.browser_process.poll() is None:
             _terminate(preview.browser_process)
         if preview.profile_path:

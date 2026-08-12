@@ -8,6 +8,7 @@ limits, and the final completion gate.
 from __future__ import annotations
 
 import copy
+import base64
 import difflib
 import hashlib
 import inspect
@@ -16,10 +17,12 @@ import importlib.util
 import os
 import platform
 import re
+import struct
 import time
 import shutil
 import shlex
 import uuid
+import zlib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from queue import Empty, Queue
@@ -27,6 +30,8 @@ from threading import Event, RLock, Thread
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import context, tools
+from .action_outcome import ActionOutcomeContractV1
+from .action_workflow import ActionExecutionCoordinatorV1
 from .commands import CommandKind, InternalActionKind, UserCommand
 from .chat_runtime import (
     RequestedEffectV2,
@@ -38,6 +43,8 @@ from .chat_runtime import (
     SemanticGoalIntakeV3,
     SemanticTurnDecisionV2,
     corrective_prompt,
+    normalize_nonchat_direct_response_transport,
+    normalize_operational_action_transport,
 )
 from .capability import (
     ExecutionStrategyV1,
@@ -95,6 +102,8 @@ from .prompts import (
     REVIEWER_SYSTEM_PROMPT,
     SEMANTIC_GOAL_INTAKE_SYSTEM_PROMPT,
     SEMANTIC_ROUTER_SYSTEM_PROMPT,
+    VISUAL_CAPABILITY_PROBE_SYSTEM_PROMPT,
+    VISUAL_EVALUATOR_SYSTEM_PROMPT,
     state_envelope,
     subagent_system_prompt,
 )
@@ -135,8 +144,34 @@ from .semantic import (
     StrategyAttemptV1,
     VerificationContractV1,
 )
+from .vision_runtime import (
+    fallback_model_name,
+    installed_vision_models,
+    pull_ollama_vision_model,
+)
 from .verifiers import discover_verifier_plugins
 from .weak_model import WeakModelPolicy
+from .orchestration import (
+    AdaptiveOrchestrationPolicyV1,
+    AdaptiveWorkerRouter,
+    EvidenceAuthority,
+    EvidenceClaimV1,
+    EvidenceVerdict,
+    FIXED_SPECIALIST_REVIEW_ORDER,
+    FixedSpecialistReviewGateV1,
+    MutationPolicy,
+    OrchestrationArm,
+    OrchestrationExperimentV1,
+    SpecialistReviewResultV1,
+    SpecialistReviewRole,
+    TaskRiskSignalsV1,
+    WorkerImpactV1,
+    WorkerMissionV2,
+    WorkerRole,
+    WorkerVisibility,
+    classify_worker_impact,
+    evidence_novelty,
+)
 from .repository_index import OllamaEmbeddingProvider, RepositoryIndex
 from .diagnostics import ErrorSignature, FailureDomain, normalize_error_message
 from .version_control import GitProtectionManager, VersionControlError
@@ -325,6 +360,7 @@ class WorkflowRuntimeSnapshotV1:
     first_byte_at: float | None = None
     task_items: tuple[dict[str, Any], ...] = ()
     next_task: str = ""
+    goal_progress: dict[str, Any] = field(default_factory=dict)
     # Durable identity for reconciling Web and terminal projections.  These
     # values describe the saved session/content and the current provider
     # attempt; they must not be inferred from a UI poll timestamp.
@@ -374,6 +410,7 @@ class WorkflowRuntimeSnapshotV1:
             "first_byte_at": self.first_byte_at,
             "task_items": [dict(item) for item in self.task_items],
             "next_task": self.next_task,
+            "goal_progress": dict(self.goal_progress),
             "session_revision": self.session_revision,
             "content_revision": self.content_revision,
             "attempt_id": self.attempt_id,
@@ -483,6 +520,16 @@ class AgentRuntime:
         self._delegations_this_slice = 0
         self._provider_input_tokens = 0
         self._provider_output_tokens = 0
+        # A failed pixel-bound probe is a model capability result, not a
+        # transient workflow error.  Cache it for this runtime so an Action
+        # cannot burn repeated weak-model calls on the same impossible visual
+        # gate after the first conclusive failure.
+        self._vision_probe_failures: dict[str, str] = {}
+        self._vision_probe_passed_for = ""
+        self._vision_evaluator_provider: Any | None = None
+        self._vision_evaluator_key = ""
+        self._vision_fallback_pull_attempted = False
+        self._vision_pull_last_progress: tuple[str, int | None] = ("", None)
         self._live_provider_activity: dict[str, Any] = {
             "state": "idle",
             "actor": "",
@@ -519,21 +566,76 @@ class AgentRuntime:
         self.local_web_server: Any | None = None
         self.sleep_controller = SleepController()
         self.weak_model_policy = WeakModelPolicy()
+        self.adaptive_orchestration_policy = AdaptiveOrchestrationPolicyV1()
+        self.worker_router = AdaptiveWorkerRouter(self.adaptive_orchestration_policy)
         self.intent_architect = IntentArchitect()
         model_name = str(getattr(provider, "model", "")).casefold()
         self._global_memory_enabled = not model_name.startswith(("offline", "fake", "test"))
         self.global_lessons = GlobalLessonStore()
         self._used_global_lesson_ids: set[str] = set()
+        repository_cache_path = self.workspace / ".coding-agent" / "repository-index-v1.json"
         self.repository_index = RepositoryIndex(
             self.workspace,
             embedding_provider=OllamaEmbeddingProvider.from_environment(),
-            cache_path=self.workspace / ".coding-agent" / "repository-index-v1.json",
+            cache_path=repository_cache_path,
+            autoload_cache=False,
         )
         self.repository_index_warmup_error = ""
+        if repository_cache_path.is_file():
+            try:
+                cache_size = repository_cache_path.stat().st_size
+            except OSError:
+                cache_size = 0
+            cache_label = (
+                f"{cache_size / (1024 * 1024):.1f} MB"
+                if cache_size >= 1024 * 1024
+                else f"{cache_size / 1024:.1f} KB"
+            )
+            self._publish_activity_step(
+                f"Loading saved repository index · {cache_label}",
+                source_kind="HARNESS",
+                actor="repository-index",
+                phase="retrieving_context",
+                state="active",
+                operation="Reading the saved source index from disk",
+                waiting_on="harness",
+            )
+            loaded_repository_cache = self.repository_index.load_cache()
+            self._publish_activity_step(
+                (
+                    f"Saved repository index loaded · {len(self.repository_index.entries)} files"
+                    if loaded_repository_cache
+                    else "Saved repository index was invalid · rebuilding from project files"
+                ),
+                source_kind="HARNESS",
+                actor="repository-index",
+                phase="retrieving_context",
+                state="completed",
+                operation=(
+                    "Checking the saved index against current project files"
+                    if loaded_repository_cache
+                    else "Starting a clean source scan"
+                ),
+                waiting_on="harness",
+            )
         if self.config.repository_index_warmup_files > 0:
             try:
+                def report_repository_progress(
+                    message: str,
+                    progress: Mapping[str, Any],
+                ) -> None:
+                    self._publish_activity_step(
+                        message,
+                        source_kind="HARNESS",
+                        actor="repository-index",
+                        operation=message,
+                        waiting_on="harness",
+                        **dict(progress),
+                    )
+
                 self.repository_index.update_all(
                     max_files=self.config.repository_index_warmup_files,
+                    on_progress=report_repository_progress,
                 )
                 self.store.sync_repository_index(self.workspace, self.repository_index)
             except (OSError, UnicodeError, ValueError) as exc:
@@ -550,7 +652,7 @@ class AgentRuntime:
                 state={
                     **self._session_runtime_snapshot(),
                     "interaction_mode": InteractionModeV2.WORKING.value,
-                    "minimum_strategy": ExecutionStrategyV1.RECURSIVE.value,
+                    "minimum_strategy": ExecutionStrategyV1.STAGED.value,
                 },
             )
         else:
@@ -562,8 +664,11 @@ class AgentRuntime:
             )
             if not self._foreign_execution_owner_live:
                 self._persist_runtime_snapshot()
+                self._recover_legacy_false_action_completion()
         self._chat_conversation = [dict(item) for item in self.store.list_chat_messages(self.session_id)]
         tools.register_artifact_provider(self.workspace, self.store.get_chat_artifact)
+        tools.register_vision_evaluator(self.workspace, self._evaluate_images_with_provider)
+        tools.register_output_publisher(self.workspace, self._publish_output_tool)
         tools.configure_workspace(self.workspace)
 
         active_policy_goal = self.store.load_active_goal(self.session_id)
@@ -571,6 +676,18 @@ class AgentRuntime:
             persisted_policy = active_policy_goal.metadata.get("weak_model_policy")
             if isinstance(persisted_policy, Mapping):
                 self.weak_model_policy = WeakModelPolicy.from_dict(persisted_policy)
+            persisted_orchestration = active_policy_goal.metadata.get(
+                "adaptive_orchestration_policy"
+            )
+            if isinstance(persisted_orchestration, Mapping):
+                self.adaptive_orchestration_policy = (
+                    AdaptiveOrchestrationPolicyV1.from_dict(
+                        persisted_orchestration
+                    )
+                )
+                self.worker_router = AdaptiveWorkerRouter(
+                    self.adaptive_orchestration_policy
+                )
 
         recovery = (
             None
@@ -682,6 +799,20 @@ class AgentRuntime:
                 "recovery",
                 "Read-only ULTRA uncertainty was reconciled automatically; no workspace write was replayed.",
                 entities=list(auto_reconciled),
+            )
+
+        terminal_ultra_failure = (
+            None
+            if self._foreign_execution_owner_live
+            else self._reconcile_terminal_ultra_failure()
+        )
+        if terminal_ultra_failure is not None:
+            self.events.publish(
+                "recovery",
+                "A terminal ULTRA failure was restored as an actionable retry checkpoint.",
+                goal_id=terminal_ultra_failure[0],
+                run_id=terminal_ultra_failure[1],
+                mutation_replayed=False,
             )
 
         # Planning/review phases are model-call transients. A process can stop
@@ -963,7 +1094,7 @@ class AgentRuntime:
                 recreated_state = {
                     **recreated_state,
                     "interaction_mode": InteractionModeV2.WORKING.value,
-                    "minimum_strategy": ExecutionStrategyV1.RECURSIVE.value,
+                    "minimum_strategy": ExecutionStrategyV1.STAGED.value,
                 }
             self.store.save_workflow_session(
                 self.session_id,
@@ -1003,8 +1134,333 @@ class AgentRuntime:
 
         self.store.mutate_workflow_session(self.session_id, reduce_session)
 
+    def _publish_visible_activity(
+        self,
+        kind: str,
+        message: str,
+        **data: Any,
+    ) -> None:
+        """Publish one visible operation and journal it for Web tracing."""
+
+        payload = {
+            "session_id": self.session_id,
+            "message": str(message),
+            "summary": str(message),
+            "recorded_at": time.time(),
+            **dict(data),
+        }
+        self.events.publish(kind, str(message), **data)
+        if kind == "provider.activity":
+            now = time.monotonic()
+            key = (
+                str(data.get("actor") or ""),
+                str(data.get("provider_state") or data.get("state") or ""),
+                str(data.get("operation") or message),
+            )
+            previous = getattr(self, "_last_persisted_provider_activity", None)
+            if (
+                isinstance(previous, tuple)
+                and len(previous) == 2
+                and previous[0] == key
+                and now - float(previous[1]) < 2.0
+            ):
+                return
+            self._last_persisted_provider_activity = (key, now)
+        try:
+            goal = self.active_goal()
+            self.store.append_event(
+                kind,
+                goal_id=goal.id if goal is not None else None,
+                entity_type="workflow_session",
+                entity_id=self.session_id,
+                payload=payload,
+            )
+        except Exception:
+            # The terminal remains authoritative and live if the observer
+            # journal is briefly locked or the session row is being created.
+            pass
+
+    def _publish_activity_step(self, message: str, **data: Any) -> None:
+        self._publish_visible_activity("activity.step", message, **data)
+
+    def _publish_provider_activity(self, message: str, **data: Any) -> None:
+        self._publish_visible_activity("provider.activity", message, **data)
+
+    def _persist_semantic_session_title(self, title: str, turn_id: str) -> str:
+        """Persist the first model-authored public title for this session."""
+
+        normalized = " ".join(str(title).split())[:80]
+        if not normalized:
+            return ""
+        for attempt in range(2):
+            session = self.store.get_workflow_session(self.session_id)
+            state = dict(session.get("state") or {})
+            existing = " ".join(str(state.get("session_title") or "").split())
+            if existing:
+                return existing
+            try:
+                self.store.mutate_workflow_session(
+                    self.session_id,
+                    lambda current: {
+                        "state": {
+                            **dict(current.get("state") or {}),
+                            "session_title": normalized,
+                            "session_title_source": "model_first_semantic_response",
+                            "session_title_turn_id": str(turn_id),
+                        }
+                    },
+                    expected_revision=int(session.get("revision") or 0),
+                )
+                self._publish_activity_step(
+                    f"Session named · {normalized}",
+                    source_kind="MODEL",
+                    actor="semantic-router",
+                    phase="routing",
+                    state="completed",
+                    operation=f"Session named · {normalized}",
+                    waiting_on="harness",
+                )
+                return normalized
+            except WorkflowSessionConflictError:
+                if attempt:
+                    raise
+        return normalized
+
     def session_snapshot(self) -> Mapping[str, Any]:
         return dict(self._ensure_workflow_session().get("state", {}))
+
+    def _workflow_progress_projection(
+        self,
+        goal: Goal | None,
+        plan: Plan | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Build the one task/checklist/evidence projection used by every UI.
+
+        Ultra work nodes supersede legacy plan-task status once the recursive
+        harness exists.  The projection remains read-only: it explains what
+        the durable store says without inventing completion or verification.
+        """
+
+        if goal is None:
+            return [], {
+                "objective": "",
+                "status": "ready",
+                "total": 0,
+                "done": 0,
+                "working": 0,
+                "pending": 0,
+                "blocked": 0,
+                "completion_percent": 0,
+                "verification_percent": 0,
+                "verified_units": 0,
+                "total_units": 0,
+                "evidence": [],
+            }
+
+        evidence_rows = tuple(self.store.list_evidence(goal.id))
+        evidence_by_task: dict[str, list[Evidence]] = {}
+        for evidence in evidence_rows:
+            if evidence.task_id:
+                evidence_by_task.setdefault(str(evidence.task_id), []).append(evidence)
+
+        run = self.store.get_active_ultra_run(goal.id)
+        if run is None and not goal.metadata.get("goal_change_sets"):
+            recorded_runs = self.store.list_ultra_runs(goal.id)
+            run = recorded_runs[-1] if recorded_runs else None
+
+        def state_for(status: str) -> str:
+            normalized = status.casefold()
+            if normalized in {"completed", "done", "integrated", "skipped"}:
+                return "done"
+            if normalized in {
+                "in_progress", "running", "reviewing", "testing", "fixing",
+                "integrating", "verifying", "recovering",
+            }:
+                return "working"
+            if normalized in {
+                "failed", "blocked", "conflict", "uncertain", "revision_required",
+            }:
+                return "blocked"
+            return "pending"
+
+        def test_receipts(tests: Sequence[Mapping[str, Any]]) -> list[str]:
+            receipts: list[str] = []
+            for test in tests:
+                passed = bool(test.get("passed") or test.get("success")) or str(
+                    test.get("status") or ""
+                ).casefold() in {"passed", "success", "completed", "ok"}
+                if not passed:
+                    continue
+                label = str(
+                    test.get("summary")
+                    or test.get("name")
+                    or test.get("command")
+                    or "Verification check passed"
+                ).strip()
+                if label and label not in receipts:
+                    receipts.append(" ".join(label.split()))
+            return receipts
+
+        items: list[dict[str, Any]] = []
+        if run is not None:
+            nodes = sorted(
+                self.store.list_work_nodes(run.id),
+                key=lambda node: (node.depth, node.position, node.created_at, node.id),
+            )
+            for node in nodes:
+                status = str(node.status.value)
+                state = state_for(status)
+                linked = list(evidence_by_task.get(node.id, ()))
+                if node.master_task_id and node.master_task_id != node.id:
+                    linked.extend(evidence_by_task.get(str(node.master_task_id), ()))
+                evidence_text = [
+                    " ".join(item.summary.split())
+                    for item in linked
+                    if item.summary.strip()
+                ]
+                result = node.result
+                tests = tuple(result.tests) if result is not None else ()
+                evidence_text.extend(
+                    item for item in test_receipts(tests) if item not in evidence_text
+                )
+                verified_receipts = [
+                    " ".join(item.summary.split())
+                    for item in linked
+                    if item.verified and item.summary.strip()
+                ]
+                for receipt in test_receipts(tests):
+                    if receipt not in verified_receipts:
+                        verified_receipts.append(receipt)
+                criteria = tuple(node.contract.success_criteria) or (node.objective,)
+                criterion_status = (
+                    "verified"
+                    if state == "done" and verified_receipts
+                    else "done"
+                    if state == "done"
+                    else state
+                )
+                checklist = [
+                    {
+                        "id": f"{node.id}:criterion:{index + 1}",
+                        "title": " ".join(str(criterion).split()),
+                        "status": criterion_status,
+                        "state": criterion_status,
+                        "evidence": list(verified_receipts[:8]),
+                    }
+                    for index, criterion in enumerate(criteria)
+                    if str(criterion).strip()
+                ]
+                total_checks = len(checklist) or 1
+                verified_checks = total_checks if criterion_status == "verified" else 0
+                items.append({
+                    "id": node.id,
+                    "title": node.title,
+                    "description": node.objective,
+                    "objective": node.objective,
+                    "status": status,
+                    "state": state,
+                    "parent_id": node.parent_id,
+                    "depth": int(node.depth),
+                    "dependencies": list(node.depends_on),
+                    "assigned_role": node.assigned_role,
+                    "attempts": int(node.attempts),
+                    "read_paths": list(node.contract.read_paths),
+                    "write_paths": list(node.contract.write_paths),
+                    "checklist": checklist,
+                    "evidence": evidence_text[:12],
+                    "verified_evidence": verified_receipts[:12],
+                    "verified_count": verified_checks,
+                    "total_count": total_checks,
+                    "verification_percent": round(100 * verified_checks / total_checks),
+                    "result_summary": str(result.summary if result is not None else ""),
+                    "issues": list(result.issues) if result is not None else ([node.error] if node.error else []),
+                    "changed_files": list(result.changed_files) if result is not None else [],
+                })
+        # A newly prepared/recovered Ultra run legitimately has no work nodes
+        # until its plan is approved.  Do not let that empty scheduler shell
+        # hide the durable plan tasks and reset every UI to 0/0 progress.
+        if not items and plan is not None:
+            for task in plan.tasks:
+                status = str(task.status.value)
+                state = state_for(status)
+                linked = list(evidence_by_task.get(task.id, ()))
+                receipts = [" ".join(item.summary.split()) for item in linked if item.summary.strip()]
+                verified_receipts = [
+                    " ".join(item.summary.split())
+                    for item in linked
+                    if item.verified and item.summary.strip()
+                ]
+                criterion_status = (
+                    "verified" if state == "done" and verified_receipts
+                    else "done" if state == "done" else state
+                )
+                checklist = [
+                    {
+                        "id": f"{task.id}:criterion:{index + 1}",
+                        "title": " ".join(str(criterion).split()),
+                        "status": criterion_status,
+                        "state": criterion_status,
+                        "evidence": list(verified_receipts[:8]),
+                    }
+                    for index, criterion in enumerate(task.acceptance_criteria)
+                ]
+                total_checks = len(checklist) or 1
+                verified_checks = total_checks if criterion_status == "verified" else 0
+                items.append({
+                    "id": task.id,
+                    "title": task.title,
+                    "description": task.description,
+                    "objective": task.description,
+                    "status": status,
+                    "state": state,
+                    "parent_id": task.parent_id,
+                    "depth": 0,
+                    "dependencies": list(task.depends_on),
+                    "assigned_role": task.role.name,
+                    "attempts": int(task.attempts),
+                    "read_paths": [],
+                    "write_paths": [],
+                    "verification_steps": list(task.verification),
+                    "checklist": checklist,
+                    "evidence": receipts[:12],
+                    "verified_evidence": verified_receipts[:12],
+                    "verified_count": verified_checks,
+                    "total_count": total_checks,
+                    "verification_percent": round(100 * verified_checks / total_checks),
+                    "result_summary": "",
+                    "issues": [],
+                    "changed_files": [],
+                })
+
+        roots = [item for item in items if not item.get("parent_id")] or items
+        total_units = sum(max(1, int(item.get("total_count") or 0)) for item in roots)
+        verified_units = sum(int(item.get("verified_count") or 0) for item in roots)
+        done_units = sum(
+            max(1, int(item.get("total_count") or 0))
+            for item in roots
+            if item.get("state") == "done"
+        )
+        counts = {
+            name: sum(item.get("state") == name for item in items)
+            for name in ("done", "working", "pending", "blocked")
+        }
+        goal_evidence = [
+            " ".join(item.summary.split())
+            for item in evidence_rows
+            if item.verified and item.summary.strip()
+        ][-12:]
+        progress = {
+            "objective": goal.objective,
+            "status": goal.status.value,
+            "total": len(items),
+            **counts,
+            "completion_percent": round(100 * done_units / total_units) if total_units else 0,
+            "verification_percent": round(100 * verified_units / total_units) if total_units else 0,
+            "verified_units": verified_units,
+            "total_units": total_units,
+            "evidence": goal_evidence,
+        }
+        return items, progress
 
     def workflow_runtime_snapshot(self) -> WorkflowRuntimeSnapshotV1:
         """Derive the single status snapshot consumed by all frontends."""
@@ -1125,6 +1581,7 @@ class AgentRuntime:
         active_step = 0
         last_tool = ""
         task_items: list[dict[str, Any]] = []
+        goal_progress: dict[str, Any] = {}
         next_task = ""
         mutated = bool((goal.metadata if goal is not None else {}).get("workspace_mutated"))
         if goal is not None:
@@ -1183,51 +1640,128 @@ class AgentRuntime:
                 else ""
             )
             mutated = mutated or bool(goal.metadata.get("mutation_sequence", 0))
-            plan = self.store.get_latest_plan(goal.id)
-            if plan is not None:
+            latest_plan = self.store.get_latest_plan(goal.id)
+            progress_plan = latest_plan
+            # During an in-scope replan the newest revision is intentionally
+            # pending approval while ``active_plan_revision`` still names the
+            # accepted work whose completed/blocked statuses are authoritative.
+            # Present that accepted progress until the replacement is
+            # approved; otherwise opening /todo during recovery falsely shows
+            # a brand-new zero-task project.
+            if (
+                latest_plan is not None
+                and goal.active_plan_revision is not None
+                and latest_plan.revision != goal.active_plan_revision
+                and latest_plan.status is PlanStatus.PENDING_APPROVAL
+            ):
                 try:
-                    content_revision = max(content_revision, int(plan.revision))
+                    progress_plan = self.store.get_plan(
+                        goal.id,
+                        goal.active_plan_revision,
+                    )
+                except NotFoundError:
+                    progress_plan = latest_plan
+            if latest_plan is not None:
+                try:
+                    content_revision = max(content_revision, int(latest_plan.revision))
                 except (TypeError, ValueError):
                     pass
             if goal.status is GoalStatus.AWAITING_PLAN_APPROVAL:
                 waiting_on = "user"
                 resume_action = "Review plan"
                 reason = (
-                    f"Plan r{plan.revision} is ready for review."
-                    if plan is not None
+                    f"Plan r{latest_plan.revision} is ready for review."
+                    if latest_plan is not None
                     else "The plan is ready for review."
                 )
-            if plan is not None:
-                active = [task for task in plan.tasks if task.status.value in {"in_progress", "verifying"}]
+            if progress_plan is not None:
+                active = [
+                    task
+                    for task in progress_plan.tasks
+                    if task.status.value in {"in_progress", "verifying"}
+                ]
                 if active:
                     current_task_id = active[0].id
                     current_task = f"{active[0].id} · {active[0].title}"
-            if plan is not None:
-                for task in plan.tasks:
-                    status = str(task.status.value if hasattr(task.status, "value") else task.status)
-                    task_items.append({
-                        "id": str(task.id),
-                        "title": str(task.title),
-                        "status": status,
-                        "dependencies": list(getattr(task, "depends_on", ()) or ()),
-                        "evidence": " ".join(str(getattr(task, "evidence", "") or "").split()),
-                    })
-                    if not next_task and status in {"pending", "ready", "queued"}:
-                        next_task = str(task.title)
+            task_items, goal_progress = self._workflow_progress_projection(
+                goal,
+                progress_plan,
+            )
+            pending_plan_revision = (
+                latest_plan.revision
+                if latest_plan is not None
+                and latest_plan.status is PlanStatus.PENDING_APPROVAL
+                and latest_plan.revision != goal.active_plan_revision
+                else None
+            )
+            goal_progress.update({
+                "plan_revision": (
+                    progress_plan.revision if progress_plan is not None else None
+                ),
+                "approved_plan_revision": goal.active_plan_revision,
+                "latest_plan_revision": (
+                    latest_plan.revision if latest_plan is not None else None
+                ),
+                "pending_plan_revision": pending_plan_revision,
+                "projection_basis": (
+                    "accepted_plan_during_replan"
+                    if pending_plan_revision is not None
+                    and progress_plan is not None
+                    and progress_plan.revision != pending_plan_revision
+                    else "current_execution"
+                ),
+            })
+            active_projected = next(
+                (task for task in task_items if task.get("state") == "working"),
+                None,
+            )
+            if active_projected is not None:
+                current_task_id = str(active_projected.get("id") or current_task_id)
+                current_task = (
+                    f"{current_task_id} / {active_projected.get('title') or 'Active task'}"
+                )
+            for task in task_items:
+                if not next_task and task.get("state") == "pending":
+                    next_task = str(task.get("title") or "")
             actions = self.store.list_actions(goal.id, status="running")
             if actions:
                 last_tool = str(actions[-1].get("tool_name") or "")
                 if not waiting_on:
                     waiting_on = "tool"
         elif pending is not None and str(pending.get("status") or "").casefold() != "completed":
-            phase = "retrying" if str(pending.get("status")) == "awaiting_provider" else "routing"
-            reason = str(pending.get("last_error") or "Routing the saved request.")
-            waiting_on = "provider" if phase == "retrying" else "model"
-            resume_action = "Retry" if phase == "retrying" else ""
+            pending_status = str(pending.get("status") or "").casefold()
+            if pending_status == "awaiting_provider":
+                phase = "retrying"
+                waiting_on = "provider"
+                resume_action = "Retry"
+            elif pending_status == "needs_evidence":
+                phase = "paused"
+                waiting_on = "evidence"
+                resume_action = "Resume"
+            else:
+                phase = "routing"
+                waiting_on = "model"
+                resume_action = ""
+            reason = str(
+                pending.get("last_error")
+                or (
+                    "Required output evidence is still missing."
+                    if pending_status == "needs_evidence"
+                    else "Routing the saved request."
+                )
+            )
             route = route if route != "" else "pending"
         else:
-            # No goal and no pending turn means the session has not started.
-            phase = "ready"
+            # A completed bounded Action is a real terminal outcome, not the
+            # same state as an untouched composer. Keep its delivery visible
+            # until the next request starts.
+            last_semantic = state.get("last_semantic_turn")
+            last_semantic = last_semantic if isinstance(last_semantic, Mapping) else {}
+            if str(last_semantic.get("result_status") or "") == "action_completed":
+                phase = "completed"
+                reason = "Requested action and deliverables completed with tool evidence."
+            else:
+                phase = "ready"
             route = route if route not in {"", "unknown"} else "pending"
             strategy = strategy if strategy != "" else "pending"
 
@@ -1335,10 +1869,22 @@ class AgentRuntime:
                 provider_signal = float(provider_signal)
             except (TypeError, ValueError):
                 provider_signal = None
+        provider_fresh = True
+        if goal is not None and provider_signal is not None:
+            try:
+                provider_fresh = provider_signal >= goal.updated_at.timestamp() - 1.0
+            except (AttributeError, TypeError, ValueError):
+                provider_fresh = True
+        elif goal is not None and str(provider_activity.get("state") or "idle") != "idle":
+            provider_fresh = False
+        if not provider_fresh:
+            # Provider telemetry belongs to one attempt. A resume/replan/model
+            # transition invalidates an older final callback in process memory.
+            provider_signal = None
         if provider_signal and (heartbeat_at is None or provider_signal > heartbeat_at):
             heartbeat_at = provider_signal
         age = max(0.0, time.time() - heartbeat_at) if heartbeat_at else None
-        provider_state = str(provider_activity.get("state") or "idle")
+        provider_state = str(provider_activity.get("state") or "idle") if provider_fresh else "idle"
         # A live goal can remain RUNNING while the durable retry policy waits
         # for its next attempt.  Project that boundary explicitly instead of
         # leaving the header at a misleading generic Working/Planning state.
@@ -1433,7 +1979,14 @@ class AgentRuntime:
             if goal is not None
             else None
         )
-        if isinstance(pending_tool, Mapping):
+        if (
+            isinstance(pending_tool, Mapping)
+            and bool(pending_tool)
+            and bool(
+                str(pending_tool.get("action_fingerprint") or "").strip()
+                or str(pending_tool.get("tool") or "").strip()
+            )
+        ):
             pending_decision = str(pending_tool.get("decision") or "").casefold()
             if not pending_decision:
                 pending_name = str(pending_tool.get("tool") or "the next action")
@@ -1445,6 +1998,54 @@ class AgentRuntime:
                     or f"Approval is required before {pending_name} can run."
                 )
                 resume_action = "Retry"
+        # ``GoalStatus.RUNNING`` is an intent/control-plane state, not proof
+        # that a worker is alive.  A completed background future used to leave
+        # the Goal RUNNING while the durable execution lease was already at a
+        # boundary.  Both terminal and Web clients then advertised Working
+        # forever with zero active agents.  The versioned execution lease is
+        # the authority for liveness: without an active execution lease the
+        # workflow is starting or paused, never ordinary Working.  A stale
+        # durable action is diagnostic evidence, not proof of a live worker.
+        if (
+            goal is not None
+            and goal.status is GoalStatus.RUNNING
+            and not lease_active
+            and phase
+            not in {
+                "waiting_for_approval",
+                "awaiting_approval",
+                "retrying",
+            }
+        ):
+            lease_state = str(
+                execution_lease.get("lease_state") or ""
+            ).casefold()
+            lease_stage = str(execution_lease.get("stage") or "").strip()
+            # Reaching this branch already means the lease is not live.  An
+            # expired lease must never inherit "working" from a stale action:
+            # that action may be the crash window we are trying to expose.
+            if lease_state in {"boundary", "released", "active"}:
+                phase = "paused"
+                waiting_on = str(goal.metadata.get("waiting_on") or "recovery")
+                reason = str(
+                    goal.metadata.get("waiting_question")
+                    or goal.metadata.get("retry_reason")
+                    or (
+                        "The worker heartbeat expired at the saved execution checkpoint."
+                        if lease_state == "active"
+                        else "No worker owns the saved execution checkpoint."
+                    )
+                )
+                if lease_stage and not reason:
+                    reason = f"Execution stopped at {lease_stage}."
+                resume_action = str(
+                    goal.metadata.get("resume_action") or "Retry"
+                )
+            elif not execution_lease:
+                phase = "starting"
+                waiting_on = "worker"
+                reason = "The accepted goal is waiting for its worker to claim execution."
+                resume_action = ""
         if phase == "completed":
             liveness = "completed"
         elif provider_state == "network_unavailable":
@@ -1455,7 +2056,7 @@ class AgentRuntime:
             "waiting_for_approval",
             "awaiting_approval",
             "reviewing",
-        } and waiting_on == "user":
+        }:
             liveness = "waiting" if waiting_on == "user" else "paused"
         elif provider_state == "receiving":
             liveness = "receiving"
@@ -1472,8 +2073,13 @@ class AgentRuntime:
         stale_after = max(15.0, float(self.config.activity_heartbeat_seconds) * 4.0)
         if liveness in {"client_active", "request_sent", "receiving", "processing_response"} and age is not None and age > stale_after:
             liveness = "stalled"
-        actor_label = (active_actor or str(provider_activity.get("actor") or "")).replace("-", " ").replace("_", " ").strip().title()
-        active_operation = str(provider_activity.get("operation") or "")
+        actor_label = (
+            active_actor
+            or (str(provider_activity.get("actor") or "") if provider_fresh else "")
+        ).replace("-", " ").replace("_", " ").strip().title()
+        active_operation = str(provider_activity.get("operation") or "") if provider_fresh else ""
+        if phase == "paused":
+            active_operation = current_task or "Saved checkpoint; recovery details are available below"
         if not active_operation:
             active_operation = current_task or reason or (
                 f"{actor_label} is active" if actor_label else phase.replace("_", " ").title()
@@ -1485,10 +2091,10 @@ class AgentRuntime:
                 limit=24,
             )[-8:]
         )
-        stream_kind = str(provider_activity.get("stream_kind") or "none")
-        stream_state = str(provider_activity.get("stream_state") or "idle")
-        safe_stream_preview = str(provider_activity.get("safe_stream_preview") or "")[-4_000:]
-        first_byte_at = provider_activity.get("first_byte_at")
+        stream_kind = str(provider_activity.get("stream_kind") or "none") if provider_fresh else "none"
+        stream_state = str(provider_activity.get("stream_state") or "idle") if provider_fresh else "idle"
+        safe_stream_preview = str(provider_activity.get("safe_stream_preview") or "")[-4_000:] if provider_fresh else ""
+        first_byte_at = provider_activity.get("first_byte_at") if provider_fresh else None
         try:
             first_byte_at = float(first_byte_at) if first_byte_at is not None else None
         except (TypeError, ValueError):
@@ -1557,6 +2163,7 @@ class AgentRuntime:
             first_byte_at=first_byte_at,
             task_items=tuple(task_items),
             next_task=next_task,
+            goal_progress=goal_progress,
             session_revision=session_revision,
             content_revision=content_revision,
             attempt_id=attempt_id,
@@ -2153,14 +2760,11 @@ class AgentRuntime:
         }
 
     def replace_permission_adapter(self, adapter: PermissionAdapter) -> None:
-        if (
-            self.ultra_session is not None
-            and self.ultra_session.running
-            and not self.ultra_session.safe_for_reconfiguration
-        ):
-            raise RuntimeStateError(
-                "pause ULTRA and wait for active agents to reach a safe checkpoint before changing permissions"
-            )
+        # Access is now a live approval policy over the same host workspace,
+        # not a runner/filesystem migration.  Updating it between tool calls is
+        # safe and is required for `/access full` to release a currently
+        # blocked worker immediately.  In-flight subprocesses are unaffected;
+        # every later boundary reads the replacement adapter.
         self.permission_adapter = adapter
         if self.ultra_session is not None:
             self.ultra_session.switch_permissions(adapter)
@@ -2258,6 +2862,7 @@ class AgentRuntime:
             reasoning_effort=self.reasoning_effort,
             version_control=self.version_control,
             session_id=self.session_id,
+            adaptive_orchestration_policy=self.adaptive_orchestration_policy,
         )
 
     def start_ultra(
@@ -2482,10 +3087,128 @@ class AgentRuntime:
             if not str(item.get("answer") or "").strip()
         )
 
+    def _intake_project_manifest_facts(self) -> tuple[str, ...]:
+        """Read bounded, deterministic project entry-point facts visibly."""
+
+        facts: list[str] = []
+        for relative in ("package.json", "pyproject.toml", "requirements.txt", "README.md"):
+            path = self.workspace / relative
+            if not path.is_file():
+                continue
+            self._publish_activity_step(
+                f"Opening {relative}",
+                source_kind="HARNESS",
+                actor="repository-index",
+                phase="retrieving_context",
+                state="active",
+                operation=f"Reading the project entry point {relative}",
+                waiting_on="harness",
+            )
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    content = handle.read(64_000)
+            except OSError as exc:
+                self._publish_activity_step(
+                    f"Could not read {relative} · continuing with the repository index",
+                    source_kind="HARNESS",
+                    actor="repository-index",
+                    phase="retrieving_context",
+                    state="completed",
+                    operation=f"Skipped unreadable project entry point {relative}",
+                    detail=f"{type(exc).__name__}: {exc}",
+                    waiting_on="harness",
+                )
+                continue
+            line_count = max(1, len(content.splitlines()))
+            finding = "project entry point is present"
+            fact = f"Project entry point: {relative} is present."
+            if relative == "package.json":
+                try:
+                    package = json.loads(content)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    package = {}
+                if isinstance(package, Mapping):
+                    raw_scripts = package.get("scripts")
+                    script_mapping = raw_scripts if isinstance(raw_scripts, Mapping) else {}
+                    scripts = tuple(
+                        str(name)[:60]
+                        for name in script_mapping.keys()
+                    )[:12]
+                    raw_dependencies = package.get("dependencies")
+                    raw_dev_dependencies = package.get("devDependencies")
+                    dependencies = (
+                        raw_dependencies if isinstance(raw_dependencies, Mapping) else {}
+                    )
+                    dev_dependencies = (
+                        raw_dev_dependencies
+                        if isinstance(raw_dev_dependencies, Mapping)
+                        else {}
+                    )
+                    dependency_names = tuple(
+                        dict.fromkeys((
+                            *dependencies.keys(),
+                            *dev_dependencies.keys(),
+                        ))
+                    )[:16]
+                    name = " ".join(str(package.get("name") or "").split())[:80]
+                    finding_parts: list[str] = []
+                    if name:
+                        finding_parts.append(f"project {name}")
+                    if scripts:
+                        finding_parts.append("scripts " + ", ".join(scripts))
+                    if dependency_names:
+                        finding_parts.append(
+                            "declared packages " + ", ".join(dependency_names)
+                        )
+                    if finding_parts:
+                        finding = "; ".join(finding_parts)
+                        fact = f"Project package manifest: {finding}."
+            elif relative == "requirements.txt":
+                requirements = tuple(
+                    line.strip().split(";", 1)[0][:100]
+                    for line in content.splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")
+                )[:16]
+                if requirements:
+                    finding = f"{len(requirements)} declared Python requirements"
+                    fact = f"Project requirements manifest: {finding}."
+            elif relative == "README.md":
+                heading = next(
+                    (
+                        " ".join(line.lstrip("#").split())[:120]
+                        for line in content.splitlines()
+                        if line.lstrip().startswith("#") and line.lstrip("#").strip()
+                    ),
+                    "",
+                )
+                if heading:
+                    finding = f"README title {heading}"
+                    fact = f"Project README: title={heading}."
+            self._publish_activity_step(
+                f"Read {relative}:1-{line_count}",
+                source_kind="HARNESS",
+                actor="repository-index",
+                phase="retrieving_context",
+                state="completed",
+                operation=f"Found {finding}",
+                waiting_on="harness",
+            )
+            facts.append(fact)
+        return tuple(facts)
+
     def _intake_repository_facts(self, query: str) -> tuple[str, ...]:
         """Return a small provenance-bearing slice before asking the user."""
 
-        facts: list[str] = []
+        self._publish_activity_step(
+            "Finding the project files relevant to this request",
+            source_kind="HARNESS",
+            actor="semantic-router",
+            phase="retrieving_context",
+            state="active",
+            operation="Searching the repository index (dependencies and build output excluded)",
+            waiting_on="harness",
+        )
+        facts: list[str] = list(self._intake_project_manifest_facts())
         if self._global_memory_enabled:
             for lesson in self.global_lessons.search(query, limit=4):
                 self._used_global_lesson_ids.add(lesson.id)
@@ -2498,14 +3221,54 @@ class AgentRuntime:
                 query,
                 max_entries=8,
                 budget_chars=6_000,
+                # Semantic routing needs a fast repository sample, not repeated
+                # whole-graph caller/callee expansion before the first model
+                # request. Planning can retrieve graph neighborhoods later.
+                include_graph_neighborhood=False,
             )
-        except (OSError, UnicodeError, ValueError, TypeError):
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            self._publish_activity_step(
+                "Repository context lookup was unavailable · continuing with the saved request",
+                source_kind="HARNESS",
+                actor="semantic-router",
+                phase="retrieving_context",
+                state="completed",
+                operation="Repository lookup skipped; preparing the model request",
+                detail=f"{type(exc).__name__}: {exc}",
+                completed=0,
+                total=0,
+                waiting_on="harness",
+            )
             return tuple(facts)
+        self._publish_activity_step(
+            f"Repository context ready · {len(context_slice.entries)} relevant entries selected",
+            source_kind="HARNESS",
+            actor="semantic-router",
+            phase="retrieving_context",
+            state="completed",
+            operation="Repository context is ready; preparing the model request",
+            completed=len(context_slice.entries),
+            total=len(context_slice.entries),
+            waiting_on="harness",
+        )
         self._record_repository_context_slice(
             context_slice,
             stage="semantic_intake",
         )
         for entry in context_slice.entries:
+            self._publish_activity_step(
+                f"Read indexed excerpt {entry.path}:{entry.start}-{entry.end}",
+                source_kind="HARNESS",
+                actor="repository-index",
+                phase="retrieving_context",
+                state="completed",
+                operation=f"Found {entry.kind} {entry.name} for request context",
+                detail=(
+                    f"current artifact hash {entry.file_hash[:12]} · "
+                    f"provenance {entry.provenance}"
+                ),
+                waiting_on="harness",
+            )
             facts.append(
                 "Discovered repository context: "
                 f"{entry.path} -> {entry.kind} {entry.name} "
@@ -2517,6 +3280,58 @@ class AgentRuntime:
                 f"Repository retrieval omitted {context_slice.omitted_entries} lower-ranked entries."
             )
         return tuple(facts)
+
+    def _semantic_repository_facts(
+        self,
+        pending: dict[str, Any],
+        query: str,
+    ) -> tuple[str, ...]:
+        """Read repository context once per semantic turn and reuse it.
+
+        Goal intake and validation consume the same immutable, provenance-bearing
+        slice as routing.  Re-querying after routing made the visible activity
+        regress from ``Routing`` back to ``Searching`` and wasted weak-model
+        context time without adding evidence.
+        """
+
+        cached = pending.get("repository_manifest")
+        if isinstance(cached, (list, tuple)):
+            return tuple(str(item) for item in cached)
+        facts = self._intake_repository_facts(query)
+        pending["repository_manifest"] = list(facts)
+        self._save_pending_semantic_turn(pending)
+        return facts
+
+    @staticmethod
+    def _semantic_strategy(
+        capability_envelope: ModelCapabilityEnvelopeV1,
+        decision: SemanticTurnDecisionV2,
+        pending: Mapping[str, Any],
+    ) -> StrategyDecisionV1:
+        """Choose depth without turning a bounded Action into a Goal.
+
+        Model capability may deepen a real project Goal.  It may not change the
+        semantic outcome of a bounded run/inspect/preview Action; that path
+        already has a bounded multi-tool loop and deterministic effect gates.
+        """
+
+        explicit_recursive = (
+            str(pending.get("minimum_strategy") or pending.get("requested_mode"))
+            .strip()
+            .casefold()
+            in {"recursive", "ultra"}
+        )
+        is_goal = decision.route is RouteKind.GOAL
+        return select_execution_strategy(
+            capability_envelope,
+            decision.task_demand,
+            minimum=(
+                ExecutionStrategyV1.RECURSIVE
+                if is_goal and explicit_recursive
+                else ExecutionStrategyV1.STAGED
+            ),
+            allow_capability_escalation=is_goal,
+        )
 
     def _record_repository_context_slice(
         self,
@@ -2779,11 +3594,20 @@ class AgentRuntime:
             semantic_turn_id = str(semantic_turn["turn_id"])
         if semantic_decision.route is not RouteKind.GOAL or semantic_decision.goal_intake is None:
             raise RuntimeStateError("Goal dispatch requires an accepted model-authored goal intake")
+        semantic_state = dict(
+            self.store.get_workflow_session(self.session_id).get("state") or {}
+        )
+        active_semantic = semantic_state.get("pending_semantic_turn")
+        repository_facts = (
+            self._semantic_repository_facts(dict(active_semantic), value)
+            if isinstance(active_semantic, Mapping)
+            else self._intake_repository_facts(value)
+        )
         decision = self.intent_architect.validate(
             semantic_decision.goal_intake,
             original_input=value,
             requested_mode=requested_mode,
-            repository_facts=self._intake_repository_facts(value),
+            repository_facts=repository_facts,
         )
         intake = self.store.create_intake_session(
             self.session_id,
@@ -2897,7 +3721,18 @@ class AgentRuntime:
                 semantic_decision=semantic,
                 semantic_turn_id=str(semantic_turn["turn_id"]),
             )
-        self._complete_semantic_turn(str(semantic_turn["turn_id"]), result_status=str(getattr(result, "status", "routed")))
+        if str(getattr(result, "status", "")) == "action_incomplete":
+            self._hold_semantic_turn(
+                str(semantic_turn["turn_id"]),
+                result_status="action_incomplete",
+                reason=str(getattr(result, "reason", "") or getattr(result, "message", "")),
+                limitations=tuple(getattr(result, "limitations", ()) or ()),
+            )
+        else:
+            self._complete_semantic_turn(
+                str(semantic_turn["turn_id"]),
+                result_status=str(getattr(result, "status", "routed")),
+            )
         return decision, result
 
     def answer_intake_question(self, question_id: str, value: str) -> Any:
@@ -2988,16 +3823,24 @@ class AgentRuntime:
 
     def active_ultra_run(self) -> Any | None:
         goal = self.active_goal() or self.store.get_latest_goal(self.session_id)
+        # An Ultra run belongs to a goal, and that goal belongs to this
+        # workflow session.  Falling back to an unfiltered project-wide run
+        # when a fresh session has no goal leaks old agents, failures, and
+        # recovery state into the new conversation.
+        if goal is None:
+            return None
         run_id = str(goal.metadata.get("ultra_run_id", "")) if goal else ""
         if run_id:
             try:
-                return self.store.get_ultra_run(run_id)
+                run = self.store.get_ultra_run(run_id)
+                if str(getattr(run, "goal_id", "")) == goal.id:
+                    return run
             except NotFoundError:
                 pass
-        active = self.store.get_active_ultra_run(goal.id if goal else None)
+        active = self.store.get_active_ultra_run(goal.id)
         if active is not None:
             return active
-        runs = self.store.list_ultra_runs(goal.id if goal else None)
+        runs = self.store.list_ultra_runs(goal.id)
         return runs[-1] if runs else None
 
     def ultra_questions(self) -> tuple[Mapping[str, Any], ...]:
@@ -3302,6 +4145,23 @@ class AgentRuntime:
             if non_candidate_blockers:
                 blocker = non_candidate_blockers[0]
                 current = self.store.get_goal(goal.id)
+                failure_fingerprint = str(
+                    blocker.get("failure_fingerprint") or ""
+                ).strip()
+                retry_state = dict(
+                    current.metadata.get("verification_retry_state") or {}
+                )
+                same_retry = bool(
+                    failure_fingerprint
+                    and failure_fingerprint
+                    == str(retry_state.get("failure_fingerprint") or "")
+                )
+                retry_attempts = (
+                    max(0, int(retry_state.get("attempts") or 0))
+                    if same_retry
+                    else 0
+                )
+                retry_exhausted = same_retry and retry_attempts >= 1
                 if current.status is GoalStatus.REVISING:
                     self.store.transition_goal(
                         goal.id,
@@ -3311,19 +4171,36 @@ class AgentRuntime:
                 self.store.update_goal_metadata(
                     goal.id,
                     waiting_question=(
+                        "The same saved verification failure was reproduced after its bounded "
+                        "retry. Another identical Retry is disabled; inspect the evidence or "
+                        "change the model before continuing. The accepted artifact was preserved."
+                        if retry_exhausted
+                        else
                         "Automatic verification repair was exhausted without evidence of a "
                         "candidate-code defect. Inspect or retry the saved verification boundary; "
                         "the accepted artifact was preserved."
                     ),
                     waiting_on="verification",
-                    resume_action="retry_verification",
+                    resume_action=(
+                        "inspect_verification"
+                        if retry_exhausted
+                        else "retry_verification"
+                    ),
                     auto_retryable=False,
                     verification_blocker=dict(blocker),
+                    verification_retry_state={
+                        "failure_fingerprint": failure_fingerprint,
+                        "attempts": retry_attempts,
+                        "exhausted": retry_exhausted,
+                        "last_outcome": "same_failure" if retry_exhausted else "available",
+                    },
                 )
                 self.events.publish(
                     "ultra.non_candidate_failure_boundary",
                     "Verification failure was not routed into a product replan.",
                     diagnostic=dict(blocker),
+                    retry_attempts=retry_attempts,
+                    retry_exhausted=retry_exhausted,
                 )
                 return result
             feedback = self._ultra_quality_feedback(result)
@@ -3624,6 +4501,231 @@ class AgentRuntime:
     def active_goal(self) -> Goal | None:
         return self.store.load_active_goal(self.session_id)
 
+    def _reconcile_terminal_ultra_failure(self) -> tuple[str, str] | None:
+        """Make a terminal Ultra failure authoritative over a stale active Goal.
+
+        The Ultra engine and the legacy Goal projection are committed through
+        separate durable gates.  A process can stop after the run is marked
+        BLOCKED but before the Goal transition is written.  Restoring that
+        state as RUNNING invents work that no worker owns and hides the Retry
+        action from both terminal and web clients.  A terminal run is safe to
+        reconcile because it cannot be concurrently executing; live-owner
+        runtimes skip startup recovery before reaching this helper.
+        """
+
+        from .ultra_models import UltraRunStatus
+
+        goal = self.store.load_active_goal(self.session_id)
+        repair_paused = bool(
+            goal is not None
+            and goal.status is GoalStatus.PAUSED
+            and str(goal.metadata.get("resume_action") or "")
+            in {"inspect_verification", "retry_verification", "ultra_replan"}
+        )
+        if goal is None or (
+            goal.status not in {
+                GoalStatus.RUNNING,
+                GoalStatus.VERIFYING,
+                GoalStatus.REVIEWING,
+                GoalStatus.RECOVERING,
+            }
+            and not repair_paused
+        ):
+            return None
+        run_id = str(goal.metadata.get("ultra_run_id") or "").strip()
+        if not run_id:
+            return None
+        try:
+            run = self.store.get_ultra_run(run_id)
+        except NotFoundError:
+            return None
+        if run.status not in {
+            UltraRunStatus.BLOCKED,
+            UltraRunStatus.REVISION_REQUIRED,
+        }:
+            return None
+
+        if run.status is UltraRunStatus.REVISION_REQUIRED:
+            failure_diagnostics: list[dict[str, Any]] = []
+            findings: list[str] = []
+            for node in self.store.list_work_nodes(run.id):
+                result = getattr(node, "result", None)
+                if result is None:
+                    continue
+                findings.extend(
+                    str(item).strip()
+                    for item in getattr(result, "issues", ())
+                    if str(item).strip()
+                )
+                metadata = dict(getattr(result, "metadata", {}) or {})
+                component = dict(metadata.get("component_package") or {})
+                failure = component.get("failure_diagnostic")
+                if isinstance(failure, Mapping):
+                    failure_diagnostics.append(dict(failure))
+            candidate_text = " ".join(findings).casefold()
+            candidate_defect = any(
+                marker in candidate_text
+                for marker in (
+                    " is not defined",
+                    "referenceerror",
+                    "syntaxerror",
+                    "required dom element",
+                    "required dom elements",
+                    "matched no elements",
+                    "failed to resolve module specifier",
+                    "candidate-code defect",
+                    "candidate code defect",
+                )
+            ) or any(
+                str(item.get("blocker_owner") or "") == "candidate_code"
+                or str(item.get("failure_kind") or "") == "application"
+                for item in failure_diagnostics
+            )
+            non_candidate = next(
+                (
+                    item
+                    for item in failure_diagnostics
+                    if bool(item.get("mutation_prohibited"))
+                    and str(item.get("blocker_owner") or "")
+                    in {"test_harness", "tooling", "environment"}
+                ),
+                None,
+            )
+            if candidate_defect:
+                # Observable candidate/runtime failures outrank an older
+                # harness-contract label.  Keeping the stale label prohibited
+                # mutation and stranded a fixable application behind Retry.
+                non_candidate = None
+            if non_candidate is not None:
+                self.store.update_goal_metadata(
+                    goal.id,
+                    waiting_question=(
+                        "Automatic verification repair was exhausted without evidence of a "
+                        "candidate-code defect. Inspect or retry the saved verification boundary; "
+                        "the accepted artifact was preserved."
+                    ),
+                    waiting_on="verification",
+                    resume_status=GoalStatus.RUNNING.value,
+                    resume_action="retry_verification",
+                    auto_retryable=False,
+                    verification_blocker=dict(non_candidate),
+                    terminal_ultra_failure={
+                        "run_id": run.id,
+                        "status": run.status.value,
+                        "diagnostic": redact_text(
+                            "; ".join(findings)
+                            or run.error
+                            or "Ultra quality verification requires attention.",
+                            2_000,
+                        ),
+                        "mutation_replayed": False,
+                    },
+                )
+                self.store.transition_goal(
+                    goal.id,
+                    GoalStatus.PAUSED,
+                    reason="restored Ultra verification boundary",
+                )
+            else:
+                feedback = redact_text(
+                    "; ".join(
+                        item
+                        for item in (str(run.error or "").strip(), *findings)
+                        if item
+                    )
+                    or "The saved Ultra quality gate requires a materially different strategy.",
+                    4_000,
+                )
+                repair_fingerprint = hashlib.sha256(
+                    f"{run.id}\n{feedback}".encode("utf-8")
+                ).hexdigest()
+                already_started = str(
+                    goal.metadata.get("automatic_replan_started_for") or ""
+                ) == repair_fingerprint
+                self.store.update_goal_metadata(
+                    goal.id,
+                    waiting_question="",
+                    retry_reason=(
+                        "A candidate application defect was found. The harness will rebuild "
+                        "the failed branch from the saved evidence automatically."
+                    ),
+                    waiting_on="diagnosis",
+                    resume_status=GoalStatus.REVISING.value,
+                    resume_action="ultra_replan",
+                    replan_feedback=feedback,
+                    auto_retryable=not already_started,
+                    automatic_replan_fingerprint=repair_fingerprint,
+                    terminal_ultra_failure={
+                        "run_id": run.id,
+                        "status": run.status.value,
+                        "diagnostic": feedback,
+                        "mutation_replayed": False,
+                    },
+                )
+                self.store.transition_goal(
+                    goal.id,
+                    GoalStatus.PAUSED,
+                    reason="restored Ultra quality-revision boundary",
+                )
+            self.store.append_event(
+                "ultra.goal_terminal_state_reconciled",
+                goal_id=goal.id,
+                entity_type="ultra_run",
+                entity_id=run.id,
+                payload={
+                    "run_status": run.status.value,
+                    "prior_goal_status": goal.status.value,
+                    "goal_status": GoalStatus.PAUSED.value,
+                    "diagnostic": dict(non_candidate or {}),
+                    "candidate_defect": candidate_defect,
+                    "mutation_replayed": False,
+                },
+            )
+            return goal.id, run.id
+
+        diagnostic = redact_text(
+            run.error
+            or "The recursive harness stopped before the final acceptance checkpoint.",
+            2_000,
+        )
+        self.store.update_goal_metadata(
+            goal.id,
+            waiting_question="",
+            waiting_on="recovery",
+            resume_status=GoalStatus.RUNNING.value,
+            resume_action="Retry",
+            retry_reason=(
+                "The recursive harness stopped at a saved checkpoint. Retry resumes "
+                "unfinished branches without replaying accepted mutations."
+            ),
+            auto_retryable=True,
+            terminal_ultra_failure={
+                "run_id": run.id,
+                "status": run.status.value,
+                "diagnostic": diagnostic,
+                "mutation_replayed": False,
+            },
+        )
+        self.store.transition_goal(
+            goal.id,
+            GoalStatus.BLOCKED,
+            reason="restored terminal ULTRA failure checkpoint",
+        )
+        self.store.append_event(
+            "ultra.goal_terminal_state_reconciled",
+            goal_id=goal.id,
+            entity_type="ultra_run",
+            entity_id=run.id,
+            payload={
+                "run_status": run.status.value,
+                "prior_goal_status": goal.status.value,
+                "goal_status": GoalStatus.BLOCKED.value,
+                "diagnostic": diagnostic,
+                "mutation_replayed": False,
+            },
+        )
+        return goal.id, run.id
+
     def set_external_tool_approval_resolver(
         self,
         resolver: Callable[[str, str], bool] | None,
@@ -3633,13 +4735,22 @@ class AgentRuntime:
         self._external_tool_approval_resolver = resolver
 
     def _approval_session_groups(self) -> set[str]:
-        """Return permission groups explicitly allowed for this session."""
+        """Return tool permissions explicitly allowed for this session.
+
+        ``allow_session`` is a user-facing session-wide promise, not a hidden
+        policy-group promise.  Older builds persisted individual groups, so a
+        non-empty legacy value is upgraded to the wildcard on read.  This
+        prevents an existing session from asking again merely because the next
+        action happens to be classified as ``host_action`` instead of
+        ``project_preview``.
+        """
 
         session = self.store.get_workflow_session(self.session_id)
         raw = dict(session.get("state") or {}).get("approval_session_groups") or []
         if not isinstance(raw, (list, tuple, set, frozenset)):
             return set()
-        return {str(item).strip() for item in raw if str(item).strip()}
+        groups = {str(item).strip() for item in raw if str(item).strip()}
+        return {"*"} if groups else set()
 
     def _remember_approval_session_group(self, group: str) -> None:
         normalized = str(group or "").strip()
@@ -3650,6 +4761,13 @@ class AgentRuntime:
             return
         groups.add(normalized)
         self._persist_runtime_snapshot(approval_session_groups=sorted(groups))
+
+    def set_session_tool_permissions(self, enabled: bool) -> None:
+        """Enable or clear the durable session-wide tool permission grant."""
+
+        self._persist_runtime_snapshot(
+            approval_session_groups=["*"] if bool(enabled) else []
+        )
 
     def resolve_tool_approval(self, action_fingerprint: str, decision: str) -> bool:
         """Resolve one visible tool approval without weakening the policy.
@@ -3687,7 +4805,7 @@ class AgentRuntime:
             )
             self.store.update_goal_metadata(goal.id, pending_tool_approval=pending)
             if value == "allow_session":
-                self._remember_approval_session_group(session_group)
+                self._remember_approval_session_group("*")
 
         resolver = self._external_tool_approval_resolver
         if resolver is None:
@@ -3741,7 +4859,9 @@ class AgentRuntime:
             workspace=str(self.workspace),
             sandboxed=self.access_level == "full",
         )
-        if policy.group in self._approval_session_groups():
+        session_permissions = self._approval_session_groups()
+        if "*" in session_permissions or policy.group in session_permissions:
+            group_label = "all approved workspace actions"
             self.store.append_event(
                 "approval.session_reused",
                 goal_id=goal.id if goal is not None else None,
@@ -3751,7 +4871,7 @@ class AgentRuntime:
             )
             self.events.publish(
                 "approval.session_reused",
-                f"Session permission reused for {str(name).replace('_', ' ')}.",
+                f"Permission already granted for {group_label} this session; running {str(name).replace('_', ' ')}.",
                 tool=name,
                 risk=risk,
                 policy_group=policy.group,
@@ -3873,8 +4993,11 @@ class AgentRuntime:
                 )
             allowed = resolved_value in {"allow_once", "allow_session", "allow", "yes"}
         if allowed and decision_from_user and resolved_value == "allow_session":
-            self._remember_approval_session_group(policy.group)
+            self._remember_approval_session_group("*")
         if allowed:
+            recorded_decision = (
+                "allow_session" if resolved_value == "allow_session" else "allow_once"
+            )
             # ``goal`` was read before the approval callback and therefore
             # may not contain the marker persisted immediately above. Reload
             # the durable row before clearing it; otherwise an approved
@@ -3900,13 +5023,25 @@ class AgentRuntime:
                 goal_id=goal.id if goal is not None else None,
                 entity_type="tool",
                 entity_id=name,
-                payload={"tool": name, "risk": risk, "action_fingerprint": approval_fingerprint, "decision": "allow"},
+                payload={
+                    "tool": name,
+                    "risk": risk,
+                    "action_fingerprint": approval_fingerprint,
+                    "decision": recorded_decision,
+                    "policy_group": policy.group,
+                },
             )
             self.events.publish(
                 "approval.received",
-                "Approved — resuming the saved action.",
+                (
+                    f"Approved {policy.group.replace('_', ' ')} for this session; resuming the saved action."
+                    if recorded_decision == "allow_session"
+                    else "Approved once; resuming the saved action."
+                ),
                 tool=name,
                 action_fingerprint=approval_fingerprint,
+                decision=recorded_decision,
+                policy_group=policy.group,
                 waiting_on="tool",
                 phase="starting",
                 objective=(goal.objective if goal is not None else ""),
@@ -3943,7 +5078,7 @@ class AgentRuntime:
         )
         self.events.publish(
             "sleep.mode_changed",
-            f"Sleep Mode {'enabled' if enabled else 'disabled'}.",
+            f"Full access automation {'enabled' if enabled else 'disabled'}.",
             enabled=bool(enabled),
             policy=normalized_policy if enabled else "off",
             sleep_state="on" if enabled else "off",
@@ -4415,7 +5550,7 @@ class AgentRuntime:
                 state = dict(session.get("state", {}))
                 if (
                     state.get("minimum_strategy")
-                    != ExecutionStrategyV1.RECURSIVE.value
+                    != ExecutionStrategyV1.STAGED.value
                     or state.get("interaction_mode")
                     != InteractionModeV2.WORKING.value
                 ):
@@ -4425,7 +5560,7 @@ class AgentRuntime:
                             "state": {
                                 **dict(current_state.get("state") or {}),
                                 "interaction_mode": InteractionModeV2.WORKING.value,
-                                "minimum_strategy": ExecutionStrategyV1.RECURSIVE.value,
+                                "minimum_strategy": ExecutionStrategyV1.STAGED.value,
                             }
                         },
                         expected_revision=int(session.get("revision") or 0),
@@ -4445,7 +5580,7 @@ class AgentRuntime:
             else InteractionModeV2.WORKING.value
         )
         if target is SessionMode.NORMAL:
-            state["minimum_strategy"] = ExecutionStrategyV1.RECURSIVE.value
+            state["minimum_strategy"] = ExecutionStrategyV1.STAGED.value
         elif target is SessionMode.PLAN:
             state["minimum_strategy"] = ExecutionStrategyV1.RECURSIVE.value
         if goal is not None:
@@ -4563,7 +5698,11 @@ class AgentRuntime:
         """
         name = str(actor or "").casefold()
         local = self.execution_class == "local"
-        if name == "semantic-router":
+        if name == "vision-probe":
+            tokens, deadline = 128, 180.0 if local else 120.0
+        elif name == "vision-evaluator":
+            tokens, deadline = 2_048, 300.0 if local else 180.0
+        elif name == "semantic-router":
             # This stage emits one compact classification tool call. Giving a
             # partially CPU-offloaded local model a planner-sized atomic
             # budget hides a wedged runner for ten minutes because no response
@@ -4589,7 +5728,7 @@ class AgentRuntime:
             tokens, deadline = None, 900.0
         effort = (
             "off"
-            if local and name in {"semantic-router", "semantic-goal-intake"}
+            if local and name in {"semantic-router", "semantic-goal-intake", "vision-probe"}
             else str(getattr(self.provider, "reasoning_effort", "") or "") or None
         )
         return ProviderCallPolicyV1(
@@ -4598,7 +5737,7 @@ class AgentRuntime:
             reasoning_effort=effort,
             temperature=(
                 0.0
-                if local and name in {"semantic-router", "semantic-goal-intake"}
+                if local and name in {"semantic-router", "semantic-goal-intake", "vision-probe"}
                 else None
             ),
             stage_deadline_seconds=deadline,
@@ -5124,8 +6263,7 @@ class AgentRuntime:
                     diagnose = getattr(self.provider, "diagnose_connectivity", None)
                     if callable(diagnose):
                         transport_recovery_attempted = True
-                        self.events.publish(
-                            "provider.activity",
+                        self._publish_provider_activity(
                             "Provider connection lost · checking for recovery",
                             actor=actor, phase=actor, state="waiting",
                             provider_state="network_unavailable", waiting_on="network",
@@ -5142,8 +6280,7 @@ class AgentRuntime:
                         except Exception:
                             reachable = False
                         if reachable:
-                            self.events.publish(
-                                "provider.activity",
+                            self._publish_provider_activity(
                                 "Provider connection restored · resuming the same saved stage",
                                 actor=actor, phase=actor, state="active",
                                 provider_state="provider_connected", waiting_on="model",
@@ -5189,6 +6326,376 @@ class AgentRuntime:
         if retry_after is not None:
             setattr(unavailable, "retry_after_seconds", retry_after)
         raise unavailable from last_error
+
+    @staticmethod
+    def _vision_probe_image() -> tuple[str, str]:
+        """Return a dependency-free high-contrast OCR canary.
+
+        Small multimodal models can identify every color in a grid yet return
+        an unstable spatial ordering.  A large bitmap token is still entirely
+        pixel-bound, while providing a much more reliable capability check for
+        the weak vision models this harness is designed around.
+        """
+
+        token = "VISION-731"
+        glyphs = {
+            "V": ("10001", "10001", "10001", "10001", "01010", "01010", "00100"),
+            "I": ("11111", "00100", "00100", "00100", "00100", "00100", "11111"),
+            "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
+            "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
+            "N": ("10001", "11001", "11001", "10101", "10011", "10011", "10001"),
+            "-": ("00000", "00000", "00000", "11111", "00000", "00000", "00000"),
+            "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+            "3": ("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
+            "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+        }
+        scale, gap, padding = 12, 12, 32
+        glyph_width, glyph_height = 5 * scale, 7 * scale
+        width = (padding * 2) + (len(token) * glyph_width) + ((len(token) - 1) * gap)
+        height = (padding * 2) + glyph_height
+        rows = bytearray()
+        for y in range(height):
+            rows.append(0)
+            for x in range(width):
+                foreground = False
+                local_x = x - padding
+                local_y = y - padding
+                if 0 <= local_y < glyph_height and local_x >= 0:
+                    cell_width = glyph_width + gap
+                    glyph_index = local_x // cell_width
+                    glyph_x = local_x % cell_width
+                    if glyph_index < len(token) and glyph_x < glyph_width:
+                        pattern = glyphs[token[glyph_index]]
+                        foreground = pattern[local_y // scale][glyph_x // scale] == "1"
+                rows.extend((18, 18, 18) if foreground else (250, 248, 242))
+
+        def chunk(kind: bytes, data: bytes) -> bytes:
+            return (
+                struct.pack(">I", len(data))
+                + kind
+                + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+            )
+
+        png = (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(rows), level=9))
+            + chunk(b"IEND", b"")
+        )
+        return base64.b64encode(png).decode("ascii"), token.casefold()
+
+    @staticmethod
+    def _vision_provider_identity(provider: Any) -> tuple[str, str, str]:
+        provider_name = (
+            provider.__class__.__name__.removesuffix("Provider").casefold()
+            or "provider"
+        )
+        model_name = str(getattr(provider, "model", "unknown"))
+        return provider_name, model_name, f"{provider_name}:{model_name}"
+
+    def _call_vision_provider(
+        self,
+        provider: Any,
+        conversation: list[dict[str, Any]],
+        system: str,
+        *,
+        actor: str,
+    ) -> AssistantTurn:
+        if provider is self.provider:
+            return self._call_provider(
+                conversation,
+                (),
+                system,
+                actor=actor,
+                step=1,
+                stream_text=False,
+            )
+        provider_name, model_name, _key = self._vision_provider_identity(provider)
+        self._publish_provider_activity(
+            f"Calling visual evaluator {provider_name}/{model_name}",
+            source_kind="MODEL",
+            actor=actor,
+            phase="visual_review",
+            state="active",
+            operation=f"Reading current screenshot pixels with {model_name}",
+            waiting_on="model",
+            provider=provider_name,
+            model=model_name,
+        )
+        turn = provider.call(conversation, (), system)
+        if not isinstance(turn, AssistantTurn):
+            raise TypeError(
+                f"visual evaluator returned {type(turn).__name__}, expected AssistantTurn"
+            )
+        self._publish_provider_activity(
+            f"Visual evaluator {provider_name}/{model_name} responded",
+            source_kind="MODEL",
+            actor=actor,
+            phase="visual_review",
+            state="completed",
+            operation="Received pixel-bound visual evidence",
+            waiting_on="harness",
+            provider=provider_name,
+            model=model_name,
+        )
+        return turn
+
+    def _verify_vision_capability(
+        self,
+        provider: Any | None = None,
+    ) -> tuple[bool, str]:
+        candidate = provider or self.provider
+        _provider_name, _model_name, key = self._vision_provider_identity(candidate)
+        if self._vision_probe_passed_for == key:
+            return True, ""
+        cached_failure = self._vision_probe_failures.get(key, "")
+        if cached_failure:
+            return False, cached_failure
+        encoded, expected = self._vision_probe_image()
+        turn = self._call_vision_provider(
+            candidate,
+            [{
+                "role": "user",
+                "content": "Read the large token printed in the attached image and return the required JSON.",
+                "images": [{
+                    "path": "__vision_capability_probe__.png",
+                    "mime_type": "image/png",
+                    "sha256": hashlib.sha256(base64.b64decode(encoded)).hexdigest(),
+                    "data": encoded,
+                }],
+            }],
+            VISUAL_CAPABILITY_PROBE_SYSTEM_PROMPT,
+            actor="vision-probe",
+        )
+        raw = str(turn.text or "").strip()
+        start, end = raw.find("{"), raw.rfind("}")
+        if start < 0 or end <= start:
+            reason = "the model did not return the visual capability probe JSON"
+            self._vision_probe_failures[key] = reason
+            return False, reason
+        try:
+            payload = json.loads(raw[start : end + 1])
+        except json.JSONDecodeError:
+            reason = "the model returned malformed visual capability probe JSON"
+            self._vision_probe_failures[key] = reason
+            return False, reason
+        observed = str(payload.get("token") or "").strip().casefold() if isinstance(payload, Mapping) else ""
+        if observed != expected:
+            reason = "the model could not read the pixel-only OCR probe"
+            self._vision_probe_failures[key] = reason
+            return False, reason
+        self._vision_probe_passed_for = key
+        self._vision_probe_failures.pop(key, None)
+        return True, ""
+
+    def _vision_install_authorized(self) -> bool:
+        return self.access_level == "full" or "*" in self._approval_session_groups()
+
+    def _vision_pull_progress(self, payload: Mapping[str, Any]) -> None:
+        status = str(payload.get("status") or "Downloading visual model")
+        try:
+            total = int(payload.get("total") or 0)
+            completed = int(payload.get("completed") or 0)
+        except (TypeError, ValueError):
+            total, completed = 0, 0
+        percent = min(100, round((completed / total) * 100)) if total > 0 else None
+        progress_key = (status, percent)
+        if progress_key == self._vision_pull_last_progress:
+            return
+        self._vision_pull_last_progress = progress_key
+        message = status + (f" · {percent}%" if percent is not None else "")
+        self._publish_activity_step(
+            message,
+            source_kind="HARNESS",
+            actor="vision-model-manager",
+            phase="visual_model_setup",
+            state="active",
+            operation=message,
+            waiting_on="network",
+            progress_percent=percent,
+            completed_bytes=completed,
+            total_bytes=total,
+        )
+
+    def _resolve_vision_provider(self) -> tuple[Any | None, str]:
+        """Return the first pixel-proven evaluator, installing only with authority."""
+
+        reasons: list[str] = []
+        candidates: list[Any] = [self.provider]
+        if self._vision_evaluator_provider is not None:
+            candidates.append(self._vision_evaluator_provider)
+        current_ids = set()
+        for item in candidates:
+            _provider_name, model_name, key = self._vision_provider_identity(item)
+            current_ids.update({key.casefold(), model_name.casefold()})
+        host = str(getattr(self.provider, "host", "") or "http://localhost:11434")
+        for descriptor in installed_vision_models(
+            ollama_host=host,
+            exclude=current_ids,
+        ):
+            candidates.append(descriptor.create_provider())
+        seen: set[str] = set()
+        for candidate in candidates:
+            provider_name, model_name, key = self._vision_provider_identity(candidate)
+            if key.casefold() in seen:
+                continue
+            seen.add(key.casefold())
+            try:
+                ensure_capabilities = getattr(candidate, "_ensure_capabilities", None)
+                if callable(ensure_capabilities):
+                    ensure_capabilities()
+                profile = getattr(candidate, "capability_profile", None)
+                capabilities = getattr(candidate, "capabilities", None)
+                advertised = bool(
+                    getattr(profile, "vision_support", False)
+                    or getattr(capabilities, "supports_vision", False)
+                )
+                if not advertised:
+                    reasons.append(f"{provider_name}/{model_name}: vision is not advertised")
+                    continue
+                passed, reason = self._verify_vision_capability(candidate)
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                reasons.append(f"{provider_name}/{model_name}: capability probe failed: {exc}")
+                continue
+            if passed:
+                self._vision_evaluator_provider = candidate
+                self._vision_evaluator_key = key
+                return candidate, ""
+            reasons.append(f"{provider_name}/{model_name}: {reason}")
+
+        if (
+            not self._vision_fallback_pull_attempted
+            and self._vision_install_authorized()
+            and self.provider_name == "ollama"
+        ):
+            self._vision_fallback_pull_attempted = True
+            selected = fallback_model_name()
+            self._publish_activity_step(
+                f"Installing visual evaluator · {selected}",
+                source_kind="HARNESS",
+                actor="vision-model-manager",
+                phase="visual_model_setup",
+                state="active",
+                operation="Downloading the configured local visual model through Ollama",
+                waiting_on="network",
+                model=selected,
+            )
+            try:
+                descriptor = pull_ollama_vision_model(
+                    selected,
+                    host=host,
+                    on_progress=self._vision_pull_progress,
+                )
+                candidate = descriptor.create_provider()
+                passed, reason = self._verify_vision_capability(candidate)
+                if passed:
+                    self._vision_evaluator_provider = candidate
+                    self._vision_evaluator_key = self._vision_provider_identity(candidate)[2]
+                    self._publish_activity_step(
+                        f"Visual evaluator ready · {descriptor.model}",
+                        source_kind="HARNESS",
+                        actor="vision-model-manager",
+                        phase="visual_model_setup",
+                        state="completed",
+                        operation="Pixel-only capability probe passed",
+                        waiting_on="harness",
+                        model=descriptor.model,
+                    )
+                    return candidate, ""
+                reasons.append(f"ollama/{descriptor.model}: {reason}")
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                reasons.append(f"visual fallback installation failed: {exc}")
+        return None, "; ".join(reasons) or "no verified vision-capable model is available"
+
+    def _evaluate_images_with_provider(
+        self,
+        images: list[dict[str, str]],
+        purpose: str,
+        criteria: str,
+    ) -> Mapping[str, Any]:
+        """Return image-bound evidence from the configured model or fail closed."""
+
+        evaluator, resolution_reason = self._resolve_vision_provider()
+        if evaluator is None:
+            return {"status": "unsupported", "reason": resolution_reason}
+
+        paths = [str(item["path"]) for item in images]
+        prompt = state_envelope(
+            {
+                "purpose": purpose,
+                "criteria": criteria,
+                "images": [
+                    {
+                        "path": item["path"],
+                        "sha256": item["sha256"],
+                        "mime_type": item["mime_type"],
+                    }
+                    for item in images
+                ],
+            },
+            "VISUAL_EVALUATION_REQUEST",
+            max_chars=12_000,
+        )
+        turn = self._call_vision_provider(
+            evaluator,
+            [{"role": "user", "content": prompt, "images": images}],
+            VISUAL_EVALUATOR_SYSTEM_PROMPT,
+            actor="vision-evaluator",
+        )
+        raw = str(turn.text or "").strip()
+        start, end = raw.find("{"), raw.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("vision model did not return the required JSON object")
+        payload = json.loads(raw[start : end + 1])
+        if not isinstance(payload, Mapping):
+            raise ValueError("vision model response must be a JSON object")
+        result = dict(payload)
+        if result.get("status") != "evaluated":
+            raise ValueError("vision model did not confirm image evaluation")
+        evaluations = result.get("evaluations")
+        if not isinstance(evaluations, list) or len(evaluations) != len(paths):
+            raise ValueError("vision model must return exactly one evaluation per image")
+        evaluated_paths: list[str] = []
+        readable_by_path: dict[str, bool] = {}
+        for item in evaluations:
+            if not isinstance(item, Mapping):
+                raise ValueError("every image evaluation must be an object")
+            path = str(item.get("path") or "")
+            if path not in paths or path in evaluated_paths:
+                raise ValueError("vision model returned an unknown or duplicate image path")
+            evaluated_paths.append(path)
+            if not isinstance(item.get("readable"), bool):
+                raise ValueError("every image evaluation needs a boolean readable verdict")
+            readable_by_path[path] = bool(item["readable"])
+            for score_name in ("visual_quality_score", "requirement_fit_score"):
+                score = item.get(score_name)
+                if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 100:
+                    raise ValueError(f"{score_name} must be between 0 and 100")
+            for list_name in ("strengths", "issues", "visible_facts"):
+                values = item.get(list_name)
+                if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+                    raise ValueError(f"every image evaluation {list_name} must be a string array")
+        for field in ("ranking", "selected"):
+            values = result.get(field)
+            if not isinstance(values, list) or any(str(value) not in paths for value in values):
+                raise ValueError(f"vision model {field} must contain only supplied paths")
+            if len(values) != len(set(map(str, values))):
+                raise ValueError(f"vision model {field} cannot contain duplicate paths")
+        if len(result["ranking"]) != len(paths) or set(map(str, result["ranking"])) != set(paths):
+            raise ValueError("vision model ranking must contain every supplied path exactly once")
+        if any(not readable_by_path[str(path)] for path in result["selected"]):
+            raise ValueError("vision model cannot select an image it marked unreadable")
+        if not isinstance(result.get("copy_facts"), list) or any(
+            not isinstance(value, str) for value in result.get("copy_facts", ())
+        ):
+            raise ValueError("vision model copy_facts must be a string array")
+        evaluator_provider, evaluator_model, _key = self._vision_provider_identity(evaluator)
+        # Provider identity is runtime evidence; never accept a model-authored
+        # self-label as provenance for the visual verdict.
+        result["model"] = evaluator_model
+        result["provider"] = evaluator_provider
+        return result
 
     def _provider_call_with_watchdog(
         self,
@@ -5270,8 +6777,7 @@ class AgentRuntime:
                 "started_at": time.time(),
                 "last_signal_at": time.time(),
             }
-        self.events.publish(
-            "provider.activity",
+        self._publish_provider_activity(
             request_message,
             source_kind="MODEL",
             actor=actor,
@@ -5289,8 +6795,7 @@ class AgentRuntime:
             physical_request_id=physical_request_id,
             physical_attempt=physical_attempt,
         )
-        self.events.publish(
-            "provider.activity",
+        self._publish_provider_activity(
             f"Opening {self.model_name} request for {actor}",
             source_kind="MODEL",
             actor=actor,
@@ -5363,8 +6868,7 @@ class AgentRuntime:
                 if activity.state == "request_created"
                 else f"Provider {state_label}"
             )
-            self.events.publish(
-                "provider.activity",
+            self._publish_provider_activity(
                 message,
                 source_kind="MODEL",
                 actor=actor,
@@ -5438,8 +6942,7 @@ class AgentRuntime:
                     self._live_provider_activity["last_signal_at"] = time.time()
                 if transport_state == "network_unavailable":
                     local_runner = self.execution_class == "local"
-                    self.events.publish(
-                        "provider.activity",
+                    self._publish_provider_activity(
                         (
                             "Local model runner unavailable · saved stage unchanged"
                             if local_runner
@@ -5456,8 +6959,7 @@ class AgentRuntime:
                         detail=str(getattr(diagnostic, "provider_message", "") or exc),
                         heartbeat_at=time.time(), elapsed_seconds=max(0, int(time.monotonic() - started_at)),
                     )
-                self.events.publish(
-                    "provider.activity",
+                self._publish_provider_activity(
                     f"Provider request failed: {type(exc).__name__}",
                     source_kind="MODEL",
                     actor=actor,
@@ -5505,8 +7007,8 @@ class AgentRuntime:
                             cancel()
                         except Exception:
                             pass
-                    self.events.publish(
-                        "provider.activity", "Request stopped by user", actor=actor,
+                    self._publish_provider_activity(
+                        "Request stopped by user", actor=actor,
                         phase=provider_phase, state="stopped", provider_state="stopped",
                         operation=f"Stopped {self.model_name} for {actor}", waiting_on="user",
                         heartbeat_at=time.time(), elapsed_seconds=int(total),
@@ -5538,8 +7040,7 @@ class AgentRuntime:
                         activity_message = "Ollama is actively generating on GPU"
                         if structured_call:
                             activity_message += " · structured response is atomic"
-                        self.events.publish(
-                            "provider.activity",
+                        self._publish_provider_activity(
                             activity_message,
                             source_kind="MODEL", actor=actor, phase=provider_phase,
                             state="active", provider_state="server_processing",
@@ -5550,8 +7051,7 @@ class AgentRuntime:
                             physical_attempt=physical_attempt,
                         )
                     elif self.execution_class == "cloud" and not bool(diagnosis.get("reachable", True)):
-                        self.events.publish(
-                            "provider.activity",
+                        self._publish_provider_activity(
                             "Internet/provider unavailable · saved stage unchanged",
                             source_kind="MODEL", actor=actor, phase=provider_phase,
                             state="waiting", provider_state="network_unavailable",
@@ -5721,6 +7221,7 @@ class AgentRuntime:
             goal_metadata = {
                     "run_id": run_id,
                     "weak_model_policy": self.weak_model_policy.to_dict(),
+                    "adaptive_orchestration_policy": self.adaptive_orchestration_policy.to_dict(),
                     "goal_contract": contract.to_dict(),
                     "goal_contract_fingerprint": contract.fingerprint,
                     "semantic_goal": semantic_goal.to_dict(),
@@ -5999,16 +7500,198 @@ class AgentRuntime:
             # state is authoritative; never overwrite it with this stale read.
             return
 
+    def _hold_semantic_turn(
+        self,
+        turn_id: str,
+        *,
+        result_status: str,
+        reason: str,
+        limitations: Sequence[str] = (),
+    ) -> None:
+        """Keep an incomplete bounded Action resumable and visibly non-ready."""
+
+        session = self.store.get_workflow_session(self.session_id)
+        expected_revision = int(session.get("revision") or 0)
+
+        def reduce_session(current: dict[str, Any]) -> Mapping[str, Any]:
+            state = dict(current.get("state") or {})
+            pending = dict(state.get("pending_semantic_turn") or {})
+            if str(pending.get("turn_id")) != str(turn_id):
+                raise WorkflowSessionConflictError(
+                    "semantic turn was replaced before its evidence boundary was saved"
+                )
+            try:
+                evidence_retry_count = max(
+                    1,
+                    int(pending.get("evidence_retry_count") or 0) + 1,
+                )
+            except (TypeError, ValueError):
+                evidence_retry_count = 1
+            pending.update(
+                {
+                    "status": "needs_evidence",
+                    "stage": "dispatching",
+                    "attempt_state": "waiting",
+                    "result_status": str(result_status),
+                    "last_error": redact_text(reason, 2_000),
+                    "missing_deliverables": [
+                        redact_text(item, 500) for item in limitations if str(item).strip()
+                    ],
+                    "resume_action": "resume",
+                    "evidence_retry_count": evidence_retry_count,
+                }
+            )
+            state["pending_semantic_turn"] = pending
+            state["route"] = "action"
+            return {
+                "state": state,
+                "goal_id": current.get("goal_id"),
+                "session_mode": str(current.get("session_mode") or SessionMode.NORMAL.value),
+                "plan_state": str(current.get("plan_state") or PlanState.NONE.value),
+                "run_state": RunState.BLOCKED.value,
+                "ultra_profile": str(current.get("ultra_profile") or "standard"),
+                "sleep_state": str(current.get("sleep_state") or "off"),
+            }
+
+        try:
+            self.store.mutate_workflow_session(
+                self.session_id,
+                reduce_session,
+                expected_revision=expected_revision,
+            )
+        except WorkflowSessionConflictError:
+            return
+
+    def prepare_automatic_semantic_retry(self) -> bool:
+        """Claim one bounded Full-access retry for a missing-evidence Action."""
+
+        session = self.store.get_workflow_session(self.session_id)
+        expected_revision = int(session.get("revision") or 0)
+        pending = dict(session.get("state", {}).get("pending_semantic_turn") or {})
+        if str(pending.get("status") or "").casefold() != "needs_evidence":
+            return False
+        try:
+            retry_count = max(1, int(pending.get("evidence_retry_count") or 1))
+            automatic_for = int(pending.get("automatic_evidence_retry_for") or 0)
+        except (TypeError, ValueError):
+            retry_count, automatic_for = 1, 0
+        if retry_count >= max(2, int(self.config.no_action_limit)):
+            return False
+        if automatic_for == retry_count:
+            return False
+
+        def reduce_session(current: dict[str, Any]) -> Mapping[str, Any]:
+            state = dict(current.get("state") or {})
+            current_pending = dict(state.get("pending_semantic_turn") or {})
+            if str(current_pending.get("status") or "").casefold() != "needs_evidence":
+                raise WorkflowSessionConflictError("semantic evidence boundary already changed")
+            current_pending["automatic_evidence_retry_for"] = retry_count
+            state["pending_semantic_turn"] = current_pending
+            return {"state": state}
+
+        try:
+            self.store.mutate_workflow_session(
+                self.session_id,
+                reduce_session,
+                expected_revision=expected_revision,
+            )
+        except WorkflowSessionConflictError:
+            return False
+        return True
+
+    def _recover_legacy_false_action_completion(self) -> None:
+        """Reopen old bounded Actions that were marked complete without outputs.
+
+        Earlier builds returned ``SliceResult('chat', ...)`` even when the
+        accepted route was Action and its effect gate failed. This one-time
+        projection repair is deliberately narrow: it only touches an Action
+        with that legacy result status and only when deterministic effect or
+        media evidence is still absent.
+        """
+
+        session = self.store.get_workflow_session(self.session_id)
+        state = dict(session.get("state") or {})
+        if isinstance(state.get("pending_semantic_turn"), Mapping):
+            return
+        last = state.get("last_semantic_turn")
+        if not isinstance(last, Mapping) or str(last.get("result_status") or "") != "chat":
+            return
+        recovered = dict(last)
+        decision_raw = recovered.get("route_decision") or recovered.get("decision")
+        if not isinstance(decision_raw, Mapping) or str(decision_raw.get("route") or "").casefold() != "action":
+            return
+        original = str(recovered.get("original_input") or "")
+        try:
+            semantic = SemanticTurnDecisionV2.from_mapping(
+                decision_raw,
+                original_input=original,
+                parse_goal_intake=False,
+            )
+        except (TypeError, ValueError):
+            return
+        outcome = ActionOutcomeContractV1.from_request(
+            original,
+            requested_effects=semantic.requested_effects,
+        )
+        categories: list[str] = []
+        actions_by_id = {
+            str(item.get("id") or ""): item
+            for item in self.store.list_session_actions(self.session_id)
+        }
+        for raw_record in recovered.get("action_records", ()):
+            if not isinstance(raw_record, Mapping) or str(raw_record.get("status")) != "completed":
+                continue
+            categories.append(str(raw_record.get("category") or ""))
+            action = actions_by_id.get(str(raw_record.get("action_id") or ""), {})
+            tool_name = str(raw_record.get("tool_name") or action.get("tool_name") or "")
+            output = str(raw_record.get("output") or action.get("result_summary") or "")
+            outcome.observe(tool_name, output)
+        missing = (*semantic.missing_effects(categories), *outcome.missing())
+        if not missing:
+            return
+        reason = "Legacy Action completion lacked required evidence: " + "; ".join(missing)
+        recovered.update(
+            {
+                "status": "needs_evidence",
+                "attempt_state": "waiting",
+                "result_status": "action_incomplete",
+                "last_error": redact_text(reason, 2_000),
+                "missing_deliverables": [redact_text(item, 500) for item in missing],
+                "resume_action": "resume",
+                "false_completion_recovered_at": time.time(),
+            }
+        )
+
+        def reduce_session(current: dict[str, Any]) -> Mapping[str, Any]:
+            current_state = dict(current.get("state") or {})
+            if isinstance(current_state.get("pending_semantic_turn"), Mapping):
+                return current
+            current_state["pending_semantic_turn"] = recovered
+            current_state["route"] = "action"
+            return {
+                "state": current_state,
+                "goal_id": current.get("goal_id"),
+                "session_mode": str(current.get("session_mode") or SessionMode.NORMAL.value),
+                "plan_state": str(current.get("plan_state") or PlanState.NONE.value),
+                "run_state": RunState.BLOCKED.value,
+                "ultra_profile": str(current.get("ultra_profile") or "standard"),
+                "sleep_state": str(current.get("sleep_state") or "off"),
+            }
+
+        self.store.mutate_workflow_session(self.session_id, reduce_session)
+
     def _record_semantic_action(
         self,
         turn_id: str,
         action_id: str,
         *,
+        tool_name: str = "",
         category: str,
         mutating: bool,
         status: str,
         output: str = "",
         changed_paths: Sequence[str] = (),
+        args: Mapping[str, Any] | None = None,
     ) -> None:
         if not turn_id:
             return
@@ -6016,11 +7699,13 @@ class AgentRuntime:
         expected_revision = int(session.get("revision") or 0)
         record = {
             "action_id": action_id,
+            "tool_name": str(tool_name),
             "category": str(category),
             "mutating": bool(mutating),
             "status": str(status),
             "output": redact_text(output, 2_000),
             "changed_paths": list(changed_paths),
+            "args": redact_data(dict(args or {})),
         }
 
         def reduce_session(current: dict[str, Any]) -> Mapping[str, Any]:
@@ -6120,7 +7805,9 @@ class AgentRuntime:
                 )
             ):
                 pending["interaction_mode"] = InteractionModeV2.WORKING.value
-                pending["minimum_strategy"] = ExecutionStrategyV1.RECURSIVE.value
+                pending.setdefault(
+                    "minimum_strategy", ExecutionStrategyV1.STAGED.value
+                )
                 self._save_pending_semantic_turn(pending)
         else:
             original = str(text or "")
@@ -6141,7 +7828,11 @@ class AgentRuntime:
                     if bound_mode is RunMode.PLAN
                     else InteractionModeV2.WORKING.value
                 ),
-                "minimum_strategy": ExecutionStrategyV1.RECURSIVE.value,
+                "minimum_strategy": (
+                    ExecutionStrategyV1.RECURSIVE.value
+                    if bound_mode is RunMode.PLAN
+                    else ExecutionStrategyV1.STAGED.value
+                ),
                 "forced_route": forced_route.value if forced_route else "",
                 "answers": dict(answers or {}),
                 "status": "routing",
@@ -6181,15 +7872,23 @@ class AgentRuntime:
             )
 
         accepted = pending.get("route_decision") or pending.get("decision")
-        if isinstance(accepted, Mapping) and (
-            str(pending.get("status")) in {"routed", "dispatching"}
-            or str(pending.get("stage")) == "goal_intake"
-        ):
+        # Once a semantic contract has passed validation it is immutable for
+        # this exact saved request.  Evidence pauses, app restarts, and Full
+        # auto retries must resume that accepted contract instead of asking a
+        # weak model to classify the same request again.  Re-routing here was
+        # the source of the repeated "submit_semantic_route exactly once"
+        # boundary even though a valid Action decision was already persisted.
+        if isinstance(accepted, Mapping):
             decision = SemanticTurnDecisionV2.from_mapping(
                 accepted,
                 original_input=original,
                 forced_route=forced_route,
                 parse_goal_intake=False,
+            )
+            if forced_route is None:
+                decision = decision.contract_operational_goal_to_action()
+            self._persist_semantic_session_title(
+                decision.session_title, str(pending.get("turn_id") or "")
             )
             capability_raw = pending.get("model_capability_envelope")
             capability_envelope = (
@@ -6197,32 +7896,14 @@ class AgentRuntime:
                 if isinstance(capability_raw, Mapping)
                 else self.model_capability_envelope()
             )
-            strategy = select_execution_strategy(
-                capability_envelope,
-                decision.task_demand,
-                minimum=(
-                    ExecutionStrategyV1.RECURSIVE
-                    if str(pending.get("minimum_strategy") or pending.get("requested_mode")).casefold()
-                    in {"recursive", "ultra"}
-                    else ExecutionStrategyV1.STAGED
-                ),
-                allow_capability_escalation=(
-                    str(pending.get("minimum_strategy") or pending.get("requested_mode")).casefold()
-                    in {"recursive", "ultra"}
-                ),
+            strategy = self._semantic_strategy(
+                capability_envelope, decision, pending
             )
-            if strategy.strategy is ExecutionStrategyV1.RECURSIVE:
+            if (
+                decision.route is RouteKind.GOAL
+                and strategy.strategy is ExecutionStrategyV1.RECURSIVE
+            ):
                 pending["minimum_strategy"] = ExecutionStrategyV1.RECURSIVE.value
-            if decision.route is RouteKind.ACTION and strategy.strategy is ExecutionStrategyV1.RECURSIVE:
-                decision = decision.promote_action_to_goal()
-                pending.update({
-                    "status": "routed",
-                    "stage": "goal_intake",
-                    "route_decision": decision.to_dict(),
-                    "decision": decision.to_dict(),
-                    "strategy_decision": strategy.to_dict(),
-                })
-                self._save_pending_semantic_turn(pending)
             if decision.route is RouteKind.GOAL:
                 legacy_intake = accepted.get("goal_intake")
                 if isinstance(legacy_intake, Mapping) and not pending.get("legacy_goal_intake"):
@@ -6251,25 +7932,55 @@ class AgentRuntime:
             "recent_conversation": recent,
             "workflow_mode": str(pending.get("requested_mode")),
             "artifact_manifest": manifest,
-            "repository_manifest": self._intake_repository_facts(original),
+            "repository_manifest": self._semantic_repository_facts(
+                pending, original
+            ),
             "answered_intake_decisions": dict(answers or {}),
             "forced_route": forced_route.value if forced_route else None,
             "MODEL_CAPABILITY_ENVELOPE": capability_envelope.to_dict(),
         }
+        route_input_envelope = state_envelope(
+            envelope,
+            "SEMANTIC_TURN_INPUT",
+            max_chars=max(18_000, len(original) * 2 + 12_000),
+        )
         conversation: list[dict[str, Any]] = [
             {
                 "role": "user",
-                "content": state_envelope(
-                    envelope,
-                    "SEMANTIC_TURN_INPUT",
-                    max_chars=max(18_000, len(original) * 2 + 12_000),
-                ),
+                "content": route_input_envelope,
             }
         ]
+
+        def fresh_repair_conversation(category: str, error: str) -> list[dict[str, Any]]:
+            # A weak local model often stops emitting tools when its previous
+            # assistant function call is replayed and followed by a correction.
+            # Start a fresh, self-contained transport attempt instead. The
+            # original saved request/envelope remains byte-for-byte identical;
+            # only the validator feedback is appended.
+            return [{
+                "role": "user",
+                "content": (
+                    route_input_envelope
+                    + "\n\nSEMANTIC_ROUTE_AUTOMATIC_REPAIR\n"
+                    + f"category: {category}\nvalidation_error: {error}\n"
+                    + "Return exactly one submit_semantic_route function call. "
+                    + "Preserve the exact user request, effects, and authority; repair only "
+                    + "the reported contract field. Do not answer with plain text."
+                ),
+            }]
         schema_repairs = int(pending.get("schema_attempts", 0))
         semantic_repairs = int(pending.get("semantic_attempts", 0))
         repair_limit = self._structured_repair_limit()
         step = schema_repairs + semantic_repairs + 1
+        self._publish_activity_step(
+            "Project context prepared · asking the model to classify the request",
+            source_kind="HARNESS",
+            actor="semantic-router",
+            phase="routing",
+            state="active",
+            operation="Sending the first model request",
+            waiting_on="model",
+        )
         while True:
             try:
                 turn = self._call_provider(
@@ -6328,34 +8039,94 @@ class AgentRuntime:
                 self._save_pending_semantic_turn(pending)
                 if schema_repairs > repair_limit:
                     break
-                conversation.append({"role": "user", "content": "SCHEMA VALIDATION ERROR: " + structural_error + ". Repair only the function-call shape."})
+                self._publish_activity_step(
+                    f"Weak-model response shape was incomplete · repairing automatically ({schema_repairs}/{repair_limit})",
+                    source_kind="HARNESS",
+                    actor="semantic-router",
+                    phase="routing",
+                    state="active",
+                    operation="Starting a fresh structured route attempt",
+                    detail=structural_error,
+                    waiting_on="model",
+                )
+                conversation = fresh_repair_conversation("schema", structural_error)
                 step += 1
                 continue
             try:
+                route_payload, direct_response_repair = normalize_nonchat_direct_response_transport(
+                    turn.tool_calls[0].args
+                )
+                route_payload, outcome_repair = normalize_operational_action_transport(
+                    route_payload
+                )
+                route_transport_repairs = tuple(
+                    item for item in (direct_response_repair, outcome_repair) if item
+                )
+                if route_transport_repairs:
+                    self.store.append_event(
+                        "semantic_turn.transport_repaired",
+                        entity_type="semantic_turn",
+                        entity_id=str(pending["turn_id"]),
+                        payload={
+                            "session_id": self.session_id,
+                            "repair": "weak_model_route_transport_normalization",
+                            "repairs": list(route_transport_repairs),
+                            "reason": "; ".join(route_transport_repairs),
+                            "original_outcome_kind": str(
+                                turn.tool_calls[0].args.get("outcome_kind") or ""
+                            ),
+                            "normalized_outcome_kind": str(
+                                route_payload.get("outcome_kind") or ""
+                            ),
+                        },
+                    )
+                    self._publish_activity_step(
+                        "Weak-model route repaired automatically; continuing the same request",
+                        source_kind="HARNESS",
+                        actor="semantic-router",
+                        phase="routing",
+                        state="completed",
+                        operation="Validated bounded run/preview authority",
+                        detail="; ".join(route_transport_repairs),
+                        waiting_on="harness",
+                    )
                 decision = SemanticTurnDecisionV2.from_mapping(
-                    turn.tool_calls[0].args,
+                    route_payload,
                     original_input=original,
                     forced_route=forced_route,
                     parse_goal_intake=False,
                 )
-                strategy = select_execution_strategy(
-                    capability_envelope,
-                    decision.task_demand,
-                    minimum=(
-                        ExecutionStrategyV1.RECURSIVE
-                        if str(pending.get("minimum_strategy") or "").casefold()
-                        in {"recursive", "ultra"}
-                        else ExecutionStrategyV1.STAGED
-                    ),
-                    allow_capability_escalation=(
-                        str(pending.get("minimum_strategy") or "").casefold()
-                        in {"recursive", "ultra"}
-                    ),
+                authored_route = decision.route
+                if forced_route is None:
+                    decision = decision.contract_operational_goal_to_action()
+                if authored_route is RouteKind.GOAL and decision.route is RouteKind.ACTION:
+                    self.store.append_event(
+                        "semantic_turn.operational_goal_contracted",
+                        entity_type="semantic_turn",
+                        entity_id=str(pending["turn_id"]),
+                        payload={
+                            "session_id": self.session_id,
+                            "reason": (
+                                "The accepted effects only run, inspect, install declared "
+                                "dependencies, or preview the existing project; no source write "
+                                "or external side effect was authorized."
+                            ),
+                            "requested_effects": [
+                                effect.value for effect in decision.requested_effects
+                            ],
+                        },
+                    )
+                self._persist_semantic_session_title(
+                    decision.session_title, str(pending.get("turn_id") or "")
                 )
-                if strategy.strategy is ExecutionStrategyV1.RECURSIVE:
+                strategy = self._semantic_strategy(
+                    capability_envelope, decision, pending
+                )
+                if (
+                    decision.route is RouteKind.GOAL
+                    and strategy.strategy is ExecutionStrategyV1.RECURSIVE
+                ):
                     pending["minimum_strategy"] = ExecutionStrategyV1.RECURSIVE.value
-                if decision.route is RouteKind.ACTION and strategy.strategy is ExecutionStrategyV1.RECURSIVE:
-                    decision = decision.promote_action_to_goal()
                 if (
                     RunMode.parse(str(pending.get("requested_mode"))) is RunMode.PLAN
                     and decision.route is RouteKind.ACTION
@@ -6382,10 +8153,20 @@ class AgentRuntime:
                 self._save_pending_semantic_turn(pending)
                 if semantic_repairs > repair_limit:
                     break
-                conversation.append({"role": "user", "content": "SEMANTIC CONSISTENCY ERROR: " + message + ". Preserve the exact request and repair only this inconsistency."})
+                self._publish_activity_step(
+                    f"Weak-model route was inconsistent · repairing automatically ({semantic_repairs}/{repair_limit})",
+                    source_kind="HARNESS",
+                    actor="semantic-router",
+                    phase="routing",
+                    state="active",
+                    operation="Starting a fresh semantic route attempt",
+                    detail=message,
+                    waiting_on="model",
+                )
+                conversation = fresh_repair_conversation("semantic", message)
                 step += 1
                 continue
-            raw_intake = turn.tool_calls[0].args.get("goal_intake")
+            raw_intake = route_payload.get("goal_intake")
             pending.update({
                 "status": "routed",
                 "stage": "goal_intake" if decision.route is RouteKind.GOAL else "dispatching",
@@ -6433,6 +8214,23 @@ class AgentRuntime:
                     "provider": self.provider_name,
                 },
             )
+            self._publish_activity_step(
+                (
+                    "Request classified as a project workflow · preparing goal intake"
+                    if decision.route is RouteKind.GOAL
+                    else f"Request classified as {decision.route.value} · dispatching it"
+                ),
+                source_kind="HARNESS",
+                actor="semantic-router",
+                phase="goal_intake" if decision.route is RouteKind.GOAL else "dispatching",
+                state="completed",
+                operation=(
+                    "Preparing the project contract"
+                    if decision.route is RouteKind.GOAL
+                    else f"Dispatching {decision.route.value} response"
+                ),
+                waiting_on="harness",
+            )
             if decision.route is RouteKind.GOAL:
                 return pending, self._semantic_goal_intake_preflight(
                     pending,
@@ -6474,7 +8272,7 @@ class AgentRuntime:
 
         original = str(pending.get("original_input") or "")
         requested_mode = str(pending.get("requested_mode") or "normal")
-        repository_manifest = self._intake_repository_facts(original)
+        repository_manifest = self._semantic_repository_facts(pending, original)
         capability_raw = pending.get("model_capability_envelope")
         capability_envelope = (
             ModelCapabilityEnvelopeV1.from_mapping(capability_raw)
@@ -11215,6 +13013,73 @@ class AgentRuntime:
             item for item in self.store.list_session_actions(self.session_id)
             if str(item.get("id")) in action_ids and str(item.get("status")) == "uncertain"
         ]
+        # Read-only browser actions and managed processes are owned by the
+        # previous Python runtime, not by the workspace. An interrupted
+        # dependency check may also continue when this session already has
+        # Full/session-wide authority; its next call performs an integrity
+        # check before any install. None of these stale zero-path attempts is
+        # an uncertain source-code mutation requiring user reconciliation.
+        for item in tuple(uncertain):
+            tool_name = str(item.get("tool_name") or "")
+            side_effect_free = not bool(item.get("mutating"))
+            ephemeral_process = tool_name in {"start_process", "stop_process"}
+            authorized_dependency_retry = (
+                tool_name == "install_dependencies"
+                and (
+                    self.access_level == "full"
+                    or "*" in self._approval_session_groups()
+                )
+            )
+            if (
+                (
+                    not side_effect_free
+                    and not ephemeral_process
+                    and not authorized_dependency_retry
+                )
+                or item.get("changed_paths")
+            ):
+                continue
+            action_id = str(item.get("id") or "")
+            reason = (
+                "Recovered an interrupted read-only, ephemeral, or already-authorized dependency action after restart; "
+                "no workspace paths changed and no old in-memory resource lease was reused. "
+                "Dependency retries still run the package-manager integrity check before any install."
+            )
+            self.store.reconcile_uncertain_session_action(
+                action_id,
+                reason,
+                status="failed",
+            )
+            try:
+                recovered_args = json.loads(str(item.get("args_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                recovered_args = {}
+            self._record_semantic_action(
+                str(pending.get("turn_id") or ""),
+                action_id,
+                tool_name=tool_name,
+                category="process",
+                mutating=bool(item.get("mutating")),
+                status="failed",
+                output=reason,
+                args=recovered_args if isinstance(recovered_args, Mapping) else {},
+            )
+            self.store.append_event(
+                "semantic_action.ephemeral_reconciled",
+                entity_type="session_action",
+                entity_id=action_id,
+                payload={
+                    "session_id": self.session_id,
+                    "tool_name": tool_name,
+                    "workspace_mutation": False,
+                    "replayed": False,
+                },
+            )
+        if uncertain:
+            uncertain = [
+                item for item in self.store.list_session_actions(self.session_id)
+                if str(item.get("id")) in action_ids and str(item.get("status")) == "uncertain"
+            ]
         if uncertain:
             return SliceResult(
                 "uncertain",
@@ -11250,7 +13115,18 @@ class AgentRuntime:
                 semantic_decision=semantic,
                 semantic_turn_id=str(semantic_turn["turn_id"]),
             )
-        self._complete_semantic_turn(str(semantic_turn["turn_id"]), result_status=str(getattr(result, "status", "routed")))
+        if str(getattr(result, "status", "")) == "action_incomplete":
+            self._hold_semantic_turn(
+                str(semantic_turn["turn_id"]),
+                result_status="action_incomplete",
+                reason=str(getattr(result, "reason", "") or getattr(result, "message", "")),
+                limitations=tuple(getattr(result, "limitations", ()) or ()),
+            )
+        else:
+            self._complete_semantic_turn(
+                str(semantic_turn["turn_id"]),
+                result_status=str(getattr(result, "status", "routed")),
+            )
         return result
 
     def _promote_preapproval_working_goal(self, goal: Goal) -> Goal:
@@ -11593,6 +13469,41 @@ class AgentRuntime:
                 "cannot resume while crash-window work is uncertain; inspect it and use "
                 f"resolve it from the recovery card first ({preview}{suffix})"
             )
+        retry_state = dict(
+            goal.metadata.get("verification_retry_state") or {}
+        )
+        if bool(retry_state.get("exhausted")):
+            raise RuntimeStateError(
+                "the identical verification retry is exhausted; inspect the saved "
+                "evidence or change model before continuing"
+            )
+        if str(goal.metadata.get("resume_action") or "") == "retry_verification":
+            blocker = dict(goal.metadata.get("verification_blocker") or {})
+            failure_fingerprint = str(
+                blocker.get("failure_fingerprint") or ""
+            ).strip()
+            same_retry = bool(
+                failure_fingerprint
+                and failure_fingerprint
+                == str(retry_state.get("failure_fingerprint") or "")
+            )
+            retry_attempts = (
+                max(0, int(retry_state.get("attempts") or 0)) + 1
+                if same_retry
+                else 1
+            )
+            self.store.update_goal_metadata(
+                goal.id,
+                verification_retry_state={
+                    "failure_fingerprint": failure_fingerprint,
+                    "attempts": retry_attempts,
+                    "exhausted": False,
+                    "last_outcome": "running",
+                    "last_retry_at": time.time(),
+                    "model": self.model_name,
+                },
+            )
+            goal = self.store.get_goal(goal.id)
         desired = (
             GoalStatus.RUNNING
             if resumable_failed_ultra
@@ -11627,6 +13538,25 @@ class AgentRuntime:
         )
         self.events.publish("phase", f"Goal resumed in {desired.value}.")
         ultra_run_id = str(goal.metadata.get("ultra_run_id", ""))
+        if (
+            ultra_run_id
+            and self.ultra_session is not None
+            and not self.ultra_session.running
+        ):
+            # A finished Future is a terminal attempt, not a resumable worker.
+            # Reusing this object changed the Goal to RUNNING but launched no
+            # scheduler, leaving the terminal at Working with zero agents.
+            # Drop only the in-memory session; restore_ultra() rebuilds the
+            # graph from durable nodes/evidence and does not replay accepted
+            # mutations.
+            self.ultra_session.close()
+            self.ultra_session = None
+            self.events.publish(
+                "ultra.terminal_session_rebuilt",
+                "Rebuilding the stopped Ultra scheduler from its durable checkpoint.",
+                run_id=ultra_run_id,
+                mutation_replayed=False,
+            )
         if ultra_run_id and self.ultra_session is None:
             try:
                 self.restore_ultra(ultra_run_id)
@@ -13113,6 +15043,11 @@ class AgentRuntime:
                 payload={"fingerprint": signature.fingerprint, "domain": domain.value, "operation": call.name},
             )
         self._watchdog.record(scoped_name, args, result)
+        if str(actor).startswith("delegation_"):
+            result = (
+                f"{result}\n\n[HARNESS_REF action:{action_id}; "
+                "cite this exact ref in return_work.claims.evidence_refs]"
+            )
         return result
 
     def _reset_dependants(self, goal: Goal, plan: Plan, task_id: str, *, actor: str) -> None:
@@ -13445,6 +15380,709 @@ class AgentRuntime:
         self.store.transition_goal(goal.id, GoalStatus.PAUSED, reason="coordinator requested user input")
         return "Goal paused durably for user input."
 
+    def _normal_task_class(self, task: Task) -> str:
+        metadata = dict(task.metadata)
+        explicit = str(
+            metadata.get("task_class")
+            or metadata.get("specialist_domain")
+            or metadata.get("concern")
+            or ""
+        ).strip()
+        if explicit:
+            return re.sub(r"[^a-z0-9_.-]+", "-", explicit.casefold()).strip("-")[:80] or "general"
+        return f"normal-{task.risk}"
+
+    def _normal_task_risk_signals(
+        self,
+        goal: Goal,
+        plan: Plan,
+        task: Task,
+    ) -> TaskRiskSignalsV1:
+        task_id = task.id.upper()
+        changes = [
+            dict(item)
+            for item in self._effective_expected_changes(goal, plan)
+            if isinstance(item, Mapping)
+            and task_id
+            in {
+                str(value).strip().upper()
+                for value in item.get("supports_tasks", ())
+                if str(value).strip()
+            }
+        ]
+        metadata = dict(task.metadata)
+        concerns = {
+            str(item).strip().casefold()
+            for item in metadata.get("concerns", ())
+            if str(item).strip()
+        }
+        expected_paths = [
+            str(item.get("path") or item.get("artifact") or "").strip().casefold()
+            for item in changes
+        ]
+        evidence = [
+            item
+            for item in self.store.list_evidence(goal.id, task_id=task.id)
+            if item.plan_revision == plan.revision
+        ]
+        authoritative = [
+            item
+            for item in evidence
+            if item.verified or item.created_by == "user"
+        ]
+        return TaskRiskSignalsV1(
+            declared_risk=task.risk,
+            changed_file_count=len({path for path in expected_paths if path}),
+            touches_interfaces=bool(
+                metadata.get("owned_interfaces")
+                or metadata.get("interface_change")
+                or concerns & {"api", "interface", "integration", "schema"}
+            ),
+            security_sensitive=bool(
+                metadata.get("security_sensitive")
+                or concerns & {"security", "authentication", "authorization", "secrets"}
+            ),
+            tests_changed=bool(
+                metadata.get("tests_changed")
+                or any(
+                    path.startswith("test")
+                    or "/test" in path
+                    or path.endswith((".spec.js", ".test.js", "_test.py"))
+                    for path in expected_paths
+                )
+            ),
+            prior_failed_approaches=max(
+                int(task.attempts or 0),
+                len(
+                    [
+                        item
+                        for item in goal.metadata.get("failed_attempts", ())
+                        if isinstance(item, Mapping)
+                        and str(item.get("task_id") or "").upper() == task_id
+                    ]
+                ),
+            ),
+            missing_evidence_count=max(
+                0,
+                len(task.acceptance_criteria) - len(authoritative),
+            ),
+            ambiguous_design=bool(
+                metadata.get("ambiguous_design")
+                or metadata.get("multiple_viable_architectures")
+            ),
+            deterministic_gate_available=bool(task.verification),
+            subjective_acceptance=bool(metadata.get("subjective_acceptance")),
+        )
+
+    @staticmethod
+    def _worker_visibility(role: WorkerRole) -> WorkerVisibility:
+        return {
+            WorkerRole.PREDICTOR: WorkerVisibility.CONTRACT_ONLY,
+            WorkerRole.FALSIFIER: WorkerVisibility.ARTIFACT_WITHOUT_RATIONALE,
+            WorkerRole.CHALLENGER: WorkerVisibility.CONTRACT_ONLY,
+            WorkerRole.SELECTOR: WorkerVisibility.ANONYMOUS_CANDIDATES,
+            WorkerRole.REPAIRER: WorkerVisibility.VERIFIED_FINDINGS_ONLY,
+            WorkerRole.REVIEWER: WorkerVisibility.ARTIFACT_WITHOUT_RATIONALE,
+            WorkerRole.BUILDER: WorkerVisibility.FULL_SCOPED_CONTEXT,
+        }[role]
+
+    @staticmethod
+    def _worker_mutation_policy(role: WorkerRole) -> MutationPolicy:
+        if role is WorkerRole.CHALLENGER:
+            return MutationPolicy.STAGING_ONLY
+        if role in {WorkerRole.REPAIRER, WorkerRole.BUILDER}:
+            return MutationPolicy.SINGLE_WRITER
+        return MutationPolicy.READ_ONLY
+
+    def _normal_worker_route(
+        self,
+        goal: Goal,
+        plan: Plan,
+        task: Task,
+    ) -> tuple[Any, str, tuple[WorkerRole, ...]]:
+        signals = self._normal_task_risk_signals(goal, plan, task)
+        task_class = self._normal_task_class(task)
+        model_fingerprint = str(
+            dict(goal.metadata.get("model_capability_envelope") or {}).get(
+                "model_fingerprint"
+            )
+            or goal.metadata.get("capability_fingerprint")
+            or hashlib.sha256(
+                f"{self.provider_name}\0{self.model_name}".encode("utf-8")
+            ).hexdigest()
+        )
+        initial = self.worker_router.route(signals)
+        if str(task.metadata.get("required_worker_role") or "").casefold() == WorkerRole.REPAIRER.value:
+            initial = replace(
+                initial,
+                roles=(WorkerRole.REPAIRER,),
+                max_model_calls=min(
+                    self.adaptive_orchestration_policy.max_model_call_multiplier,
+                    2,
+                ),
+                reason=(
+                    "the fixed specialist evidence gate produced verified findings; "
+                    "route the bounded repair directly to the single-writer repairer"
+                ),
+            )
+            return initial, model_fingerprint, ()
+        suppressed = self.store.suppressed_worker_roles(
+            model_fingerprint=model_fingerprint,
+            task_class=task_class,
+            unit_id=f"{goal.id}:{plan.revision}:{task.id}",
+            roles=initial.roles,
+            policy=self.adaptive_orchestration_policy,
+        )
+        return self.worker_router.route(signals, suppressed_roles=suppressed), model_fingerprint, suppressed
+
+    def configure_adaptive_orchestration(
+        self,
+        policy: AdaptiveOrchestrationPolicyV1 | Mapping[str, Any],
+        *,
+        benchmark_report: Any | None = None,
+    ) -> dict[str, Any]:
+        """Activate only behind a passed matched benchmark; rollback is immediate."""
+
+        selected = (
+            policy
+            if isinstance(policy, AdaptiveOrchestrationPolicyV1)
+            else AdaptiveOrchestrationPolicyV1.from_dict(policy)
+        )
+        if not selected.shadow_mode:
+            activation = getattr(benchmark_report, "activation", None)
+            if activation is None or not bool(getattr(activation, "passed", False)):
+                raise RuntimeStateError(
+                    "adaptive orchestration activation requires a passed matched benchmark gate"
+                )
+            report_model = str(
+                getattr(benchmark_report, "model_fingerprint", "") or ""
+            )
+            active_goal = self.active_goal()
+            expected_model = (
+                str(
+                    dict(active_goal.metadata.get("model_capability_envelope") or {}).get(
+                        "model_fingerprint"
+                    )
+                    or active_goal.metadata.get("capability_fingerprint")
+                    or ""
+                )
+                if active_goal is not None
+                else ""
+            )
+            if not expected_model:
+                expected_model = hashlib.sha256(
+                    f"{self.provider_name}\0{self.model_name}".encode("utf-8")
+                ).hexdigest()
+            if report_model != expected_model:
+                raise RuntimeStateError(
+                    "benchmark model fingerprint does not match the active runtime model"
+                )
+        self.adaptive_orchestration_policy = selected
+        self.worker_router = AdaptiveWorkerRouter(selected)
+        goal = self.active_goal()
+        if goal is not None:
+            self.store.update_goal_metadata(
+                goal.id,
+                adaptive_orchestration_policy=selected.to_dict(),
+            )
+        self.events.publish(
+            "orchestration.policy_configured",
+            (
+                "Adaptive worker decisions activated from a passed matched benchmark."
+                if not selected.shadow_mode
+                else "Adaptive worker decisions returned to shadow mode."
+            ),
+            goal_id=goal.id if goal is not None else None,
+            policy_fingerprint=selected.fingerprint,
+            shadow_mode=selected.shadow_mode,
+        )
+        return selected.to_dict()
+
+    def _task_artifact_digest(self, goal: Goal, plan: Plan, task: Task) -> str:
+        task_id = task.id.upper()
+        paths = tuple(
+            dict.fromkeys(
+                str(item.get("path") or item.get("artifact") or "").strip()
+                for item in self._effective_expected_changes(goal, plan)
+                if isinstance(item, Mapping)
+                and task_id
+                in {
+                    str(value).strip().upper()
+                    for value in item.get("supports_tasks", ())
+                    if str(value).strip()
+                }
+                and str(item.get("path") or item.get("artifact") or "").strip()
+            )
+        )
+        if not paths:
+            paths = tuple(
+                self._effective_artifact_ids(
+                    goal,
+                    plan,
+                    tuple(
+                        dict(goal.metadata.get("quality_target") or {}).get(
+                            "artifact_ids", ()
+                        )
+                    ),
+                )
+            )
+        hashes = self._current_artifact_hashes(paths) if paths else {}
+        return hashlib.sha256(
+            json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _fresh_authoritative_task_evidence(
+        self,
+        goal: Goal,
+        plan: Plan,
+        task_id: str,
+        *,
+        exclude_ids: Iterable[str] = (),
+    ) -> tuple[Evidence, ...]:
+        excluded = set(exclude_ids)
+        current_goal = self.store.get_goal(goal.id)
+        current_sequence = int(
+            current_goal.metadata.get("mutation_sequence", 0) or 0
+        )
+        fresh: list[Evidence] = []
+        for item in self.store.list_evidence(goal.id, task_id=task_id):
+            if item.id in excluded or item.plan_revision != plan.revision:
+                continue
+            if item.created_by == "user":
+                fresh.append(item)
+                continue
+            if not item.verified or item.created_by != "harness":
+                continue
+            tool_name = str(item.data.get("tool") or "")
+            if tool_name in {
+                "apply_patch",
+                "edit_file",
+                "install_dependencies",
+                "materialize_artifact",
+                "write_file",
+            }:
+                continue
+            try:
+                evidence_sequence = int(item.data.get("mutation_sequence", -1))
+            except (TypeError, ValueError):
+                continue
+            if evidence_sequence == current_sequence:
+                fresh.append(item)
+        return tuple(fresh)
+
+    @staticmethod
+    def _criterion_contracts(task: Task) -> tuple[dict[str, str], ...]:
+        return tuple(
+            {
+                "criterion_id": f"{task.id}:AC{index}",
+                "text": criterion,
+            }
+            for index, criterion in enumerate(task.acceptance_criteria, start=1)
+        )
+
+    def _worker_claim_coverage(
+        self,
+        task: Task,
+        report: Mapping[str, Any],
+        evidence: Sequence[Evidence],
+    ) -> tuple[bool, tuple[str, ...]]:
+        evidence_by_ref: dict[str, Evidence] = {}
+        for item in evidence:
+            evidence_by_ref[item.id] = item
+            evidence_by_ref[f"evidence:{item.id}"] = item
+            action_id = str(item.data.get("action_id") or "").strip()
+            if action_id:
+                evidence_by_ref[action_id] = item
+                evidence_by_ref[f"action:{action_id}"] = item
+        contracts = {
+            item["criterion_id"]: item["text"]
+            for item in self._criterion_contracts(task)
+        }
+
+        def supports(criterion: str, item: Evidence) -> bool:
+            text = criterion.casefold()
+            tool = str(item.data.get("tool") or "")
+            if any(
+                marker in text
+                for marker in ("browser", "click", "console", "interaction", "preview")
+            ):
+                return tool in {"preview_html", "inspect_preview"}
+            if any(
+                marker in text
+                for marker in (
+                    "behavior", "build", "execute", "integration", "restart",
+                    "run", "runtime", "test",
+                )
+            ):
+                return tool in {
+                    "inspect_preview",
+                    "preview_html",
+                    "run_bash",
+                    "run_command",
+                }
+            if any(
+                marker in text
+                for marker in ("content", "exact", "file", "hash", "line", "text")
+            ):
+                return bool(item.data.get("file_hash")) or tool in {
+                    "grep",
+                    "read_file",
+                }
+            return True
+
+        covered: set[str] = set()
+        for claim in report.get("claims", ()):
+            if not isinstance(claim, Mapping):
+                continue
+            criterion_id = str(claim.get("criterion_id") or "").strip()
+            refs = tuple(
+                str(item).strip()
+                for item in claim.get("evidence_refs", ())
+                if str(item).strip()
+            )
+            if criterion_id in contracts and any(
+                ref in evidence_by_ref
+                and supports(contracts[criterion_id], evidence_by_ref[ref])
+                for ref in refs
+            ):
+                covered.add(criterion_id)
+        required = set(contracts)
+        missing = tuple(sorted(required - covered))
+        return bool(required) and not missing, missing
+
+    def _materialize_staged_worker_candidate(
+        self,
+        *,
+        goal: Goal,
+        plan: Plan,
+        task: Task,
+        mission: WorkerMissionV2,
+        report: Mapping[str, Any],
+    ) -> Evidence | None:
+        raw_candidate = report.get("staged_candidate")
+        if mission.role is not WorkerRole.CHALLENGER or not isinstance(
+            raw_candidate, Mapping
+        ):
+            return None
+        stage_root = (
+            self.workspace / ".coding-agent" / "staging" / mission.id
+        ).resolve(strict=False)
+        owned_root = (
+            self.workspace / ".coding-agent" / "staging"
+        ).resolve(strict=False)
+        if not stage_root.is_relative_to(owned_root):
+            raise StateStoreError("challenger staging root escaped agent-owned state")
+        manifests: list[dict[str, Any]] = []
+        total_bytes = 0
+        for item in raw_candidate.get("files", ()):
+            if not isinstance(item, Mapping):
+                continue
+            relative = str(item.get("path") or "").strip().replace("\\", "/")
+            candidate_path = Path(relative)
+            if (
+                not relative
+                or candidate_path.is_absolute()
+                or ".." in candidate_path.parts
+                or candidate_path.parts[0].casefold() == ".coding-agent"
+            ):
+                raise StateStoreError(
+                    f"invalid challenger staged path: {relative!r}"
+                )
+            content = str(item.get("content") or "")
+            encoded = content.encode("utf-8")
+            total_bytes += len(encoded)
+            if total_bytes > 2_000_000:
+                raise StateStoreError("challenger staged candidate exceeds 2 MB")
+            target = (stage_root / candidate_path).resolve(strict=False)
+            if not target.is_relative_to(stage_root):
+                raise StateStoreError("challenger staged path escaped its mission")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_bytes(encoded)
+            os.replace(temporary, target)
+            manifests.append(
+                {
+                    "path": relative,
+                    "stage_path": target.relative_to(self.workspace).as_posix(),
+                    "sha256": hashlib.sha256(encoded).hexdigest(),
+                    "bytes": len(encoded),
+                    "content_preview": content[:20_000],
+                }
+            )
+        if not manifests:
+            raise StateStoreError("challenger returned an empty staged candidate")
+        return self.store.add_evidence(
+            goal_id=goal.id,
+            plan_revision=plan.revision,
+            task_id=task.id,
+            kind="staged_candidate",
+            summary="Independent challenger candidate materialized in isolated staging.",
+            data={
+                "mission_id": mission.id,
+                "approach_fingerprint": mission.approach_fingerprint,
+                "approach_summary": str(
+                    raw_candidate.get("approach_summary") or ""
+                )[:2_000],
+                "files": manifests,
+                "artifact_digest": hashlib.sha256(
+                    json.dumps(
+                        [
+                            (item["path"], item["sha256"])
+                            for item in manifests
+                        ],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+            },
+            created_by="harness",
+            verified=False,
+        )
+
+    def _record_normal_worker_observation(
+        self,
+        *,
+        goal: Goal,
+        plan: Plan,
+        task: Task,
+        delegation: Delegation,
+        mission: WorkerMissionV2,
+        experiment: OrchestrationExperimentV1,
+        report: Mapping[str, Any],
+        baseline_evidence_ids: set[str],
+        baseline_action_ids: set[str],
+        baseline_mutation_sequence: int,
+        input_tokens: int,
+        output_tokens: int,
+        model_calls: int,
+        latency_ms: int,
+    ) -> None:
+        authoritative = list(
+            self._fresh_authoritative_task_evidence(
+                goal,
+                plan,
+                task.id,
+                exclude_ids=baseline_evidence_ids,
+            )
+        )
+        authoritative_refs: set[str] = set()
+        for item in authoritative:
+            authoritative_refs.add(f"evidence:{item.id}")
+            authoritative_refs.add(item.id)
+            action_id = str(item.data.get("action_id") or "")
+            if action_id:
+                authoritative_refs.add(f"action:{action_id}")
+                authoritative_refs.add(action_id)
+        current_actions = self.store.list_actions(goal.id)
+        new_actions = [
+            item for item in current_actions if str(item.get("id")) not in baseline_action_ids
+        ]
+        current_sequence = int(
+            self.store.get_goal(goal.id).metadata.get("mutation_sequence", 0) or 0
+        )
+
+        def failed_check_is_current(item: Mapping[str, Any]) -> bool:
+            try:
+                journal = json.loads(str(item.get("args_json") or "{}"))
+                return int(journal.get("_harness_mutation_sequence", -1)) == current_sequence
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False
+
+        observed_failed_checks = [
+            item
+            for item in new_actions
+            if str(item.get("status")) == "failed"
+            and str(item.get("task_id") or "").upper() == task.id.upper()
+            and str(item.get("tool_name"))
+            in {"run_command", "run_bash", "preview_html", "inspect_preview"}
+            and failed_check_is_current(item)
+            and not any(
+                marker in str(item.get("result_summary") or "").casefold()
+                for marker in (
+                    "permission denied",
+                    "approval required",
+                    "timed out",
+                    "provider unavailable",
+                    "environment failure",
+                )
+            )
+        ]
+        artifact_hash = self._task_artifact_digest(goal, plan, task)
+        _all_covered, missing_criterion_ids = self._worker_claim_coverage(
+            task,
+            report,
+            authoritative,
+        )
+        covered_criterion_ids = {
+            item["criterion_id"] for item in self._criterion_contracts(task)
+        } - set(missing_criterion_ids)
+        claims: list[EvidenceClaimV1] = []
+        for raw_claim in report.get("claims", ()):
+            if not isinstance(raw_claim, Mapping):
+                continue
+            refs = tuple(
+                str(item).strip()
+                for item in raw_claim.get("evidence_refs", ())
+                if str(item).strip()
+            )
+            criterion_id = str(raw_claim.get("criterion_id") or "")
+            supported = bool(
+                set(refs) & authoritative_refs
+                and criterion_id in covered_criterion_ids
+            )
+            try:
+                claims.append(
+                    EvidenceClaimV1(
+                        criterion_id=criterion_id,
+                        claim=str(raw_claim.get("claim") or ""),
+                        artifact_hash=artifact_hash if supported else "",
+                        evidence_refs=refs,
+                        falsification_check=str(
+                            raw_claim.get("falsification_check") or ""
+                        ),
+                        verdict=(
+                            EvidenceVerdict.PASSED
+                            if supported and report.get("outcome") == "success"
+                            else EvidenceVerdict.NEEDS_EVIDENCE
+                        ),
+                        authority=(
+                            EvidenceAuthority.HARNESS
+                            if supported
+                            else EvidenceAuthority.MODEL
+                        ),
+                        producer_id=delegation.id,
+                        verifier_id="harness" if supported else "",
+                    )
+                )
+            except DomainError:
+                continue
+        passed_criteria = {
+            item.criterion_id for item in claims if item.authoritative and item.verdict is EvidenceVerdict.PASSED
+        }
+        required_criteria = {
+            item["criterion_id"] for item in self._criterion_contracts(task)
+        }
+        candidate_score = min(
+            1.0,
+            len(passed_criteria & required_criteria) / max(1, len(required_criteria)),
+        )
+        declared_verified = max(0, int(report.get("verified_findings", 0) or 0))
+        verified_findings = len(observed_failed_checks)
+        false_findings = max(
+            max(0, int(report.get("false_findings", 0) or 0)),
+            declared_verified - verified_findings,
+        )
+        current_goal = self.store.get_goal(goal.id)
+        mutation_sequence = int(current_goal.metadata.get("mutation_sequence", 0) or 0)
+        accepted_fixes = int(
+            mission.role is WorkerRole.REPAIRER
+            and mutation_sequence > baseline_mutation_sequence
+            and bool(authoritative)
+        )
+        novelty = evidence_novelty(
+            (f"evidence:{item}" for item in baseline_evidence_ids),
+            (f"evidence:{item.id}" for item in authoritative),
+        )
+        outcome = classify_worker_impact(
+            verified_findings=verified_findings,
+            false_findings=false_findings,
+            accepted_fixes=accepted_fixes,
+            novelty=novelty,
+            score_delta=candidate_score,
+        )
+        claimed_success = bool(
+            report.get("_claimed_success", report.get("outcome") == "success")
+        )
+        false_completion = bool(
+            claimed_success
+            and (
+                (
+                    mission.role
+                    in {WorkerRole.FALSIFIER, WorkerRole.REPAIRER, WorkerRole.REVIEWER}
+                    and not authoritative
+                    and not any(item.authoritative for item in claims)
+                )
+                or (
+                    mission.role is WorkerRole.PREDICTOR
+                    and not report.get("predicted_failures")
+                )
+                or (
+                    mission.role is WorkerRole.CHALLENGER
+                    and not report.get("staged_candidate_ref")
+                )
+                or (
+                    mission.role is WorkerRole.SELECTOR
+                    and not report.get("selection")
+                )
+            )
+        )
+        recorded_experiment = replace(
+            experiment,
+            candidate_score=candidate_score,
+            success=bool(report.get("outcome") == "success" and not false_completion),
+            false_completion=false_completion,
+            model_calls=model_calls,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
+            metrics={
+                "verified_evidence": len(authoritative),
+                "verified_findings": verified_findings,
+                "false_findings": false_findings,
+                "accepted_fixes": accepted_fixes,
+                "evidence_novelty": novelty,
+                "production_observation": True,
+                "causal": False,
+            },
+            evidence=tuple(
+                dict.fromkeys(
+                    (
+                        *(f"evidence:{item.id}" for item in authoritative),
+                        *(f"action:{item.get('id')}" for item in observed_failed_checks),
+                    )
+                )
+            ),
+        )
+        try:
+            self.store.record_orchestration_experiment(recorded_experiment)
+            self.store.record_worker_contribution(
+                WorkerImpactV1(
+                    experiment_id=recorded_experiment.id,
+                    worker_id=delegation.id,
+                    delegation_id=delegation.id,
+                    role=mission.role,
+                    task_class=recorded_experiment.task_class,
+                    model_fingerprint=recorded_experiment.model_fingerprint,
+                    outcome=outcome,
+                    approach_fingerprint=mission.approach_fingerprint,
+                    evidence_novelty=novelty,
+                    verified_findings=verified_findings,
+                    false_findings=false_findings,
+                    accepted_fixes=accepted_fixes,
+                    score_delta=candidate_score,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    latency_ms=latency_ms,
+                    claims=tuple(claims),
+                    evidence=recorded_experiment.evidence,
+                    reason=(
+                        "verified novel worker contribution"
+                        if outcome.value == "useful"
+                        else "worker produced no verified decision-changing evidence"
+                        if outcome.value == "neutral"
+                        else "worker findings were unsupported or reduced measured quality"
+                    ),
+                )
+            )
+        except StateStoreError as exc:
+            self.store.append_event(
+                "worker.contribution_not_counted",
+                goal_id=goal.id,
+                entity_type="delegation",
+                entity_id=delegation.id,
+                payload={"reason": redact_text(str(exc), 1_000)},
+            )
+
     def _coerce_role(self, role_text: str, task: str, allowed_tools: list[str]) -> RoleProfile:
         compact = " ".join(role_text.split())
         name = compact.split(".", 1)[0][:120] or "task-specific worker"
@@ -13496,7 +16134,284 @@ class AgentRuntime:
                 "summary": f"task {current_task} has unfinished dependencies: {', '.join(unfinished_dependencies)}",
                 "evidence": [],
             }
-        role = self._coerce_role(args["role"], args["task"], allowed)
+
+        route, model_fingerprint, suppressed_roles = self._normal_worker_route(
+            goal,
+            plan,
+            assigned_task,
+        )
+        prior_delegations = tuple(
+            item
+            for item in self.store.list_delegations(goal.id)
+            if item.task_id == current_task and item.plan_revision == plan.revision
+        )
+        prior_role_values = tuple(
+            str(item.metadata.get("worker_role") or "")
+            for item in prior_delegations
+        )
+        policy_active = not self.adaptive_orchestration_policy.shadow_mode
+        requested_role = args.get("worker_role")
+        if requested_role:
+            worker_role = WorkerRole(str(requested_role))
+        elif not policy_active:
+            # Shadow mode observes the proposed route without reinterpreting
+            # legacy task-specific delegations as a new production role.
+            worker_role = WorkerRole.REVIEWER
+        else:
+            worker_role = next(
+                (item for item in route.roles if item.value not in prior_role_values),
+                WorkerRole.REVIEWER,
+            )
+
+        worker_budget = max(0, route.max_model_calls - 1)
+        if policy_active and not route.roles:
+            return {
+                "outcome": "blocked",
+                "summary": (
+                    "adaptive early stop: deterministic verification is sufficient "
+                    "for this low-risk task"
+                ),
+                "evidence": [],
+                "route": route.to_dict(),
+            }
+        if policy_active and worker_role not in route.roles:
+            return {
+                "outcome": "blocked",
+                "summary": (
+                    f"worker role {worker_role.value} is outside the evidence-driven "
+                    f"route for {route.tier.value} risk"
+                ),
+                "evidence": [],
+                "route": route.to_dict(),
+            }
+        if policy_active and len(prior_delegations) >= worker_budget:
+            return {
+                "outcome": "blocked",
+                "summary": (
+                    f"adaptive worker budget exhausted: {len(prior_delegations)} "
+                    f"of {worker_budget} worker calls used"
+                ),
+                "evidence": [],
+                "route": route.to_dict(),
+            }
+
+        direct_final_writes = {
+            "apply_patch",
+            "edit_file",
+            "install_dependencies",
+            "materialize_artifact",
+            "write_file",
+        }
+        mutation_policy = self._worker_mutation_policy(worker_role)
+        if mutation_policy in {MutationPolicy.READ_ONLY, MutationPolicy.STAGING_ONLY}:
+            allowed = [item for item in allowed if item not in direct_final_writes]
+        if not allowed:
+            return {
+                "outcome": "blocked",
+                "summary": f"worker role {worker_role.value} has no policy-compliant tools",
+                "evidence": [],
+                "route": route.to_dict(),
+            }
+
+        authoritative_task_evidence = self._fresh_authoritative_task_evidence(
+            goal,
+            plan,
+            current_task,
+        )
+        verified_failure_records: list[dict[str, Any]] = [
+            {
+                "evidence_id": item.id,
+                "summary": item.summary,
+                "data": dict(item.data),
+            }
+            for item in authoritative_task_evidence
+            if str(item.data.get("terminal_status") or "").casefold() == "failed"
+            or str(item.data.get("status") or "").casefold() == "failed"
+            or "failed" in item.summary.casefold()
+        ]
+        if (
+            worker_role is WorkerRole.REPAIRER
+            and str(assigned_task.metadata.get("required_worker_role") or "").casefold()
+            == WorkerRole.REPAIRER.value
+            and str(assigned_task.metadata.get("source_artifact_hash") or "").strip()
+        ):
+            verified_failure_records.append(
+                {
+                    "evidence_gate": "fixed_specialist_review",
+                    "summary": "The fixed specialist evidence gate rejected the source artifact revision.",
+                    "data": {
+                        "artifact_hash": assigned_task.metadata.get("source_artifact_hash"),
+                        "mutation_sequence": assigned_task.metadata.get("source_mutation_sequence"),
+                        "specialist_role": assigned_task.metadata.get("source_specialist_role"),
+                        "findings": list(assigned_task.metadata.get("verified_findings", ())),
+                    },
+                }
+            )
+        current_sequence = int(
+            self.store.get_goal(goal.id).metadata.get("mutation_sequence", 0) or 0
+        )
+        for action in self.store.list_actions(goal.id):
+            if (
+                str(action.get("task_id") or "").upper() != current_task
+                or str(action.get("status") or "") != "failed"
+                or str(action.get("tool_name") or "")
+                not in {"run_bash", "run_command", "preview_html", "inspect_preview"}
+            ):
+                continue
+            try:
+                journal = json.loads(str(action.get("args_json") or "{}"))
+                action_sequence = int(
+                    journal.get("_harness_mutation_sequence", -1)
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if action_sequence != current_sequence:
+                continue
+            summary = str(action.get("result_summary") or "")
+            if any(
+                marker in summary.casefold()
+                for marker in (
+                    "approval required",
+                    "environment failure",
+                    "permission denied",
+                    "provider unavailable",
+                    "timed out",
+                )
+            ):
+                continue
+            verified_failure_records.append(
+                {
+                    "action_id": str(action.get("id") or ""),
+                    "summary": summary,
+                    "data": {
+                        "tool": action.get("tool_name"),
+                        "mutation_sequence": action_sequence,
+                    },
+                }
+            )
+        if (
+            policy_active
+            and worker_role is WorkerRole.REPAIRER
+            and not verified_failure_records
+        ):
+            return {
+                "outcome": "blocked",
+                "summary": (
+                    "adaptive early stop: repairer requires a verified failing check "
+                    "or harness finding"
+                ),
+                "evidence": [],
+                "route": route.to_dict(),
+            }
+        if policy_active and worker_role is WorkerRole.SELECTOR:
+            staged_for_selection = tuple(
+                item
+                for item in self.store.list_evidence(
+                    goal.id,
+                    task_id=current_task,
+                    kind="staged_candidate",
+                )
+                if item.plan_revision == plan.revision
+            )
+            if not staged_for_selection:
+                return {
+                    "outcome": "blocked",
+                    "summary": (
+                        "selector requires an independently materialized staged "
+                        "challenger candidate"
+                    ),
+                    "evidence": [],
+                    "route": route.to_dict(),
+                }
+
+        falsification_targets = tuple(
+            str(item).strip()
+            for item in (
+                args.get("falsification_targets")
+                or assigned_task.verification
+                or assigned_task.acceptance_criteria
+            )
+            if str(item).strip()
+        )[:3]
+        context_refs = tuple(
+            str(item).strip()
+            for item in args.get("context_refs", ())
+            if str(item).strip()
+        )
+        seed_material = (
+            f"{goal.id}\0{plan.revision}\0{current_task}\0{worker_role.value}"
+            f"\0{len(prior_delegations)}"
+        )
+        mission = WorkerMissionV2(
+            role=worker_role,
+            objective=args["task"],
+            success_criteria=tuple(assigned_task.acceptance_criteria),
+            visibility=self._worker_visibility(worker_role),
+            mutation_policy=mutation_policy,
+            allowed_tools=tuple(allowed),
+            falsification_targets=falsification_targets,
+            context_refs=context_refs,
+            max_model_calls=1,
+            seed=int(hashlib.sha256(seed_material.encode("utf-8")).hexdigest()[:8], 16),
+        )
+        duplicate = next(
+            (
+                item
+                for item in prior_delegations
+                if str(item.metadata.get("approach_fingerprint") or "")
+                == mission.approach_fingerprint
+            ),
+            None,
+        )
+        if policy_active and duplicate is not None:
+            return {
+                "outcome": "blocked",
+                "summary": (
+                    "duplicate worker approach rejected; it does not count as an "
+                    "independent review"
+                ),
+                "evidence": [],
+                "route": route.to_dict(),
+            }
+
+        role = RoleProfile(
+            name=worker_role.value,
+            mission=args["role"],
+            constraints=(
+                "Stay within the delegated assignment.",
+                f"Visibility is {mission.visibility.value}.",
+                f"Mutation policy is {mission.mutation_policy.value}.",
+                "Claims without current harness evidence references do not count.",
+            ),
+            deliverables=(args["task"],),
+            tool_policy={"allowed_tools": allowed},
+            metadata={"worker_mission": mission.to_dict()},
+        )
+        experiment = OrchestrationExperimentV1(
+            goal_id=goal.id,
+            unit_id=current_task,
+            arm=OrchestrationArm.PRODUCTION,
+            model_fingerprint=model_fingerprint,
+            policy_fingerprint=self.adaptive_orchestration_policy.fingerprint,
+            task_class=self._normal_task_class(assigned_task),
+            causal=False,
+            matched_benchmark=False,
+            metrics={
+                "shadow_mode": self.adaptive_orchestration_policy.shadow_mode,
+                "risk_tier": route.tier.value,
+            },
+        )
+        baseline_evidence_ids = {
+            item.id
+            for item in self.store.list_evidence(goal.id, task_id=current_task)
+            if item.plan_revision == plan.revision
+        }
+        baseline_action_ids = {
+            str(item.get("id")) for item in self.store.list_actions(goal.id)
+        }
+        baseline_mutation_sequence = int(
+            self.store.get_goal(goal.id).metadata.get("mutation_sequence", 0) or 0
+        )
         delegation = self.store.create_delegation(
             Delegation(
                 goal_id=goal.id,
@@ -13505,7 +16420,20 @@ class AgentRuntime:
                 parent_id=parent_id,
                 brief=args["task"],
                 role=role,
-                metadata={"success_criteria": args["success_criteria"], "depth": depth},
+                metadata={
+                    "success_criteria": list(assigned_task.acceptance_criteria),
+                    "criterion_contracts": list(
+                        self._criterion_contracts(assigned_task)
+                    ),
+                    "depth": depth,
+                    "worker_role": worker_role.value,
+                    "worker_mission": mission.to_dict(),
+                    "adaptive_route": route.to_dict(),
+                    "approach_fingerprint": mission.approach_fingerprint,
+                    "experiment_id": experiment.id,
+                    "shadow_mode": self.adaptive_orchestration_policy.shadow_mode,
+                    "suppressed_roles": [item.value for item in suppressed_roles],
+                },
             )
         )
         self.store.transition_delegation(delegation.id, DelegationStatus.IN_PROGRESS)
@@ -13515,6 +16443,61 @@ class AgentRuntime:
         worker_schemas = [*_schemas(name for name in allowed if name in external), *WORKER_SCHEMAS]
         if "delegate_task" in allowed and depth < self.config.max_delegation_depth:
             worker_schemas.append(DELEGATE_TASK)
+        visible_context: Any = args["context"]
+        if mission.visibility is WorkerVisibility.CONTRACT_ONLY:
+            visible_context = "Builder rationale and prior candidate output are intentionally hidden."
+        elif mission.visibility is WorkerVisibility.ARTIFACT_WITHOUT_RATIONALE:
+            visible_context = (
+                "Inspect the current artifact directly. Builder rationale, confidence, "
+                "and proposed conclusion are intentionally hidden."
+            )
+        elif mission.visibility is WorkerVisibility.VERIFIED_FINDINGS_ONLY:
+            visible_context = {
+                "verified_findings": verified_failure_records
+            }
+        elif mission.visibility is WorkerVisibility.ANONYMOUS_CANDIDATES:
+            staged_candidates = [
+                item
+                for item in self.store.list_evidence(
+                    goal.id,
+                    task_id=current_task,
+                    kind="staged_candidate",
+                )
+                if item.plan_revision == plan.revision
+            ]
+            visible_context = {
+                "context_refs": list(context_refs),
+                "instruction": "Compare candidate evidence without author identities or rationales.",
+                "candidates": [
+                    {
+                        "candidate_ref": "candidate:current",
+                        "artifact_digest": self._task_artifact_digest(
+                            goal,
+                            plan,
+                            assigned_task,
+                        ),
+                        "source": "current artifact; inspect it with read-only tools",
+                    },
+                    *(
+                        {
+                            "candidate_ref": f"candidate:staged:{index}",
+                            "artifact_digest": str(
+                                item.data.get("artifact_digest") or ""
+                            ),
+                            "files": [
+                                {
+                                    "path": file.get("path"),
+                                    "sha256": file.get("sha256"),
+                                    "content_preview": file.get("content_preview"),
+                                }
+                                for file in item.data.get("files", ())
+                                if isinstance(file, Mapping)
+                            ],
+                        }
+                        for index, item in enumerate(staged_candidates, start=1)
+                    ),
+                ],
+            }
         conversation: list[dict[str, Any]] = [
             {
                 "role": "user",
@@ -13524,9 +16507,14 @@ class AgentRuntime:
                         "accepted_plan_revision": plan.revision,
                         "task_id": current_task,
                         "assignment": args["task"],
-                        "success_criteria": args["success_criteria"],
-                        "context": args["context"],
+                        "success_criteria": list(assigned_task.acceptance_criteria),
+                        "criterion_contracts": list(
+                            self._criterion_contracts(assigned_task)
+                        ),
+                        "context": visible_context,
                         "allowed_tools": allowed,
+                        "worker_mission": mission.to_dict(),
+                        "adaptive_route": route.to_dict(),
                         "runtime_environment": self._runtime_environment_payload(),
                     },
                     "WORKER_BRIEF",
@@ -13534,6 +16522,10 @@ class AgentRuntime:
             }
         ]
         report: dict[str, Any] | None = None
+        worker_input_tokens = 0
+        worker_output_tokens = 0
+        worker_model_calls = 0
+        started_at = time.monotonic()
         try:
             for step in range(1, self.config.subagent_steps + 1):
                 turn = self._call_provider(
@@ -13543,6 +16535,10 @@ class AgentRuntime:
                     actor=f"worker:{delegation.id[-8:]}",
                     step=step,
                 )
+                worker_model_calls += 1
+                if turn.usage is not None:
+                    worker_input_tokens += int(turn.usage.input_tokens or 0)
+                    worker_output_tokens += int(turn.usage.output_tokens or 0)
                 conversation.append(turn.to_message())
                 for call in turn.tool_calls:
                     self.events.publish("tool_call", call.name, args=redact_data(call.args), actor=delegation.id)
@@ -13574,7 +16570,24 @@ class AgentRuntime:
         except Exception as exc:
             error = f"{type(exc).__name__}: {redact_text(exc, 1_000)}"
             self.store.transition_delegation(delegation.id, DelegationStatus.FAILED, error=error)
-            return {"outcome": "blocked", "summary": error, "evidence": []}
+            report = {"outcome": "blocked", "summary": error, "evidence": []}
+            self._record_normal_worker_observation(
+                goal=goal,
+                plan=plan,
+                task=assigned_task,
+                delegation=delegation,
+                mission=mission,
+                experiment=experiment,
+                report=report,
+                baseline_evidence_ids=baseline_evidence_ids,
+                baseline_action_ids=baseline_action_ids,
+                baseline_mutation_sequence=baseline_mutation_sequence,
+                input_tokens=worker_input_tokens,
+                output_tokens=worker_output_tokens,
+                model_calls=worker_model_calls,
+                latency_ms=max(0, int((time.monotonic() - started_at) * 1_000)),
+            )
+            return report
 
         if report is None:
             report = {
@@ -13584,6 +16597,82 @@ class AgentRuntime:
                 "changed_paths": [],
                 "remaining_risks": ["Worker result is incomplete; coordinator must inspect current state."],
                 "proposed_subtasks": [],
+            }
+        staged_candidate_evidence: Evidence | None = None
+        if mission.role is WorkerRole.CHALLENGER and report["outcome"] == "success":
+            try:
+                staged_candidate_evidence = self._materialize_staged_worker_candidate(
+                    goal=goal,
+                    plan=plan,
+                    task=assigned_task,
+                    mission=mission,
+                    report=report,
+                )
+            except StateStoreError as exc:
+                report = {
+                    **report,
+                    "_claimed_success": True,
+                    "outcome": "partial",
+                    "remaining_risks": [
+                        *report.get("remaining_risks", ()),
+                        f"NEEDS_EVIDENCE: staged challenger candidate was rejected: {redact_text(exc, 500)}",
+                    ],
+                }
+            if staged_candidate_evidence is not None:
+                report = {
+                    **report,
+                    "staged_candidate_ref": (
+                        f"staged_candidate:{staged_candidate_evidence.id}"
+                    ),
+                }
+        authoritative_delta = self._fresh_authoritative_task_evidence(
+            goal,
+            plan,
+            current_task,
+            exclude_ids=baseline_evidence_ids,
+        )
+        criteria_covered, missing_criteria = self._worker_claim_coverage(
+            assigned_task,
+            report,
+            authoritative_delta,
+        )
+        predicted_failures = tuple(
+            item
+            for item in report.get("predicted_failures", ())
+            if isinstance(item, Mapping)
+            and str(item.get("hypothesis") or "").strip()
+            and str(item.get("separating_check") or "").strip()
+        )
+        selection = report.get("selection")
+        role_contract_complete = (
+            bool(predicted_failures)
+            if mission.role is WorkerRole.PREDICTOR
+            else staged_candidate_evidence is not None
+            if mission.role is WorkerRole.CHALLENGER
+            else isinstance(selection, Mapping)
+            and bool(str(selection.get("candidate_ref") or "").strip())
+            and bool(selection.get("evidence_refs"))
+            if mission.role is WorkerRole.SELECTOR
+            else bool(authoritative_delta and criteria_covered)
+        )
+        if policy_active and report["outcome"] == "success" and not role_contract_complete:
+            report = {
+                **report,
+                "_claimed_success": True,
+                "outcome": "partial",
+                "remaining_risks": [
+                    *report.get("remaining_risks", ()),
+                    (
+                        "NEEDS_EVIDENCE: success requires fresh authoritative "
+                        "role output and, for verification/repair roles, evidence "
+                        "for every current acceptance criterion"
+                        + (
+                            f"; missing {', '.join(missing_criteria)}."
+                            if missing_criteria
+                            else "."
+                        )
+                    ),
+                ],
             }
         status = DelegationStatus.COMPLETED if report["outcome"] == "success" else DelegationStatus.FAILED
         self.store.transition_delegation(
@@ -13602,6 +16691,22 @@ class AgentRuntime:
                 data={"delegation_id": delegation.id, "role": role.name},
                 created_by=delegation.id,
             )
+        self._record_normal_worker_observation(
+            goal=goal,
+            plan=plan,
+            task=assigned_task,
+            delegation=delegation,
+            mission=mission,
+            experiment=experiment,
+            report=report,
+            baseline_evidence_ids=baseline_evidence_ids,
+            baseline_action_ids=baseline_action_ids,
+            baseline_mutation_sequence=baseline_mutation_sequence,
+            input_tokens=worker_input_tokens,
+            output_tokens=worker_output_tokens,
+            model_calls=worker_model_calls,
+            latency_ms=max(0, int((time.monotonic() - started_at) * 1_000)),
+        )
         return report
 
     def _completion_precheck(self, goal: Goal, plan: Plan) -> str | None:
@@ -13752,12 +16857,79 @@ class AgentRuntime:
             hashes[relative] = hashlib.sha256(json.dumps(members, separators=(",", ":")).encode("utf-8")).hexdigest()
         return hashes
 
+    @staticmethod
+    def _specialist_review_instruction(role: SpecialistReviewRole) -> str:
+        return {
+            SpecialistReviewRole.SECURITY: (
+                "Review only security: attack surface, trust boundaries, authentication, "
+                "authorization, validation, secrets, dependency risk, and unsafe behavior."
+            ),
+            SpecialistReviewRole.CLEAN_CODE: (
+                "Review only maintainability: clarity, duplication, dead code, naming, "
+                "complexity, error handling, and adherence to the repository's conventions."
+            ),
+            SpecialistReviewRole.TESTING: (
+                "Review only testing: executed evidence, meaningful assertions, negative and "
+                "edge cases, test isolation, and whether claimed behavior was actually exercised."
+            ),
+            SpecialistReviewRole.ARCHITECTURE: (
+                "Review only architecture: component boundaries, dependency direction, public "
+                "interfaces, integration contracts, state ownership, and long-term coherence."
+            ),
+            SpecialistReviewRole.FIDELITY: (
+                "Review only requirement fidelity: every accepted criterion, constraint, named "
+                "artifact, interaction, and user-visible outcome must be represented exactly."
+            ),
+            SpecialistReviewRole.REGRESSION: (
+                "Review only regressions: unchanged behavior, backward compatibility, startup, "
+                "integration paths, and fresh evidence after the latest mutation."
+            ),
+        }[SpecialistReviewRole(role)]
+
+    def _completion_artifact_revision(
+        self,
+        goal: Goal,
+        plan: Plan,
+    ) -> tuple[str, int, dict[str, str]]:
+        current = self.store.get_goal(goal.id)
+        mutation_sequence = int(current.metadata.get("mutation_sequence", 0) or 0)
+        target = current.metadata.get("quality_target", {})
+        artifact_ids = tuple(target.get("artifact_ids", ())) if isinstance(target, Mapping) else ()
+        artifact_ids = self._effective_artifact_ids(current, plan, artifact_ids)
+        if not artifact_ids:
+            artifact_ids = tuple(
+                dict.fromkeys(
+                    str(item.get("path") or item.get("artifact") or "").strip()
+                    for item in self._effective_expected_changes(current, plan)
+                    if isinstance(item, Mapping)
+                    and str(item.get("path") or item.get("artifact") or "").strip()
+                )
+            )
+        hashes = self._current_artifact_hashes(artifact_ids)
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "plan_fingerprint": plan.fingerprint,
+                    "mutation_sequence": mutation_sequence,
+                    "artifact_hashes": hashes,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return digest, mutation_sequence, hashes
+
     def _review_completion(
         self,
         goal: Goal,
         plan: Plan,
         claim: dict[str, Any],
+        *,
+        specialist_role: SpecialistReviewRole | None = None,
+        review_steps_override: int | None = None,
     ) -> dict[str, Any] | None:
+        role = SpecialistReviewRole(specialist_role) if specialist_role is not None else None
         goal_level_evidence = [
             item
             for item in self.store.list_evidence(goal.id)
@@ -13786,6 +16958,16 @@ class AgentRuntime:
                             "task_count": len(plan.tasks),
                         },
                         "completion_claim": claim,
+                        "specialist_review": (
+                            {
+                                "role": role.value,
+                                "scope": self._specialist_review_instruction(role),
+                                "fixed_stage": True,
+                                "read_only": True,
+                            }
+                            if role is not None
+                            else None
+                        ),
                         "goal_level_evidence": [
                             {
                                 "kind": item.kind,
@@ -13867,7 +17049,14 @@ class AgentRuntime:
             for schema in REVIEWER_SCHEMAS
             if schema.get("function", {}).get("name") == "submit_review"
         ]
-        review_steps = max(1, int(self.config.review_steps))
+        review_steps = max(
+            1,
+            int(
+                review_steps_override
+                if review_steps_override is not None
+                else self.config.review_steps
+            ),
+        )
         for step in range(1, review_steps + 1):
             final_verdict_turn = step == review_steps
             if final_verdict_turn:
@@ -13884,11 +17073,27 @@ class AgentRuntime:
                         ),
                     }
                 )
+            specialist_system = (
+                REVIEWER_SYSTEM_PROMPT
+                + "\n\nFIXED SPECIALIST ROLE: "
+                + role.value.upper()
+                + "\n"
+                + self._specialist_review_instruction(role)
+                + "\nDo not broaden into another specialist's scope. A pass still requires "
+                "direct evidence for this role or an explicit evidence-backed finding that the "
+                "dimension is unaffected."
+                if role is not None
+                else REVIEWER_SYSTEM_PROMPT
+            )
             turn = self._call_provider(
                 conversation,
                 verdict_schemas if final_verdict_turn else inspection_schemas,
-                REVIEWER_SYSTEM_PROMPT,
-                actor="independent-reviewer",
+                specialist_system,
+                actor=(
+                    f"specialist-review:{role.value}"
+                    if role is not None
+                    else "independent-reviewer"
+                ),
                 step=step,
             )
             conversation.append(turn.to_message())
@@ -13938,6 +17143,173 @@ class AgentRuntime:
                 )
         return None
 
+    def _review_completion_specialists(
+        self,
+        goal: Goal,
+        plan: Plan,
+        claim: dict[str, Any],
+    ) -> tuple[FixedSpecialistReviewGateV1, dict[str, Any] | None]:
+        """Run the fixed six-role review stage and aggregate it mechanically."""
+
+        artifact_hash, mutation_sequence, artifact_hashes = (
+            self._completion_artifact_revision(goal, plan)
+        )
+        reviews: list[SpecialistReviewResultV1] = []
+        task_ids = [task.id for task in plan.tasks]
+        for role in FIXED_SPECIALIST_REVIEW_ORDER:
+            self.events.publish(
+                "specialist_review.started",
+                f"{role.value} specialist is reviewing the current artifact revision.",
+                goal_id=goal.id,
+                plan_revision=plan.revision,
+                role=role.value,
+                actor=f"specialist-review:{role.value}",
+                phase="reviewing",
+                operation=f"Reviewing {role.value}",
+                state="active",
+                artifact_hash=artifact_hash,
+                mutation_sequence=mutation_sequence,
+            )
+            verdict = self._review_completion(
+                goal,
+                plan,
+                claim,
+                specialist_role=role,
+                review_steps_override=min(2, max(1, int(self.config.review_steps))),
+            )
+            passed = None if verdict is None else verdict.get("verdict") == "pass"
+            issues = tuple(
+                dict(item)
+                for item in (verdict or {}).get("issues", ())
+                if isinstance(item, Mapping)
+            )
+            if passed is False and not issues:
+                issues = ({
+                    "title": f"{role.value.replace('_', ' ').title()} review failed",
+                    "details": str((verdict or {}).get("summary") or "The specialist rejected the current artifact revision."),
+                    "severity": "high",
+                    "acceptance_criteria": [
+                        f"A fresh {role.value} specialist review passes against the repaired artifact hash."
+                    ],
+                },)
+            summary = str(
+                (verdict or {}).get("summary")
+                or f"{role.value} specialist did not produce a valid evidence-bound verdict."
+            )
+            stored = self.store.add_evidence(
+                goal_id=goal.id,
+                plan_revision=plan.revision,
+                kind="specialist_review",
+                summary=redact_text(summary, 4_000),
+                data={
+                    "role": role.value,
+                    "verdict": None if verdict is None else verdict.get("verdict"),
+                    "issues": redact_data(issues),
+                    "checked_task_ids": list((verdict or {}).get("checked_task_ids", task_ids)),
+                    "artifact_hash": artifact_hash,
+                    "artifact_hashes": artifact_hashes,
+                    "mutation_sequence": mutation_sequence,
+                    "fixed_stage": True,
+                    "read_only": True,
+                },
+                created_by=f"specialist-review:{role.value}",
+                verified=passed is True,
+            )
+            review = SpecialistReviewResultV1(
+                role=role,
+                artifact_hash=artifact_hash,
+                mutation_sequence=mutation_sequence,
+                passed=passed,
+                summary=summary,
+                issues=issues,
+                evidence_refs=(stored.id,),
+                reviewer_id=f"specialist-review:{role.value}",
+            )
+            reviews.append(review)
+            self.events.publish(
+                "specialist_review.completed",
+                (
+                    f"{role.value} specialist passed."
+                    if passed is True
+                    else f"{role.value} specialist found a blocker."
+                    if passed is False
+                    else f"{role.value} specialist returned no valid verdict."
+                ),
+                goal_id=goal.id,
+                role=role.value,
+                actor=f"specialist-review:{role.value}",
+                phase="reviewing",
+                operation=f"Reviewed {role.value}",
+                state="completed" if passed is True else "failed",
+                passed=passed,
+                evidence_id=stored.id,
+                artifact_hash=artifact_hash,
+                mutation_sequence=mutation_sequence,
+            )
+
+        gate = FixedSpecialistReviewGateV1(
+            artifact_hash=artifact_hash,
+            mutation_sequence=mutation_sequence,
+            reviews=tuple(reviews),
+        )
+        gate_record = gate.to_dict()
+        self.store.add_evidence(
+            goal_id=goal.id,
+            plan_revision=plan.revision,
+            kind="fixed_specialist_evidence_gate",
+            summary=(
+                "All fixed specialist reviews passed for the current artifact revision."
+                if gate.verdict is EvidenceVerdict.PASSED
+                else "The fixed specialist evidence gate requires repair."
+                if gate.verdict is EvidenceVerdict.FAILED
+                else "The fixed specialist evidence gate needs a valid fresh verdict."
+            ),
+            data=gate_record,
+            created_by="harness",
+            verified=gate.verdict is EvidenceVerdict.PASSED,
+        )
+        self.store.update_goal_metadata(
+            goal.id,
+            fixed_specialist_review=gate_record,
+        )
+        self.events.publish(
+            "specialist_review.gate",
+            f"Fixed specialist evidence gate: {gate.verdict.value}.",
+            goal_id=goal.id,
+            actor="fixed-specialist-evidence-gate",
+            phase="verifying",
+            operation="Aggregating fixed specialist evidence",
+            state=(
+                "completed"
+                if gate.verdict is EvidenceVerdict.PASSED
+                else "failed"
+            ),
+            **gate_record,
+        )
+        if gate.verdict is EvidenceVerdict.NEEDS_EVIDENCE:
+            return gate, None
+        if gate.verdict is EvidenceVerdict.PASSED:
+            return gate, {
+                "verdict": "pass",
+                "summary": "All six fixed specialist reviews passed against the current artifact revision.",
+                "issues": [],
+                "checked_task_ids": task_ids,
+            }
+        failed_reviews = [item for item in reviews if item.passed is False]
+        return gate, {
+            "verdict": "fail",
+            "summary": (
+                "Fixed specialist review failed: "
+                + ", ".join(item.role.value for item in failed_reviews)
+            ),
+            "issues": [
+                {**dict(issue), "specialist_role": item.role.value}
+                for item in failed_reviews
+                for issue in item.issues
+            ],
+            "checked_task_ids": task_ids,
+        }
+
     def _finish_goal(self, goal: Goal, plan: Plan, args: dict[str, Any]) -> str:
         blocked = self._completion_precheck(goal, plan)
         if blocked:
@@ -13952,23 +17324,39 @@ class AgentRuntime:
             )
             return f"Error: completion gate rejected: {blocked}. Continue the goal."
         self.store.transition_goal(goal.id, GoalStatus.VERIFYING, reason="completion requested; deterministic gate passed")
-        self.store.transition_goal(goal.id, GoalStatus.REVIEWING, reason="fresh-context independent review started")
+        self.store.transition_goal(
+            goal.id,
+            GoalStatus.REVIEWING,
+            reason="fixed six-specialist review started against the current artifact revision",
+        )
         current = self.store.get_goal(goal.id)
         try:
-            verdict = self._review_completion(current, plan, args)
+            _specialist_gate, verdict = self._review_completion_specialists(
+                current,
+                plan,
+                args,
+            )
         except ProviderUnavailableError as exc:
             self.store.transition_goal(goal.id, GoalStatus.RUNNING, reason="review provider unavailable")
-            return f"Error: independent review could not run: {redact_text(exc, 1_000)}. Goal remains active."
+            return f"Error: fixed specialist review could not run: {redact_text(exc, 1_000)}. Goal remains active."
         if verdict is None:
             self.store.transition_goal(goal.id, GoalStatus.RUNNING, reason="review reached slice limit without verdict")
-            return "Error: independent review produced no valid verdict. Goal remains active."
+            return "Error: one or more fixed specialists produced no valid verdict. Goal remains active."
         self.store.add_evidence(
             goal_id=goal.id,
             plan_revision=plan.revision,
             kind="final_review",
             summary=redact_text(verdict["summary"], 4_000),
-            data={"verdict": verdict["verdict"], "issues": redact_data(verdict["issues"])},
-            created_by="independent-reviewer",
+            data={
+                "verdict": verdict["verdict"],
+                "issues": redact_data(verdict["issues"]),
+                "artifact_hash": _specialist_gate.artifact_hash,
+                "mutation_sequence": _specialist_gate.mutation_sequence,
+                "specialist_roles": [
+                    role.value for role in FIXED_SPECIALIST_REVIEW_ORDER
+                ],
+            },
+            created_by="fixed-specialist-evidence-gate",
             verified=verdict["verdict"] == "pass",
         )
         if verdict["verdict"] == "pass":
@@ -14008,7 +17396,8 @@ class AgentRuntime:
                 ),
                 "routing_order": [
                     "deterministic_verification", "static_analysis", "runtime_integration",
-                    "artifact_structure", "independent_review",
+                    "artifact_structure", "adaptive_workers",
+                    "fixed_specialist_review", "evidence_gate",
                     (
                         "vision_evaluation"
                         if vision_available
@@ -14078,7 +17467,14 @@ class AgentRuntime:
                 "mutation_sequence": mutation_sequence,
                 "artifact_hashes": hashes,
                 "change_set_ids": [item.get("id") for item in fresh_goal.metadata.get("goal_change_sets", ()) if isinstance(item, Mapping)],
-                "evaluators": ["authoritative_tool_evidence", "independent-reviewer"] + (["vision"] if vision_available else []),
+                "evaluators": [
+                    "authoritative_tool_evidence",
+                    *[
+                        f"specialist-review:{role.value}"
+                        for role in FIXED_SPECIALIST_REVIEW_ORDER
+                    ],
+                    "fixed-specialist-evidence-gate",
+                ] + (["vision"] if vision_available else []),
                 "evaluator_capability_profile": evaluator_profile,
                 "evidence_ids": authoritative_ids,
                 "hard_gate_results": {str(gate): True for gate in target.get("hard_gates", ())},
@@ -14122,17 +17518,17 @@ class AgentRuntime:
             )
             self._checkpoint_accepted_goal(
                 self.store.get_goal(goal.id),
-                source="independent_final_review",
+                source="fixed_specialist_evidence_gate",
             )
             self.store.transition_goal(
                 goal.id,
                 GoalStatus.COMPLETED,
                 reason=(
-                    "all operational gates and independent review passed; "
+                    "all operational gates and fixed specialist reviews passed; "
                     "subjective visual evaluation is recorded as a limitation"
                     if disposition
                     is CompletionDisposition.COMPLETED_WITH_LIMITATIONS
-                    else "all checklist evidence passed independent final review"
+                    else "all checklist evidence passed the fixed specialist evidence gate"
                 ),
                 metadata={
                     "completion_summary": redact_text(args["summary"], 4_000),
@@ -14165,25 +17561,26 @@ class AgentRuntime:
                 },
                 expected_revision=int(completion_session.get("revision") or 0),
             )
-            self.events.publish("phase", "Goal completed after evidence gate and independent review.")
+            self.events.publish("phase", "Goal completed after all fixed specialist reviews and the evidence gate.")
             return (
                 "Goal completed with limitations. All operational gates and "
-                "independent review passed; subjective visual quality was not "
+                "fixed specialist review passed; subjective visual quality was not "
                 "claimed as verified."
                 if disposition
                 is CompletionDisposition.COMPLETED_WITH_LIMITATIONS
-                else "Goal completed. The harness accepted the independent review."
+                else "Goal completed. The harness accepted all fixed specialist reviews."
             )
 
         self._record_global_learning(
             self.store.get_goal(goal.id),
             succeeded=False,
             evidence_ref=f"goal:{goal.id}:review-failed",
-            blocker=str(verdict.get("summary") or "independent review failed"),
+            blocker=str(verdict.get("summary") or "fixed specialist review failed"),
         )
         repair_tasks = []
         existing = list(plan.tasks)
         for issue in verdict["issues"]:
+            specialist_role = str(issue.get("specialist_role") or "specialist").strip()
             repair_tasks.append(
                 {
                     "id": self._next_task_id([*existing, *repair_tasks]),
@@ -14193,26 +17590,43 @@ class AgentRuntime:
                     "verification": [f"Independently verify repair: {criterion}" for criterion in issue["acceptance_criteria"]],
                     "depends_on": [],
                     "risk": issue["severity"],
-                    "origin": "reviewer",
+                    "origin": "repairer",
+                    "metadata": {
+                        "required_worker_role": WorkerRole.REPAIRER.value,
+                        "source_specialist_role": specialist_role,
+                        "source_artifact_hash": _specialist_gate.artifact_hash,
+                        "source_mutation_sequence": _specialist_gate.mutation_sequence,
+                        "verified_findings": [dict(issue)],
+                        "fresh_verification_required": True,
+                    },
                 }
             )
         if not repair_tasks:
             repair_tasks.append(
                 {
                     "id": self._next_task_id(existing),
-                    "title": "Resolve failed independent review",
+                    "title": "Resolve failed specialist evidence gate",
                     "description": verdict["summary"],
-                    "acceptance_criteria": ["A fresh independent review returns pass with direct evidence."],
-                    "verification": ["Repeat the completion audit after addressing the review summary."],
+                    "acceptance_criteria": ["All six fresh specialist reviews pass with direct evidence."],
+                    "verification": ["Repeat the fixed specialist evidence gate after repairing the verified finding."],
                     "depends_on": [],
                     "risk": "high",
-                    "origin": "reviewer",
+                    "origin": "repairer",
+                    "metadata": {
+                        "required_worker_role": WorkerRole.REPAIRER.value,
+                        "source_artifact_hash": _specialist_gate.artifact_hash,
+                        "source_mutation_sequence": _specialist_gate.mutation_sequence,
+                        "verified_findings": [
+                            {"summary": verdict["summary"]},
+                        ],
+                        "fresh_verification_required": True,
+                    },
                 }
             )
         new_plan = self.revise_plan(
-            reason=f"independent review failed: {verdict['summary']}",
+            reason=f"fixed specialist evidence gate failed: {verdict['summary']}",
             add=repair_tasks,
-            proposed_by="reviewer",
+            proposed_by="repairer",
             inherit_approved_scope=True,
         )
         refreshed = self.store.get_goal(goal.id)
@@ -14227,7 +17641,7 @@ class AgentRuntime:
                 "acceptance_criteria": repair["acceptance_criteria"],
                 "verification": repair["verification"],
                 "status": "pending",
-                "source": "independent-reviewer",
+                "source": "fixed-specialist-evidence-gate",
             })
         self.store.update_goal_metadata(
             goal.id,
@@ -14236,7 +17650,15 @@ class AgentRuntime:
         )
         self.store.append_event(
             "refinement_cycle.started", goal_id=goal.id,
-            payload={"source_evaluation": "independent-reviewer", "repair_tasks": [item["id"] for item in repair_tasks], "plan_revision": new_plan.revision},
+            payload={
+                "source_evaluation": "fixed-specialist-evidence-gate",
+                "source_artifact_hash": _specialist_gate.artifact_hash,
+                "source_mutation_sequence": _specialist_gate.mutation_sequence,
+                "repair_role": WorkerRole.REPAIRER.value,
+                "fresh_verification_required": True,
+                "repair_tasks": [item["id"] for item in repair_tasks],
+                "plan_revision": new_plan.revision,
+            },
         )
         if self._repair_revision_is_in_scope(plan, new_plan, repair_tasks):
             accepted_repair = self.approve_plan(
@@ -14249,7 +17671,7 @@ class AgentRuntime:
                 convergence_state="refining",
             )
             return (
-                f"Independent review found {len(repair_tasks)} deficiency task(s). "
+                f"The fixed specialist evidence gate found {len(repair_tasks)} deficiency task(s). "
                 f"Harness-approved in-scope repair plan r{accepted_repair.revision}; "
                 "Goal refinement continues autonomously."
             )
@@ -14258,13 +17680,13 @@ class AgentRuntime:
             refinement_actions=actions,
             convergence_state="scope_expansion_pending",
             waiting_question=(
-                "Independent review proposed repair work that adds a dependency, "
+                "The fixed specialist evidence gate proposed repair work that adds a dependency, "
                 "external effect, sensitive permission, or path outside the approved "
                 "scope. Review and approve the new plan revision."
             ),
         )
         return (
-            f"Independent review found {len(repair_tasks)} deficiency task(s), "
+            f"The fixed specialist evidence gate found {len(repair_tasks)} deficiency task(s), "
             f"but plan r{new_plan.revision} expands the approved scope and awaits "
             "explicit approval."
         )
@@ -15087,7 +18509,12 @@ class AgentRuntime:
                 return lease_boundary
         if goal.metadata.get("ultra_run_id"):
             session = self._ensure_ultra_session()
-            if session.running:
+            # ``Future.done()`` can become true between restore_ultra() and
+            # this check.  A finished Future still contains the authoritative
+            # UltraRunResult that converge_ultra() must persist into the Goal
+            # boundary.  Checking only ``session.running`` discarded that
+            # result and manufactured a stale RUNNING Goal.
+            if getattr(session, "future", None) is not None:
                 heartbeat_stop, heartbeat_thread = self._start_execution_heartbeat(
                     "ultra-working"
                 )
@@ -15240,7 +18667,11 @@ class AgentRuntime:
             if isinstance(pending, Mapping):
                 pending_status = str(pending.get("status") or "routing")
                 stage = str(pending.get("stage") or "route").replace("_", " ")
-                status = "needs_attention" if pending_status == "awaiting_provider" else "routing"
+                status = (
+                    "needs_attention"
+                    if pending_status in {"awaiting_provider", "needs_evidence"}
+                    else "routing"
+                )
                 runtime = self.workflow_runtime_snapshot()
                 return DashboardView(
                     objective=str(pending.get("original_input") or "Saved request"),
@@ -15538,6 +18969,227 @@ class AgentRuntime:
             )
         return compact, tuple(artifacts)
 
+    def _publish_output_tool(self, prepared: dict[str, Any]) -> dict[str, Any]:
+        """Persist one generic Output envelope in the workflow session.
+
+        The tool validates files before this callback.  This method owns only
+        the durable presentation state, so publishing an answer cannot grant
+        extra filesystem, browser, or network authority.
+        """
+
+        envelope = {
+            "version": 1,
+            "output_id": "output-" + uuid.uuid4().hex[:16],
+            "status": "ready",
+            "title": str(prepared.get("title") or "Task output").strip()[:240],
+            "message": str(prepared.get("message") or "").strip()[:50_000],
+            "copy_sections": [dict(item) for item in prepared.get("copy_sections") or ()],
+            "assets": [dict(item) for item in prepared.get("assets") or ()],
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "session_id": self.session_id,
+        }
+
+        def reduce_session(current: dict[str, Any]) -> dict[str, Any]:
+            state = dict(current.get("state") or {})
+            state["latest_output"] = envelope
+            history = [
+                dict(item)
+                for item in state.get("output_history") or ()
+                if isinstance(item, Mapping)
+                and str(item.get("output_id") or "") != envelope["output_id"]
+            ]
+            history.append(
+                {
+                    "output_id": envelope["output_id"],
+                    "title": envelope["title"],
+                    "created_at": envelope["created_at"],
+                    "asset_count": len(envelope["assets"]),
+                    "copy_section_count": len(envelope["copy_sections"]),
+                }
+            )
+            state["output_history"] = history[-20:]
+            return {"state": state}
+
+        self.store.mutate_workflow_session(self.session_id, reduce_session)
+        self._publish_visible_activity(
+            "output.ready",
+            "Final task output is ready",
+            source_kind="HARNESS",
+            actor="execution",
+            phase="completed",
+            state="completed",
+            operation="Publishing the final Output page",
+            waiting_on="",
+            output_id=envelope["output_id"],
+            asset_count=len(envelope["assets"]),
+            copy_section_count=len(envelope["copy_sections"]),
+        )
+        return envelope
+
+    @staticmethod
+    def _copy_ready_fallback(text: str) -> str:
+        """Extract a likely copy-ready block without inventing new content."""
+
+        source = str(text or "").strip()
+        fenced = re.findall(r"```(?:text|markdown|md)?\s*\n([\s\S]*?)```", source, re.IGNORECASE)
+        if fenced:
+            return max((item.strip() for item in fenced), key=len, default=source)
+        marker = re.search(
+            r"(?im)^(?:#{1,6}\s*)?(?:copy\s*ready|ready\s*to\s*copy|"
+            r"linkedin\s*post|post\s*ready|جاهز\s*للنسخ|البوست)\s*:?\s*$",
+            source,
+        )
+        if marker is not None:
+            following = source[marker.end() :].strip()
+            next_heading = re.search(r"(?m)^#{1,6}\s+", following)
+            return (following[: next_heading.start()] if next_heading else following).strip() or source
+        return source
+
+    @staticmethod
+    def _sanitize_completed_action_text(text: str) -> str:
+        """Remove a weak model's stale confirmation request after delivery.
+
+        Full/session-authorized action execution is non-interactive.  Small
+        models sometimes compose a draft that asks the user to approve the
+        very tool call the harness has already executed.  Keeping that draft
+        would make a successfully published Output look unfinished.
+        """
+
+        source = str(text or "").strip()
+        lowered = source.casefold()
+        markers = (
+            "please confirm",
+            "would you like me to proceed",
+            "confirm if you would like",
+            "to complete the final step",
+            "to complete the final handoff",
+            "before publishing the final output",
+            "i need to evaluate these images",
+            "i still need to evaluate",
+            "i need to inspect these images",
+        )
+        if not any(marker in lowered for marker in markers):
+            return source
+        paragraphs = [item.strip() for item in re.split(r"\n\s*\n", source) if item.strip()]
+        kept = [
+            item
+            for item in paragraphs
+            if not any(marker in item.casefold() for marker in markers)
+        ]
+        # The common weak-model draft puts the stale request in the same
+        # paragraph as its progress claim; replace that paragraph with a
+        # truthful completed handoff instead of leaving half a sentence.
+        if len(kept) == len(paragraphs):
+            return source
+        completed = (
+            "The requested task completed successfully. The verified result and attachments "
+            "are included with this response."
+        )
+        return "\n\n".join((completed, *kept))
+
+    def _refresh_completed_action_output(
+        self,
+        final_text: str,
+        contract: ActionOutcomeContractV1,
+    ) -> None:
+        """Replace a pre-gate Output draft with the evidence-complete response.
+
+        A weak model may publish the attachments before composing its natural
+        final response. The assets and copy sections are already durable, but
+        the earlier message can still describe completed work as pending.
+        Update that same envelope after every required evidence gate passes.
+        """
+
+        if not contract.output_ready or not contract.output_id:
+            return
+        sanitized = self._sanitize_completed_action_text(final_text)
+
+        def reduce_session(current: dict[str, Any]) -> dict[str, Any]:
+            state = dict(current.get("state") or {})
+            raw = state.get("latest_output")
+            if not isinstance(raw, Mapping):
+                return {"state": state}
+            output = dict(raw)
+            if str(output.get("output_id") or "") != contract.output_id:
+                return {"state": state}
+            output["message"] = sanitized[:50_000]
+            state["latest_output"] = output
+            return {"state": state}
+
+        self.store.mutate_workflow_session(self.session_id, reduce_session)
+
+    def _ensure_action_output(
+        self,
+        final_text: str,
+        contract: ActionOutcomeContractV1,
+        *,
+        title: str,
+    ) -> None:
+        """Create the Output envelope when the model omitted explicit structure."""
+
+        if contract.output_ready:
+            self._refresh_completed_action_output(final_text, contract)
+            return
+        assets: list[dict[str, Any]] = []
+        output_images = contract.selected_images or contract.captured_images
+        for index, raw in enumerate(output_images, start=1):
+            try:
+                candidate = Path(raw)
+                candidate = (
+                    candidate.resolve(strict=True)
+                    if candidate.is_absolute()
+                    else (self.workspace / candidate).resolve(strict=True)
+                )
+                relative = candidate.relative_to(self.workspace).as_posix()
+                if not candidate.is_file():
+                    continue
+                assets.append(
+                    {
+                        "id": hashlib.sha256(f"{relative}:{index}".encode("utf-8")).hexdigest()[:16],
+                        "path": relative,
+                        "label": candidate.stem,
+                        "kind": "image",
+                        "sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+                        "byte_size": candidate.stat().st_size,
+                    }
+                )
+            except (OSError, RuntimeError, ValueError):
+                continue
+        copy_sections = (
+            [
+                {
+                    "id": hashlib.sha256(final_text.encode("utf-8", "replace")).hexdigest()[:16],
+                    "label": "Copy ready",
+                    "text": self._copy_ready_fallback(final_text),
+                }
+            ]
+            if contract.require_copy
+            else []
+        )
+        published = self._publish_output_tool(
+            {
+                "version": 1,
+                "title": str(title or "Task output"),
+                "message": final_text,
+                "copy_sections": copy_sections,
+                "assets": assets,
+            }
+        )
+        contract.observe("publish_output", json.dumps(published, ensure_ascii=False))
+
+    def publish_result_output(self, message: str, *, title: str = "Task output") -> dict[str, Any]:
+        """Publish a generic completion that did not use the bounded Action path."""
+
+        return self._publish_output_tool(
+            {
+                "version": 1,
+                "title": str(title or "Task output"),
+                "message": str(message or "The task completed."),
+                "copy_sections": [],
+                "assets": [],
+            }
+        )
+
     def _execute_chat_tool(
         self,
         call: ToolCall,
@@ -15545,6 +19197,7 @@ class AgentRuntime:
         semantic_turn_id: str = "",
     ) -> tuple[tools.ToolExecutionResult, tuple[str, ...]]:
         spec = tools.get_spec(call.name)
+        actor = "execution" if decision.route is RouteKind.ACTION else "chat"
         args = call.args if isinstance(call.args, dict) else {}
         if spec is None:
             return tools.ToolExecutionResult(False, f"Error: unknown chat tool {call.name!r}"), ()
@@ -15554,36 +19207,116 @@ class AgentRuntime:
                 f"Error: tool category {spec.category!r} is outside the accepted semantic effect contract",
                 error_code="effect_contract",
             ), ()
+        try:
+            args = dict(tools.validate_tool_arguments(spec.schema, args))
+        except (TypeError, ValueError) as exc:
+            return tools.ToolExecutionResult(
+                False,
+                f"Error: invalid arguments: {redact_text(exc, 1_000)}",
+                error_code="invalid_arguments",
+            ), ()
+        applicability_error = tools.applicability_issue(call.name, args, self.workspace)
+        if applicability_error:
+            operation = f"Preflight found a missing prerequisite for {call.name.replace('_', ' ')}"
+            self._publish_visible_activity(
+                "tool.preflight_failed",
+                operation,
+                source_kind="HARNESS",
+                actor=actor,
+                phase="preflight",
+                state="blocked",
+                operation=applicability_error,
+                tool=call.name,
+                waiting_on="model",
+                detail=applicability_error,
+            )
+            return tools.ToolExecutionResult(
+                False,
+                "Error: tool preflight: " + applicability_error,
+                error_code="precondition",
+            ), ()
         risk = spec.risk
         normal_requirement = tools.requires_approval(call.name, args)
         needs_approval = (
             self.permission_adapter.requires_approval(normal_requirement)
             if self.permission_adapter is not None else normal_requirement
         )
-        if call.name == "open_path" or (call.name == "preview_html" and bool(args.get("open_browser", True))):
+        full_access = bool(
+            self.permission_adapter is not None
+            and str(getattr(self.permission_adapter.access_level, "value", "")).casefold()
+            == "full"
+        )
+        if (
+            call.name == "open_path"
+            or (
+                call.name in {"preview_html", "browser_open"}
+                and bool(args.get("open_browser", True))
+            )
+        ) and not full_access:
             needs_approval = True
         action_id = self.store.begin_session_action(
             self.session_id, call.name, redact_data(args), risk=risk,
             mutating=spec.mutates_workspace,
         )
+        target = str(
+            args.get("path")
+            or args.get("cwd")
+            or args.get("url")
+            or args.get("command")
+            or "the project"
+        ).strip()
+        verb = {
+            "list_files": "Listing project files",
+            "read_file": f"Reading {target}",
+            "grep": f"Searching project text for {target}",
+            "run_command": f"Running the project command · {target}",
+            "run_bash": f"Running the project command · {target}",
+            "install_dependencies": "Checking and installing declared dependencies",
+            "start_process": "Starting the project and waiting for readiness",
+            "poll_process": "Checking the running project",
+            "preview_html": "Opening and verifying the project preview",
+            "inspect_preview": "Inspecting the visible browser preview",
+            "browser_open": "Opening a Playwright-controlled browser",
+            "browser_inspect": "Inspecting the current browser page and controls",
+            "browser_act": "Interacting with the current browser page",
+            "browser_screenshot": "Capturing the current browser state",
+            "browser_close": "Closing the managed browser session",
+            "publish_output": "Publishing the final Output page",
+        }.get(call.name, f"Running {call.name} · {target}")
+        self._publish_visible_activity(
+            "tool.started",
+            verb,
+            source_kind="TOOL",
+            actor=actor,
+            phase="working",
+            state="active",
+            operation=verb,
+            tool=call.name,
+            action_id=action_id,
+            waiting_on="tool",
+        )
         self._record_semantic_action(
             semantic_turn_id,
             action_id,
+            tool_name=call.name,
             category=spec.category,
             mutating=spec.mutates_workspace,
             status="running",
+            args=args,
         )
-        self.events.publish("tool_call", call.name, args=redact_data(args), actor="chat", id=call.id)
+        self.events.publish("tool_call", call.name, args=redact_data(args), actor=actor, id=call.id)
         if needs_approval and not self._approval_allowed(call.name, dict(args), risk):
             result = tools.ToolExecutionResult(False, "Permission denied by the user.", error_code="permission")
             self.store.complete_session_action(action_id, result.output, status="denied")
             self._record_semantic_action(
                 semantic_turn_id,
                 action_id,
+                tool_name=call.name,
                 category=spec.category,
                 mutating=spec.mutates_workspace,
                 status="denied",
                 output=result.output,
+                args=args,
             )
             return result, ()
 
@@ -15606,7 +19339,12 @@ class AgentRuntime:
             else {}
         )
         try:
-            with tools.workspace_context(self.workspace):
+            with tools.workspace_context(
+                self.workspace,
+                session_id=self.session_id,
+                goal_id=semantic_turn_id or "action",
+                task_id=action_id,
+            ):
                 if call.name in {"run_bash", "run_command"} and self.permission_adapter is not None:
                     command = str(args.get("command", ""))
                     if (
@@ -15624,16 +19362,6 @@ class AgentRuntime:
                         ),
                     )
                     result = tools.ToolExecutionResult.from_output(detailed)
-                elif (
-                    call.name in {"start_process", "install_dependencies"}
-                    and self.permission_adapter is not None
-                    and self.permission_adapter.access_level.value == "full"
-                ):
-                    result = tools.ToolExecutionResult(
-                        False,
-                        f"Error: {call.name} cannot run as a persistent host action in Full Docker mode; use run_command inside Docker or switch to Normal.",
-                        error_code="sandbox",
-                    )
                 else:
                     result = tools.run_tool_detailed(call.name, args)
             if call.name in {"run_bash", "run_command"} and result.ok:
@@ -15657,12 +19385,36 @@ class AgentRuntime:
                     if incomplete:
                         result = tools.ToolExecutionResult(
                             False,
-                            "Error: HTML preview started but the requested browser open/verification capability was unavailable: "
+                            "Error: browser preview started but the requested browser open/verification capability was unavailable: "
                             + result.output,
                             error_code="browser_unavailable",
                         )
                 except (TypeError, json.JSONDecodeError):
-                    result = tools.ToolExecutionResult(False, "Error: preview_html returned malformed evidence", error_code="invalid_result")
+                    result = tools.ToolExecutionResult(False, f"Error: {call.name} returned malformed evidence", error_code="invalid_result")
+            if call.name == "browser_open" and result.ok:
+                try:
+                    browser_result = json.loads(result.output)
+                    if (
+                        browser_result.get("status") != "running"
+                        or not browser_result.get("browser_session_id")
+                        or (bool(args.get("visible", True)) and not browser_result.get("browser_opened"))
+                    ):
+                        result = tools.ToolExecutionResult(
+                            False,
+                            "Error: Playwright did not open the requested managed browser: " + result.output,
+                            error_code="browser_unavailable",
+                        )
+                except (TypeError, json.JSONDecodeError):
+                    result = tools.ToolExecutionResult(False, "Error: browser_open returned malformed evidence", error_code="invalid_result")
+            if call.name == "browser_screenshot" and result.ok:
+                try:
+                    capture = json.loads(result.output)
+                    screenshot_path = Path(str(capture.get("screenshot_path") or ""))
+                    screenshot_path.resolve(strict=True).relative_to(self.workspace)
+                    if not screenshot_path.is_file() or not str(capture.get("sha256") or ""):
+                        raise ValueError("missing screenshot evidence")
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    result = tools.ToolExecutionResult(False, "Error: browser_screenshot returned unverifiable evidence", error_code="invalid_result")
             if call.name == "start_process" and result.ok:
                 try:
                     process_result = json.loads(result.output)
@@ -15707,24 +19459,57 @@ class AgentRuntime:
         self._record_semantic_action(
             semantic_turn_id,
             action_id,
+            tool_name=call.name,
             category=spec.category,
             mutating=spec.mutates_workspace,
             status="completed" if result.ok else "failed",
             output=result.output,
             changed_paths=changed,
+            args=args,
+        )
+        if result.ok and call.name == "install_dependencies":
+            try:
+                dependency_receipt = json.loads(result.output)
+            except (TypeError, json.JSONDecodeError):
+                dependency_receipt = {}
+            if dependency_receipt.get("status") == "already_satisfied":
+                verb = "Verified declared dependencies are already installed"
+        completion = (
+            f"Completed · {verb}"
+            if result.ok
+            else f"Failed · {verb}"
+        )
+        self._publish_visible_activity(
+            "tool.completed" if result.ok else "tool.failed",
+            completion,
+            source_kind="TOOL",
+            actor=actor,
+            phase="working",
+            state="completed" if result.ok else "failed",
+            operation=completion,
+            tool=call.name,
+            action_id=action_id,
+            changed_paths=list(changed),
+            waiting_on="harness",
+            detail=redact_text(result.output, 1_000),
         )
         if result.ok and call.name in {
             "start_process", "poll_process", "stop_process",
             "preview_html", "inspect_preview", "stop_preview",
+            "browser_open", "browser_inspect", "browser_act", "browser_screenshot", "browser_close",
         }:
             try:
                 resource = json.loads(result.output)
-                resource_id = str(resource.get("process_id") or resource.get("preview_id") or "")
+                resource_id = str(resource.get("process_id") or resource.get("preview_id") or resource.get("browser_session_id") or "")
                 if resource_id:
                     self.store.save_managed_resource(
                         resource_id,
                         self.session_id,
-                        kind="preview" if resource_id.startswith("preview-") else "process",
+                        kind=(
+                            "browser" if resource_id.startswith("browser-")
+                            else "preview" if resource_id.startswith("preview-")
+                            else "process"
+                        ),
                         status=str(resource.get("status") or ("stopped" if resource.get("stopped") else "running")),
                         metadata=resource,
                     )
@@ -15736,9 +19521,19 @@ class AgentRuntime:
     def _chat_evidence(outputs: list[tuple[str, str]]) -> str:
         evidence: list[str] = []
         for name, output in outputs[-5:]:
-            if name == "preview_html":
+            if name in {
+                "preview_html", "browser_open", "browser_inspect",
+                "browser_act", "browser_screenshot",
+            }:
                 try:
                     payload = json.loads(output)
+                    if name == "browser_screenshot":
+                        evidence.append(
+                            f"screenshot {payload.get('workspace_path')} · sha256 "
+                            f"{str(payload.get('sha256') or '')[:12]} · "
+                            f"{payload.get('image_width')}x{payload.get('image_height')}"
+                        )
+                        continue
                     evidence.append(
                         f"preview {payload.get('url')} · HTTP {payload.get('http_status')} · "
                         f"verification {payload.get('verification')} · browser_opened={payload.get('browser_opened')}"
@@ -15749,11 +19544,32 @@ class AgentRuntime:
             evidence.append(f"{name}: {' '.join(output.split())[:240]}")
         return "\n".join(f"- {item}" for item in evidence)
 
+    @staticmethod
+    def _compact_action_capabilities(rows: Iterable[Mapping[str, Any]]) -> str:
+        """Keep weak-model corrections useful without replaying JSON schemas.
+
+        Native tool schemas are already sent through the provider's tool channel.
+        Repeating them in every corrective user message consumed the remaining
+        context and made small local models forget completed tool receipts.
+        """
+
+        result: list[str] = []
+        for row in rows:
+            if not bool(row.get("available", True)):
+                continue
+            name = str(row.get("name") or "").strip()
+            if not name:
+                continue
+            category = str(row.get("category") or "").strip()
+            description = " ".join(str(row.get("description") or "").split())[:180]
+            result.append(f"- {name} [{category}]: {description}")
+        return "\n".join(result)
+
     def chat(
         self,
         text: str,
         *,
-        steps: int = 12,
+        steps: int | None = None,
         _route_checked: bool = False,
         semantic_decision: SemanticTurnDecisionV2 | None = None,
         semantic_turn_id: str = "",
@@ -15772,6 +19588,15 @@ class AgentRuntime:
             raise RuntimeStateError("bounded Chat/Action requires an accepted semantic effect contract")
         if semantic_decision.route not in {RouteKind.CHAT, RouteKind.ACTION}:
             raise RuntimeStateError("Goal decisions cannot execute in the bounded Chat loop")
+        if steps is None:
+            # Action workflows contain deterministic early-stop gates, so a
+            # weak model receives the normal work quantum instead of an
+            # arbitrary 12-call cliff. Plain Chat stays tightly bounded.
+            steps = (
+                max(12, int(self.config.work_quantum_steps))
+                if semantic_decision.route is RouteKind.ACTION
+                else 12
+            )
         if not semantic_turn_id:
             user_message = {"role": "user", "content": prompt}
             self._chat_conversation.append(user_message)
@@ -15791,8 +19616,12 @@ class AgentRuntime:
 
         known_artifacts = self.store.list_chat_artifacts(self.session_id)
 
-        capability_rows = tools.capability_report()
-        capabilities = json.dumps(capability_rows, ensure_ascii=False)
+        base_allowed_names = tools.names(categories=semantic_decision.allowed_categories)
+        capability_rows = tuple(
+            row for row in tools.capability_report()
+            if str(row.get("name") or "") in base_allowed_names
+        )
+        capabilities = self._compact_action_capabilities(capability_rows)
         artifact_rows = [
             {
                 key: item.get(key)
@@ -15806,12 +19635,39 @@ class AgentRuntime:
             }
             for item in known_artifacts[-10:]
         ]
-        system = CHAT_SYSTEM_PROMPT + "\n\nRUNTIME CAPABILITIES:\n" + capabilities
+        system = CHAT_SYSTEM_PROMPT + "\n\nAVAILABLE RUNTIME TOOLS (schemas are attached separately):\n" + capabilities
         system += (
             "\n\nACCEPTED SEMANTIC EFFECT CONTRACT:\n"
             + json.dumps(semantic_decision.to_dict(), ensure_ascii=False, sort_keys=True)
             + "\nUse no tool category outside this contract. The final response must be model-authored and evidence-based."
         )
+        outcome_contract = ActionOutcomeContractV1.from_request(
+            prompt,
+            requested_effects=semantic_decision.requested_effects,
+        )
+        action_coordinator = ActionExecutionCoordinatorV1.build(
+            semantic_decision.requested_effects,
+            screenshot_count=outcome_contract.screenshot_count,
+            require_browser=outcome_contract.require_browser_open,
+            require_visual_review=outcome_contract.require_visual_inspection,
+            require_output=outcome_contract.require_output,
+        )
+        if semantic_decision.route is RouteKind.ACTION and outcome_contract.active:
+            system += (
+                "\n\nDETERMINISTIC ACTION OUTPUT CONTRACT:\n"
+                + json.dumps(
+                    {
+                        "screenshot_count": outcome_contract.screenshot_count,
+                        "require_browser_open": outcome_contract.require_browser_open,
+                        "require_visual_inspection": outcome_contract.require_visual_inspection,
+                        "require_output": outcome_contract.require_output,
+                        "require_copy": outcome_contract.require_copy,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\nThe harness will reject completion until each requested deliverable has tool evidence."
+            )
         if artifact_rows:
             system += (
                 "\n\nDURABLE CHAT ARTIFACTS:\n"
@@ -15822,7 +19678,22 @@ class AgentRuntime:
         changed_paths: list[str] = []
         successful_categories: list[str] = []
         successful_outputs: list[tuple[str, str]] = []
+        completed_read_fingerprints: set[str] = set()
         if semantic_turn_id:
+            with tools.workspace_context(
+                self.workspace,
+                session_id=self.session_id,
+                goal_id=semantic_turn_id or "action",
+                task_id="resource-recovery",
+            ):
+                active_process_ids = {
+                    str(item.get("process_id") or "")
+                    for item in tools.process_manager.list_processes()
+                }
+                active_browser_ids = {
+                    str(item.get("browser_session_id") or "")
+                    for item in tools.browser_session.list_sessions()
+                }
             pending_state = dict(
                 self.store.get_workflow_session(self.session_id).get("state", {}).get(
                     "pending_semantic_turn", {}
@@ -15831,23 +19702,135 @@ class AgentRuntime:
             for record in pending_state.get("action_records", ()):
                 if isinstance(record, Mapping) and record.get("status") == "completed":
                     successful_categories.append(str(record.get("category") or ""))
-                    successful_outputs.append((
-                        str(record.get("category") or "action"),
-                        str(record.get("output") or "completed"),
-                    ))
+                    restored_name = str(
+                        record.get("tool_name") or record.get("category") or "action"
+                    )
+                    restored_output = str(record.get("output") or "completed")
+                    restored_args = (
+                        dict(record.get("args") or {})
+                        if isinstance(record.get("args"), Mapping)
+                        else {}
+                    )
+                    try:
+                        restored_payload = json.loads(restored_output)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        restored_payload = {}
+                    if not isinstance(restored_payload, Mapping):
+                        restored_payload = {}
+                    # A process or Playwright session is owned by the live
+                    # Python runtime. Its old success receipt is useful audit
+                    # history but cannot prove liveness after an app restart.
+                    # Skip only ephemeral progress; screenshot files and other
+                    # durable artifacts remain valid when their bytes exist.
+                    if (
+                        restored_name == "start_process"
+                        and str(restored_payload.get("process_id") or "")
+                        not in active_process_ids
+                    ):
+                        continue
+                    if (
+                        restored_name in {"browser_open", "browser_inspect", "browser_act"}
+                        and str(restored_payload.get("browser_session_id") or "")
+                        not in active_browser_ids
+                    ):
+                        continue
+                    if restored_name == "browser_screenshot" and (
+                        str(restored_payload.get("browser_session_id") or "")
+                        not in active_browser_ids
+                    ):
+                        raw_path = str(
+                            restored_payload.get("screenshot_path")
+                            or restored_payload.get("workspace_path")
+                            or ""
+                        ).strip()
+                        candidate = Path(raw_path)
+                        if not candidate.is_absolute():
+                            candidate = self.workspace / candidate
+                        expected_digest = str(restored_payload.get("sha256") or "").casefold()
+                        try:
+                            valid_image = (
+                                candidate.is_file()
+                                and bool(expected_digest)
+                                and hashlib.sha256(candidate.read_bytes()).hexdigest().casefold()
+                                == expected_digest
+                            )
+                        except OSError:
+                            valid_image = False
+                        if not valid_image:
+                            continue
+                        # Sessions captured before perceptual receipts were
+                        # introduced only have sha256.  Backfill the visual
+                        # fingerprint from the already-validated bytes so a
+                        # resumed task cannot count old near-duplicates as
+                        # distinct screenshots.
+                        if not str(restored_payload.get("perceptual_hash") or ""):
+                            restored_payload = dict(restored_payload)
+                            restored_payload["perceptual_hash"] = (
+                                tools.browser_session.perceptual_hash(candidate)
+                            )
+                            restored_output = json.dumps(
+                                restored_payload,
+                                ensure_ascii=False,
+                            )
+                        successful_outputs.append((restored_name, restored_output))
+                        outcome_contract.restore_durable_screenshot(restored_output)
+                        action_coordinator.restore_durable_screenshot(restored_output)
+                        continue
+                    successful_outputs.append((restored_name, restored_output))
+                    outcome_contract.observe(restored_name, restored_output)
+                    action_coordinator.observe(
+                        restored_name,
+                        restored_args,
+                        restored_output,
+                        ok=True,
+                    )
+                    if restored_name in {"list_files", "read_file", "grep"}:
+                        completed_read_fingerprints.add(
+                            hashlib.sha256(
+                                json.dumps(
+                                    [restored_name, restored_args],
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    default=str,
+                                ).encode("utf-8")
+                            ).hexdigest()
+                        )
         failure_outputs: list[str] = []
         no_action_attempts = 0
         final_text = ""
+        terminal_action_failure = ""
+        actor = "execution" if semantic_decision.route is RouteKind.ACTION else "chat"
+        visible_workflow_phase = ""
 
         for step in range(1, max(1, steps) + 1):
-            allowed_names = tools.names(categories=semantic_decision.allowed_categories)
+            allowed_names = base_allowed_names
+            provider_system = system
+            if semantic_decision.route is RouteKind.ACTION and action_coordinator.active:
+                allowed_names = action_coordinator.permitted_tools(allowed_names)
+                directive = action_coordinator.directive()
+                provider_system += "\n\n" + directive
+                current_phase = action_coordinator.phase.value
+                if current_phase != visible_workflow_phase:
+                    visible_workflow_phase = current_phase
+                    next_operation = directive.split("Next required progress: ", 1)[-1].splitlines()[0]
+                    self._publish_visible_activity(
+                        "action.workflow_phase",
+                        f"Action workflow · {current_phase.replace('_', ' ').title()}",
+                        source_kind="HARNESS",
+                        actor="action-coordinator",
+                        phase=current_phase,
+                        state="active" if current_phase != "complete" else "completed",
+                        operation=next_operation,
+                        waiting_on="model" if current_phase != "complete" else "",
+                        workflow_phase=current_phase,
+                    )
             allowed_schemas = [schema for schema in tools.TOOL_SCHEMAS if _tool_name(schema) in allowed_names]
             try:
                 turn = self._call_provider(
                     self._chat_conversation,
                     allowed_schemas,
-                    system,
-                    actor="chat",
+                    provider_system,
+                    actor=actor,
                     step=step,
                     stream_text=False,
                 )
@@ -15878,11 +19861,111 @@ class AgentRuntime:
             self.store.append_chat_message(self.session_id, message)
 
             if turn.tool_calls:
+                new_progress = False
+                repeated_tools: list[str] = []
                 for call in turn.tool_calls:
-                    result, changed = self._execute_chat_tool(
-                        call, semantic_decision, semantic_turn_id
+                    tool_was_executed = False
+                    args_value = call.args if isinstance(call.args, dict) else {}
+                    rewrite_reason = ""
+                    if semantic_decision.route is RouteKind.ACTION and action_coordinator.active:
+                        args_value, rewrite_reason = action_coordinator.rewrite_call(
+                            call.name,
+                            args_value,
+                        )
+                        if rewrite_reason:
+                            call = ToolCall(
+                                id=call.id,
+                                name=call.name,
+                                args=args_value,
+                                native=call.native,
+                            )
+                            self._publish_visible_activity(
+                                "action.argument_repaired",
+                                f"Coordinator corrected {call.name.replace('_', ' ')} arguments",
+                                source_kind="HARNESS",
+                                actor="action-coordinator",
+                                phase=action_coordinator.phase.value,
+                                state="completed",
+                                operation=rewrite_reason,
+                                tool=call.name,
+                                waiting_on="model",
+                                detail=rewrite_reason,
+                            )
+                    call_fingerprint = hashlib.sha256(
+                        json.dumps(
+                            [call.name, args_value],
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    duplicate_read = (
+                        call.name in {"list_files", "read_file", "grep"}
+                        and call_fingerprint in completed_read_fingerprints
                     )
-                    executed += 1
+                    workflow_issue = (
+                        action_coordinator.validate_call(call.name, args_value)
+                        if semantic_decision.route is RouteKind.ACTION
+                        else ""
+                    )
+                    if (
+                        semantic_decision.route is RouteKind.ACTION
+                        and action_coordinator.active
+                        and call.name not in allowed_names
+                        and not workflow_issue
+                    ):
+                        workflow_issue = (
+                            f"{call.name} is not valid during the current "
+                            f"{action_coordinator.phase.value} phase"
+                        )
+                    if workflow_issue:
+                        result = tools.ToolExecutionResult(
+                            False,
+                            "Error: action workflow order: " + workflow_issue,
+                            error_code="workflow_order",
+                        )
+                        changed = ()
+                        self._publish_visible_activity(
+                            "action.workflow_order",
+                            "Action step rejected because a prerequisite is missing",
+                            source_kind="HARNESS",
+                            actor="action-coordinator",
+                            phase=action_coordinator.phase.value,
+                            state="blocked",
+                            operation=workflow_issue,
+                            waiting_on="model",
+                            tool=call.name,
+                        )
+                    elif duplicate_read:
+                        repeated_tools.append(call.name)
+                        result = tools.ToolExecutionResult(
+                            False,
+                            f"Error: no progress; the exact {call.name} request already completed in this turn",
+                            error_code="no_progress",
+                        )
+                        changed = ()
+                    else:
+                        tool_was_executed = True
+                        result, changed = self._execute_chat_tool(
+                            call, semantic_decision, semantic_turn_id
+                        )
+                        executed += 1
+                        if result.ok:
+                            new_progress = True
+                            if call.name in {"list_files", "read_file", "grep"}:
+                                completed_read_fingerprints.add(call_fingerprint)
+                    # Harness rejections are model-correction evidence, not
+                    # runtime failures.  Feeding them back as tool failures
+                    # widened START_RUNTIME to repository reads and let weak
+                    # models regress into list_files loops.  Only an actually
+                    # executed tool may change lifecycle state/diagnostics.
+                    if tool_was_executed:
+                        action_coordinator.observe(
+                            call.name,
+                            args_value,
+                            result.output,
+                            ok=result.ok,
+                        )
                     tool_message = {
                         "role": "tool",
                         "id": call.id,
@@ -15895,7 +19978,7 @@ class AgentRuntime:
                         "tool_result",
                         result.output,
                         tool=call.name,
-                        actor="chat",
+                        actor=actor,
                         id=call.id,
                     )
                     if result.ok:
@@ -15903,25 +19986,104 @@ class AgentRuntime:
                         if spec is not None:
                             successful_categories.append(spec.category)
                         successful_outputs.append((call.name, result.output))
+                        outcome_contract.observe(call.name, result.output)
                         changed_paths.extend(changed)
                     else:
                         failure_outputs.append(result.output)
+                        if (
+                            call.name == "inspect_images"
+                            and "vision evaluation unavailable" in result.output.casefold()
+                        ):
+                            terminal_action_failure = result.output.removeprefix("Error: ").strip()
+                if terminal_action_failure:
+                    final_text = (
+                        "Execution paused at the visual evidence gate.\n"
+                        f"Cause: {terminal_action_failure}\n"
+                        "The screenshots remain saved, but Output was not published because "
+                        "this model did not prove that it can read the image bytes. Select a "
+                        "verified vision-capable model, then continue the saved task with /resume."
+                    )
+                    self._publish_visible_activity(
+                        "action.vision_unavailable",
+                        "Visual verification is unavailable for the selected model",
+                        source_kind="HARNESS",
+                        actor="vision-gate",
+                        phase="visual_review",
+                        state="blocked",
+                        operation=terminal_action_failure,
+                        waiting_on="vision_model",
+                        resume_action="resume",
+                    )
+                    break
+                if new_progress:
+                    no_action_attempts = 0
+                else:
+                    no_action_attempts += 1
+                    if no_action_attempts >= self.config.no_action_limit:
+                        final_text = (
+                            "Execution stopped before the requested result was delivered.\n"
+                            "Cause: the model did not produce new evidence after targeted workflow corrections.\n"
+                            "No missing screenshot or Output attachment is being claimed as complete. "
+                            "The exact task is saved and can be continued with /resume."
+                        )
+                        break
+                    failure_detail = failure_outputs[-1] if failure_outputs else ""
+                    correction_message = {
+                        "role": "user",
+                        "content": (
+                            "HARNESS NO-PROGRESS GATE: The last attempt added no new evidence. "
+                            + (
+                                "Do not repeat " + ", ".join(dict.fromkeys(repeated_tools)) + ". "
+                                if repeated_tools else ""
+                            )
+                            + ("Last error: " + failure_detail[:1000] + "\n" if failure_detail else "")
+                            + action_coordinator.directive()
+                            + "\nAvailable capabilities:\n"
+                            + capabilities
+                        ),
+                    }
+                    self._chat_conversation.append(correction_message)
+                    self.store.append_chat_message(self.session_id, correction_message)
                 continue
 
-            missing = semantic_decision.missing_effects(successful_categories)
-            if missing:
+            missing_effects = semantic_decision.missing_effects(successful_categories)
+            missing_deliverables = (
+                outcome_contract.missing(include_output=False)
+                if semantic_decision.route is RouteKind.ACTION
+                else ()
+            )
+            if missing_effects or missing_deliverables:
                 no_action_attempts += 1
                 if no_action_attempts >= self.config.no_action_limit:
                     detail = (
                         failure_outputs[-1]
                         if failure_outputs
-                        else "the model repeatedly returned prose without using the available tools"
+                        else (
+                            "missing required output evidence: " + "; ".join(missing_deliverables)
+                            if missing_deliverables
+                            else "the model repeatedly returned prose without using the available tools"
+                        )
                     )
-                    final_text = f"Action could not be completed: {detail}"
+                    final_text = (
+                        "Execution stopped before the requested result was delivered.\n"
+                        f"Cause: {detail}\n"
+                        "No missing screenshot or Output attachment is being claimed as complete. "
+                        "The exact task is saved and can be continued with /resume."
+                    )
                     break
                 correction_message = {
                     "role": "user",
-                    "content": corrective_prompt(missing, capabilities),
+                    "content": (
+                        corrective_prompt(missing_effects, capabilities)
+                        if missing_effects
+                        else outcome_contract.corrective_prompt(capabilities)
+                    )
+                    + (
+                        "\n" + action_coordinator.directive()
+                        if semantic_decision.route is RouteKind.ACTION
+                        and action_coordinator.active
+                        else ""
+                    ),
                 }
                 self._chat_conversation.append(correction_message)
                 self.store.append_chat_message(self.session_id, correction_message)
@@ -15945,13 +20107,80 @@ class AgentRuntime:
             })
 
         if not final_text:
-            raise ProviderUnavailableError("bounded turn ended without a model-authored response or action receipt")
+            if successful_outputs:
+                # Real tool progress at the work-quantum boundary is resumable
+                # evidence, not a provider crash. The final-missing gate below
+                # records precisely which deliverables remain.
+                final_text = (
+                    "Execution reached its bounded work checkpoint after verified tool progress. "
+                    "The exact task remains open for the missing evidence."
+                )
+            else:
+                raise ProviderUnavailableError("bounded turn ended without a model-authored response or action receipt")
+        if (
+            semantic_decision.route is RouteKind.ACTION
+            and action_coordinator.limitation_note
+            and action_coordinator.limitation_note not in final_text
+        ):
+            final_text = final_text.rstrip() + "\n\n" + action_coordinator.limitation_note
         if successful_outputs and semantic_decision.route is RouteKind.ACTION and "Action receipt" not in final_text:
             final_text = (
                 final_text.rstrip()
                 + "\n\nEvidence:\n"
                 + self._chat_evidence(successful_outputs)
             )
+        if semantic_decision.route is RouteKind.ACTION:
+            pre_output_missing = (
+                *semantic_decision.missing_effects(successful_categories),
+                *outcome_contract.missing(include_output=False),
+            )
+            if not pre_output_missing:
+                final_text = self._sanitize_completed_action_text(final_text)
+                self._ensure_action_output(
+                    final_text,
+                    outcome_contract,
+                    title=str(getattr(semantic_decision, "session_title", "") or "Task output"),
+                )
+        final_missing = (
+            (
+                *semantic_decision.missing_effects(successful_categories),
+                *outcome_contract.missing(),
+            )
+            if semantic_decision.route is RouteKind.ACTION
+            else ()
+        )
+        action_incomplete = bool(final_missing)
+        if semantic_decision.route is RouteKind.ACTION:
+            if action_incomplete:
+                self._publish_visible_activity(
+                    "action.needs_evidence",
+                    "Execution paused because required deliverables are still missing",
+                    source_kind="HARNESS",
+                    actor="execution",
+                    phase="paused",
+                    state="blocked",
+                    operation="Checking requested deliverables",
+                    waiting_on="evidence",
+                    missing_deliverables=list(final_missing),
+                    resume_action="resume",
+                )
+            else:
+                self._publish_visible_activity(
+                    "action.delivered",
+                    "Requested action and deliverables completed with evidence",
+                    source_kind="HARNESS",
+                    actor="execution",
+                    phase="completed",
+                    state="completed",
+                    operation="Delivering the requested result",
+                    waiting_on="",
+                    screenshot_count=len(outcome_contract.output_images),
+                    output_id=outcome_contract.output_id,
+                )
+        if semantic_decision.route is RouteKind.ACTION and not action_incomplete and outcome_contract.active:
+            receipt = outcome_contract.handoff_receipt()
+            if receipt not in final_text:
+                final_text = final_text.rstrip() + "\n\nDelivery:\n" + receipt
 
         artifacts = list(dict.fromkeys(changed_paths))
         # Tool execution and semantic action receipts can advance the session
@@ -15974,7 +20203,11 @@ class AgentRuntime:
                         "state": state,
                         "goal_id": None,
                         "plan_state": PlanState.NONE.value,
-                        "run_state": RunState.IDLE.value,
+                        "run_state": (
+                            RunState.BLOCKED.value
+                            if action_incomplete
+                            else RunState.IDLE.value
+                        ),
                     },
                     expected_revision=int(latest.get("revision") or 0),
                 )
@@ -15982,6 +20215,22 @@ class AgentRuntime:
             except WorkflowSessionConflictError:
                 if _attempt == 1:
                     raise
+        if semantic_decision.route is RouteKind.ACTION:
+            return SliceResult(
+                "action_incomplete" if action_incomplete else "action_completed",
+                final_text,
+                executed,
+                completed=not action_incomplete,
+                limitations=tuple(str(item) for item in final_missing),
+                phase="paused" if action_incomplete else "completed",
+                reason=(
+                    "Required deliverables still lack evidence: " + "; ".join(final_missing)
+                    if action_incomplete
+                    else "All requested bounded-action effects and deliverables have evidence."
+                ),
+                waiting_on="evidence" if action_incomplete else "",
+                resume_action="resume" if action_incomplete else "",
+            )
         return SliceResult("chat", final_text, executed)
 
     def sleep_profile(self, action: str, mode: Any) -> Mapping[str, Any]:

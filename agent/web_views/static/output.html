@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Output · GA3BAD</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%23dca437'/%3E%3Cpath d='M8 9h16v3H11v8h10v-3h-5v-3h8v9H8z' fill='%23141311'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/output.css">
+</head>
+<body>
+  <a class="skip-link" href="#result">Skip to result</a>
+  <header class="output-bar">
+    <a class="output-brand" id="liveLink" href="#"><span>G3</span><strong>GA3BAD</strong></a>
+    <nav aria-label="Task pages">
+      <a id="liveNav" href="#">Live</a>
+      <span aria-current="page">Result</span>
+    </nav>
+    <div id="outputState" class="output-state"><i></i><span>Loading</span></div>
+  </header>
+
+  <main id="result" class="result-shell" aria-busy="true">
+    <header class="result-heading">
+      <div>
+        <span class="eyebrow">TASK RESULT</span>
+        <h1 id="outputTitle">Result</h1>
+        <p id="outputMeta">Preparing the final response.</p>
+      </div>
+      <button id="copyAll" class="copy-primary" type="button" disabled>Copy response</button>
+    </header>
+
+    <article id="messageSection" class="response" aria-labelledby="messageTitle">
+      <header class="response-author">
+        <span class="response-mark" aria-hidden="true">G3</span>
+        <div><h2 id="messageTitle">GA3BAD</h2><p>Final response</p></div>
+      </header>
+      <div id="message" class="message-copy"></div>
+      <details id="verificationDetails" class="verification-details hidden">
+        <summary>Verification details</summary>
+        <pre id="verificationText"></pre>
+      </details>
+    </article>
+
+    <section id="assetsSection" class="assets-section hidden" aria-labelledby="assetsTitle">
+      <header><span class="eyebrow">FILES &amp; IMAGES</span><h2 id="assetsTitle">Included with this response</h2></header>
+      <div id="assets"></div>
+    </section>
+
+    <section id="copySection" class="copy-section hidden" aria-labelledby="copyTitle">
+      <header><span class="eyebrow">COPY READY</span><h2 id="copyTitle">Ready to use</h2></header>
+      <div id="copyItems"></div>
+    </section>
+
+    <section id="emptyState" class="empty-state hidden" role="status">
+      <span>NO OUTPUT YET</span>
+      <h2>There is no completed response yet.</h2>
+      <p>Return to Live to follow the task. A result appears here only after its required evidence is complete.</p>
+      <a id="emptyLiveLink" href="#">Open Live</a>
+    </section>
+  </main>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/output.js" defer></script>
+</body>
+</html>

@@ -10,7 +10,9 @@ from typing import Any
 
 
 def registry_path() -> Path:
-    if os.name == "nt" and os.getenv("LOCALAPPDATA"):
+    if os.getenv("GA3BAD_STATE_HOME"):
+        root = Path(os.environ["GA3BAD_STATE_HOME"])
+    elif os.name == "nt" and os.getenv("LOCALAPPDATA"):
         root = Path(os.environ["LOCALAPPDATA"]) / "GA3BAD"
     elif os.getenv("XDG_STATE_HOME"):
         root = Path(os.environ["XDG_STATE_HOME"]) / "ga3bad"
@@ -41,7 +43,13 @@ def list_recent_workspaces(*, limit: int = 12) -> tuple[dict[str, Any], ...]:
                 "available": candidate.is_dir(),
             }
         )
-    result.sort(key=lambda value: value["last_opened"], reverse=True)
+    # Missing folders must not consume the visible recent-workspace limit.
+    result.sort(
+        key=lambda value: (
+            not bool(value["available"]),
+            -float(value["last_opened"]),
+        )
+    )
     return tuple(result[: max(1, int(limit))])
 
 

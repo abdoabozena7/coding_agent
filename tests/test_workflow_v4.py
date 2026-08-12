@@ -6,6 +6,7 @@ from pathlib import Path
 from agent import tools
 from agent.config import InteractionMode, SessionPreferences
 from agent.models import GoalStatus
+from agent.orchestration import FIXED_SPECIALIST_REVIEW_ORDER
 from agent.quality import (
     ChangeSetStatus,
     ChangeSetV1,
@@ -96,6 +97,24 @@ def passing_plan_review():
             "args": {"verdict": "pass", "summary": "The plan is scoped and verifiable.", "issues": []},
         }]
     }
+
+
+def fixed_specialist_review_passes(*task_ids: str):
+    return [
+        {
+            "tool_calls": [{
+                "id": f"review-{role.value}",
+                "name": "submit_review",
+                "args": {
+                    "verdict": "pass",
+                    "summary": f"{role.value} requirements and evidence are present",
+                    "issues": [],
+                    "checked_task_ids": list(task_ids),
+                },
+            }]
+        }
+        for role in FIXED_SPECIALIST_REVIEW_ORDER
+    ]
 
 
 def blocking_plan_review(summary: str):
@@ -495,7 +514,7 @@ class PlanHarnessV4Tests(unittest.TestCase):
                         {"id": "done", "name": "update_task", "args": {"task_id": "T001", "status": "done", "note": "file read back", "evidence": ["index.html exists and was read by the workspace tool"]}},
                     ]},
                     {"tool_calls": [{"id": "finish", "name": "finish_goal", "args": {"summary": "Page created and verified", "evidence": ["index.html tool evidence"]}}]},
-                    {"tool_calls": [{"id": "review", "name": "submit_review", "args": {"verdict": "pass", "summary": "Required file and evidence are present", "issues": [], "checked_task_ids": ["T001"]}}]},
+                    *fixed_specialist_review_passes("T001"),
                 ]
             )
             try:
@@ -676,7 +695,7 @@ class PersistenceV4Tests(unittest.TestCase):
             self.assertEqual(migrated.get_goal(goal_id).objective, "Quality test")
             check = sqlite3.connect(database)
             try:
-                self.assertEqual(check.execute("PRAGMA user_version").fetchone()[0], 16)
+                self.assertEqual(check.execute("PRAGMA user_version").fetchone()[0], 17)
             finally:
                 check.close()
             migrated._migrate_v4()

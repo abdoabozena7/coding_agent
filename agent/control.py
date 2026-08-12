@@ -205,6 +205,7 @@ SEMANTIC_GOAL_SCHEMA: dict[str, Any] = {
                     "network", "external", "read_file", "list_files", "grep",
                     "write_file", "edit_file", "apply_patch",
                     "materialize_artifact", "run_bash", "run_command",
+                    "inspect_images",
                     "start_process", "preview_html", "inspect_preview",
                 ],
             },
@@ -461,6 +462,18 @@ DELEGATE_TASK = _fn(
                 "type": "array", "minItems": 1, "maxItems": 12,
                 "items": {"type": "string", "minLength": 1, "maxLength": 64},
             },
+            "worker_role": {
+                "type": "string",
+                "enum": ["predictor", "falsifier", "challenger", "selector", "repairer", "reviewer"],
+            },
+            "falsification_targets": {
+                "type": "array", "maxItems": 3,
+                "items": {"type": "string", "minLength": 3, "maxLength": 1_000},
+            },
+            "context_refs": {
+                "type": "array", "maxItems": 40,
+                "items": {"type": "string", "minLength": 1, "maxLength": 500},
+            },
         },
         "required": ["task_id", "role", "task", "success_criteria", "context", "allowed_tools"],
         "additionalProperties": False,
@@ -555,6 +568,71 @@ RETURN_WORK = _fn(
             "proposed_subtasks": {
                 "type": "array", "maxItems": 20,
                 "items": {"type": "string", "minLength": 3, "maxLength": 1_000},
+            },
+            "claims": {
+                "type": "array", "maxItems": 20,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "criterion_id": {"type": "string", "minLength": 1, "maxLength": 200},
+                        "claim": {"type": "string", "minLength": 3, "maxLength": 2_000},
+                        "evidence_refs": {
+                            "type": "array", "maxItems": 20,
+                            "items": {"type": "string", "minLength": 1, "maxLength": 1_000},
+                        },
+                        "falsification_check": {"type": "string", "minLength": 3, "maxLength": 2_000},
+                    },
+                    "required": ["criterion_id", "claim", "evidence_refs", "falsification_check"],
+                    "additionalProperties": False,
+                },
+            },
+            "verified_findings": {"type": "integer", "minimum": 0, "maximum": 100},
+            "false_findings": {"type": "integer", "minimum": 0, "maximum": 100},
+            "accepted_fixes": {"type": "integer", "minimum": 0, "maximum": 100},
+            "staged_candidate": {
+                "type": "object",
+                "properties": {
+                    "approach_summary": {"type": "string", "minLength": 3, "maxLength": 2_000},
+                    "files": {
+                        "type": "array", "minItems": 1, "maxItems": 50,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "minLength": 1, "maxLength": 1_000},
+                                "content": {"type": "string", "maxLength": 1_000_000},
+                            },
+                            "required": ["path", "content"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["approach_summary", "files"],
+                "additionalProperties": False,
+            },
+            "predicted_failures": {
+                "type": "array", "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "hypothesis": {"type": "string", "minLength": 3, "maxLength": 1_000},
+                        "separating_check": {"type": "string", "minLength": 3, "maxLength": 1_000},
+                    },
+                    "required": ["hypothesis", "separating_check"],
+                    "additionalProperties": False,
+                },
+            },
+            "selection": {
+                "type": "object",
+                "properties": {
+                    "candidate_ref": {"type": "string", "minLength": 1, "maxLength": 1_000},
+                    "evidence_refs": {
+                        "type": "array", "minItems": 1, "maxItems": 20,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 1_000},
+                    },
+                    "reason": {"type": "string", "minLength": 3, "maxLength": 2_000},
+                },
+                "required": ["candidate_ref", "evidence_refs", "reason"],
+                "additionalProperties": False,
             },
         },
         "required": ["outcome", "summary", "evidence", "changed_paths", "remaining_risks", "proposed_subtasks"],
