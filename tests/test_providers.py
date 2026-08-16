@@ -617,6 +617,29 @@ class OllamaProviderTests(unittest.TestCase):
             provider.call([], [], "system")
         self.assertEqual(raised.exception.diagnostic.kind, ProviderFailureKind.MALFORMED_STREAM)
 
+    def test_empty_non_tool_response_is_typed_but_tool_stage_can_repair_it(self):
+        empty = b'{"message":{"content":""},"done":true}\n'
+        provider = OllamaProvider(model="offline")
+        provider.capability_profile = __import__(
+            "agent.local_provider", fromlist=["ModelCapabilityProfile"]
+        ).ModelCapabilityProfile(
+            "offline", tool_call_support=True, health_status="reachable"
+        )
+        provider._post_json = Mock(return_value=io.BytesIO(empty))
+
+        with self.assertRaises(ProviderRequestError) as raised:
+            provider.call([], [], "system")
+        self.assertEqual(
+            raised.exception.diagnostic.kind, ProviderFailureKind.EMPTY_RESPONSE
+        )
+
+        provider._post_json = Mock(return_value=io.BytesIO(empty))
+        turn = provider.call(
+            [], [{"type": "function", "function": {"name": "submit"}}], "system"
+        )
+        self.assertIsNone(turn.text)
+        self.assertEqual(turn.tool_calls, [])
+
     def test_thinking_tool_name_and_bad_ndjson_are_robust(self):
         lines = [
             b"not-json\n",

@@ -666,8 +666,15 @@ class ArchitectureSpecV1:
     version: int = 1
 
     def __post_init__(self) -> None:
-        if not self.summary.strip() or not self.components:
-            raise AgentProtocolError("ArchitectureSpecV1 requires a summary and components")
+        missing = []
+        if not self.summary.strip():
+            missing.append("summary")
+        if not self.components:
+            missing.append("components (a non-empty array of objects)")
+        if missing:
+            raise AgentProtocolError(
+                "ArchitectureSpecV1 is missing required fields: " + ", ".join(missing)
+            )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ArchitectureSpecV1":
@@ -2280,6 +2287,34 @@ class UltraOrchestrator:
         if isinstance(nested, Mapping):
             normalized = dict(nested)
             actions.append(f"{phase} envelope unwrapped")
+        if phase == "architecture":
+            # Preserve model-authored architecture semantics while accepting
+            # common transport-only envelope/field aliases. No component or
+            # decision is invented by the harness.
+            for envelope in ("architecture_spec", "design"):
+                nested_architecture = normalized.get(envelope)
+                if isinstance(nested_architecture, Mapping):
+                    normalized = dict(nested_architecture)
+                    actions.append(f"architecture {envelope} envelope unwrapped")
+                    break
+            if not str(normalized.get("summary") or "").strip():
+                for alias in ("overview", "description"):
+                    if str(normalized.get(alias) or "").strip():
+                        normalized["summary"] = normalized[alias]
+                        actions.append(f"architecture.{alias} normalized to summary")
+                        break
+            if not normalized.get("components"):
+                for alias in ("modules", "services"):
+                    raw_alias = normalized.get(alias)
+                    if isinstance(raw_alias, Sequence) and not isinstance(
+                        raw_alias, (str, bytes)
+                    ):
+                        normalized["components"] = list(raw_alias)
+                        actions.append(f"architecture.{alias} normalized to components")
+                        break
+            if isinstance(normalized.get("components"), Mapping):
+                normalized["components"] = [dict(normalized["components"])]
+                actions.append("architecture.components object normalized to array")
         # Transport-only collection drift is mechanically reversible. Keep
         # each model-authored item unchanged while restoring the typed array
         # envelope expected by lifecycle validation.

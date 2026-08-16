@@ -181,6 +181,7 @@ from .local_provider import (
     ProviderFailureKind,
     ProviderRequestError,
 )
+from .model_status import classify_model_failure, model_status_for
 from .ultra_models import normalize_contract_path
 
 try:
@@ -372,6 +373,7 @@ class WorkflowRuntimeSnapshotV1:
     retry_at: float | None = None
     failure_kind: str = ""
     local_adaptation_policy: dict[str, Any] = field(default_factory=dict)
+    model_status: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -419,6 +421,7 @@ class WorkflowRuntimeSnapshotV1:
             "retry_at": self.retry_at,
             "failure_kind": self.failure_kind,
             "local_adaptation_policy": dict(self.local_adaptation_policy),
+            "model_status": dict(self.model_status),
         }
 
 
@@ -540,6 +543,7 @@ class AgentRuntime:
             "started_at": None,
             "last_signal_at": None,
         }
+        self._model_status = model_status_for(provider, model_descriptor)
         try:
             provider_parameters = inspect.signature(self.provider.call).parameters.values()
             self._provider_accepts_activity = any(
@@ -641,7 +645,7 @@ class AgentRuntime:
             except (OSError, UnicodeError, ValueError) as exc:
                 self.repository_index_warmup_error = f"{type(exc).__name__}: {exc}"
         try:
-            self.store.get_workflow_session(self.session_id)
+            existing_session = self.store.get_workflow_session(self.session_id)
         except NotFoundError:
             self.store.save_workflow_session(
                 self.session_id,
@@ -656,6 +660,12 @@ class AgentRuntime:
                 },
             )
         else:
+            prior_model_status = dict(
+                existing_session.get("state", {}).get("model_status") or {}
+            )
+            self._model_status = model_status_for(
+                self.provider, self.model_descriptor, prior_model_status
+            )
             # A second process may open the same session for a read-only
             # command while the real worker is blocked in a model/tool call.
             # It must not overwrite the worker identity or run crash recovery.
@@ -670,6 +680,9 @@ class AgentRuntime:
         tools.register_vision_evaluator(self.workspace, self._evaluate_images_with_provider)
         tools.register_output_publisher(self.workspace, self._publish_output_tool)
         tools.configure_workspace(self.workspace)
+        self._model_lifecycle_unsubscribe = self.events.subscribe(
+            self._on_model_lifecycle_event
+        )
 
         active_policy_goal = self.store.load_active_goal(self.session_id)
         if active_policy_goal is not None:
@@ -908,6 +921,98 @@ class AgentRuntime:
     def reasoning_effort(self) -> str:
         return str(getattr(self.provider, "reasoning_effort", "medium"))
 
+    def model_status_snapshot(self) -> dict[str, Any]:
+        """Return lifecycle facts without treating selection as execution."""
+
+        return dict(self._model_status)
+
+    def _on_model_lifecycle_event(self, event: Any) -> None:
+        """Project validated Ultra responses into the shared model lifecycle."""
+
+        kind = str(getattr(event, "kind", "") or "")
+        data = dict(getattr(event, "data", {}) or {})
+        stage = str(data.get("phase") or data.get("actor") or "ultra")
+        if kind == "ultra.agent":
+            self._record_model_status(
+                response_status="passed",
+                contract_status="verified",
+                contract_stage=stage,
+                failure_kind="",
+                last_error="",
+            )
+        elif kind == "ultra.typed_return_rejected":
+            self._record_model_status(
+                response_status="passed",
+                contract_status="failed",
+                contract_stage=stage,
+                failure_kind="typed_return_failed",
+                last_error=str(
+                    getattr(event, "message", "") or "typed return rejected"
+                ),
+            )
+
+    def _record_model_status(self, **updates: Any) -> None:
+        status = model_status_for(
+            self.provider, self.model_descriptor, self._model_status
+        )
+        status.update(
+            {
+                key: redact_text(value, 1_000) if key == "last_error" else value
+                for key, value in updates.items()
+            }
+        )
+        self._model_status = status
+        try:
+            self._persist_runtime_snapshot()
+        except (NotFoundError, StateStoreError, WorkflowSessionConflictError):
+            # Diagnostics must not mask the original model failure while a
+            # concurrent UI read is recreating a missing session envelope.
+            pass
+
+    def record_model_contract_status(
+        self,
+        stage: str,
+        *,
+        verified: bool,
+        error: str = "",
+        failure_kind: str = "",
+    ) -> None:
+        """Persist stage-specific model contract evidence."""
+
+        self._record_model_status(
+            contract_status="verified" if verified else "failed",
+            contract_stage=str(stage or ""),
+            failure_kind="" if verified else str(
+                failure_kind or "typed_return_failed"
+            ),
+            last_error="" if verified else str(
+                error or "model response contract failed"
+            ),
+        )
+
+    def record_model_failure(
+        self,
+        error: BaseException,
+        *,
+        stage: str = "",
+        pending_semantic: Mapping[str, Any] | None = None,
+        probe: bool = False,
+    ) -> None:
+        diagnosis = classify_model_failure(error, pending_semantic)
+        updates: dict[str, Any] = {
+            "failure_kind": diagnosis.category.value,
+            "last_error": diagnosis.message,
+            "probe_status" if probe else "response_status": "failed",
+        }
+        if diagnosis.category.value == "model_not_installed":
+            updates["inventory_status"] = "missing"
+        if not diagnosis.provider_boundary:
+            updates.update(
+                contract_status="failed",
+                contract_stage=str(stage or diagnosis.stage or ""),
+            )
+        self._record_model_status(**updates)
+
     def model_capability_envelope(self) -> ModelCapabilityEnvelopeV1:
         """Return the metadata-only capability snapshot used for new work."""
 
@@ -1023,6 +1128,7 @@ class AgentRuntime:
         )
         return {
             "model_snapshot": descriptor,
+            "model_status": self.model_status_snapshot(),
             "model_capability_envelope": self.model_capability_envelope().to_dict(),
             "local_adaptation_policy": self.local_adaptation_policy(),
             "reasoning_effort": self.reasoning_effort,
@@ -2172,6 +2278,7 @@ class AgentRuntime:
             retry_at=retry_at,
             failure_kind=failure_kind,
             local_adaptation_policy=local_policy,
+            model_status=dict(state.get("model_status") or self._model_status),
         )
 
     # Short alias for API consumers that use the “runtime snapshot” wording.
@@ -2483,6 +2590,10 @@ class AgentRuntime:
                 )
         self.provider = provider
         self.model_descriptor = descriptor
+        # The selected adapter may already have passed a transactional
+        # inventory/capability preflight. It has not yet answered or satisfied
+        # a GA3BAD stage, so response and contract evidence start clean.
+        self._model_status = model_status_for(provider, descriptor)
         # A model switch is a durable attempt boundary.  Update the pending
         # semantic turn in the same transaction path as all other workflow
         # state so a stale provider/capability envelope cannot survive into
@@ -4475,6 +4586,10 @@ class AgentRuntime:
             self._closed = True
         if self.ultra_session is not None:
             self.ultra_session.close()
+        unsubscribe = getattr(self, "_model_lifecycle_unsubscribe", None)
+        if callable(unsubscribe):
+            unsubscribe()
+            self._model_lifecycle_unsubscribe = None
         try:
             session = self.store.get_workflow_session(self.session_id)
             lease = dict((session.get("state") or {}).get("execution_lease") or {})
@@ -5793,6 +5908,7 @@ class AgentRuntime:
         actor: str,
         step: int,
         stream_text: bool = True,
+        require_tool_call: bool = False,
         normalization_context: Mapping[str, Any] | None = None,
         provider_checkpoint: Mapping[str, Any] | None = None,
     ) -> AssistantTurn:
@@ -5880,7 +5996,17 @@ class AgentRuntime:
             )
         ensure_capabilities = getattr(self.provider, "_ensure_capabilities", None)
         if callable(ensure_capabilities):
-            ensure_capabilities()
+            try:
+                ensure_capabilities()
+            except Exception as exc:
+                self.record_model_failure(exc, stage=actor, probe=True)
+                raise
+            self._record_model_status(
+                inventory_status="discovered",
+                probe_status="passed",
+                failure_kind="",
+                last_error="",
+            )
         capability_profile = getattr(self.provider, "capability_profile", None)
         native_tools = bool(getattr(capability_profile, "tool_call_support", True))
         if current_goal is not None and capability_profile is not None:
@@ -5920,23 +6046,23 @@ class AgentRuntime:
         provider_schemas: Sequence[dict[str, Any]] = (
             () if use_json_action_adapter else schemas
         )
-        if use_json_action_adapter:
-            names = [_tool_name(schema) for schema in schemas if _tool_name(schema)]
-            compact_contracts = [
-                {
-                    "name": _tool_name(schema),
-                    "parameters": dict(schema.get("function", {}).get("parameters", {})),
-                }
-                for schema in schemas
-                if _tool_name(schema)
-            ]
-            system = (
-                system
-                + "\n\nNATIVE TOOL TRANSPORT IS DISABLED FOR THIS STAGE. "
-                + "Make exactly one bounded action proposal as "
-                + '{"name":"AVAILABLE_NAME","args":{...}} with no lifecycle IDs. '
-                + f"Available names: {', '.join(names)}. The harness validates and executes it.\n"
-                + "Use this exact compact action contract:\n"
+        names = [_tool_name(schema) for schema in schemas if _tool_name(schema)]
+        compact_contracts = [
+            {
+                "name": _tool_name(schema),
+                "parameters": dict(schema.get("function", {}).get("parameters", {})),
+            }
+            for schema in schemas
+            if _tool_name(schema)
+        ]
+
+        def json_action_contract() -> str:
+            return (
+                "\n\nNATIVE TOOL TRANSPORT IS DISABLED FOR THIS STAGE. "
+                "Make exactly one bounded action proposal as "
+                '{"name":"AVAILABLE_NAME","args":{...}} with no lifecycle IDs. '
+                f"Available names: {', '.join(names)}. The harness validates and executes it.\n"
+                "Use this exact compact action contract:\n"
                 + redact_text(
                     json.dumps(
                         compact_contracts,
@@ -5946,6 +6072,9 @@ class AgentRuntime:
                     40_000,
                 )
             )
+
+        if use_json_action_adapter:
+            system = system + json_action_contract()
             if current_goal is not None:
                 self.store.append_event(
                     "provider.request_adapter_selected", goal_id=current_goal.id,
@@ -6107,10 +6236,13 @@ class AgentRuntime:
                                 ),
                                 payload={"actor": actor, **receipt},
                             )
+                    missing_required_call = bool(
+                        require_tool_call and schemas and not turn.tool_calls
+                    )
                     incomplete_contract_repair = bool(
-                        contract_repairs
-                        and schemas
+                        schemas
                         and not turn.tool_calls
+                        and (contract_repairs or missing_required_call)
                     )
                     if not invalid_names and not incomplete_contract_repair:
                         break
@@ -6152,6 +6284,13 @@ class AgentRuntime:
                         turn.text = None
                         turn.native = {**dict(turn.native or {}), "tool_contract_error": contract_error}
                         break
+                    if missing_required_call and not use_json_action_adapter:
+                        # Ollama models can advertise tools yet return an empty
+                        # native-tool turn. Retry this exact governed stage once
+                        # through the already validated JSON action adapter.
+                        use_json_action_adapter = True
+                        provider_schemas = ()
+                        system = system + json_action_contract()
                     provider_conversation.append(turn.to_message())
                     provider_conversation.append(
                         {
@@ -6209,6 +6348,11 @@ class AgentRuntime:
                     },
                 )
                 self._emit_usage(turn)
+                self._record_model_status(
+                    response_status="passed",
+                    failure_kind="",
+                    last_error="",
+                )
                 return turn
             except (KeyboardInterrupt, SystemExit):
                 raise
@@ -6305,6 +6449,16 @@ class AgentRuntime:
                 if delay:
                     self.sleeper(delay)
         assert last_error is not None
+        diagnosis = classify_model_failure(last_error)
+        if diagnosis.category.value in {
+            "empty_response",
+            "tool_contract_failed",
+            "typed_return_failed",
+            "capability_mismatch",
+            "invalid_request",
+        }:
+            self.record_model_failure(last_error, stage=actor)
+            raise last_error
         boundary_prefix = (
             "Local model runner unavailable (provider unavailable); saved stage unchanged: "
             if self.execution_class == "local"
@@ -7990,6 +8144,7 @@ class AgentRuntime:
                     actor="semantic-router",
                     step=step,
                     stream_text=False,
+                    require_tool_call=True,
                     normalization_context={"exact_latest_user_input": original},
                 )
             except ProviderUnavailableError as exc:
@@ -8024,6 +8179,12 @@ class AgentRuntime:
             elif not isinstance(turn.tool_calls[0].args, Mapping):
                 structural_error = "submit_semantic_turn arguments must be an object"
             if structural_error:
+                self.record_model_contract_status(
+                    "route",
+                    verified=False,
+                    error=structural_error,
+                    failure_kind="tool_contract_failed",
+                )
                 schema_repairs += 1
                 pending.update({
                     "schema_attempts": schema_repairs,
@@ -8166,6 +8327,7 @@ class AgentRuntime:
                 conversation = fresh_repair_conversation("semantic", message)
                 step += 1
                 continue
+            self.record_model_contract_status("route", verified=True)
             raw_intake = route_payload.get("goal_intake")
             pending.update({
                 "status": "routed",
@@ -8352,6 +8514,7 @@ class AgentRuntime:
                         actor="semantic-goal-intake",
                         step=step,
                         stream_text=False,
+                        require_tool_call=True,
                     )
                 except ProviderUnavailableError as exc:
                     pending.update({

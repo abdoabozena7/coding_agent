@@ -178,10 +178,12 @@
     const badge = $("stateBadge");
     badge.textContent = overview.state || "EMPTY";
     badge.dataset.state = String(overview.state || "empty").toLowerCase();
+    const modelStatus = overview.model_status || {};
+    const lifecycle = `probe ${modelStatus.probe_status || "unknown"} · response ${modelStatus.response_status || "not run"} · contract ${modelStatus.contract_status || "not run"}`;
     $("runLabel").textContent = overview.goal_id
-      ? `${overview.provider || "provider"}/${overview.model || "model"} · ${overview.status || "recorded"} · ${String(overview.goal_id).slice(-8)}`
+      ? `${overview.provider || "provider"}/${overview.model || "model"} · ${overview.status || "recorded"} · ${lifecycle} · ${String(overview.goal_id).slice(-8)}`
       : overview.state === "LIVE"
-        ? `${overview.provider || "provider"}/${overview.model || "model"} · bounded workspace activity`
+        ? `${overview.provider || "provider"}/${overview.model || "model"} · ${lifecycle}`
         : "No durable activity is available yet";
     const counts = overview.counts || {};
     $("countOverview").textContent = "1";

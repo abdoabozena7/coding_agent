@@ -21,6 +21,7 @@ from ..models import (
     validate_task_dag,
 )
 from ..model_catalog import ExecutionClass, ModelCatalog
+from ..model_status import preflight_model_selection
 from ..quality import ChangeSetStatus
 from ..store import NotFoundError, StalePlanError
 from ..ultra_models import AgentRunStatus, WorkNodeStatus
@@ -100,17 +101,24 @@ def _public_workflow_reason(
             "The model's routing response could not be validated. "
             "The saved request is ready for a targeted retry."
         )
-    if kind in {"contract", "schema", "semantic"}:
+    if kind in {
+        "contract",
+        "schema",
+        "semantic",
+        "tool_contract_failed",
+        "typed_return_failed",
+        "empty_response",
+    }:
         return (
             "The model response needs a small repair before the workflow can continue. "
             "The saved request is ready for a targeted retry."
         )
     if not text:
-        if kind == "quota":
+        if kind in {"quota", "quota_exceeded"}:
             return "The provider limit was reached. The saved request is ready to retry or switch models."
-        if kind == "rate_limit":
+        if kind in {"rate_limit", "rate_limited"}:
             return "The provider asked us to wait. The saved request is ready to retry later."
-        if kind == "transport" and local:
+        if kind in {"transport", "transport_failed", "runner_unreachable"} and local:
             return "The local model runner is unavailable. The saved request is preserved."
         return "The saved request is ready for recovery."
     return text
@@ -1194,6 +1202,31 @@ class CoreWebAdapter:
                     **item.to_dict(),
                     "display_name": item.display_name,
                     "selected": item.id == current_id,
+                    "status": {
+                        "selection_status": (
+                            "selected" if item.id == current_id else "available"
+                        ),
+                        "inventory_status": (
+                            "discovered" if item.source == "ollama" else "configured"
+                        ),
+                        "probe_status": (
+                            "passed" if item.source == "ollama" else "not_run"
+                        ),
+                        "response_status": (
+                            self.runtime.model_status_snapshot().get(
+                                "response_status", "not_run"
+                            )
+                            if item.id == current_id
+                            else "not_run"
+                        ),
+                        "contract_status": (
+                            self.runtime.model_status_snapshot().get(
+                                "contract_status", "not_run"
+                            )
+                            if item.id == current_id
+                            else "not_run"
+                        ),
+                    },
                 }
                 for item in models
             ],
@@ -1217,6 +1250,13 @@ class CoreWebAdapter:
                 "execution_class": self.runtime.execution_class,
             }
         )
+        model = {
+            **model,
+            "status": dict(
+                state.get("model_status")
+                or self.runtime.model_status_snapshot()
+            ),
+        }
         manager = GitProtectionManager(self.runtime.workspace)
         config = manager.load_config()
         try:
@@ -1338,8 +1378,16 @@ class CoreWebAdapter:
                 raise ValueError("That model is no longer available. Refresh the model list.")
             provider = descriptor.create_provider()
             setattr(provider, "reasoning_effort", self.runtime.reasoning_effort)
+            preflight_model_selection(provider, descriptor)
             self.runtime.replace_provider(provider, descriptor)
-            action_message = f"Model changed to {descriptor.provider}/{descriptor.model}."
+            verification = (
+                "inventory and capabilities verified, first response not yet tested"
+                if descriptor.provider == "ollama"
+                else "selected, first response not yet tested"
+            )
+            action_message = (
+                f"Model changed to {descriptor.provider}/{descriptor.model}; {verification}."
+            )
         elif action == "reconfigure_protection":
             provider_name = str(request.value or request.target_id or "").strip().casefold()
             if provider_name not in {"github", "local_git", "snapshot"}:
@@ -1441,6 +1489,11 @@ class CoreWebAdapter:
                 ):
                     continue
                 provider = descriptor.create_provider()
+                try:
+                    preflight_model_selection(provider, descriptor)
+                except Exception as exc:
+                    catalog._diagnose(f"ollama:{descriptor.model}", exc)
+                    continue
                 envelope = self.runtime._capability_envelope_for(provider, descriptor)
                 score = (
                     envelope.level,

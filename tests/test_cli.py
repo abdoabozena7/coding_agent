@@ -1094,7 +1094,7 @@ class CLITests(unittest.TestCase):
         answer.assert_called_once()
         transcript = captured["store"].snapshot().transcript
         self.assertTrue(
-            any("Local model stopped unexpectedly" in item.text for item in transcript)
+            any("Local model could not load" in item.text for item in transcript)
         )
         self.assertNotIn("local", captured["recovery_options"])
         self.assertIn("model", captured["recovery_options"])

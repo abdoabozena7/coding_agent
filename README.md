@@ -93,8 +93,10 @@ python -m agent
 The interactive terminal opens on the original animated full-screen `GA3BAD` welcome. Press
 Enter, then review the five explicit setup decisions: workspace, project protection,
 model, permissions, and workflow mode. Back returns to the previous decision. Ollama
-models are probed during discovery; configured cloud credentials are clearly labeled
-as unverified until their first request.
+models are probed during discovery and again before a model switch is committed;
+configured cloud credentials are clearly labeled as unverified until their first
+request. Selection, inventory discovery, capability probing, a successful response,
+and a valid GA3BAD stage contract are reported as separate lifecycle facts.
 
 After setup, there is one calm, persistent workspace rather than a sequence of
 screens. It always shows the conversation, a fixed project-progress area, one
@@ -442,6 +444,14 @@ usage, IDs, malformed arguments, and provider-native replay metadata. Gemini
 thought signatures/function IDs and Ollama thinking/tool names are retained.
 The TUI can add or replace a masked key under Providers in `/settings`; choose
 Runtime / Model there to select or reconnect at a safe checkpoint.
+
+Ollama model names are exact inventory identifiers. For example,
+`gpt-oss:120b-cloud` is a small local alias that routes inference to Ollama Cloud;
+it is not interchangeable with an uninstalled local `gpt-oss:120b`. Register the
+cloud alias explicitly with `ollama pull gpt-oss:120b-cloud`. A failed preflight
+leaves the previous provider active. Contract failures, empty responses, quota,
+authentication, transport, missing-model, and model-load failures retain distinct
+diagnostics in `/live` and `/advanced-tracing`.
 
 ## Runtime tuning
 

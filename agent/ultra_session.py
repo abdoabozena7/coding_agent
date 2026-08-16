@@ -173,6 +173,8 @@ _TESTER_VERIFICATION_COMMAND_RE = re.compile(
     r"^\s*(?:"
     r"(?:(?:\"[^\"]+\"|'[^']+'|python(?:\.exe)?)\s+-m\s+)?pytest\b|"
     r"(?:\"[^\"]+\"|'[^']+'|python(?:\.exe)?)\s+-m\s+(?:unittest|compileall)\b|"
+    r"(?:python3?(?:\.exe)?|\"[^\"]+\"|'[^']+')\s+"
+    r"[^\s;&|<>`]+\.py(?:\s+[^\r\n;&|<>`]*)?$|"
     r"npm\s+(?:test|run\s+(?:test|build|lint|check))\b|"
     r"(?:pnpm|yarn)\s+(?:test|build|lint|check)\b|"
     r"cargo\s+(?:test|check|clippy|build)\b|"
@@ -8955,6 +8957,32 @@ window.buildPreview=(context)=>{
                 "workspace_artifacts": "passed",
                 "executable_gate": "passed",
             }
+            # Majority consensus cannot erase a mandatory reviewer rejection.
+            # Recover missing durable review projections only from the
+            # corresponding accepted vote; integration still requires all
+            # three named review gates.
+            vote_roles = {
+                "security": "security",
+                "clean_code": "clean_code",
+                "testing": "test_quality",
+                "test_quality": "test_quality",
+            }
+            for vote in tuple(dict(consensus or {}).get("votes") or ()):
+                if not isinstance(vote, Mapping):
+                    continue
+                voter = str(vote.get("voter_agent_id") or "").rsplit(":", 1)[-1]
+                required_role = vote_roles.get(voter.casefold())
+                if (
+                    required_role
+                    and reviews.get(required_role) != "failed"
+                    and str(vote.get("verdict") or "").casefold() == "accept"
+                ):
+                    reviews[required_role] = "passed"
+            if not all(
+                reviews.get(role) == "passed"
+                for role in ("clean_code", "security", "test_quality")
+            ):
+                continue
             self.store.save_change_set(
                 replace(
                     change_set,

@@ -695,6 +695,16 @@ class OllamaProvider:
                 operation="parse_stream", provider_message="Ollama returned no valid NDJSON chunks",
                 endpoint=f"{self.host}/api/chat",
             ))
+        if valid_chunks and not text_parts and not raw_tool_calls and not tools:
+            raise ProviderRequestError(
+                ProviderDiagnostic(
+                    reachable=True,
+                    kind=ProviderFailureKind.EMPTY_RESPONSE,
+                    operation="parse_stream",
+                    provider_message="Ollama returned no visible content or tool calls",
+                    endpoint=f"{self.host}/api/chat",
+                )
+            )
         self._assert_gpu_residency()
 
         tool_calls = []

@@ -815,6 +815,7 @@ class ProviderFailureKind(str, Enum):
     UNSUPPORTED_STRUCTURED_OUTPUT = "unsupported_structured_output"
     CONTEXT_LIMIT = "context_limit_exceeded"
     MALFORMED_STREAM = "malformed_streamed_response"
+    EMPTY_RESPONSE = "empty_response"
     INVALID_TYPED_OUTPUT = "invalid_typed_output"
 
 

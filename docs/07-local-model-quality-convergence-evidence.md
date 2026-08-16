@@ -62,9 +62,9 @@
 ## Provider compatibility
 
 - Ollama configuration separates base URL, protocol, endpoint, selected model, capability profile, request compiler, and response parser.
-- Safe capability probing uses `GET /api/version` and `GET /api/tags`, records daemon/model evidence, and caches the result before meaningful generation.
+- Safe capability probing uses `GET /api/version`, exact-name inventory from `GET /api/tags`, and capabilities from `POST /api/show`. A model switch is committed only after this Ollama preflight succeeds.
 - The request compiler omits tools, structured output, thinking, and known-unsupported fields unless supported. A reachable unsupported-field HTTP rejection is classified accurately and retried once with only that safe field removed.
-- Connection refusal, DNS/socket failure, timeout, HTTP 4xx/5xx, missing endpoint/model, model-load failure, invalid payload, unsupported tools/format/parameter, context overflow, and a wholly malformed NDJSON stream have distinct diagnostics. Provider bodies are retained after secret redaction.
+- Selection, inventory, probe, response, and stage-contract status are persisted separately. Connection refusal, DNS/socket failure, timeout, authentication, quota, rate limit, HTTP 4xx/5xx, missing endpoint/model, model-load failure, empty response, tool-contract failure, typed-return failure, invalid payload, unsupported tools/format/parameter, context overflow, and a wholly malformed NDJSON stream have distinct diagnostics. Provider bodies are retained after secret redaction.
 
 ## Live local-model validation (2026-07-12)
 

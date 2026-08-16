@@ -795,8 +795,43 @@ class PlanStudioIntegrationTests(LocalWebViewTestCase):
                 },
             )
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["message"], "Model changed to ollama/coder.")
+        self.assertEqual(
+            response.json()["message"],
+            "Model changed to ollama/coder; inventory and capabilities verified, first response not yet tested.",
+        )
         replace_provider.assert_called_once_with(provider, descriptor)
+
+    def test_switch_model_preflight_failure_keeps_current_provider(self):
+        descriptor = mock.Mock()
+        descriptor.id = "ollama:gpt-oss:120b-cloud@http://localhost:11434"
+        descriptor.provider = "ollama"
+        descriptor.model = "gpt-oss:120b-cloud"
+        descriptor.create_provider.return_value = ScriptedProvider([])
+        catalog = mock.Mock()
+        catalog.by_id.return_value = descriptor
+        with (
+            mock.patch("agent.web_views.service.ModelCatalog", return_value=catalog),
+            mock.patch(
+                "agent.web_views.service.preflight_model_selection",
+                side_effect=ValueError("model alias is not installed"),
+            ),
+            mock.patch.object(self.runtime, "replace_provider") as replace_provider,
+        ):
+            response = self.client.post(
+                f"/api/sessions/{self.runtime.session_id}/actions",
+                headers=self.csrf_headers(),
+                json={
+                    "action": "switch_model",
+                    "target_id": descriptor.id,
+                    "value": descriptor.id,
+                    "expected_sequence": self.store.latest_event_sequence(),
+                    "source": "web",
+                },
+            )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("not installed", response.text)
+        replace_provider.assert_not_called()
 
     def test_continue_local_model_selects_the_strongest_local_candidate(self):
         weak = mock.Mock()

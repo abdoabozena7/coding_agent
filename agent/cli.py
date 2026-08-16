@@ -57,7 +57,7 @@ from .diagnostics import (
 from .evaluation import learn_from_benchmark_trend, record_benchmark_trend
 from .events import EventBus
 from .model_catalog import ExecutionClass, ModelCatalog, ModelDescriptor
-from .local_provider import ProviderRequestError
+from .model_status import classify_model_failure, preflight_model_selection
 from .models import DomainError, GoalStatus
 from .providers import get_provider
 from .runtime import AgentRuntime, ProviderUnavailableError, RuntimeErrorBase, SliceResult
@@ -126,22 +126,6 @@ DEFAULT_PROJECTS_ROOT = APP_ROOT / "projects"
 
 class PickerBack(Exception):
     """Internal navigation signal used by the staged interactive setup."""
-
-
-def _provider_request_failure(error: BaseException) -> ProviderRequestError | None:
-    """Find a typed provider failure through wrapper exceptions."""
-
-    current: BaseException | None = error
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, ProviderRequestError):
-            return current
-        cause = getattr(current, "__cause__", None)
-        current = cause if isinstance(cause, BaseException) else getattr(
-            current, "__context__", None
-        )
-    return None
 
 
 def _full_auto_retry_delay(attempt: int) -> float:
@@ -1118,7 +1102,8 @@ def _descriptor_for_explicit_model(
 ) -> ModelDescriptor:
     model = _validated_model_name(model)
     if catalog is not None and provider == "ollama":
-        for item in catalog.discover():
+        discovered = catalog.discover()
+        for item in discovered:
             if item.provider == provider and item.model == model:
                 return item
         omitted = [
@@ -1130,6 +1115,28 @@ def _descriptor_for_explicit_model(
             raise ValueError(
                 f"Ollama model {model!r} is not selectable because it does not advertise tool calling"
             )
+        related = next(
+            (
+                item.model
+                for item in discovered
+                if item.provider == "ollama"
+                and (
+                    item.model.casefold() == f"{model}-cloud".casefold()
+                    or item.model.casefold() == f"{model}:cloud".casefold()
+                )
+            ),
+            "",
+        )
+        suggestion = (
+            f" Available related model: {related!r}. "
+            f"Register it explicitly with 'ollama pull {related}'."
+            if related
+            else " Refresh the catalog after installing the exact model with 'ollama pull <model>'."
+        )
+        raise ValueError(
+            f"Ollama model {model!r} is not installed at {catalog.ollama_host}."
+            + suggestion
+        )
     cloud = provider in {"openai", "gemini"} or model.casefold().endswith(
         (":cloud", "-cloud")
     )
@@ -1795,6 +1802,7 @@ def _execute_model(runtime: AgentRuntime, console: ConsoleUI, value: str | None,
             )
     provider = descriptor.create_provider()
     setattr(provider, "reasoning_effort", effort or runtime.reasoning_effort)
+    preflight_model_selection(provider, descriptor)
     runtime.replace_provider(provider, descriptor)
     variable = {
         "openai": "OPENAI_MODEL",
@@ -4781,6 +4789,7 @@ def _persistent_interactive_loop(
                     return False
             provider = descriptor.create_provider()
             setattr(provider, "reasoning_effort", runtime.reasoning_effort)
+            preflight_model_selection(provider, descriptor)
             current_goal = runtime.active_goal()
             accepted_scope = False
             if current_goal is not None:
@@ -4852,9 +4861,15 @@ def _persistent_interactive_loop(
                     + (" Accepted quality gates remain unchanged." if accepted_scope else ""),
                 )
             else:
+                verification = (
+                    " Inventory and capabilities verified; first response not yet tested."
+                    if descriptor.provider == "ollama"
+                    else " First response not yet tested."
+                )
                 store.append_transcript(
                     "assistant",
-                    f"Model changed to {descriptor.provider}/{descriptor.model} ({descriptor.execution_class.value}).",
+                    f"Model changed to {descriptor.provider}/{descriptor.model} "
+                    f"({descriptor.execution_class.value}).{verification}",
                 )
             return True
 
@@ -5356,19 +5371,14 @@ def _persistent_interactive_loop(
                         except (StateStoreError, KeyError, TypeError, AttributeError):
                             pending_semantic = None
                         semantic_recovery = isinstance(pending_semantic, Mapping)
-                        typed_provider_failure = _provider_request_failure(exc)
-                        # Providers normally expose a typed diagnostic, but
-                        # the runtime deliberately wraps legacy/raw provider
-                        # exceptions (including plain ``429 quota`` or DNS
-                        # messages) in ProviderUnavailableError.  Treat that
-                        # wrapper as a provider boundary too; otherwise Full
-                        # Auto would surface a manual retry instead of moving
-                        # to the local fallback it was explicitly asked to use.
-                        provider_failure = (
-                            typed_provider_failure is not None
-                            or isinstance(exc, ProviderUnavailableError)
-                            or semantic_recovery
+                        diagnosis = classify_model_failure(
+                            exc,
+                            pending_semantic if semantic_recovery else None,
                         )
+                        # A saved semantic turn proves only that recovery is
+                        # possible. It does not turn schema/typed-return errors
+                        # into provider availability failures.
+                        provider_failure = diagnosis.provider_boundary
                         local_provider = (
                             str(getattr(runtime, "execution_class", "local")).casefold()
                             != "cloud"
@@ -5378,35 +5388,41 @@ def _persistent_interactive_loop(
                             if semantic_recovery
                             else {}
                         )
-                        provider_message = (
-                            str(validation_error.get("message") or pending_semantic.get("last_error") or exc)
-                            if semantic_recovery
-                            else
-                            (
-                                "The local model runner could not complete its structured response."
-                                if local_provider
-                                else "The cloud provider could not complete this request."
-                            )
-                            if provider_failure
-                            else redact_text(str(exc), 800)
-                        )
+                        provider_message = diagnosis.message
                         semantic_stage = (
-                            str(pending_semantic.get("stage") or "route").replace("_", " ")
-                            if semantic_recovery
-                            else ""
+                            str(
+                                diagnosis.stage
+                                or (
+                                    pending_semantic.get("stage")
+                                    if semantic_recovery
+                                    else ""
+                                )
+                                or ""
+                            ).replace("_", " ")
                         )
-                        title = (
-                            f"{semantic_stage.title()} needs attention"
-                            if semantic_recovery
-                            else
-                            (
-                                "Local model stopped unexpectedly"
-                                if local_provider
-                                else "Cloud model request failed"
-                            )
-                            if provider_failure
-                            else "That step did not finish"
+                        title = diagnosis.title(
+                            "local" if local_provider else "cloud"
                         )
+                        try:
+                            if provider_failure:
+                                runtime.record_model_failure(
+                                    exc,
+                                    stage=diagnosis.stage,
+                                    pending_semantic=(
+                                        pending_semantic
+                                        if semantic_recovery
+                                        else None
+                                    ),
+                                )
+                            else:
+                                runtime.record_model_contract_status(
+                                    diagnosis.stage or semantic_stage,
+                                    verified=False,
+                                    error=diagnosis.message,
+                                    failure_kind=diagnosis.category.value,
+                                )
+                        except (AttributeError, StateStoreError):
+                            pass
                         action_records = (
                             tuple(pending_semantic.get("action_records") or ())
                             if semantic_recovery
@@ -5446,7 +5462,11 @@ def _persistent_interactive_loop(
                             and goal.active_plan_revision is None
                         ):
                             try:
-                                runtime.pause("local model failed while starting the saved goal")
+                                runtime.pause(
+                                    diagnosis.pause_reason(
+                                        "local" if local_provider else "cloud"
+                                    )
+                                )
                             except Exception as pause_error:
                                 store.append_log(f"provider recovery pause: {pause_error}")
                             retry_action = (

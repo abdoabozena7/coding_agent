@@ -51,6 +51,7 @@ from agent.ultra_session import (
     _repair_double_escaped_python_source,
     _run_python_test_artifacts,
     _normalize_tester_verification_call,
+    _tester_verification_command_allowed,
     _tester_command_receipt,
     _store_node_status,
     _validate_workspace_artifacts,
@@ -590,6 +591,16 @@ def test_tester_cd_verifier_is_normalized_to_typed_cwd_without_shell_expansion()
     )
     assert not javascript_changed
     assert javascript == 'const value = \\"literal\\";\n'
+
+
+def test_tester_accepts_approval_bound_direct_python_script_without_shell_composition():
+    assert _tester_verification_command_allowed("python hello.py")
+    assert _tester_verification_command_allowed(
+        "python3 scripts/check_output.py --exact"
+    )
+    assert not _tester_verification_command_allowed(
+        "python hello.py && del hello.py"
+    )
 
 
 def test_tester_command_receipt_uses_only_authoritative_exit_status():

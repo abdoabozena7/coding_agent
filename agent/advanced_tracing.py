@@ -828,6 +828,7 @@ class AdvancedTraceProjection:
                 "status": str(runtime_snapshot.phase or runtime_snapshot.liveness or "idle"),
                 "provider": getattr(self.adapter.runtime, "provider_name", ""),
                 "model": getattr(self.adapter.runtime, "model_name", ""),
+                "model_status": self.adapter.runtime.model_status_snapshot(),
                 "mode": getattr(getattr(self.adapter.runtime, "interaction_mode", None), "value", "working"),
                 "objective": str(
                     session_state.get("session_title")
@@ -861,6 +862,7 @@ class AdvancedTraceProjection:
             "objective": self.goal.objective,
             "provider": getattr(self.run, "provider", getattr(self.adapter.runtime, "provider_name", "")),
             "model": getattr(self.run, "model", getattr(self.adapter.runtime, "model_name", "")),
+            "model_status": self.adapter.runtime.model_status_snapshot(),
             "mode": getattr(getattr(self.adapter.runtime, "interaction_mode", None), "value", "working"),
             "created_at": self.goal.created_at.isoformat(),
             "updated_at": self.goal.updated_at.isoformat(),
